@@ -1,0 +1,75 @@
+# ============================================================
+# Harness_go .gitignore
+# 仅纳入源码、配置、文档与知识库；以下均为可再生的构建产物、
+# 依赖、运行时数据与调试快照
+# ============================================================
+
+# ---------- 依赖与构建产物 ----------
+node_modules/
+dist/
+build/
+out/
+*.tsbuildinfo
+.vite/
+coverage/
+
+# Go 构建产物（后续单二进制服务端）
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.prof
+/harness-go
+/harness_go
+/data/
+
+# ---------- 日志与临时文件 ----------
+*.log
+logs/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.tmp
+*.temp
+*.cache
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- 编辑器与 IDE ----------
+.idea/
+.vscode/
+*.iml
+*.swp
+.sublime-workspace
+
+# ---------- 环境变量与密钥 ----------
+.env
+.env.*
+!.env.example
+*.pem
+secret.key
+
+# ---------- Harness Agent 运行时数据 ----------
+.harness/
+*.pid
+
+# ---------- demo 调试快照与浏览器录制宏 ----------
+# ARIA 页面快照 / 自动化录制提示词（工具生成，可重新录制）
+demo/*.yaml
+# Playwright 自动化调试产物（页面快照、trace、报告）
+demo/.playwright-cli/
+demo/.playwright/
+demo/playwright-report/
+demo/test-results/
+# 验收截图（自测产物）
+demo/*.png
+demo/serve.out.log
+demo/serve.err.log
+
+# ---------- 其他 ----------
+*.zip
+*.tar
+*.tar.gz
