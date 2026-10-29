@@ -24,6 +24,11 @@ coverage/
 /harness-go
 /harness_go
 /data/
+/bin/
+*.db
+*.db-wal
+*.db-shm
+.golangci-lint-cache/
 
 # ---------- 日志与临时文件 ----------
 *.log

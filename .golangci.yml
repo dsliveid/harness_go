@@ -1,0 +1,90 @@
+# golangci-lint v2 配置（harness_go）
+# 安装：go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+# 运行：make lint  或  golangci-lint run
+#
+# 分层依赖规则（见 docs/架构设计文档.md §2.2 / docs/插件体系设计.md §3.4）
+# 是本项目"依赖单向向内"的机械保障，任何越界 import 都会被拦下。
+
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: standard
+  enable:
+    - depguard      # 分层依赖强制
+    - bodyclose
+    - errorlint
+    - gocritic
+    - misspell
+    - revive
+    - unconvert
+    - unparam
+    - whitespace
+  settings:
+    depguard:
+      rules:
+        # ① 传输层不得直连存储层：api → service → agent/store
+        api-no-store:
+          files:
+            - "**/internal/api/**"
+          deny:
+            - pkg: "harness-go/internal/store"
+              desc: "api 层禁止直连 store，必须经 service 层（架构 §2.2 依赖规则）"
+            - pkg: "harness-go/internal/agent"
+              desc: "api 层禁止直连 agent 引擎，必须经 service 层"
+
+        # ② 公开契约与插件实现不得依赖内核内部实现
+        #    工具只能通过 pkg/toolapi.Host 获取受控能力（插件体系设计 §3.4）
+        plugin-isolation:
+          files:
+            - "**/pkg/toolapi/**"
+            - "**/internal/plugins/**"
+          deny:
+            - pkg: "harness-go/internal/store"
+              desc: "插件禁止直连 store，请使用 Host.Blobs()/Host.Config()"
+            - pkg: "harness-go/internal/llm"
+              desc: "插件禁止直连 llm，请使用 Host.LLM()"
+            - pkg: "harness-go/internal/agent"
+              desc: "插件禁止直连 agent，请使用 Host.Spawn()"
+            - pkg: "harness-go/internal/api"
+              desc: "插件禁止依赖传输层"
+            - pkg: "harness-go/internal/service"
+              desc: "插件禁止依赖用例层"
+
+        # ③ 插件之间互不依赖：一个插件一个包，只依赖契约
+        plugin-no-cross-import:
+          files:
+            - "**/internal/plugins/**"
+          deny:
+            - pkg: "harness-go/internal/plugins"
+              desc: "插件之间禁止互相 import（每个插件必须独立）"
+
+        # ④ 基础服务侧 tools 包不得依赖具体插件
+        tools-no-plugins:
+          files:
+            - "**/internal/tools/**"
+          deny:
+            - pkg: "harness-go/internal/plugins"
+              desc: "internal/tools 只做协议与调度，禁止依赖具体插件实现"
+
+  exclusions:
+    generated: lax
+    rules:
+      - path: "_test\\.go"
+        linters:
+          - unparam
+          - gocritic
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    generated: lax
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
