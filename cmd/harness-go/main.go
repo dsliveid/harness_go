@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -31,9 +32,16 @@ import (
 	"harness-go/internal/llm"
 	"harness-go/internal/observ"
 	"harness-go/internal/prompt"
+	"harness-go/internal/secret"
 	"harness-go/internal/service"
 	"harness-go/internal/store"
 	"harness-go/internal/tokenizer"
+	"harness-go/internal/tools"
+	"harness-go/internal/tools/hostimpl"
+	"harness-go/internal/tools/loader"
+	"harness-go/internal/tools/registry"
+	"harness-go/internal/tools/router"
+	"harness-go/pkg/toolapi"
 )
 
 // 由构建时 ldflags 注入，见 Makefile。
@@ -64,13 +72,23 @@ func run() error {
 		return err
 	}
 
-	logger := observ.NewLogger(cfg.Log.Level, cfg.Log.Format, os.Stdout)
-	slog.SetDefault(logger)
-
 	dataDir, err := cfg.EnsureDataDir()
 	if err != nil {
 		return err
 	}
+
+	// 日志双写：stdout + data/app.log（`GET /api/v1/logs` 尾行读取该文件）。
+	// 日志文件打开失败不阻断启动（只退化为 stdout），但必须打印告警。
+	logWriter := io.Writer(os.Stdout)
+	if logFile, lErr := os.OpenFile(filepath.Join(dataDir, "app.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); lErr == nil {
+		logWriter = io.MultiWriter(os.Stdout, logFile)
+		defer func() { _ = logFile.Close() }()
+	} else {
+		fmt.Fprintf(os.Stderr, "harness-go: 无法打开 data/app.log（日志面板将为空）: %v\n", lErr)
+	}
+
+	logger := observ.NewLogger(cfg.Log.Level, cfg.Log.Format, logWriter)
+	slog.SetDefault(logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -115,6 +133,46 @@ func run() error {
 	// ⑦ 审批闸门（5min 超时视为拒绝）
 	gate := approval.NewGate(approval.DefaultTimeout)
 
+	// ⑦' 工具子系统（A-10 协议层）：注册表 → 插件装配 → 执行面路由 → 执行适配
+	toolReg := registry.New(registry.Options{
+		CoreSoftLimit:     cfg.Tools.CoreSoftLimit,
+		DeferredSoftLimit: cfg.Tools.DeferredSoftLimit,
+		Logger:            logger,
+	})
+	workDir, wErr := os.Getwd()
+	if wErr != nil {
+		return fmt.Errorf("获取工作区根目录失败: %w", wErr)
+	}
+	toolHost := hostimpl.New(hostimpl.Options{WorkDir: workDir})
+	pluginOK, pluginFail := registerBuiltins(ctx, toolReg, toolHost, nil, logger)
+	toolRouter := router.New(router.Options{
+		Executor: toolapi.ExecutorServer,
+		Capabilities: map[string]bool{
+			toolapi.CapWorkspaceRead:  true,
+			toolapi.CapWorkspaceWrite: true,
+			toolapi.CapProcess:        true,
+			toolapi.CapNetwork:        true,
+			toolapi.CapLLM:            true,
+		},
+	})
+	toolLimits := loader.Limits{CoreSoft: cfg.Tools.CoreSoftLimit, DeferredSoft: cfg.Tools.DeferredSoftLimit}
+	toolRunner := tools.NewRunner(toolReg, toolRouter, toolLimits)
+	injection := toolRunner.Injection()
+	logger.Info("工具注入预算",
+		"plugins_ok", pluginOK,
+		"plugins_failed", pluginFail,
+		"core", len(injection.Core),
+		"deferred", len(injection.DeferredIndex),
+		"on_demand", len(injection.OnDemand),
+		"cost_core", injection.CostCore,
+		"cost_index", injection.CostIndex,
+		"cost_total", injection.CostTotal,
+		"core_soft_limit", injection.Limits.CoreSoft,
+	)
+	for _, warn := range toolReg.Warnings() {
+		logger.Warn("工具注入软上限告警（不阻断启动）", "detail", warn)
+	}
+
 	// ⑧ 引擎
 	engine, err := agent.New(agent.Deps{
 		Sessions:      service.NewSessionProvider(sessionStore),
@@ -122,6 +180,8 @@ func run() error {
 		Events:        bus,
 		Models:        &staticResolver{provider: provider},
 		Builder:       builder,
+		Tools:         toolRunner,
+		Catalog:       toolRunner,
 		Gate:          gate,
 		MaxConcurrent: 8,
 		MaxSteps:      20,
@@ -165,19 +225,41 @@ func run() error {
 		Sessions:   sessionStore,
 		Engine:     engine,
 		SystemBase: defaultSystemBase,
+		// 每轮重新取工具定义：PATCH /tools/tiers 改档后下一轮对话即生效
+		ToolRefs: toolRunner.PromptRefs,
+		// B-3：审批决策端点需经同一闸门提交（引擎在此登记待决项）
+		Gate: gate,
 	})
 	if n, rErr := runSvc.RecoverInterrupted(ctx); rErr == nil && n > 0 {
 		logger.Warn("已将未完成 Run 置为 interrupted（不做断点续跑）", "count", n)
 	}
 	maintenanceSvc := service.NewMaintenanceService(mainStore, sessionStore, runSvc, gate.PendingCount)
+	toolSvc := service.NewToolService(toolRunner, mainStore)
+	toolSvc.LoadOverrides(ctx)
+
+	// ⑩' B-4：厂商（api_key 密文落库）+ 配置 + 日志尾行
+	secretCipher, cErr := secret.LoadOrCreate(filepath.Join(dataDir, "secret.key"))
+	if cErr != nil {
+		return cErr
+	}
+	providerSvc := service.NewProviderService(service.ProviderServiceOptions{
+		Main:   mainStore,
+		Cipher: secretCipher,
+	})
+	settingsSvc := service.NewSettingsService(mainStore)
+	logSvc := service.NewLogService(filepath.Join(dataDir, "app.log"), 500)
 
 	// ⑪ 路由
-	router := api.NewRouter(api.Deps{
+	httpHandler := api.NewRouter(api.Deps{
 		Version:     version,
 		Log:         logger,
 		Sessions:    sessionSvc,
 		Runs:        runSvc,
 		Maintenance: maintenanceSvc,
+		Tools:       toolSvc,
+		Providers:   providerSvc,
+		Settings:    settingsSvc,
+		Logs:        logSvc,
 		Bus:         bus,
 		Auth:        authSvc,
 		AuthConfig: api.AuthConfig{
@@ -193,7 +275,7 @@ func run() error {
 
 	server := &http.Server{
 		Addr:              cfg.Server.Addr,
-		Handler:           router,
+		Handler:           httpHandler,
 		ReadHeaderTimeout: 10 * time.Second,
 		// WriteTimeout 保持 0：SSE 长连接需要
 	}
@@ -225,12 +307,13 @@ func run() error {
 		logger.Info("收到退出信号，开始优雅关闭（最长 30s）")
 	}
 
-	// ⑬ 优雅关闭：停止接收 → 等待在途请求 → 关闭存储
+	// ⑬ 优雅关闭：停止接收 → 等待在途请求 → 停止插件 → 关闭存储
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if sErr := server.Shutdown(shutdownCtx); sErr != nil {
 		logger.Error("HTTP 优雅关闭失败", "err", sErr)
 	}
+	toolReg.Stop(shutdownCtx)
 	logger.Info("已退出")
 	return nil
 }

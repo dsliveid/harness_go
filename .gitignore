@@ -6,7 +6,11 @@
 
 # ---------- 依赖与构建产物 ----------
 node_modules/
-dist/
+# 前端构建产物：demo 为只读视觉基线，其 dist 不入库；
+# web/dist 需要「目录存在」（//go:embed all:dist 的编译期要求），故只忽略内容、保留 .gitkeep
+/demo/dist/
+/web/dist/*
+!/web/dist/.gitkeep
 build/
 out/
 *.tsbuildinfo

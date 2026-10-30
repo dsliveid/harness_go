@@ -1,0 +1,33 @@
+{
+  "id": "builtin.echo",
+  "name": "Echo",
+  "version": "0.1.0",
+  "kind": "builtin",
+  "description": "工具契约一致性 fixture：回显输入文本，用于验证「模型调用 → 审批 → 执行 → tool_events 落库」全链路",
+  "default_tier": "core",
+  "protocol_version": 1,
+  "author": "harness-go",
+  "tools": [
+    {
+      "name": "echo",
+      "namespace": "builtin",
+      "description": "回显输入文本（工具契约 fixture，只读无副作用）",
+      "tier": "core",
+      "executor": "server",
+      "risk": "readonly",
+      "capabilities": [],
+      "version": "0.1.0",
+      "schema_json": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "要回显的文本"
+          }
+        },
+        "required": ["text"],
+        "additionalProperties": false
+      }
+    }
+  ]
+}

@@ -62,6 +62,13 @@ type ToolRunner interface {
 	Run(ctx context.Context, req ToolRunRequest) (ToolRunResult, error)
 }
 
+// ToolCatalog 工具目录（可选端口）：提供工具风险级，避免引擎硬编码风险。
+//
+// 由 internal/tools 的 Runner 适配实现；未注入时引擎按 write 保守处理。
+type ToolCatalog interface {
+	Risk(toolName string) (model.Risk, bool)
+}
+
 // ToolRunRequest 工具执行请求。
 type ToolRunRequest struct {
 	RunID       string
@@ -69,6 +76,7 @@ type ToolRunRequest struct {
 	ToolEventID string
 	ToolName    string
 	ArgsJSON    string
+	AccessMode  string // readonly | confirm | full（工具可据此自行收紧行为）
 }
 
 // ToolRunResult 工具执行结果。

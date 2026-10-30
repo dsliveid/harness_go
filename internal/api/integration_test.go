@@ -19,6 +19,7 @@ import (
 	"harness-go/internal/llm"
 	"harness-go/internal/observ"
 	"harness-go/internal/prompt"
+	"harness-go/internal/secret"
 	"harness-go/internal/service"
 	"harness-go/internal/store"
 	"harness-go/internal/tokenizer"
@@ -78,8 +79,17 @@ func newTestServer(t *testing.T) (*httptest.Server, string) {
 		Sessions:   sessionStore,
 		Engine:     engine,
 		SystemBase: "你是测试助手",
+		Gate:       gate, // B-3：审批决策端点
 	})
 	maintenanceSvc := service.NewMaintenanceService(mainStore, sessionStore, runSvc, gate.PendingCount)
+
+	cipher, err := secret.New(make([]byte, secret.KeySize))
+	if err != nil {
+		t.Fatalf("创建密钥失败: %v", err)
+	}
+	providerSvc := service.NewProviderService(service.ProviderServiceOptions{Main: mainStore, Cipher: cipher})
+	settingsSvc := service.NewSettingsService(mainStore)
+	logSvc := service.NewLogService("", 100)
 
 	logger := observ.NewLogger("error", "text", io.Discard)
 	router := NewRouter(Deps{
@@ -88,6 +98,9 @@ func newTestServer(t *testing.T) (*httptest.Server, string) {
 		Sessions:    sessionSvc,
 		Runs:        runSvc,
 		Maintenance: maintenanceSvc,
+		Providers:   providerSvc,
+		Settings:    settingsSvc,
+		Logs:        logSvc,
 		Bus:         bus,
 		Auth:        tokenSvc,
 		AuthConfig: AuthConfig{

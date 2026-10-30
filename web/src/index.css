@@ -1,0 +1,260 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  *, ::before, ::after {
+    border-color: var(--edge);
+  }
+}
+
+:root {
+  --bg-rgb: 8, 12, 20;
+  --panel-rgb: 13, 18, 28;
+  --panel2-rgb: 19, 25, 38;
+  --panel3-rgb: 28, 36, 54;
+  /* 清晰明确的高科技精密线框，无阴影，纯粹结构感 */
+  --edge-rgb: 36, 49, 74;
+  --edge2-rgb: 54, 73, 110;
+  --ink-rgb: 241, 245, 249;
+  --inkdim-rgb: 148, 163, 184;
+  --inkfaint-rgb: 100, 116, 139;
+  --accent-rgb: 59, 130, 246;
+  --accent2-rgb: 139, 92, 246;
+  --ok-rgb: 16, 185, 129;
+  --warn-rgb: 245, 158, 11;
+  --err-rgb: 244, 63, 94;
+
+  --bg: rgb(var(--bg-rgb));
+  --panel: rgb(var(--panel-rgb));
+  --panel2: rgb(var(--panel2-rgb));
+  --panel3: rgb(var(--panel3-rgb));
+  --edge: rgb(var(--edge-rgb));
+  --edge2: rgb(var(--edge2-rgb));
+  --ink: rgb(var(--ink-rgb));
+  --inkdim: rgb(var(--inkdim-rgb));
+  --inkfaint: rgb(var(--inkfaint-rgb));
+  --accent: rgb(var(--accent-rgb));
+  --accent2: rgb(var(--accent2-rgb));
+  --accent-glow: transparent;
+  --ok: rgb(var(--ok-rgb));
+  --warn: rgb(var(--warn-rgb));
+  --err: rgb(var(--err-rgb));
+  color-scheme: dark;
+}
+
+html.light {
+  --bg-rgb: 248, 250, 252;
+  --panel-rgb: 255, 255, 255;
+  --panel2-rgb: 243, 245, 248;
+  --panel3-rgb: 233, 236, 242;
+  /* 干净、明确、清晰的浅色精密线框，无任何模糊脏阴影 */
+  --edge-rgb: 218, 224, 233;
+  --edge2-rgb: 188, 196, 210;
+  /* 浅色主题强对比度深度加黑文字体系：深度浓黑、笔画扎实、绝无浅灰发虚 */
+  --ink-rgb: 0, 0, 0;          /* 主文字：纯正浓黑 #000000，绝对高对比度与最高清晰度 */
+  --inkdim-rgb: 17, 24, 39;     /* 次级文字：深度炭黑 Gray-900 (#111827)，对比鲜明饱满，完全告别灰蒙 */
+  --inkfaint-rgb: 55, 65, 81;   /* 辅助文字：强对比度深铅灰 Gray-700 (#374151)，大幅加深，即便最小标注与图标依然清晰 */
+  --accent-rgb: 29, 78, 216;     /* 浅色模式高清晰饱和蓝 Blue-700 */
+  --accent2-rgb: 109, 40, 217;   /* 浅色模式高清晰饱和紫 Purple-700 */
+  --ok-rgb: 5, 150, 105;        /* Emerald-600，浅色模式更深更清晰 */
+  --warn-rgb: 217, 119, 6;
+  --err-rgb: 225, 29, 72;
+
+  --bg: rgb(var(--bg-rgb));
+  --panel: rgb(var(--panel-rgb));
+  --panel2: rgb(var(--panel2-rgb));
+  --panel3: rgb(var(--panel3-rgb));
+  --edge: rgb(var(--edge-rgb));
+  --edge2: rgb(var(--edge2-rgb));
+  --ink: rgb(var(--ink-rgb));
+  --inkdim: rgb(var(--inkdim-rgb));
+  --inkfaint: rgb(var(--inkfaint-rgb));
+  --accent: rgb(var(--accent-rgb));
+  --accent2: rgb(var(--accent2-rgb));
+  --accent-glow: transparent;
+  --ok: rgb(var(--ok-rgb));
+  --warn: rgb(var(--warn-rgb));
+  --err: rgb(var(--err-rgb));
+  color-scheme: light;
+}
+
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", Roboto, sans-serif;
+  overscroll-behavior: none;
+  scrollbar-width: thin;
+  letter-spacing: normal;
+  text-rendering: geometricPrecision;
+  font-synthesis: none;
+}
+
+/* 浅色模式字体清晰度与对比度增强：禁用伪粗体模糊合成，保证 DirectWrite 矢量微指令精准贴合像素格 */
+html.light,
+html.light body {
+  color: rgb(var(--ink-rgb));
+  font-synthesis: none;
+}
+
+html.light input,
+html.light textarea,
+html.light button,
+html.light select {
+  font-weight: inherit;
+  font-synthesis: none;
+}
+
+html.light ::placeholder {
+  color: rgb(55, 65, 81) !important;
+  opacity: 1 !important;
+}
+
+/* 深色模式维持微光抗锯齿 */
+html.dark body {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* 键盘导航聚焦时仅对按钮与链接显示微弱轮廓，坚决杜绝输入框/文本域聚焦时出现横线与描边 */
+button:focus-visible, a:focus-visible {
+  outline: 1.5px solid var(--accent);
+  outline-offset: 1px;
+}
+button:focus:not(:focus-visible), a:focus:not(:focus-visible) {
+  outline: none;
+}
+textarea, input, textarea:focus, textarea:focus-visible, input:focus, input:focus-visible {
+  outline: none !important;
+  box-shadow: none !important;
+  border-bottom-color: inherit;
+}
+
+/* 移动端安全区 + 动态视口 */
+.app-shell { height: 100dvh; padding-bottom: env(safe-area-inset-bottom); }
+/* 输入控件字号统一走组件自身的 text-[13px]（inputCls），移动端不再强制放大到 16px。
+   旧规则 `@media (pointer: coarse) { input, textarea { font-size:16px !important } }`
+   （原为 iOS 聚焦防缩放）会让设置弹窗里「厂商名称 / Base URL / API Key」等文本框内文字
+   在手机上明显偏大、与旁边标签不协调，已移除。 */
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-thumb { background: var(--edge2); border-radius: 9999px; }
+::-webkit-scrollbar-thumb:hover { background: var(--inkfaint); }
+::-webkit-scrollbar-track { background: transparent; }
+
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { scrollbar-width: none; }
+
+/* 悬浮微光光晕（已取消阴影，保持纯粹清晰线框） */
+.tech-glow {
+  box-shadow: none;
+}
+
+/* Markdown 原型渲染增强 */
+.md {
+  color: var(--ink);
+}
+.md p {
+  margin: 0 0 10px;
+  line-height: 1.7;
+}
+.md p:last-child {
+  margin-bottom: 0;
+}
+.md ul, .md ol {
+  margin: 6px 0 10px;
+  padding-left: 20px;
+  line-height: 1.7;
+}
+.md li {
+  margin-bottom: 4px;
+}
+.md code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  background: var(--panel2);
+  border: 1px solid var(--edge);
+  padding: 1.5px 6px;
+  border-radius: 5px;
+  color: var(--accent);
+}
+.md pre {
+  margin: 10px 0;
+}
+.md blockquote {
+  margin: 10px 0;
+  padding: 8px 12px;
+  border-left: 3px solid var(--accent);
+  color: var(--inkdim);
+  background: var(--panel2);
+  border-radius: 0 8px 8px 0;
+  font-size: 13px;
+}
+.md h1, .md h2, .md h3, .md h4 {
+  color: var(--ink);
+  font-weight: 600;
+  letter-spacing: -0.015em;
+}
+.md h2 {
+  font-size: 15px;
+  margin: 16px 0 8px;
+}
+.md h3 {
+  font-size: 14px;
+  margin: 14px 0 6px;
+}
+.md table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  margin: 10px 0;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--edge);
+}
+.md th {
+  background: var(--panel2);
+  border-bottom: 1px solid var(--edge);
+  padding: 6px 10px;
+  font-weight: 600;
+  text-align: left;
+}
+.md td {
+  border-bottom: 1px solid var(--edge);
+  padding: 6px 10px;
+}
+.md tr:last-child td {
+  border-bottom: none;
+}
+.md tr:hover td {
+  background: var(--panel2);
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 0.3; transform: scale(0.9); }
+  50% { opacity: 1; transform: scale(1.15); }
+}
+.typing-dot { animation: pulse-dot 1.2s infinite ease-in-out; }
+.typing-dot:nth-child(2) { animation-delay: .2s; }
+.typing-dot:nth-child(3) { animation-delay: .4s; }
+
+@keyframes slide-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.slide-up { animation: slide-up .2s cubic-bezier(0.16, 1, 0.3, 1); }
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(-8px) scale(0.96); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.toast-in { animation: toast-in .2s cubic-bezier(0.16, 1, 0.3, 1); }
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.fade-in { animation: fade-in .15s ease-out; }

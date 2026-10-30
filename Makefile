@@ -19,7 +19,9 @@ LDFLAGS := -s -w \
 
 all: build
 
-## 仅编译 Go 二进制（要求 web/dist 已存在，否则 embed 失败）
+## 仅编译 Go 二进制（前端产物由 //go:embed all:dist 内嵌）
+## 注意：web/dist/.gitkeep 必须入库，否则 embed 目录不存在会导致编译失败；
+##       未构建前端时二进制仍可启动，`/` 返回「前端未构建」提示页
 build:
 	go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/$(BINARY) ./cmd/harness-go
 

@@ -24,6 +24,12 @@ type RunServiceOptions struct {
 	SystemBase string
 	SOP        []string
 	Tools      []prompt.ToolRef
+	// ToolRefs 动态工具注入（优先于静态 Tools）：每轮重新取，
+	// 保证 PATCH /tools/tiers 改档后「下一轮对话生效」。
+	ToolRefs func() []prompt.ToolRef
+	// Gate 审批闸门（B-3）：引擎登记的待决项由本服务经 DecideApproval 提交，
+	// 不注入时审批端点返回 unavailable（不静默成功）。
+	Gate *approval.Gate
 }
 
 // RunService Run 用例：创建（异步执行）/ 停止 / 查询 / 启动恢复。
@@ -34,6 +40,8 @@ type RunService struct {
 	systemBase string
 	sop        []string
 	tools      []prompt.ToolRef
+	toolRefs   func() []prompt.ToolRef
+	gate       *approval.Gate
 
 	mu      sync.Mutex
 	cancels map[string]context.CancelFunc
@@ -48,8 +56,18 @@ func NewRunService(opts RunServiceOptions) *RunService {
 		systemBase: opts.SystemBase,
 		sop:        opts.SOP,
 		tools:      opts.Tools,
+		toolRefs:   opts.ToolRefs,
+		gate:       opts.Gate,
 		cancels:    make(map[string]context.CancelFunc),
 	}
+}
+
+// currentTools 返回本轮应注入的工具定义（动态优先）。
+func (s *RunService) currentTools() []prompt.ToolRef {
+	if s.toolRefs != nil {
+		return s.toolRefs()
+	}
+	return s.tools
 }
 
 // CreateRun 写入用户消息 + 创建 Run(pending) + 异步执行。
@@ -115,7 +133,7 @@ func (s *RunService) CreateRun(ctx context.Context, sessionID, userInput, modelR
 		SystemBase:     s.systemBase,
 		SOP:            s.sop,
 		ProjectSummary: "",
-		Tools:          s.tools,
+		Tools:          s.currentTools(),
 	}
 	go func() {
 		defer func() {
@@ -168,6 +186,58 @@ func (s *RunService) RunningCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.cancels)
+}
+
+// DecideApproval 提交审批决策（B-3：审批决策端点）。
+//
+// 校验顺序：决策合法 → Run 归属与状态（waiting_approval）→ 审批项存在 → Gate 命中。
+// 「本会话允许」额外写入会话级审批规则；任何一步不满足都返回明确错误码，绝不静默成功。
+func (s *RunService) DecideApproval(ctx context.Context, sessionID, runID, approvalID, decision, reason string) error {
+	if s.gate == nil {
+		return apperr.New(apperr.CodeUnavailable, "审批闸门未启用")
+	}
+	var d approval.Decision
+	switch approval.Decision(decision) {
+	case approval.AllowOnce, approval.AllowSession, approval.Deny:
+		d = approval.Decision(decision)
+	default:
+		return invalidArg("decision 只能是 allow_once / allow_session / deny")
+	}
+	if approvalID == "" {
+		return invalidArg("approval_id 不能为空")
+	}
+
+	sdb, err := s.sessions.Acquire(ctx, sessionID)
+	if err != nil {
+		return err
+	}
+	run, err := sdb.Runs().Get(ctx, runID)
+	if err != nil {
+		return wrapStoreErr(err, apperr.CodeRunNotFound, "Run 不存在")
+	}
+	if run.Status != model.RunWaitingApproval {
+		return apperr.New(apperr.CodeRunStateConflict,
+			"Run 当前状态为 %s，不在等待审批", string(run.Status))
+	}
+	ev, err := sdb.ToolEvents().GetByRun(ctx, runID, approvalID)
+	if err != nil {
+		return wrapStoreErr(err, apperr.CodeApprovalNotFound, "审批请求不存在")
+	}
+
+	// Gate 提交：未命中说明已被处理或已超时（超时已按拒绝落库）
+	if !s.gate.Resolve(approvalID, d) {
+		return apperr.New(apperr.CodeApprovalNotFound, "审批请求不存在或已处理")
+	}
+
+	// 「本会话允许」→ 写会话级规则（后续同类调用免审）
+	if d == approval.AllowSession {
+		if err := sdb.ApprovalRules().Add(ctx, ev.ToolName, ""); err != nil {
+			return err
+		}
+	}
+	// 审计落库（best-effort：决策已生效，审计失败不回滚决策）
+	_ = sdb.Approvals().Decide(ctx, approvalID, runID, ev.ID, string(d), reason)
+	return nil
 }
 
 // RecoverInterrupted 启动恢复：把未完成 Run 置 interrupted（ADR-009 不做断点续跑）。

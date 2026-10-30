@@ -65,6 +65,12 @@ const (
 	CodePluginDegraded  Code = "plugin.degraded"
 )
 
+// 审批（B-3：审批决策端点）
+const (
+	CodeApprovalNotFound      Code = "approval.not_found"
+	CodeApprovalAlreadyDecide Code = "approval.already_decided"
+)
+
 // Error 统一错误类型。
 type Error struct {
 	Code    Code
@@ -173,9 +179,10 @@ func StatusFor(code Code) int {
 		return http.StatusUnauthorized
 	case CodeForbidden, CodeAuthSSODisabled, CodeToolDenied:
 		return http.StatusForbidden
-	case CodeNotFound, CodeSessionNotFound, CodeRunNotFound, CodeToolNotFound:
+	case CodeNotFound, CodeSessionNotFound, CodeRunNotFound, CodeToolNotFound,
+		CodeApprovalNotFound:
 		return http.StatusNotFound
-	case CodeConflict, CodeRunStateConflict:
+	case CodeConflict, CodeRunStateConflict, CodeApprovalAlreadyDecide:
 		return http.StatusConflict
 	case CodeRateLimited, CodeAuthRateLimited:
 		return http.StatusTooManyRequests

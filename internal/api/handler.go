@@ -21,13 +21,20 @@ type Deps struct {
 	Sessions    *service.SessionService
 	Runs        *service.RunService
 	Maintenance *service.MaintenanceService
+	Tools       *service.ToolService
+	Providers   *service.ProviderService
+	Settings    *service.SettingsService
+	Logs        *service.LogService
 	Bus         *events.Bus
 	Auth        *auth.Service
 	AuthConfig  AuthConfig
 	VerifyToken TokenVerifier
 }
 
-type handlers struct{ d Deps }
+type handlers struct {
+	d   Deps
+	web *assets
+}
 
 // ============ 会话 ============
 
@@ -170,6 +177,11 @@ func (h *handlers) runEvents(w http.ResponseWriter, r *http.Request) {
 
 	var fromSeq int64
 	if v := r.Header.Get("Last-Event-ID"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			fromSeq = n
+		}
+	} else if v := r.URL.Query().Get("last_event_id"); v != "" {
+		// EventSource 无法自定义请求头，浏览器侧续传走 query（见 web/src/lib/sse.ts）
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			fromSeq = n
 		}

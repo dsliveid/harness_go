@@ -364,10 +364,15 @@ func (r *ToolEventRepo) Finish(ctx context.Context, id string, status model.Tool
 
 // ListByRun 按 Run 列出工具事件（UI 回放）。
 func (r *ToolEventRepo) ListByRun(ctx context.Context, runID string) ([]model.ToolEvent, error) {
+	return r.listWhere(ctx, "run_id=?", runID)
+}
+
+// listWhere 按 where 条件查询工具事件（where 仅接受内部常量，参数一律占位符）。
+func (r *ToolEventRepo) listWhere(ctx context.Context, where string, args ...any) ([]model.ToolEvent, error) {
 	rows, err := r.s.conn().QueryContext(ctx,
 		`SELECT id, run_id, message_id, tool_name, namespace, args_json, result_json, result_blob,
 		        status, risk, executor, device_id, source_trust, approved_by, error, started_at, ended_at
-		 FROM tool_events WHERE run_id=? ORDER BY started_at ASC`, runID)
+		 FROM tool_events WHERE `+where+` ORDER BY started_at ASC`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("store: 查询工具事件失败: %w", err)
 	}
@@ -425,6 +430,20 @@ func (r *ToolEventRepo) ListByRun(ctx context.Context, runID string) ([]model.To
 	return out, rows.Err()
 }
 
+// GetByRun 取某 Run 下的单个工具事件（审批决策校验用）。
+//
+// 不存在时返回 ErrNotFound（由 service 层翻译为 approval.not_found）。
+func (r *ToolEventRepo) GetByRun(ctx context.Context, runID, id string) (*model.ToolEvent, error) {
+	list, err := r.listWhere(ctx, `run_id=? AND id=?`, runID, id)
+	if err != nil {
+		return nil, err
+	}
+	if len(list) == 0 {
+		return nil, ErrNotFound
+	}
+	return &list[0], nil
+}
+
 // ============ 审批规则 ============
 
 // ApprovalRuleRepo 会话库审批规则仓储（「本会话允许」）。
@@ -471,6 +490,32 @@ func (r *ApprovalRuleRepo) Delete(ctx context.Context, id string) error {
 		return fmt.Errorf("store: 删除审批规则失败: %w", err)
 	}
 	return ensureAffected(res, "审批规则 "+id)
+}
+
+// ============ 审批（决策审计） ============
+
+// ApprovalRepo 会话库审批仓储（记录人工决策，供审计与 UI 回放）。
+type ApprovalRepo struct{ s *SessionDB }
+
+// Approvals 返回审批仓储。
+func (s *SessionDB) Approvals() *ApprovalRepo { return &ApprovalRepo{s: s} }
+
+// Decide 记录一次审批决策（id 复用审批 ID = 工具事件 ID，幂等覆盖）。
+func (r *ApprovalRepo) Decide(ctx context.Context, id, runID, toolEventID, decision, reason string) error {
+	if id == "" || runID == "" {
+		return errors.New("store: 审批记录缺少必要字段")
+	}
+	now := NowMillis()
+	_, err := r.s.conn().ExecContext(ctx,
+		`INSERT INTO approvals(id, run_id, tool_event_id, request_json, decision, reason, requested_at, decided_at)
+		 VALUES(?,?,?,'{}',?,?,?,?)
+		 ON CONFLICT(id) DO UPDATE SET decision=excluded.decision,
+		   reason=excluded.reason, decided_at=excluded.decided_at`,
+		id, runID, toolEventID, decision, nullIfEmpty(reason), now, now)
+	if err != nil {
+		return fmt.Errorf("store: 记录审批决策失败: %w", err)
+	}
+	return nil
 }
 
 // nullIfEmpty 空串写 NULL（便于 COALESCE 语义）。

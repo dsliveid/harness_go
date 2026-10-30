@@ -36,7 +36,8 @@ type Deps struct {
 	Events        EventPublisher
 	Models        ModelResolver
 	Builder       ContextBuilder
-	Tools         ToolRunner // 可为 nil（无工具场景）
+	Tools         ToolRunner  // 可为 nil（无工具场景）
+	Catalog       ToolCatalog // 可为 nil（nil 时工具风险按 write 保守处理）
 	Gate          Approver
 	MaxConcurrent int
 	MaxSteps      int
@@ -339,14 +340,19 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 	msg *model.Message, cancelled bool,
 ) {
 	eventID := newID()
-	// 风险级由工具契约提供；A 阶段执行器未接入工具注册表时按 write 保守处理
+	// 风险级由工具契约提供（Catalog 未注入时按 write 保守处理）
 	risk := model.RiskWrite
+	if e.deps.Catalog != nil {
+		if r, ok := e.deps.Catalog.Risk(tc.Name); ok {
+			risk = r
+		}
+	}
 	ev := &model.ToolEvent{
 		ID:          eventID,
 		RunID:       req.RunID,
 		ToolName:    tc.Name,
 		Namespace:   "builtin",
-		ArgsJSON:    tc.Arguments,
+		ArgsJSON:    normalizeArgs(tc.Arguments),
 		Status:      model.ToolPending,
 		Risk:        risk,
 		Executor:    model.ExecutorServer,
@@ -440,6 +446,7 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 		ToolEventID: eventID,
 		ToolName:    tc.Name,
 		ArgsJSON:    string(tc.Arguments),
+		AccessMode:  string(req.AccessMode),
 	})
 	if runErr != nil {
 		errText := runErr.Error()
@@ -523,6 +530,24 @@ func toLLMMessage(m *model.Message) llm.Message {
 		}
 	}
 	return out
+}
+
+// normalizeArgs 保证落库的 args 是合法 JSON。
+//
+// tool_events.args 是 json.RawMessage：模型偶尔给出非法 JSON，
+// 直接落库会让整个事件序列化失败（曾导致 /tool-events 返回空响应体）。
+func normalizeArgs(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return json.RawMessage(`{}`)
+	}
+	if json.Valid(raw) {
+		return raw
+	}
+	b, err := json.Marshal(string(raw))
+	if err != nil {
+		return json.RawMessage(`{}`)
+	}
+	return b
 }
 
 // toolMessage 构造回灌给模型的 tool 消息。

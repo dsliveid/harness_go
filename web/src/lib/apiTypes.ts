@@ -1,0 +1,361 @@
+/**
+ * harness-go API 类型与路径常量 —— **由 `api/openapi.yaml` 人工对齐生成**。
+ *
+ * 契约铁律（docs/protocols.md §3）：
+ *   1. `api/openapi.yaml` 是唯一物理边界，本文件必须与之逐字段一致；
+ *   2. 字段变更顺序固定：改 yaml → 改本文件 → 双端同步，禁止口头约定字段；
+ *   3. 阶段 A 冻结后只允许**向后兼容的新增字段**（可选字段 + 默认值）。
+ *
+ * 时间戳一律 Unix 毫秒（number）。
+ */
+
+/* ============ 基础 ============ */
+
+export type RunStatus =
+  | 'pending'
+  | 'running'
+  | 'waiting_approval'
+  | 'completed'
+  | 'failed'
+  | 'cancelled'
+  | 'interrupted';
+
+export type ToolEventStatus =
+  | 'pending'
+  | 'approved'
+  | 'denied'
+  | 'running'
+  | 'ok'
+  | 'error'
+  | 'timeout';
+
+export type Risk = 'readonly' | 'write' | 'command' | 'danger';
+export type Executor = 'server' | 'desktop' | 'mobile' | 'browser' | 'any';
+export type ToolTier = 'core' | 'deferred' | 'on_demand';
+export type MessageRole = 'system' | 'user' | 'assistant' | 'tool';
+export type PluginKind = 'builtin' | 'mcp' | 'http' | 'package' | 'wasm';
+export type HealthStatus = 'available' | 'degraded' | 'unavailable';
+
+export interface ApiErrorBody {
+  error: {
+    code: string;
+    message: string;
+    trace_id?: string;
+    details?: Record<string, unknown>;
+  };
+}
+
+export interface Page<T> {
+  items: T[];
+  limit?: number;
+  offset?: number;
+}
+
+/* ============ 认证 ============ */
+
+export interface User {
+  id: string;
+  username: string;
+  display_name: string;
+  role: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface LoginRequest {
+  username: string;
+  password: string;
+}
+
+export interface LoginResponse {
+  user: User;
+  token: string;
+  expires_at?: number;
+}
+
+export interface SSORequest {
+  user_name: string;
+  pwd?: string;
+  ts?: number;
+  sign?: string;
+}
+
+export interface ChangePasswordRequest {
+  old_password: string;
+  new_password: string;
+}
+
+/* ============ 会话 / 消息 / Run ============ */
+
+export interface Session {
+  id: string;
+  title: string;
+  workspace_path: string;
+  access_mode: 'readonly' | 'confirm' | 'full';
+  model_ref: string;
+  user_id: string;
+  message_count: number;
+  last_message_at?: number;
+  total_tokens: number;
+  last_run_status?: RunStatus;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface CreateSessionRequest {
+  title?: string;
+  model_ref?: string;
+  workspace_path?: string;
+}
+
+export interface Message {
+  id: string;
+  seq: number;
+  run_id?: string;
+  role: MessageRole;
+  content: string;
+  reasoning?: string;
+  tool_calls?: Array<Record<string, unknown>>;
+  tool_call_id?: string;
+  attachments?: Array<Record<string, unknown>>;
+  token_count: number;
+  usage?: Record<string, unknown>;
+  created_at: number;
+}
+
+export interface Run {
+  id: string;
+  trigger_type: string;
+  status: RunStatus;
+  stop_reason?: string;
+  model_ref: string;
+  executor: Executor;
+  device_id?: string;
+  parent_run_id?: string;
+  input_tokens: number;
+  output_tokens: number;
+  cached_tokens: number;
+  is_estimated: boolean;
+  error_code?: string;
+  error_message?: string;
+  started_at?: number;
+  ended_at?: number;
+  created_at: number;
+}
+
+export interface CreateRunRequest {
+  input: string;
+  model_ref?: string;
+}
+
+export interface CreateRunResponse {
+  run_id: string;
+  status: RunStatus;
+}
+
+export interface ToolEvent {
+  id: string;
+  run_id: string;
+  message_id?: string;
+  tool_name: string;
+  namespace: string;
+  args?: Record<string, unknown>;
+  /** 标准化结果：{ content, meta?, cost_tokens? } */
+  result?: Record<string, unknown>;
+  result_blob?: string;
+  status: ToolEventStatus;
+  risk: Risk;
+  executor: Executor;
+  device_id?: string;
+  source_trust: 'trusted' | 'untrusted';
+  approved_by?: string;
+  error?: string;
+  started_at?: number;
+  ended_at?: number;
+}
+
+/* ============ 工具契约（A-10） ============ */
+
+export interface ToolHealth {
+  status: HealthStatus;
+  message?: string;
+  checked_at: string;
+}
+
+export interface ToolSummary {
+  name: string;
+  namespace: string;
+  tier: ToolTier;
+  default_tier: ToolTier;
+  cost_tokens: number;
+  risk: Risk;
+  executor: Executor;
+  plugin_id: string;
+  health: ToolHealth;
+}
+
+export interface ToolPluginInfo {
+  id: string;
+  name: string;
+  version: string;
+  kind: PluginKind;
+  default_tier: ToolTier;
+  tools: string[];
+}
+
+export interface ToolSnapshot {
+  total: number;
+  core: ToolSummary[];
+  deferred: ToolSummary[];
+  on_demand: ToolSummary[];
+  cost_total: number;
+  cost_core: number;
+  cost_deferred: number;
+  limits: { core_soft: number; deferred_soft: number };
+  warnings: string[];
+  plugins: ToolPluginInfo[];
+  overrides: Record<string, ToolTier>;
+  generated_at: string;
+}
+
+export interface ToolIndexEntry {
+  name: string;
+  description: string;
+  cost_tokens: number;
+}
+
+export interface ToolInjection {
+  core: Array<Record<string, unknown>>;
+  deferred_index: ToolIndexEntry[];
+  on_demand: Array<Record<string, unknown>>;
+  deferred_hidden?: string[];
+  cost_core: number;
+  cost_index: number;
+  cost_total: number;
+  limits: { core_soft: number; deferred_soft: number };
+  warnings?: string[];
+}
+
+export interface ToolTierPatch {
+  tiers: Record<string, ToolTier>;
+}
+
+/* ============ SSE 事件（docs/protocols.md §2/§4） ============ */
+
+export type RunEventType =
+  | 'run.status'
+  | 'message.start'
+  | 'message.delta'
+  | 'message.end'
+  | 'tool.started'
+  | 'tool.progress'
+  | 'tool.result'
+  | 'approval.request'
+  | 'approval.decision'
+  | 'resync'
+  | 'error';
+
+export interface RunEvent<T = Record<string, unknown>> {
+  v: number;
+  seq: number;
+  type: RunEventType;
+  run_id: string;
+  at: number;
+  payload: T;
+}
+
+/* ============ 路径常量（与 openapi.yaml 的 paths 一一对应） ============ */
+
+export const API_PATHS = {
+  healthz: '/healthz',
+  root: '/',
+  authLogin: '/api/v1/auth/login',
+  authSSO: '/api/v1/auth/sso',
+  authMe: '/api/v1/auth/me',
+  authLogout: '/api/v1/auth/logout',
+  authPassword: '/api/v1/auth/password',
+  sessions: '/api/v1/sessions',
+  session: (sid: string) => `/api/v1/sessions/${sid}`,
+  messages: (sid: string) => `/api/v1/sessions/${sid}/messages`,
+  runs: (sid: string) => `/api/v1/sessions/${sid}/runs`,
+  run: (sid: string, rid: string) => `/api/v1/sessions/${sid}/runs/${rid}`,
+  runStop: (sid: string, rid: string) => `/api/v1/sessions/${sid}/runs/${rid}/stop`,
+  runEvents: (sid: string, rid: string) => `/api/v1/sessions/${sid}/runs/${rid}/events`,
+  runToolEvents: (sid: string, rid: string) =>
+    `/api/v1/sessions/${sid}/runs/${rid}/tool-events`,
+  /** B-3：审批决策（aid = 等待中的审批 ID = tool_events.id） */
+  approvalDecide: (sid: string, rid: string, aid: string) =>
+    `/api/v1/sessions/${sid}/runs/${rid}/approvals/${aid}/decide`,
+  tools: '/api/v1/tools',
+  toolsInjection: '/api/v1/tools/injection',
+  toolsTiers: '/api/v1/tools/tiers',
+  maintenance: '/api/v1/settings/maintenance',
+  /* B-4：厂商 / 配置 / 统计 / 日志 */
+  providers: '/api/v1/providers',
+  provider: (pid: string) => `/api/v1/providers/${pid}`,
+  providerTest: (pid: string) => `/api/v1/providers/${pid}/test`,
+  settings: '/api/v1/settings',
+  stats: '/api/v1/stats',
+  logs: '/api/v1/logs',
+} as const;
+
+/** 免鉴权路径（与 internal/api/router.go 的 publicPaths 保持一致）。 */
+export const PUBLIC_PATHS = [API_PATHS.authLogin, API_PATHS.authSSO] as const;
+
+/* ============ B-3 / B-4 新增 DTO（与 openapi.yaml schemas 对应） ============ */
+
+/** 审批决策（aid = 等待中的审批 ID = tool_events.id）。 */
+export type ApprovalDecision = 'allow_once' | 'allow_session' | 'deny';
+
+export interface ApprovalDecisionRequest {
+  decision: ApprovalDecision;
+  /** 拒绝原因（会作为工具结果回传模型） */
+  reason?: string;
+}
+
+export interface ApprovalDecisionResponse {
+  approval_id: string;
+  decision: ApprovalDecision;
+  status: 'accepted';
+}
+
+/** 模型厂商（api_key 出参恒为空，has_api_key 表示是否已配置密钥）。 */
+export interface ProviderDTO {
+  id: string;
+  name: string;
+  base_url: string;
+  api_key?: string;
+  has_api_key: boolean;
+  models: string[];
+  enabled: boolean;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface ProviderInput {
+  name?: string;
+  base_url?: string;
+  /** 留空表示保留原密钥（更新时） */
+  api_key?: string;
+  models?: string[];
+  enabled?: boolean;
+}
+
+export interface ProviderTestResult {
+  ok: boolean;
+  latency_ms: number;
+  model: string;
+  code?: string;
+  error?: string;
+}
+
+/** 通用配置：键到任意 JSON 片段（白名单键见后端 service.settingsWhitelist）。 */
+export interface SettingsResponse {
+  items: Record<string, unknown>;
+}
+
+/** 日志尾行。 */
+export interface LogLine {
+  level: string;
+  text: string;
+}

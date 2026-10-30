@@ -2,7 +2,6 @@ package api
 
 import (
 	"errors"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -27,14 +26,8 @@ func (h *handlers) root(w http.ResponseWriter, r *http.Request) {
 
 	userName := r.URL.Query().Get("user_name")
 	if userName == "" {
-		// 无凭据：正常入口。A 阶段前端尚未迁入（阶段 B），先返回提示页。
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = io.WriteString(w, `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
-<title>harness-go</title></head><body style="font-family:system-ui;padding:2rem;line-height:1.7">
-<h1>harness-go</h1>
-<p>服务端已就绪。前端将在阶段 B 从 <code>demo/</code> 迁入 <code>web/</code> 后由本入口提供。</p>
-<p>可用 <code>GET /healthz</code> 检查健康状态，或用 <code>Authorization: Bearer &lt;token&gt;</code> 调用 <code>/api/v1/*</code>。</p>
-</body></html>`)
+		// 无凭据：正常入口，返回内嵌前端（未构建时返回构建提示页）
+		h.web.serveIndex(w)
 		return
 	}
 

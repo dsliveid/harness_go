@@ -179,6 +179,20 @@ type Token struct {
 	CreatedAt  int64  `json:"created_at"`
 }
 
+// Provider 模型厂商配置（主库）。APIKey 只作入参/出参（出参脱敏），落库仅存 api_key_enc 密文。
+type Provider struct {
+	ID        string   `json:"id"`
+	Name      string   `json:"name"`
+	BaseURL   string   `json:"base_url"`
+	APIKey    string   `json:"api_key,omitempty"`
+	Models    []string `json:"models"`
+	Enabled   bool     `json:"enabled"`
+	CreatedAt int64    `json:"created_at"`
+	UpdatedAt int64    `json:"updated_at"`
+	APIKeyEnc []byte   `json:"-"`
+	HasAPIKey bool     `json:"has_api_key"`
+}
+
 // TokenKind 令牌类型常量。
 const (
 	TokenKindAPI        = "api"

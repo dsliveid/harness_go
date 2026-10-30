@@ -1,0 +1,917 @@
+openapi: 3.0.3
+info:
+  title: harness-go API
+  version: 1.0.0
+  description: |
+    harness-go 单二进制服务的 HTTP 契约（**单一真源**：docs/开发实施计划.md §6 第 3 类协议）。
+
+    冻结规则：
+    - 本文件是前后端唯一物理边界，禁止口头约定字段；
+    - 阶段 A 冻结后**只允许向后兼容的新增字段**；
+    - 破坏性变更流程：改本文件 → 重新生成/校对 `web/src/lib/apiTypes.ts` → 双端同步。
+
+    通用约定：
+    - 鉴权：`Authorization: Bearer <token>` 或 Cookie `hg_sess`（HttpOnly, SameSite=Lax）。
+    - 错误体统一：`{"error":{"code","message","trace_id","details"}}`，`trace_id` 与日志一致。
+    - 时间戳一律为 Unix 毫秒（int64）。
+    - 分页列表统一返回 `{"items":[...],"limit":N,"offset":M}`。
+    - `Cache-Control: no-store`；SSE 端点除外（`no-cache`）。
+servers:
+  - url: /
+    description: 同源部署（单二进制内置前端）
+tags:
+  - name: auth
+    description: 认证与免登
+  - name: sessions
+    description: 会话
+  - name: runs
+    description: Run 与事件流
+  - name: tools
+    description: 工具契约与注入预算
+  - name: ops
+    description: 运维
+security:
+  - bearerAuth: []
+  - cookieAuth: []
+paths:
+  /healthz:
+    get:
+      tags: [ops]
+      summary: 健康检查（免鉴权）
+      security: []
+      responses:
+        "200":
+          description: 服务状态与协议版本
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  version: { type: string }
+                  protocol_version: { type: integer, example: 1 }
+                  uptime_s: { type: integer }
+  /:
+    get:
+      tags: [auth]
+      summary: SPA 入口（同时承担 SSO 免登拦截与凭据剥离）
+      description: |
+        带 `user_name` 查询参数时：校验凭据 → `Set-Cookie` → **302 到不含凭据的干净 URL**；
+        校验失败 302 `/?sso_error=1`（不区分「用户不存在/口令错误」）。
+      security: []
+      parameters:
+        - name: user_name
+          in: query
+          schema: { type: string }
+        - name: pwd
+          in: query
+          schema: { type: string }
+        - name: ts
+          in: query
+          description: signed 模式的时间戳（|now-ts| ≤ 60s）
+          schema: { type: integer }
+        - name: sign
+          in: query
+          description: signed 模式的 HMAC-SHA256(user_name + "\n" + ts + "\n" + ip)
+          schema: { type: string }
+      responses:
+        "302":
+          description: 重定向到干净 URL（登录成功）或 /?sso_error=1（失败）
+        "200":
+          description: 未带凭据时返回前端静态资源
+  /api/v1/auth/login:
+    post:
+      tags: [auth]
+      summary: 账号口令登录（返回令牌并写 Cookie）
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: { type: string }
+                password: { type: string, format: password }
+      responses:
+        "200":
+          description: 登录成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: "#/components/schemas/User" }
+                  token: { type: string, description: 明文令牌仅此一次返回 }
+                  expires_at: { type: integer, format: int64 }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /api/v1/auth/sso:
+    post:
+      tags: [auth]
+      summary: SSO 免登（前端兜底的 URL 自愈路径）
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                user_name: { type: string }
+                pwd: { type: string, format: password }
+                ts: { type: integer }
+                sign: { type: string }
+      responses:
+        "200":
+          description: 免登成功（写 Cookie）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user: { $ref: "#/components/schemas/User" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /api/v1/auth/me:
+    get:
+      tags: [auth]
+      summary: 当前登录用户（首屏静默探测，避免闪登录页）
+      responses:
+        "200":
+          description: 当前用户
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /api/v1/auth/logout:
+    post:
+      tags: [auth]
+      summary: 退出登录（吊销当前令牌并清 Cookie）
+      responses:
+        "204": { description: 已退出 }
+  /api/v1/auth/password:
+    post:
+      tags: [auth]
+      summary: 修改口令
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [old_password, new_password]
+              properties:
+                old_password: { type: string, format: password }
+                new_password: { type: string, format: password, minLength: 8 }
+      responses:
+        "204": { description: 修改成功 }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /api/v1/sessions:
+    get:
+      tags: [sessions]
+      summary: 会话列表（**只读主库摘要列**，绝不扫会话库）
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Offset"
+      responses:
+        "200":
+          description: 会话分页
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Session" }
+                  limit: { type: integer }
+                  offset: { type: integer }
+    post:
+      tags: [sessions]
+      summary: 新建会话（只写主库，首条消息才建 session.db）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title: { type: string }
+                model_ref: { type: string }
+                workspace_path: { type: string }
+      responses:
+        "201":
+          description: 已创建
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+  /api/v1/sessions/{sid}:
+    parameters:
+      - $ref: "#/components/parameters/SessionID"
+    get:
+      tags: [sessions]
+      summary: 会话详情
+      responses:
+        "200":
+          description: 会话
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Session" }
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [sessions]
+      summary: 重命名会话
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title]
+              properties:
+                title: { type: string }
+      responses:
+        "204": { description: 已更新 }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+    delete:
+      tags: [sessions]
+      summary: 删除会话（主库软删 + 会话目录回收）
+      responses:
+        "204": { description: 已删除 }
+  /api/v1/sessions/{sid}/messages:
+    parameters:
+      - $ref: "#/components/parameters/SessionID"
+    get:
+      tags: [sessions]
+      summary: 消息列表（**以 DB 为准**；流式 delta 只是预览）
+      parameters:
+        - name: after_seq
+          in: query
+          schema: { type: integer, format: int64, default: 0 }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 200 }
+      responses:
+        "200":
+          description: 消息分页
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Message" }
+  /api/v1/sessions/{sid}/runs:
+    parameters:
+      - $ref: "#/components/parameters/SessionID"
+    post:
+      tags: [runs]
+      summary: 发起 Run（异步；超并发不拒绝，置 pending 排队）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [input]
+              properties:
+                input: { type: string }
+                model_ref: { type: string }
+      responses:
+        "202":
+          description: 已受理
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  run_id: { type: string }
+                  status: { $ref: "#/components/schemas/RunStatus" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/v1/sessions/{sid}/runs/{rid}:
+    parameters:
+      - $ref: "#/components/parameters/SessionID"
+      - $ref: "#/components/parameters/RunID"
+    get:
+      tags: [runs]
+      summary: Run 详情（状态机以 DB 为准）
+      responses:
+        "200":
+          description: Run
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Run" }
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/v1/sessions/{sid}/runs/{rid}/stop:
+    parameters:
+      - $ref: "#/components/parameters/SessionID"
+      - $ref: "#/components/parameters/RunID"
+    post:
+      tags: [runs]
+      summary: 停止 Run（幂等）
+      responses:
+        "204": { description: 已请求停止 }
+  /api/v1/sessions/{sid}/runs/{rid}/events:
+    parameters:
+      - $ref: "#/components/parameters/SessionID"
+      - $ref: "#/components/parameters/RunID"
+    get:
+      tags: [runs]
+      summary: Run 事件流（SSE，支持 Last-Event-ID 断线续传）
+      description: |
+        事件帧格式：`id: <seq>\nevent: <type>\ndata: <json>\n\n`。
+        `delta` 不落库（预览通道）；终端对齐走 `resync` 事件后重拉 `/messages`。
+        慢消费者缓冲满会被主动断开（绝不阻塞 Run）。
+      parameters:
+        - name: Last-Event-ID
+          in: header
+          schema: { type: integer, format: int64 }
+      responses:
+        "200":
+          description: text/event-stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+  /api/v1/sessions/{sid}/runs/{rid}/tool-events:
+    parameters:
+      - $ref: "#/components/parameters/SessionID"
+      - $ref: "#/components/parameters/RunID"
+    get:
+      tags: [runs]
+      summary: 工具调用事件（回放与审计）
+      responses:
+        "200":
+          description: 工具事件列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/ToolEvent" }
+  /api/v1/tools:
+    get:
+      tags: [tools]
+      summary: 工具注册表快照（tier / default_tier / cost_tokens / health / 软上限告警）
+      responses:
+        "200":
+          description: 注册表快照
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ToolSnapshot" }
+        "503":
+          $ref: "#/components/responses/ToolUnavailable"
+  /api/v1/tools/injection:
+    get:
+      tags: [tools]
+      summary: 本轮注入视图与 token 预算明细
+      description: core 全量定义 / deferred 仅名称索引（约 18 token/条）/ on_demand 零注入。
+      responses:
+        "200":
+          description: 注入预算明细
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ToolInjection" }
+        "503":
+          $ref: "#/components/responses/ToolUnavailable"
+  /api/v1/tools/tiers:
+    patch:
+      tags: [tools]
+      summary: 调整工具档位（写入主库 settings.tools.tiers，**下一轮对话生效**）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tiers]
+              properties:
+                tiers:
+                  type: object
+                  additionalProperties:
+                    $ref: "#/components/schemas/ToolTier"
+                  example: { echo: on_demand }
+      responses:
+        "200":
+          description: 调整后的注册表快照
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ToolSnapshot" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "503":
+          $ref: "#/components/responses/ToolUnavailable"
+  /api/v1/settings/maintenance:
+    get:
+      tags: [ops]
+      summary: 运维统计（库大小 / 打开会话库数 / 待审批数 / 未完成 Run）
+      responses:
+        "200":
+          description: 运维统计
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  # ===== B-3 审批决策 =====
+  /api/v1/sessions/{sid}/runs/{rid}/approvals/{aid}/decide:
+    post:
+      tags: [runs]
+      summary: 提交审批决策（allow_once / allow_session / deny）
+      description: |
+        aid = 等待中的审批 ID（= tool_events.id）。
+        Run 必须处于 waiting_approval，否则 409；Gate 未命中（已处理/已超时）404。
+      parameters:
+        - { name: sid, in: path, required: true, schema: { type: string } }
+        - { name: rid, in: path, required: true, schema: { type: string } }
+        - { name: aid, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ApprovalDecisionRequest" }
+      responses:
+        "200":
+          description: 决策已受理
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApprovalDecisionResponse" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  # ===== B-4 模型厂商 =====
+  /api/v1/providers:
+    get:
+      tags: [providers]
+      summary: 列出模型厂商（api_key 恒为空，has_api_key 表示是否已配置）
+      responses:
+        "200":
+          description: 厂商列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Provider" }
+    post:
+      tags: [providers]
+      summary: 新增模型厂商
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ProviderInput" }
+      responses:
+        "201":
+          description: 创建成功
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Provider" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+  /api/v1/providers/{pid}:
+    patch:
+      tags: [providers]
+      summary: 更新模型厂商（api_key 留空表示保留原密钥）
+      parameters:
+        - { name: pid, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ProviderInput" }
+      responses:
+        "200":
+          description: 更新后的厂商
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Provider" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [providers]
+      summary: 删除模型厂商
+      parameters:
+        - { name: pid, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: 已删除 }
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/v1/providers/{pid}/test:
+    post:
+      tags: [providers]
+      summary: 连通测试（用该厂商发一次极小 chat 请求，返回延迟与错误码）
+      parameters:
+        - { name: pid, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                model: { type: string, description: 留空则用厂商首个模型 }
+      responses:
+        "200":
+          description: 测试结果（业务失败也返回 200，ok=false）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProviderTestResult" }
+        "404":
+          $ref: "#/components/responses/NotFound"
+  # ===== B-4 通用配置 / 统计 / 日志 =====
+  /api/v1/settings:
+    get:
+      tags: [settings]
+      summary: 读取白名单配置键（未设置的键不返回）
+      responses:
+        "200":
+          description: 配置项
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SettingsMap" }
+    patch:
+      tags: [settings]
+      summary: 批量写入配置（键必须命中白名单，值必须为合法 JSON）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        "200":
+          description: 写入后的全量白名单配置
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SettingsMap" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+  /api/v1/stats:
+    get:
+      tags: [ops]
+      summary: 统计面板数据（会话数 / 打开会话库 / 运行中 Run / 待审批 / 主库统计）
+      responses:
+        "200":
+          description: 统计
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+  /api/v1/logs:
+    get:
+      tags: [ops]
+      summary: 应用日志尾行（仅返回尾部 N 行，永不返回全文）
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, default: 200, maximum: 2000 } }
+        - { name: level, in: query, schema: { type: string, enum: [error, warn, info, debug] } }
+      responses:
+        "200":
+          description: 日志行
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        level: { type: string }
+                        text: { type: string }
+                  limit: { type: integer }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: hg_sess
+  parameters:
+    SessionID:
+      name: sid
+      in: path
+      required: true
+      schema: { type: string }
+    RunID:
+      name: rid
+      in: path
+      required: true
+      schema: { type: string }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, default: 50, maximum: 200 }
+    Offset:
+      name: offset
+      in: query
+      schema: { type: integer, default: 0, minimum: 0 }
+  responses:
+    BadRequest:
+      description: 参数错误
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorBody" }
+    Unauthorized:
+      description: 未认证或凭据无效（不区分「用户不存在/口令错误」）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorBody" }
+    NotFound:
+      description: 资源不存在
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorBody" }
+    Conflict:
+      description: 状态冲突（如 Run 不在 waiting_approval）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorBody" }
+    RateLimited:
+      description: 触发限流（带 Retry-After）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorBody" }
+    ToolUnavailable:
+      description: 工具子系统未接入
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorBody" }
+  schemas:
+    ErrorBody:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, example: invalid_argument }
+            message: { type: string }
+            trace_id: { type: string }
+            details: { type: object, additionalProperties: true }
+    User:
+      type: object
+      properties:
+        id: { type: string }
+        username: { type: string }
+        display_name: { type: string }
+        role: { type: string }
+        created_at: { type: integer, format: int64 }
+        updated_at: { type: integer, format: int64 }
+    Session:
+      type: object
+      properties:
+        id: { type: string }
+        title: { type: string }
+        workspace_path: { type: string }
+        access_mode: { type: string, enum: [readonly, confirm, full] }
+        model_ref: { type: string }
+        user_id: { type: string }
+        message_count: { type: integer, format: int64 }
+        last_message_at: { type: integer, format: int64 }
+        total_tokens: { type: integer, format: int64 }
+        last_run_status: { $ref: "#/components/schemas/RunStatus" }
+        created_at: { type: integer, format: int64 }
+        updated_at: { type: integer, format: int64 }
+    Message:
+      type: object
+      properties:
+        id: { type: string }
+        seq: { type: integer, format: int64 }
+        run_id: { type: string }
+        role: { type: string, enum: [system, user, assistant, tool] }
+        content: { type: string }
+        reasoning: { type: string }
+        tool_calls: { type: array, items: { type: object, additionalProperties: true } }
+        tool_call_id: { type: string }
+        attachments: { type: array, items: { type: object, additionalProperties: true } }
+        token_count: { type: integer }
+        usage: { type: object, additionalProperties: true }
+        created_at: { type: integer, format: int64 }
+    RunStatus:
+      type: string
+      enum: [pending, running, waiting_approval, completed, failed, cancelled, interrupted]
+    Run:
+      type: object
+      properties:
+        id: { type: string }
+        trigger_type: { type: string }
+        status: { $ref: "#/components/schemas/RunStatus" }
+        stop_reason: { type: string }
+        model_ref: { type: string }
+        executor: { type: string, enum: [server, desktop, mobile, browser, any] }
+        device_id: { type: string }
+        parent_run_id: { type: string }
+        input_tokens: { type: integer, format: int64 }
+        output_tokens: { type: integer, format: int64 }
+        cached_tokens: { type: integer, format: int64 }
+        is_estimated: { type: boolean }
+        error_code: { type: string }
+        error_message: { type: string }
+        started_at: { type: integer, format: int64 }
+        ended_at: { type: integer, format: int64 }
+        created_at: { type: integer, format: int64 }
+    ToolEvent:
+      type: object
+      properties:
+        id: { type: string }
+        run_id: { type: string }
+        message_id: { type: string }
+        tool_name: { type: string }
+        namespace: { type: string, example: builtin }
+        args: { type: object, additionalProperties: true }
+        result: { type: object, additionalProperties: true, description: "标准化结果：{content, meta?, cost_tokens?}" }
+        result_blob: { type: string }
+        status: { type: string, enum: [pending, approved, denied, running, ok, error, timeout] }
+        risk: { $ref: "#/components/schemas/Risk" }
+        executor: { type: string, enum: [server, desktop, mobile, browser, any] }
+        device_id: { type: string }
+        source_trust: { type: string, enum: [trusted, untrusted] }
+        approved_by: { type: string }
+        error: { type: string }
+        started_at: { type: integer, format: int64 }
+        ended_at: { type: integer, format: int64 }
+    Risk:
+      type: string
+      enum: [readonly, write, command, danger]
+    ToolTier:
+      type: string
+      enum: [core, deferred, on_demand]
+    ToolSummary:
+      type: object
+      properties:
+        name: { type: string }
+        namespace: { type: string }
+        tier: { $ref: "#/components/schemas/ToolTier" }
+        default_tier: { $ref: "#/components/schemas/ToolTier" }
+        cost_tokens: { type: integer }
+        risk: { $ref: "#/components/schemas/Risk" }
+        executor: { type: string }
+        plugin_id: { type: string }
+        health:
+          type: object
+          properties:
+            status: { type: string, enum: [available, degraded, unavailable] }
+            message: { type: string }
+            checked_at: { type: string, format: date-time }
+    ToolSnapshot:
+      type: object
+      properties:
+        total: { type: integer }
+        core:
+          type: array
+          items: { $ref: "#/components/schemas/ToolSummary" }
+        deferred:
+          type: array
+          items: { $ref: "#/components/schemas/ToolSummary" }
+        on_demand:
+          type: array
+          items: { $ref: "#/components/schemas/ToolSummary" }
+        cost_total: { type: integer }
+        cost_core: { type: integer }
+        cost_deferred: { type: integer }
+        limits:
+          type: object
+          properties:
+            core_soft: { type: integer }
+            deferred_soft: { type: integer }
+        warnings:
+          type: array
+          items: { type: string }
+        plugins:
+          type: array
+          items:
+            type: object
+            properties:
+              id: { type: string }
+              name: { type: string }
+              version: { type: string }
+              kind: { type: string, enum: [builtin, mcp, http, package, wasm] }
+              default_tier: { $ref: "#/components/schemas/ToolTier" }
+              tools:
+                type: array
+                items: { type: string }
+        overrides:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/ToolTier" }
+        generated_at: { type: string, format: date-time }
+    ToolInjection:
+      type: object
+      properties:
+        core:
+          type: array
+          items: { type: object, additionalProperties: true }
+        deferred_index:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              description: { type: string }
+              cost_tokens: { type: integer }
+        on_demand:
+          type: array
+          items: { type: object, additionalProperties: true }
+        deferred_hidden:
+          type: array
+          items: { type: string }
+        cost_core: { type: integer }
+        cost_index: { type: integer }
+        cost_total: { type: integer }
+        limits:
+          type: object
+          properties:
+            core_soft: { type: integer }
+            deferred_soft: { type: integer }
+        warnings:
+          type: array
+          items: { type: string }
+
+    # ===== B-3 审批 =====
+    ApprovalDecisionRequest:
+      type: object
+      required: [decision]
+      properties:
+        decision:
+          type: string
+          enum: [allow_once, allow_session, deny]
+        reason: { type: string, description: 拒绝原因（会作为工具结果回传模型） }
+    ApprovalDecisionResponse:
+      type: object
+      properties:
+        approval_id: { type: string }
+        decision: { type: string }
+        status: { type: string, description: 恒为 accepted }
+    # ===== B-4 厂商 =====
+    Provider:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        base_url: { type: string }
+        api_key: { type: string, description: 出参恒为空（只入不留） }
+        has_api_key: { type: boolean }
+        models:
+          type: array
+          items: { type: string }
+        enabled: { type: boolean }
+        created_at: { type: integer }
+        updated_at: { type: integer }
+    ProviderInput:
+      type: object
+      properties:
+        name: { type: string }
+        base_url: { type: string }
+        api_key: { type: string, description: 留空表示保留原密钥 }
+        models:
+          type: array
+          items: { type: string }
+        enabled: { type: boolean, default: true }
+    ProviderTestResult:
+      type: object
+      properties:
+        ok: { type: boolean }
+        latency_ms: { type: integer }
+        model: { type: string }
+        code: { type: string, description: 失败时的 llm 错误分类 }
+        error: { type: string }
+    # ===== B-4 配置 =====
+    SettingsMap:
+      type: object
+      properties:
+        items:
+          type: object
+          description: 键到任意 JSON 片段（白名单键见 service.settingsWhitelist）
+          additionalProperties: true
