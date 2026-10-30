@@ -1,0 +1,40 @@
+# ============================================================
+# EditorConfig —— 约束编辑器写盘行为，与 .gitattributes 配套
+# ============================================================
+# 为什么需要这个文件：
+#   .gitattributes 只约束 **git 检出**，管不到 **编辑器保存**。
+#   在 Windows 上完全可能出现：重新检出后文件是 LF，
+#   打开改一行按 Ctrl+S 又变回 CRLF —— 这就是"重检好了、编辑一次又坏"。
+#   本文件让支持的编辑器（VS Code 原生支持、JetBrains 大多内置、
+#   Vim/Emacs 需插件）在保存时统一写 LF。
+#
+# 注意：本文件不改变任何 git 配置，仅规范编辑器行为。
+#       装了 EditorConfig 插件的编辑器会自动读取，无需手动设置。
+# ============================================================
+
+# 兜底：所有文件使用 LF、UTF-8、行尾不留多余空白
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+# Go：gofmt 强制 Tab 缩进，不受 2 空格影响
+[*.go]
+indent_style = tab
+
+# Makefile：make 语法硬性要求 Tab 缩进，写成空格会报 "missing separator"
+[Makefile]
+indent_style = tab
+
+# Markdown：行尾两个空格是软换行语法，不能裁剪
+[*.md]
+trim_trailing_whitespace = false
+
+# Windows 专用脚本：保留 CRLF（与 .gitattributes 的 *.ps1 eol=crlf 保持一致）
+[*.{ps1,cmd,bat}]
+end_of_line = crlf
