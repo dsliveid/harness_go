@@ -167,7 +167,8 @@ export const useSessions = create<SessionState>((set, get) => ({
       workspaceId: proj ? wsOfProject(proj) : get().activeWorkspaceId,
       workspacePath: proj?.path,
       accessMode: 'confirm',
-      modelRef: 'deepseek/deepseek-chat',
+      // mock 用演示默认模型；real 交给服务端（未配置厂商时为空，运行时回退 default provider）
+      modelRef: apiMode === 'mock' ? 'deepseek/deepseek-chat' : '',
       updatedAt: Date.now(),
     }
     set((st) => ({ sessions: [s, ...st.sessions], currentId: id }))

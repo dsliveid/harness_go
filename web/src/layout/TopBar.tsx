@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
-import { PanelLeft, PanelLeftClose, Lock, Unlock, Moon, Sun, Settings, Bot, ChevronDown, Folder, LogOut, UserRound, KeyRound } from 'lucide-react'
+import { PanelLeft, PanelLeftClose, Lock, Unlock, Moon, Sun, Settings, Bot, ChevronDown, Folder, LogOut, KeyRound } from 'lucide-react'
 import { useSessions } from '../stores/sessionStore'
 import { useUI } from '../stores/uiStore'
+import { useSettings } from '../stores/settingsStore'
 import { roleLabel, useAuth } from '../stores/authStore'
-import { providers } from '../mock/data'
 import { Button, IconButton } from '../components/ui'
 import { ChangePasswordModal } from '../features/auth/ChangePasswordModal'
 import { SseStatus } from '../features/chat/SseStatus'
@@ -13,6 +13,10 @@ export function TopBar() {
   const { sessions, currentId, setAccessMode, setModel, workspaces, activeWorkspaceId } = useSessions()
   const { setSettings, theme, toggleTheme, sidebarOpen, toggleSidebar, toast } = useUI()
   const { user, loggedInAt, expiresAt, logout } = useAuth()
+  // 厂商列表以主库为唯一真源（real 模式由 settingsStore.loadProviders 拉取；
+  // mock 模式 settingsStore 内置演示数据）——不要再直接读 mock/data，否则 real 模式下
+  // 选中的模型不在列表里会导致选择器显示空白。
+  const providers = useSettings((st) => st.settings.providers)
   const [accountOpen, setAccountOpen] = useState(false)
   const [pwdOpen, setPwdOpen] = useState(false)
   const accountRef = useRef<HTMLDivElement>(null)
@@ -33,6 +37,12 @@ export function TopBar() {
 
   const models = providers.filter((p) => p.enabled).flatMap((p) => p.models.map((m) => ({ ref: `${p.id}/${m.id}`, name: m.id, limit: m.contextLimit })))
   const currentModel = models.find((m) => m.ref === s?.modelRef)
+  // 会话当前 modelRef 不在已配置列表里（未配置厂商 / 厂商被禁用）时补一个占位项，
+  // 否则受控 select 的 value 无匹配 option，界面上会显示为空白（real 模式未配厂商时即为空串）。
+  const modelChoices =
+    !s || models.some((m) => m.ref === s.modelRef)
+      ? models
+      : [{ ref: s.modelRef, name: s.modelRef || '默认模型', limit: 0 }, ...models]
   // 标题恒为当前会话标题（对话区常驻，定时任务/插件市场以弹窗呈现，不再改写标题）
   const pageTitle = s?.title ?? '新对话'
 
@@ -82,12 +92,12 @@ export function TopBar() {
               <Bot size={13} />
             </span>
             <select
-              className="h-8 pl-6 pr-6 max-w-[120px] sm:max-w-[200px] rounded-lg bg-panel2 text-[12px] font-medium text-ink outline-none cursor-pointer appearance-none hover:bg-panel3 transition-all focus:ring-1 focus:ring-accent/40"
+              className="h-8 pl-6 pr-6 max-w-[96px] sm:max-w-[200px] rounded-lg bg-panel2 text-[12px] font-medium text-ink outline-none cursor-pointer appearance-none hover:bg-panel3 transition-all focus:ring-1 focus:ring-accent/40"
               value={s.modelRef}
               onChange={(e) => setModel(s.id, e.target.value)}
               title="会话级模型（切换不影响其他会话）"
             >
-              {models.map((m) => (
+              {modelChoices.map((m) => (
                 <option key={m.ref} value={m.ref} className="bg-panel text-ink py-1">
                   {m.name}
                 </option>
@@ -116,12 +126,16 @@ export function TopBar() {
         </div>
       )}
 
-      <div className="h-4 w-px bg-edge mx-0.5" />
+      {/* 分隔线：移动端顶栏空间紧张，隐藏（视觉上也不需要） */}
+      <div className="hidden sm:block h-4 w-px bg-edge mx-0.5" />
 
-      {/* 主题与全局设置 */}
-      <IconButton onClick={toggleTheme} title={theme === 'dark' ? '切换为浅色主题' : '切换为深色主题'} ariaLabel="切换主题">
-        {theme === 'dark' ? <Moon size={15} /> : <Sun size={15} />}
-      </IconButton>
+      {/* 主题与全局设置：主题开关在移动端收起（设置 → 外观 面板可切换），
+          避免 360px 宽度下把会话标题挤成 0 宽 */}
+      <div className="hidden sm:flex">
+        <IconButton onClick={toggleTheme} title={theme === 'dark' ? '切换为浅色主题' : '切换为深色主题'} ariaLabel="切换主题">
+          {theme === 'dark' ? <Moon size={15} /> : <Sun size={15} />}
+        </IconButton>
+      </div>
       <IconButton onClick={() => setSettings(true)} title="程序设置" ariaLabel="打开设置">
         <Settings size={15} />
       </IconButton>
@@ -129,7 +143,7 @@ export function TopBar() {
       {/* 账户菜单：账号密码登录态与退出 */}
       <div className="relative flex items-center" ref={accountRef}>
         <button
-          className="h-8 pl-1 pr-2 flex items-center gap-1.5 rounded-lg border border-edge bg-panel2/60 hover:bg-panel3 transition-colors select-none"
+          className="h-8 pl-1 pr-1.5 sm:pr-2 flex items-center gap-1.5 rounded-lg border border-edge bg-panel2/60 hover:bg-panel3 transition-colors select-none"
           onClick={() => setAccountOpen((v) => !v)}
           title={`账户：${user?.name ?? '未登录'}（点击查看登录信息）`}
           aria-label="账户菜单"
@@ -138,7 +152,7 @@ export function TopBar() {
             {(user?.name ?? '?').slice(0, 1).toUpperCase()}
           </span>
           <span className="hidden sm:inline text-[12px] text-inkdim font-medium max-w-[80px] truncate">{user?.name ?? '未登录'}</span>
-          <ChevronDown size={11} className="text-inkfaint" />
+          <ChevronDown size={11} className="text-inkfaint hidden sm:block" />
         </button>
 
         {accountOpen && (
