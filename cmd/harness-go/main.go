@@ -130,6 +130,13 @@ func run() error {
 	// ⑥ 模型 provider（未配置真实端点时回退 fake，便于端到端验证）
 	provider, providerDesc := buildProvider(logger)
 
+	// ⑥' 厂商密钥 + 运行时模型解析：providers 表（B-4 界面配置）优先，未命中回退 env/fake
+	secretCipher, cErr := secret.LoadOrCreate(filepath.Join(dataDir, "secret.key"))
+	if cErr != nil {
+		return cErr
+	}
+	modelResolver := service.NewProviderResolver(mainStore, secretCipher, logger, provider, providerDesc)
+
 	// ⑦ 审批闸门（5min 超时视为拒绝）
 	gate := approval.NewGate(approval.DefaultTimeout)
 
@@ -178,7 +185,7 @@ func run() error {
 		Sessions:      service.NewSessionProvider(sessionStore),
 		Summary:       service.NewSummaryWriter(mainStore),
 		Events:        bus,
-		Models:        &staticResolver{provider: provider},
+		Models:        modelResolver,
 		Builder:       builder,
 		Tools:         toolRunner,
 		Catalog:       toolRunner,
@@ -238,10 +245,6 @@ func run() error {
 	toolSvc.LoadOverrides(ctx)
 
 	// ⑩' B-4：厂商（api_key 密文落库）+ 配置 + 日志尾行
-	secretCipher, cErr := secret.LoadOrCreate(filepath.Join(dataDir, "secret.key"))
-	if cErr != nil {
-		return cErr
-	}
 	providerSvc := service.NewProviderService(service.ProviderServiceOptions{
 		Main:   mainStore,
 		Cipher: secretCipher,
@@ -340,9 +343,12 @@ func buildProvider(logger *slog.Logger) (llm.Provider, string) {
 	return fake, fake.Describe()
 }
 
-// staticResolver 单 provider 解析器（A 阶段不做多 provider 路由）。
+// staticResolver 单 provider 解析器（A 阶段占位，B 阶段已由 service.ProviderResolver 取代）。
+//
+// 保留为**测试/降级用**：当需要强制单 provider（不查 providers 表）时可显式使用。
 type staticResolver struct{ provider llm.Provider }
 
+// Resolve 固定返回注入的 provider（不做模型路由）。
 func (r *staticResolver) Resolve(_ context.Context, modelRef string) (llm.Provider, string, error) {
 	if r.provider == nil {
 		return nil, "", errors.New("未配置模型 provider")
