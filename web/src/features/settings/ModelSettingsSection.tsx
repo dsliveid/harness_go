@@ -7,6 +7,7 @@ import {
   useSettings, type AppSettings, type CapSlot,
 } from '../../stores/settingsStore'
 import { fetchProviderModels } from '../../mock/settingsData'
+import { api, apiMode } from '../../lib/api'
 import { Badge, Button, Field, Switch, inputCls } from '../../components/ui'
 import { cn } from '../../components/ui'
 
@@ -46,13 +47,35 @@ export function ModelSettingsSection() {
   const patch = (fn: (cur: AppSettings) => AppSettings) => patchDraft(fn)
   const toggleExpand = (id: string) => setExpanded((e) => ({ ...e, [id]: !e[id] }))
 
-  const handleTest = (p: Provider) => {
+  const handleTest = async (p: Provider) => {
     if (tested[p.id] === 'testing') return
+    if (!p.baseUrl.trim()) {
+      toast('warn', '请先填写该厂商的 Base URL')
+      return
+    }
     setTested((t) => ({ ...t, [p.id]: 'testing' }))
-    setTimeout(() => {
+    // mock 模式：demo 的模拟延迟；real 模式：由服务端用该厂商发一次极小请求
+    if (apiMode === 'mock') {
+      setTimeout(() => {
+        setTested((t) => ({ ...t, [p.id]: 'ok' }))
+        toast('success', `${p.name} 连接成功（模拟 218ms）`)
+      }, 500)
+      return
+    }
+    try {
+      const res = await api.testProvider(p.id)
+      if (res.ok) {
+        setTested((t) => ({ ...t, [p.id]: 'ok' }))
+        toast('success', `${p.name} 连接成功（${res.latency_ms}ms）`)
+      } else {
+        setTested((t) => ({ ...t, [p.id]: 'ok' }))
+        toast('error', `${p.name} 连接失败：${res.error || res.code || '未知错误'}`)
+      }
+    } catch (e) {
       setTested((t) => ({ ...t, [p.id]: 'ok' }))
-      toast('success', `${p.name} 连接成功（模拟 218ms）`)
-    }, 500)
+      const msg = e instanceof Error ? e.message : '网络异常'
+      toast('error', `连接测试失败：${msg}${p.id.startsWith('pv-') ? '（请先保存后再测试）' : ''}`)
+    }
   }
 
   // 模拟 GET {baseUrl}/models：按厂商名匹配目录，600ms 延迟

@@ -1,6 +1,9 @@
 import { create } from 'zustand'
 import type { ModelInfo, Provider } from '../types'
 import { defaultModels, providers as mockProviders } from '../mock/data'
+import { api, apiMode } from '../lib/api'
+import type { ProviderDTO, ProviderInput } from '../lib/apiTypes'
+import { useUI } from './uiStore'
 
 // 能力槽位（demo 命名沿用 types.ts：chat / vision / image / decision）
 export type CapSlot = 'chat' | 'vision' | 'image' | 'decision'
@@ -17,14 +20,91 @@ export interface AppSettings {
   proxyUrl: string
 }
 
+/** 已配置密钥时的输入框掩码占位（提交时若仍等于该值，表示「不修改密钥」） */
+export const PROVIDER_KEY_MASK = '••••••••'
+
 const initialSettings: AppSettings = {
-  providers: mockProviders,
-  defaultProviderId: mockProviders[0]?.id ?? '',
-  capabilityModels: { ...defaultModels },
+  // real 模式的厂商来自主库 providers 表（loadProviders 拉取）；mock 沿用 demo 样例
+  providers: apiMode === 'mock' ? mockProviders : [],
+  defaultProviderId: apiMode === 'mock' ? (mockProviders[0]?.id ?? '') : '',
+  capabilityModels:
+    apiMode === 'mock'
+      ? { ...defaultModels }
+      : { chat: '', vision: '', image: '', decision: '' },
   disabledTools: [],
   disabledSops: [],
   proxyEnabled: false,
   proxyUrl: '',
+}
+
+/** 服务端 ProviderDTO → UI Provider（密钥恒为掩码，明文永不出栈） */
+function toUiProvider(d: ProviderDTO): Provider {
+  return {
+    id: d.id,
+    name: d.name,
+    baseUrl: d.base_url,
+    enabled: d.enabled,
+    apiKeyMasked: d.has_api_key ? PROVIDER_KEY_MASK : '',
+    models: (d.models ?? []).map((id) => ({
+      id,
+      contextLimit: 64000,
+      capabilities: ['chat'],
+      protocol: 'chat_completions',
+    })),
+  }
+}
+
+/** UI Provider → 提交体：掩码占位不得当密钥回传（否则会把「••••」写成真密钥） */
+function toProviderInput(p: Provider): ProviderInput {
+  const input: ProviderInput = {
+    name: p.name,
+    base_url: p.baseUrl,
+    models: p.models.map((m) => m.id),
+    enabled: p.enabled,
+  }
+  if (p.apiKeyMasked && p.apiKeyMasked !== PROVIDER_KEY_MASK) input.api_key = p.apiKeyMasked
+  return input
+}
+
+/**
+ * 把「草稿里的厂商配置」同步到服务端（仅 real 模式）。
+ *
+ * 差异提交：新增 → create、字段变化 → update、被删 → delete；
+ * 未变化的厂商不发请求（避免无谓写入与密钥覆盖）。返回是否有变更。
+ */
+async function syncProvidersToServer(prev: Provider[], next: Provider[]): Promise<boolean> {
+  if (apiMode !== 'real') return false
+  const prevMap = new Map(prev.map((p) => [p.id, p]))
+  const nextIds = new Set(next.map((p) => p.id))
+  let changed = false
+  try {
+    for (const p of next) {
+      const before = prevMap.get(p.id)
+      if (!before) {
+        await api.createProvider(toProviderInput(p))
+        changed = true
+        continue
+      }
+      const same =
+        before.name === p.name &&
+        before.baseUrl === p.baseUrl &&
+        before.enabled === p.enabled &&
+        before.apiKeyMasked === p.apiKeyMasked &&
+        before.models.map((m) => m.id).join(',') === p.models.map((m) => m.id).join(',')
+      if (same) continue
+      await api.updateProviderById(p.id, toProviderInput(p))
+      changed = true
+    }
+    for (const p of prev) {
+      if (nextIds.has(p.id)) continue
+      await api.deleteProvider(p.id)
+      changed = true
+    }
+  } catch {
+    useUI.getState().toast('error', '同步厂商配置失败，请检查服务状态后重试')
+    return false
+  }
+  return changed
 }
 
 interface SettingsState {
@@ -42,6 +122,8 @@ interface SettingsState {
    * 若当前正在编辑草稿，则同步草稿避免出现「改了但没保存」的错觉）
    */
   setDisabledTools: (next: string[]) => void
+  /** 从服务端拉取厂商列表（real 模式；登录后调用） */
+  loadProviders: () => Promise<void>
 }
 
 export const useSettings = create<SettingsState>((set, get) => ({
@@ -56,7 +138,30 @@ export const useSettings = create<SettingsState>((set, get) => ({
     const { draft, settings } = get()
     if (!draft) return
     set(commit ? { settings: draft, draft: null } : { draft: null })
-    void settings
+    if (!commit || apiMode !== 'real') return
+    // 厂商/模型改动立即落库：差异提交后再拉回服务端真值（密钥只回掩码）
+    void syncProvidersToServer(settings.providers, draft.providers).then((changed) => {
+      if (changed) void get().loadProviders()
+    })
+  },
+
+  // 登录后拉取厂商列表：服务端为唯一真源（has_api_key 只回布尔，不回明文）
+  loadProviders: async () => {
+    if (apiMode !== 'real') return
+    try {
+      const list = (await api.listProviders()).map(toUiProvider)
+      set((s) => ({
+        settings: {
+          ...s.settings,
+          providers: list,
+          defaultProviderId: list.some((p) => p.id === s.settings.defaultProviderId)
+            ? s.settings.defaultProviderId
+            : (list[0]?.id ?? ''),
+        },
+      }))
+    } catch {
+      /* 服务未起/网络异常：保留现有列表，避免把已配置厂商清空 */
+    }
   },
   patchDraft: (fn) =>
     set((s) => (s.draft ? { draft: fn(s.draft) } : s)),

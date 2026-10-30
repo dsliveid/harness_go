@@ -87,7 +87,9 @@ func (s *RunService) CreateRun(ctx context.Context, sessionID, userInput, modelR
 		modelRef = sess.ModelRef
 	}
 	if modelRef == "" {
-		return nil, invalidArg("会话未配置模型，请先设置 model_ref")
+		// 未配置模型时不阻断对话：回退 "default"（provider 层未配置真实端点时会解析到
+		// fake provider，保证单二进制开箱可用）。真实使用请在「设置 → 模型」配置厂商。
+		modelRef = "default"
 	}
 
 	sdb, err := s.sessions.Acquire(ctx, sessionID)

@@ -17,13 +17,19 @@ import { startMockRun, type Decision, type StreamEvent } from '../mock/stream'
 import { SseClient } from './sse'
 import {
   API_PATHS,
+  type ChangePasswordRequest,
   type CreateRunResponse,
+  type LogLine,
   type LoginRequest,
   type LoginResponse,
   type Message as ApiMessage,
+  type ProviderDTO,
+  type ProviderInput,
+  type ProviderTestResult,
   type Run as ApiRun,
   type RunStatus as ApiRunStatus,
   type Session as ApiSession,
+  type SSORequest,
   type ToolEvent as ApiToolEvent,
   type ToolInjection,
   type ToolSnapshot,
@@ -40,21 +46,22 @@ export const API_MODE_STORAGE_KEY = 'harness.apiMode'
 
 /**
  * 解析当前数据模式：
- *   1. `VITE_API_MODE`（构建期注入，便于 CI/预览切 real）
- *   2. `localStorage['harness.apiMode']`（运行期手动切换）
- *   3. 默认 `mock`（B-1 出口要求与 demo 行为一致）
+ *   1. `VITE_API_MODE`（构建期注入，便于 CI/预览强制指定）
+ *   2. `localStorage['harness.apiMode']`（运行期手动切换，便于对比 mock 基线）
+ *   3. 默认：**开发态 mock**（可离线调 UI）/ **构建产物 real**（B-2 起接真实接口）
  */
 export function resolveApiMode(): ApiMode {
+  const env = (import.meta as unknown as { env?: Record<string, string | boolean | undefined> }).env
   try {
-    const fromEnv = (import.meta as unknown as { env?: Record<string, string | undefined> }).env
-      ?.VITE_API_MODE
+    const fromEnv = env?.VITE_API_MODE
     if (fromEnv === 'real' || fromEnv === 'mock') return fromEnv
     const stored = typeof localStorage !== 'undefined' ? localStorage.getItem(API_MODE_STORAGE_KEY) : null
     if (stored === 'real' || stored === 'mock') return stored
   } catch {
     /* 工作于非浏览器环境（SSR/测试）时忽略 */
   }
-  return 'mock'
+  // 生产构建默认 real：单二进制内嵌产物直连本机后端；dev 默认 mock 保留 demo 基线
+  return env?.DEV === true || env?.DEV === 'true' ? 'mock' : 'real'
 }
 
 export const apiMode: ApiMode = resolveApiMode()
@@ -92,6 +99,11 @@ export interface StartRunOptions {
   modelRef?: string
   /** 流式事件回调（UI 侧再做 ~50ms 批量提交） */
   onEvent: (e: StreamEvent) => void
+  /**
+   * 断线/重连对齐回调（阶段 B-3）：SSE 重连或收到服务端 `resync` 事件时触发，
+   * 上层应重拉消息快照覆盖本地流式态（铁律：消息最终内容以 DB 为准）。
+   */
+  onResync?: () => void
 }
 
 export interface CreateSessionInput {
@@ -105,6 +117,10 @@ export interface ApiClient {
   // 认证
   me(): Promise<User | null>
   login(req: LoginRequest): Promise<LoginResponse>
+  /** SSO 免登（前端兜底自愈：vite dev / 纯静态部署时服务端未拦截 URL 参数）；凭据以 Cookie 落地，不回传 token */
+  ssoLogin(req: SSORequest): Promise<{ user: User }>
+  /** 修改密码（需已登录；成功后其他会话被吊销） */
+  changePassword(req: ChangePasswordRequest): Promise<void>
   logout(): Promise<void>
   // 会话
   listSessions(params?: { limit?: number; offset?: number }): Promise<Session[]>
@@ -125,6 +141,18 @@ export interface ApiClient {
   patchToolTiers(tiers: Record<string, ToolTier>): Promise<ToolSnapshot>
   // 运维
   getMaintenance(): Promise<Record<string, unknown>>
+  // 厂商（B-4）
+  listProviders(): Promise<ProviderDTO[]>
+  createProvider(input: ProviderInput): Promise<ProviderDTO>
+  updateProviderById(id: string, input: ProviderInput): Promise<ProviderDTO>
+  deleteProvider(id: string): Promise<void>
+  /** 连通测试：用该厂商发一次极小请求，返回延迟与错误码 */
+  testProvider(id: string): Promise<ProviderTestResult>
+  // 配置 / 统计 / 日志（B-4）
+  getSettings(): Promise<Record<string, unknown>>
+  patchSettings(patch: Record<string, unknown>): Promise<Record<string, unknown>>
+  getStats(): Promise<Record<string, unknown>>
+  getLogs(params?: { limit?: number; level?: string }): Promise<LogLine[]>
 }
 
 /* ============ HTTP 基础设施 ============ */
@@ -284,6 +312,15 @@ export const mockApi: ApiClient = {
   async login(req) {
     return { user: { id: 'mock-user', username: req.username, display_name: '演示用户', role: 'admin', created_at: 0, updated_at: 0 }, token: 'mock-token' }
   },
+  async ssoLogin(req) {
+    // mock 模式无服务端会话，退化为按 user_name 直接进入演示态
+    const res = await mockApi.login({ username: req.user_name, password: req.pwd ?? '' })
+    return { user: res.user }
+  },
+  async changePassword() {
+    // mock 模式的密码校验由 authStore 的演示逻辑承担（localStorage 模拟服务端凭据），
+    // 此方法仅在 real 模式被调用，保留空实现以满足接口完整性。
+  },
   async logout() {
     /* no-op */
   },
@@ -373,6 +410,62 @@ export const mockApi: ApiClient = {
   async getMaintenance() {
     return { mode: 'mock', open_sessions: 0, pending_approvals: 0, unfinished_runs: 0 }
   },
+
+  // ---- B-4：厂商 / 配置 / 统计 / 日志（mock 走 demo 样例） ----
+  async listProviders() {
+    return mockData.providers.map((p) => ({
+      id: p.id,
+      name: p.name,
+      base_url: p.baseUrl,
+      has_api_key: Boolean(p.apiKeyMasked),
+      models: p.models.map((m) => m.id),
+      enabled: p.enabled,
+      created_at: 0,
+      updated_at: 0,
+    }))
+  },
+  async createProvider(input) {
+    return {
+      id: `pv-mock-${Date.now()}`,
+      name: input.name ?? '新厂商',
+      base_url: input.base_url ?? '',
+      has_api_key: Boolean(input.api_key),
+      models: input.models ?? [],
+      enabled: input.enabled ?? true,
+      created_at: Date.now(),
+      updated_at: Date.now(),
+    }
+  },
+  async updateProviderById(id, input) {
+    return {
+      id,
+      name: input.name ?? '',
+      base_url: input.base_url ?? '',
+      has_api_key: Boolean(input.api_key),
+      models: input.models ?? [],
+      enabled: input.enabled ?? true,
+      created_at: 0,
+      updated_at: Date.now(),
+    }
+  },
+  async deleteProvider() {
+    /* no-op */
+  },
+  async testProvider() {
+    return { ok: true, latency_ms: 120, model: 'mock' }
+  },
+  async getSettings() {
+    return {}
+  },
+  async patchSettings() {
+    return {}
+  },
+  async getStats() {
+    return { mode: 'mock' }
+  },
+  async getLogs() {
+    return []
+  },
 }
 
 /* ============ real 实现（B-2 起逐端点启用） ============ */
@@ -386,6 +479,9 @@ function mapSseToStreamEvent(type: string, data: string): StreamEvent | null {
     return null
   }
   switch (type) {
+    case 'message.start':
+      // 消息壳由前端在本地先建，无需额外动作
+      return null
     case 'message.delta':
       return { type: 'delta', text: String(payload.delta ?? '') }
     case 'message.end':
@@ -401,13 +497,38 @@ function mapSseToStreamEvent(type: string, data: string): StreamEvent | null {
           risk: (payload.risk as Risk) ?? 'write',
         },
       }
+    case 'tool.progress':
+      // 增量输出仅用于本地预览，最终结果以 tool.result 为准
+      return null
     case 'tool.result':
       return {
         type: 'tool_result',
         callId: String(payload.tool_event_id ?? ''),
         result: typeof payload.result === 'string' ? payload.result : JSON.stringify(payload.result ?? ''),
         durationMs: 0,
+        skipped: payload.status === 'denied' ? true : undefined,
       }
+    case 'approval.request':
+      // 审批闸门已阻塞在服务端（Run=waiting_approval），前端弹出 ApprovalBar
+      return {
+        type: 'approval',
+        approval: {
+          id: String(payload.approval_id ?? ''),
+          runId: String(payload.run_id ?? ''),
+          toolCallId: String(payload.tool_event_id ?? ''),
+          toolName: String(payload.tool_name ?? ''),
+          risk: (payload.risk as Risk) ?? 'write',
+          args: (payload.args as Record<string, unknown>) ?? {},
+          summary: String(payload.summary ?? ''),
+          createdAt: Date.now(),
+        },
+      }
+    case 'approval.decision':
+      // 决策结果（含超时视为拒绝）由随后的 run.status 事件收口，此处不重复驱动 UI
+      return null
+    case 'resync':
+      // 服务端补发完成：由 onEvent 外层触发 onResync 拉消息快照
+      return null
     case 'run.status': {
       const status = String(payload.status ?? '')
       if (status === 'completed') {
@@ -429,6 +550,26 @@ function mapSseToStreamEvent(type: string, data: string): StreamEvent | null {
   }
 }
 
+/**
+ * 提交审批决策（B-3）：POST /sessions/{sid}/runs/{rid}/approvals/{aid}/decide
+ *
+ * 决策后服务端解除闸门阻塞，Run 继续在**同一条事件流**上推送（订阅不关闭）。
+ * 失败（409 已被决策 / 404 审批不存在）不打断本地 UI，由后续 run.status 事件收口。
+ */
+async function decideApproval(
+  sessionId: string,
+  runId: string,
+  approvalId: string,
+  decision: Decision,
+  reason?: string,
+): Promise<void> {
+  await request<void>(API_PATHS.approvalDecide(sessionId, runId, approvalId), {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify({ decision, reason: reason ?? '' }),
+  })
+}
+
 export const realApi: ApiClient = {
   mode: 'real',
 
@@ -447,6 +588,21 @@ export const realApi: ApiClient = {
     })
     setApiToken(res.token)
     return res
+  },
+  async ssoLogin(req) {
+    const res = await request<{ user: User }>(API_PATHS.authSSO, {
+      method: 'POST',
+      body: JSON.stringify(req),
+    })
+    // 凭据走 Set-Cookie（hg_sess），不落前端内存令牌
+    return res
+  },
+  async changePassword(req) {
+    await request<void>(API_PATHS.authPassword, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify(req),
+    })
   },
   async logout() {
     await request<void>(API_PATHS.authLogout, { method: 'POST', headers: authHeaders() })
@@ -495,15 +651,24 @@ export const realApi: ApiClient = {
       headers: authHeaders(),
       body: JSON.stringify({ input: opts.input, model_ref: opts.modelRef }),
     })
+    // 当前挂起的审批 id（由 approval.request 事件携带），resume 时回填给 decide 端点
+    let approvalId = ''
     const sse = new SseClient({
       url: toAbsolute(API_PATHS.runEvents(opts.sessionId, created.run_id)),
       onEvent: (ev) => {
+        if (ev.type === 'resync') {
+          // 服务端补发完成：以 DB 为准重拉消息快照（delta 只是预览）
+          opts.onResync?.()
+          return
+        }
         const mapped = mapSseToStreamEvent(ev.type, ev.data)
-        if (mapped) opts.onEvent(mapped)
+        if (!mapped) return
+        if (mapped.type === 'approval') approvalId = mapped.approval.id
+        opts.onEvent(mapped)
       },
       onResync: () => {
-        // 终态对齐：上层应重拉消息快照（chatStore 在 B-3 接入）
-        opts.onEvent({ type: 'done', tokensIn: 0, tokensOut: 0 })
+        // 断线重连：SSE 已按 Last-Event-ID 续传，额外拉一次快照兜底
+        opts.onResync?.()
       },
     })
     sse.connect()
@@ -513,8 +678,11 @@ export const realApi: ApiClient = {
         sse.close()
         void realApi.stopRun(opts.sessionId, created.run_id)
       },
-      resume: () => {
-        // 审批端点属阶段 B-3（approval decide API 尚未落地），此处保留签名
+      resume: (decision, reason) => {
+        if (!approvalId) return
+        const aid = approvalId
+        approvalId = ''
+        void decideApproval(opts.sessionId, created.run_id, aid, decision, reason).catch(() => undefined)
       },
     }
   },
@@ -547,6 +715,61 @@ export const realApi: ApiClient = {
 
   async getMaintenance() {
     return request<Record<string, unknown>>(API_PATHS.maintenance, { headers: authHeaders() })
+  },
+
+  // ---- B-4：厂商 / 配置 / 统计 / 日志 ----
+  async listProviders() {
+    const res = await request<{ items: ProviderDTO[] }>(API_PATHS.providers, { headers: authHeaders() })
+    return res.items ?? []
+  },
+  async createProvider(input) {
+    return request<ProviderDTO>(API_PATHS.providers, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify(input),
+    })
+  },
+  async updateProviderById(id, input) {
+    return request<ProviderDTO>(API_PATHS.provider(id), {
+      method: 'PATCH',
+      headers: authHeaders(),
+      body: JSON.stringify(input),
+    })
+  },
+  async deleteProvider(id) {
+    await request<void>(API_PATHS.provider(id), { method: 'DELETE', headers: authHeaders() })
+  },
+  async testProvider(id) {
+    return request<ProviderTestResult>(API_PATHS.providerTest(id), {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({}),
+    })
+  },
+  async getSettings() {
+    const res = await request<{ items: Record<string, unknown> }>(API_PATHS.settings, {
+      headers: authHeaders(),
+    })
+    return res.items ?? {}
+  },
+  async patchSettings(patch) {
+    const res = await request<{ items: Record<string, unknown> }>(API_PATHS.settings, {
+      method: 'PATCH',
+      headers: authHeaders(),
+      body: JSON.stringify(patch),
+    })
+    return res.items ?? {}
+  },
+  async getStats() {
+    return request<Record<string, unknown>>(API_PATHS.stats, { headers: authHeaders() })
+  },
+  async getLogs(params) {
+    const q = new URLSearchParams()
+    if (params?.limit) q.set('limit', String(params.limit))
+    if (params?.level) q.set('level', params.level)
+    const path = q.toString() ? `${API_PATHS.logs}?${q}` : API_PATHS.logs
+    const res = await request<{ items: LogLine[] }>(path, { headers: authHeaders() })
+    return res.items ?? []
   },
 }
 

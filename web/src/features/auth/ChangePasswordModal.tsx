@@ -139,7 +139,8 @@ export function ChangePasswordModal({ open, onClose }: { open: boolean; onClose:
 
         <div className="rounded-lg border border-edge bg-panel2/40 px-2.5 py-2 text-[11px] text-inkfaint leading-relaxed">
           · 新密码至少 8 位，且不能与当前密码相同
-          <br />· 忘记当前密码时，可在服务端用 <code className="font-mono text-accent">harness reset-password</code> 重置（原型不模拟）
+          <br />· 修改成功后其他设备会话会被吊销，需用新密码重新登录
+          <br />· 忘记密码无法自助找回，请由服务端管理员重置
         </div>
       </div>
     </Modal>

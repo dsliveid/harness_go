@@ -3,6 +3,7 @@ import { Blocks, Wrench, Cpu, Sparkles, Boxes, Monitor, Smartphone, Wifi, WifiOf
 import { usePlugins } from '../../stores/pluginStore'
 import { useUI } from '../../stores/uiStore'
 import { Badge, Modal, Tabs, cn } from '../../components/ui'
+import { RealModeNotice } from '../../components/RealModeNotice'
 import { ToolsPane, McpPane, SkillsPane, ExtensionsPane } from '../plugins/PluginsPage'
 import { clientPlatformLabel, osLabel } from '../../lib/platform'
 import type { DeviceNode } from '../../types'
@@ -73,6 +74,7 @@ export function MarketModal() {
       height="h-[min(780px,92dvh)] sm:h-[min(780px,86dvh)]"
     >
       <div className="flex flex-col h-full min-h-0">
+        <RealModeNotice text="插件市场仍是本地演示数据：市场包、签名校验与安装下发属阶段 E/F，尚未接入服务端。" />
         {/* 固定头：当前客户端 + 一级分类（不随列表滚动、不改变弹窗高度） */}
         <div className="shrink-0 border-b border-edge/60 bg-panel2/30 px-4 pt-2.5 pb-2">
           <div className="flex items-center gap-2 flex-wrap mb-1.5">

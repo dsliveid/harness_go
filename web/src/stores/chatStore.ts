@@ -3,14 +3,17 @@ import type {
   Approval, CompactionPending, CompactionRecord, CompactionStrategy, DataScope, Message, Run, ToolCall,
 } from '../types'
 import { longSessionMessages, messages as mockMessages } from '../mock/data'
-import { startMockRun, type Decision, type MockRunHandle } from '../mock/stream'
+import { startMockRun, type Decision, type MockRunHandle, type StreamEvent } from '../mock/stream'
+import { api, apiMode, type RunHandle } from '../lib/api'
 import { COMPACTION_RATIO, resolveModelContext } from '../lib/context'
 import { DATA_SCOPE_LABEL } from '../lib/dataScopes'
 import { useSessions } from './sessionStore'
 import { useUI } from './uiStore'
 
 // 模块级流式缓冲：delta 累积后按 50ms 批量提交，避免逐 token setState
-let handle: MockRunHandle | null = null
+let handle: RunHandle | MockRunHandle | null = null
+// startRun 的 POST 在途时点了「停止」：拿到句柄后立即补一次 stop，避免服务端 Run 空跑
+let cancelPending = false
 let pendingText = ''
 let flushTimer: ReturnType<typeof setTimeout> | null = null
 let streamingMsgId: string | null = null
@@ -56,6 +59,8 @@ interface ChatState {
   reapply: (msgId: string) => void
   deleteFrom: (msgId: string) => void
   messagesOf: (sessionId: string) => Message[]
+  /** 以 DB 为准重拉某会话的消息快照（real 模式；断线重连/resync 时对齐） */
+  reloadMessages: (sessionId: string) => Promise<void>
 }
 
 export const useChat = create<ChatState>((set, get) => {
@@ -135,11 +140,7 @@ export const useChat = create<ChatState>((set, get) => {
       approval: null,
     }))
 
-    handle = startMockRun({
-      sessionId,
-      runId,
-      input,
-      onEvent: (e) => {
+    const onStreamEvent = (e: StreamEvent) => {
         switch (e.type) {
           case 'delta':
             pendingText += e.text
@@ -235,20 +236,57 @@ export const useChat = create<ChatState>((set, get) => {
             break
           }
         }
-      },
-    })
+    }
+
+    if (apiMode === 'mock') {
+      handle = startMockRun({ sessionId, runId, input, onEvent: onStreamEvent })
+      return
+    }
+
+    // real 模式：Run 在服务端执行（本地 runId 仅用于消息壳，真实 id 以服务端返回为准）
+    cancelPending = false
+    // 模型引用：会话级配置优先（服务端在为空时还会回退 default）
+    const modelRef = useSessions.getState().sessions.find((s) => s.id === sessionId)?.modelRef || undefined
+    void api
+      .startRun({
+        sessionId,
+        input,
+        modelRef,
+        onEvent: onStreamEvent,
+        onResync: () => {
+          // 断线重连 / 服务端 resync：以 DB 快照覆盖本地流式态（delta 只是预览）
+          void get().reloadMessages(sessionId)
+        },
+      })
+      .then((h) => {
+        handle = h
+        if (cancelPending) {
+          cancelPending = false
+          h.stop()
+        }
+      })
+      .catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : '启动对话失败'
+        flush()
+        set({ streaming: false, runStatus: 'failed', lastError: msg, approval: null, reasoning: '' })
+        useUI.getState().toast('error', msg)
+        streamingMsgId = null
+        currentRunId = null
+        handle = null
+      })
   }
 
   return {
-    messages: [...mockMessages, ...longSessionMessages],
-    runStatus: 'running',
+    // real 模式消息来自 DB（登录后/reloadMessages 拉取）；mock 模式保留 demo 样例
+    messages: apiMode === 'mock' ? [...mockMessages, ...longSessionMessages] : [],
+    runStatus: 'completed',
     approval: null,
     queued: [],
     streaming: false,
     reasoning: '',
-    tokensIn: 18420,
-    tokensOut: 1280,
-    cachedTokens: 15980,
+    tokensIn: apiMode === 'mock' ? 18420 : 0,
+    tokensOut: apiMode === 'mock' ? 1280 : 0,
+    cachedTokens: apiMode === 'mock' ? 15980 : 0,
     lastError: null,
     compactions: [],
     compactionPending: null,
@@ -259,6 +297,19 @@ export const useChat = create<ChatState>((set, get) => {
     setDraft: (text) => set({ draft: text }),
 
     messagesOf: (sessionId) => get().messages.filter((m) => m.sessionId === sessionId && !m.reverted),
+
+    // 以 DB 为准重拉消息快照：断线重连（resync）后覆盖本地流式态
+    reloadMessages: async (sessionId) => {
+      if (apiMode === 'mock') return
+      try {
+        const list = await api.listMessages(sessionId)
+        set((s) => ({
+          messages: [...s.messages.filter((m) => m.sessionId !== sessionId), ...list],
+        }))
+      } catch {
+        /* 拉取失败保留本地态，等待下一次 resync 再对齐 */
+      }
+    },
 
     send: (input) => {
       const text = input.trim()
@@ -271,7 +322,11 @@ export const useChat = create<ChatState>((set, get) => {
     },
 
     stop: () => {
-      if (!handle) return
+      if (!handle) {
+        // POST 仍在途（real 模式）：先记账，拿到句柄后立刻 stop
+        if (get().streaming) cancelPending = true
+        return
+      }
       handle.stop()
       handle = null
       flush()

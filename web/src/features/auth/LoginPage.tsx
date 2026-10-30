@@ -1,8 +1,9 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Sparkles, Eye, EyeOff, LogIn, Sun, Moon, User, Lock, Zap } from 'lucide-react'
 import { Button, Switch, inputCls, cn } from '../../components/ui'
 import { useAuth } from '../../stores/authStore'
 import { useUI } from '../../stores/uiStore'
+import { apiMode } from '../../lib/api'
 
 /**
  * 极简自托管登录界面：
@@ -12,8 +13,27 @@ import { useUI } from '../../stores/uiStore'
  * - 提供便捷的一键填入演示账号快捷操作
  */
 export function LoginPage() {
-  const { login, loginDirect, loading, error, clearError } = useAuth()
+  const { login, loginDirect, ssoLogin, loading, error, clearError } = useAuth()
   const { theme, toggleTheme } = useUI()
+  // 演示入口仅在 mock 模式出现（real 模式账号由服务端引导创建）
+  const isDemo = apiMode === 'mock'
+
+  // SSO 兜底自愈：dev / 纯静态部署时服务端不拦截 GET /，由前端读 query 换取 Cookie，
+  // 并立刻把凭据从地址栏抹掉（不留浏览器历史、不被 Referer 带出）
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    const userName = params.get('user_name')
+    if (!userName) return
+    const pwd = params.get('pwd') ?? undefined
+    for (const k of ['user_name', 'pwd', 'ts', 'sign']) params.delete(k)
+    const qs = params.toString()
+    window.history.replaceState(
+      {},
+      '',
+      `${window.location.pathname}${qs ? `?${qs}` : ''}${window.location.hash}`,
+    )
+    void ssoLogin(userName, pwd)
+  }, [ssoLogin])
 
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
@@ -135,32 +155,42 @@ export function LoginPage() {
               <span>{loading ? '正在验证…' : '进入工作台'}</span>
             </Button>
 
-            {/* 演示直通：免输入直接登录（原型专用，正式版移除） */}
-            <Button
-              type="button"
-              variant="outline"
-              className="w-full justify-center gap-1.5 h-9 text-[13px]"
-              disabled={loading}
-              title="原型演示：免输入账号密码，以内置账号直接进入工作台（正式版将移除该入口）"
-              onClick={() => { clearError(); void loginDirect() }}
-            >
-              <Zap size={13} className="text-warn" />
-              <span>直接登录（演示模式）</span>
-            </Button>
+            {/* 演示直通 + 一键填入：仅 mock 演示模式（real 模式账号由服务端引导创建） */}
+            {isDemo ? (
+              <>
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="w-full justify-center gap-1.5 h-9 text-[13px]"
+                  disabled={loading}
+                  title="演示模式：免输入账号密码，以内置账号直接进入工作台（仅 mock 数据模式可用）"
+                  onClick={() => { clearError(); void loginDirect() }}
+                >
+                  <Zap size={13} className="text-warn" />
+                  <span>直接登录（演示模式）</span>
+                </Button>
 
-            {/* 演示账号一键填入胶囊 */}
-            <div className="rounded-xl border border-edge bg-panel2/40 px-3 py-2 flex items-center justify-between text-[12px]">
-              <span className="text-inkdim">
-                演示账号：<code className="font-mono text-accent font-medium">admin</code>
-              </span>
-              <button
-                type="button"
-                className="text-accent hover:underline font-medium cursor-pointer"
-                onClick={fillDemo}
-              >
-                一键填入
-              </button>
-            </div>
+                <div className="rounded-xl border border-edge bg-panel2/40 px-3 py-2 flex items-center justify-between text-[12px]">
+                  <span className="text-inkdim">
+                    演示账号：<code className="font-mono text-accent font-medium">admin</code>
+                  </span>
+                  <button
+                    type="button"
+                    className="text-accent hover:underline font-medium cursor-pointer"
+                    onClick={fillDemo}
+                  >
+                    一键填入
+                  </button>
+                </div>
+              </>
+            ) : (
+              <div className="rounded-xl border border-edge bg-panel2/40 px-3 py-2 text-[11px] text-inkfaint leading-relaxed">
+                账号由服务端创建：首次启动见日志或{' '}
+                <code className="font-mono text-accent">data/initial_password</code>
+                <br />
+                支持免登链接 <code className="font-mono text-inkdim">/?user_name=xxx&pwd=xxx</code>
+              </div>
+            )}
           </div>
         </form>
       </main>

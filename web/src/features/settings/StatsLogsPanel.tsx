@@ -1,8 +1,9 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { ChevronDown, ChevronRight } from 'lucide-react'
-import { logEntries, tokenStats, tokenSummary } from '../../mock/settingsData'
+import { logEntries as mockLogEntries, tokenStats, tokenSummary } from '../../mock/settingsData'
 import { Badge, cn } from '../../components/ui'
 import type { LogEntry, TokenStatRow } from '../../types'
+import { api, apiMode } from '../../lib/api'
 
 const fmt = (n: number) => n >= 10_000 ? `${(n / 1000).toFixed(1)}k` : String(n)
 const fmtTime = (t: number) => {
@@ -200,13 +201,44 @@ const LEVEL_BADGE: Record<LogEntry['level'], { tone: 'gray' | 'yellow' | 'red'; 
 }
 
 export function LogsPanel() {
+  // real 模式：日志来自服务端 data/app.log 尾行；mock 模式用演示数据
+  const [logEntries, setLogEntries] = useState<LogEntry[]>(apiMode === 'mock' ? mockLogEntries : [])
   const [level, setLevel] = useState<LevelFilter>('all')
   const [source, setSource] = useState<SourceFilter>('all')
   const [range, setRange] = useState<TimeRange>('today')
   const [keyword, setKeyword] = useState('')
   const [expandedId, setExpandedId] = useState<string | null>(null)
 
-  const sources = useMemo(() => Array.from(new Set(logEntries.map((l) => l.source))), [])
+  useEffect(() => {
+    if (apiMode !== 'real') return
+    let alive = true
+    void api
+      .getLogs({ limit: 500 })
+      .then((lines) => {
+        if (!alive) return
+        const now = Date.now()
+        setLogEntries(
+          lines.map((l, i) => {
+            const lv = l.level.toLowerCase()
+            return {
+              id: `srv-${i}`,
+              time: now,
+              level: lv.includes('warn') ? 'warn' : lv.includes('err') ? 'error' : 'info',
+              source: 'server',
+              text: l.text,
+            } as LogEntry
+          }),
+        )
+      })
+      .catch(() => {
+        if (alive) setLogEntries([])
+      })
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  const sources = useMemo(() => Array.from(new Set(logEntries.map((l) => l.source))), [logEntries])
   const list = useMemo(() => {
     const ms = TIME_RANGES.find((r) => r.key === range)?.ms ?? null
     const kw = keyword.trim().toLowerCase()
@@ -216,7 +248,7 @@ export function LogsPanel() {
       (!ms || Date.now() - l.time <= ms) &&
       (!kw || l.text.toLowerCase().includes(kw) || (l.detail ?? '').toLowerCase().includes(kw) || (l.traceId ?? '').includes(kw)),
     )
-  }, [level, source, range, keyword])
+  }, [level, source, range, keyword, logEntries])
 
   return (
     <div className="flex flex-col gap-3">

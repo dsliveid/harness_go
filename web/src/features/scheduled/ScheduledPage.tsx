@@ -5,6 +5,7 @@ import { usePlugins } from '../../stores/pluginStore'
 import { useUI } from '../../stores/uiStore'
 import { Badge, Button, Empty, Modal, Switch, cn } from '../../components/ui'
 import { PromptModal, type PromptField } from '../../components/PromptModal'
+import { RealModeNotice } from '../../components/RealModeNotice'
 import type { ScheduledTask } from '../../types'
 
 const fmtTime = (t?: number) =>
@@ -85,6 +86,7 @@ export function ScheduledModal() {
         height="h-[min(720px,92dvh)] sm:h-[min(720px,86dvh)]"
       >
         <div className="flex flex-col h-full min-h-0">
+          <RealModeNotice text="定时任务仍是本地演示数据：调度器与运行记录属阶段 G，尚未接入服务端。" />
           {/* 固定头：调度说明 + 新建（不随列表滚动、不改变弹窗高度） */}
           <div className="shrink-0 border-b border-edge/60 bg-panel2/30 px-4 py-2.5">
             <div className="flex items-start gap-2">

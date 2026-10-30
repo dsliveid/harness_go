@@ -1,6 +1,8 @@
 import { useEffect } from 'react'
 import { Sparkles } from 'lucide-react'
 import { useUI } from '../stores/uiStore'
+import { useSessions } from '../stores/sessionStore'
+import { useSettings } from '../stores/settingsStore'
 import { useBreakpoint } from './useBreakpoint'
 import { Sidebar } from './Sidebar'
 import { TopBar } from './TopBar'
@@ -34,9 +36,17 @@ function UpdateBanner() {
 export function AppShell() {
   useBreakpoint()
   const { breakpoint, sidebarOpen, setSidebar, theme, panel } = useUI()
+  const loadSessions = useSessions((s) => s.load)
+  const loadProviders = useSettings((s) => s.loadProviders)
   useEffect(() => {
     void initPwa()
   }, [])
+
+  // 进入工作台即从主库拉取会话列表与厂商配置（real 模式；mock 模式为空操作）
+  useEffect(() => {
+    void loadSessions()
+    void loadProviders()
+  }, [loadSessions, loadProviders])
 
   useEffect(() => {
     const root = document.documentElement

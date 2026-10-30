@@ -57,8 +57,8 @@ try {
     if (-not $login.token) { Add-Fail 'login returned no token' }
     $H = @{ Authorization = 'Bearer ' + $login.token }
     $me = Invoke-RestMethod -Uri "$base/api/v1/auth/me" -Headers $H
-    if ($me.user.username -ne $user) { Add-Fail ('me.username expected ' + $user + ', got ' + $me.user.username) }
-    if ($me.user.role -ne 'admin' -and $me.user.role -ne 'owner') { Add-Fail ('me.role expected admin/owner, got ' + $me.user.role) }
+    if ($me.username -ne $user) { Add-Fail ('me.username expected ' + $user + ', got ' + $me.username) }
+    if ($me.role -ne 'admin' -and $me.role -ne 'owner') { Add-Fail ('me.role expected admin/owner, got ' + $me.role) }
 
     $badCode = Get-StatusCode { Invoke-RestMethod -Uri "$base/api/v1/auth/login" -Method Post -ContentType 'application/json' -Body '{"username":"admin","password":"wrong-pwd"}' }
     if ($badCode -ne 401) { Add-Fail ('wrong password expected 401, got ' + $badCode) }

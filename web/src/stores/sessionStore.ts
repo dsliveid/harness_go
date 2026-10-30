@@ -5,6 +5,8 @@ import {
   projectLinks as mockProjectLinks, sessions as mockSessions, workspaces as mockWorkspaces,
   DEFAULT_WORKSPACE_ID,
 } from '../mock/data'
+import { api, apiMode } from '../lib/api'
+import { useUI } from './uiStore'
 
 /** 项目所属工作空间（缺省视为内置服务端空间） */
 export const wsOfProject = (p: Project) => p.workspaceId ?? DEFAULT_WORKSPACE_ID
@@ -26,6 +28,8 @@ interface SessionState {
   /** 项目级数据权限策略（数据范围 × 拒绝/询问/允许） */
   dataGrants: DataScopeGrant[]
   currentId: string
+  /** 从服务端拉取会话列表（real 模式；登录后/进入工作台时调用） */
+  load: () => Promise<void>
   select: (id: string) => void
   create: (projectId?: string) => string
   rename: (id: string, title: string) => void
@@ -59,14 +63,41 @@ interface SessionState {
 export const useSessions = create<SessionState>((set, get) => ({
   workspaces: mockWorkspaces,
   activeWorkspaceId: DEFAULT_WORKSPACE_ID,
-  sessions: mockSessions,
+  // real 模式会话列表来自主库（load() 拉取）；mock 模式沿用 demo 样例
+  sessions: apiMode === 'mock' ? mockSessions : [],
   projects: mockProjects,
   projectLinks: mockProjectLinks,
   approvalRules: mockApprovalRules,
   dataGrants: mockDataGrants,
-  currentId: 's1',
+  currentId: apiMode === 'mock' ? 's1' : '',
 
-  select: (id) => set({ currentId: id }),
+  // 登录后从主库拉取会话列表：空列表自动建一条，避免右侧空屏
+  load: async () => {
+    if (apiMode === 'mock') return
+    try {
+      const list = await api.listSessions({ limit: 100 })
+      if (list.length === 0) {
+        get().create()
+        return
+      }
+      const keep = get().currentId
+      const current = list.some((s) => s.id === keep) ? keep : list[0].id
+      set({ sessions: list, currentId: current })
+      // 动态 import 规避 sessionStore ↔ chatStore 的静态循环依赖
+      const { useChat } = await import('./chatStore')
+      void useChat.getState().reloadMessages(current)
+    } catch {
+      useUI.getState().toast('error', '加载会话列表失败，请检查服务状态')
+    }
+  },
+
+  select: (id) => {
+    set({ currentId: id })
+    if (apiMode === 'real' && id) {
+      // 切换会话即拉取该会话消息快照（以 DB 为准）
+      void import('./chatStore').then((m) => m.useChat.getState().reloadMessages(id))
+    }
+  },
 
   // ---- 工作空间 ----
   setWorkspace: (id) => {
@@ -140,18 +171,47 @@ export const useSessions = create<SessionState>((set, get) => ({
       updatedAt: Date.now(),
     }
     set((st) => ({ sessions: [s, ...st.sessions], currentId: id }))
+    if (apiMode === 'real') {
+      // 先乐观插入（同步返回 id 供调用方 select），再以服务端返回的会话替换本地壳
+      void api
+        .createSession({ title: s.title })
+        .then((created) => {
+          set((st) => ({
+            sessions: st.sessions.map((x) => (x.id === id ? created : x)),
+            currentId: st.currentId === id ? created.id : st.currentId,
+          }))
+        })
+        .catch(() => {
+          set((st) => {
+            const rest = st.sessions.filter((x) => x.id !== id)
+            return {
+              sessions: rest,
+              currentId: st.currentId === id ? (rest[0]?.id ?? '') : st.currentId,
+            }
+          })
+          useUI.getState().toast('error', '创建会话失败，请检查服务状态')
+        })
+    }
     return id
   },
-  rename: (id, title) =>
-    set((s) => ({ sessions: s.sessions.map((x) => (x.id === id ? { ...x, title } : x)) })),
-  remove: (id) =>
+  rename: (id, title) => {
+    set((s) => ({ sessions: s.sessions.map((x) => (x.id === id ? { ...x, title } : x)) }))
+    if (apiMode === 'real') {
+      void api.renameSession(id, title).catch(() => useUI.getState().toast('error', '重命名失败'))
+    }
+  },
+  remove: (id) => {
     set((s) => {
       const rest = s.sessions.filter((x) => x.id !== id)
       return {
         sessions: rest,
         currentId: s.currentId === id ? (rest.find((x) => !x.archivedAt)?.id ?? s.currentId) : s.currentId,
       }
-    }),
+    })
+    if (apiMode === 'real') {
+      void api.deleteSession(id).catch(() => useUI.getState().toast('error', '删除会话失败'))
+    }
+  },
   archive: (id) =>
     set((s) => ({
       sessions: s.sessions.map((x) => (x.id === id ? { ...x, archivedAt: Date.now() } : x)),

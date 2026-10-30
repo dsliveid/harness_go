@@ -91,7 +91,8 @@ func (h *handlers) me(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"user": toAuthUser(user)})
+	// 契约（api/openapi.yaml /api/v1/auth/me）：直接返回 User 对象（不包 user 字段）
+	writeJSON(w, http.StatusOK, toAuthUser(user))
 }
 
 // logout 吊销当前令牌并清 Cookie（幂等）。

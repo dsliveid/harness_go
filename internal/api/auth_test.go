@@ -129,13 +129,11 @@ func TestCookieAuthWorks(t *testing.T) {
 		t.Fatalf("Cookie 鉴权应成功，得到 %d", meResp.StatusCode)
 	}
 	var me struct {
-		User struct {
-			Username string `json:"username"`
-		} `json:"user"`
+		Username string `json:"username"`
 	}
 	_ = json.NewDecoder(meResp.Body).Decode(&me)
-	if me.User.Username != testUsername {
-		t.Fatalf("me 返回用户错误: %+v", me.User)
+	if me.Username != testUsername {
+		t.Fatalf("me 返回用户错误: %+v", me)
 	}
 
 	// 登出后 Cookie 失效（登出请求需手动带 Cookie：client 无 cookie jar）

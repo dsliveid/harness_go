@@ -359,3 +359,9 @@ export interface LogLine {
   level: string;
   text: string;
 }
+
+/** 日志尾行响应（GET /api/v1/logs?limit=&level=）。 */
+export interface LogsResponse {
+  items: LogLine[];
+  limit: number;
+}
