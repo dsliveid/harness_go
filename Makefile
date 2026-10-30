@@ -19,7 +19,7 @@ LDFLAGS := -s -w \
 	-X main.commit=$(COMMIT) \
 	-X main.buildTime=$(BUILDAT)
 
-.PHONY: all build web build-all lint vet test fmt tidy run clean check
+.PHONY: all build web build-all lint vet test fmt tidy run clean check check-eol
 
 all: build
 
@@ -63,6 +63,21 @@ run: build
 
 ## 出口门禁：lint + vet + test
 check: vet test lint
+
+## 换行符自检：检出应为 LF 的文件是否被 CRLF 污染（只读检测，不改动任何 git 配置）
+## 仓库一致性由 .gitattributes 保证，本目标仅用于发现"编辑器写盘"造成的静默漂移
+check-eol:
+	@bad=$$(git ls-files --eol | grep 'w/crlf' | grep -v -E '\.(ps1|cmd|bat)$$' || true); \
+	if [ -n "$$bad" ]; then \
+		echo "✗ 检测到 CRLF 污染（这些文件应为 LF）："; \
+		echo "$$bad"; \
+		echo ""; \
+		echo "修复方式：git rm -r --cached . && git reset --hard HEAD"; \
+		echo "（无需改动任何 git 配置，.gitattributes 已声明统一 LF）"; \
+		exit 1; \
+	else \
+		echo "✓ 换行符检查通过：无 CRLF 污染"; \
+	fi
 
 clean:
 	rm -rf $(BIN_DIR) web/dist
