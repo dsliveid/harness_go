@@ -10,6 +10,10 @@ VERSION  ?= 0.0.0-dev
 COMMIT   ?= none
 BUILDAT  ?= unknown
 
+## 前端产物目录的占位文件：web/dist 目录必须存在（//go:embed all:dist 的编译期要求），
+## 但内容不入库，故用 .gitkeep 占位
+DIST_KEEP := web/dist/.gitkeep
+
 LDFLAGS := -s -w \
 	-X main.version=$(VERSION) \
 	-X main.commit=$(COMMIT) \
@@ -62,3 +66,4 @@ check: vet test lint
 
 clean:
 	rm -rf $(BIN_DIR) web/dist
+	@mkdir -p web/dist && touch $(DIST_KEEP)
