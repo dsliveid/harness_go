@@ -15,7 +15,9 @@
 #
 # 若工作区已有 CRLF 文件，本文件生效后需重新检出才会转回 LF：
 #   git rm -r --cached . && git reset --hard HEAD
-# 日常自检：make check-eol
+# 日常自检（Windows 开发机用 PowerShell，无需 make）：
+#   git ls-files --eol | Select-String 'w/crlf' | Select-String -NotMatch '\.(ps1|cmd|bat)$'
+#   （输出为空即干净；Linux/CI 上可用 make check-eol）
 # ============================================================
 
 # 兜底默认：所有文件由 git 自动判定文本/二进制，文本一律 LF 检出。
