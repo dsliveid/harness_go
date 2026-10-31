@@ -123,6 +123,21 @@ type BudgetConfig struct {
 	HistoryRatio float64 `yaml:"history_ratio"` // 历史段占比上限 (0,1]，默认 0.6
 }
 
+// MCPConfig 外部插件接入（阶段 E / MCP + 工具市场）参数。
+//
+// 安全边界（docs/MCP接入设计.md §10）：
+//   - cloud 形态恒禁止 stdio（服务端不起子进程，Validate 硬约束）；
+//   - server 形态使用 stdio 需显式 AllowStdio；
+//   - TrustedKeys 是受信 ed25519 公钥（hex）：安装签名包的信任根，为空时
+//     任何签名都无法通过 → 签名包一律硬拒（无法证明来源）；
+//   - AllowUnsigned 默认 false：未签名包拒绝安装（出口标准「装未签名包被拒」）。
+type MCPConfig struct {
+	Enabled       bool     `yaml:"enabled"`        // 外部插件总开关（关闭时相关端点返回 unavailable）
+	AllowStdio    bool     `yaml:"allow_stdio"`    // server 形态显式放行 stdio
+	TrustedKeys   []string `yaml:"trusted_keys"`   // 受信公钥（64 位 hex ed25519）
+	AllowUnsigned bool     `yaml:"allow_unsigned"` // 允许安装未签名包（默认拒绝）
+}
+
 // LogConfig 日志。
 type LogConfig struct {
 	Level  string `yaml:"level"`  // debug | info | warn | error
@@ -139,6 +154,7 @@ type Config struct {
 	Tools      ToolsConfig      `yaml:"tools"`
 	Devices    DevicesConfig    `yaml:"devices"`
 	Budget     BudgetConfig     `yaml:"budget"`
+	MCP        MCPConfig        `yaml:"mcp"`
 	Log        LogConfig        `yaml:"log"`
 
 	// ConfigFile 实际加载的配置文件路径（空 = 未使用文件）
@@ -181,6 +197,12 @@ func Default() Config {
 		Budget: BudgetConfig{
 			MaxTotal:     0,   // 默认不限预算（闸门直通）；配置后超限走五级降级
 			HistoryRatio: 0.6, // 历史段占比上限，仅 MaxTotal>0 时生效
+		},
+		MCP: MCPConfig{
+			Enabled:       true,  // 外部插件默认启用（未配置 Server/包时零副作用）
+			AllowStdio:    false, // server 形态需显式放行 stdio
+			TrustedKeys:   nil,   // 受信公钥（空 = 签名包无法安装）
+			AllowUnsigned: false, // 出口铁律：未签名包默认被拒
 		},
 		Log: LogConfig{Level: "info", Format: "text"},
 	}

@@ -110,8 +110,11 @@ func (r *Runner) Run(ctx context.Context, req agent.ToolRunRequest) (agent.ToolR
 }
 
 // PromptRefs 返回注入用的工具引用（tier 由 prompt 自行分层处理）。
+//
+// 使用 InjectedSpecs：health 不可用/熔断的插件（如 MCP Server 故障隔离）整体
+// 移出注入集合，下一个 Run 生效；已注册工具仍可被显式调用（宽进严出）。
 func (r *Runner) PromptRefs() []prompt.ToolRef {
-	specs := r.reg.Specs()
+	specs := r.reg.InjectedSpecs()
 	out := make([]prompt.ToolRef, 0, len(specs))
 	for _, s := range specs {
 		out = append(out, prompt.ToolRef{
@@ -126,7 +129,7 @@ func (r *Runner) PromptRefs() []prompt.ToolRef {
 
 // Injection 返回本轮注入视图与预算明细（供端点与启动日志）。
 func (r *Runner) Injection() loader.Injection {
-	return loader.Build(r.reg.Specs(), r.limits)
+	return loader.Build(r.reg.InjectedSpecs(), r.limits)
 }
 
 // Specs 返回全部工具规格（tier 已应用覆盖）。

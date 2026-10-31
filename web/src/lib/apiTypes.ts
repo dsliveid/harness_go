@@ -308,6 +308,20 @@ export const API_PATHS = {
   deviceWS: '/api/v1/devices/ws',
   /** C-6：会话租约（跨端写者归属） */
   sessionLease: (sid: string) => `/api/v1/sessions/${sid}/lease`,
+  /* 阶段 E：外部插件与工具市场 */
+  mcpServers: '/api/v1/mcp/servers',
+  mcpServer: (id: string) => `/api/v1/mcp/servers/${id}`,
+  mcpTest: '/api/v1/mcp/test',
+  mcpReload: (id: string) => `/api/v1/mcp/servers/${id}/reload`,
+  mcpEnable: (id: string) => `/api/v1/mcp/servers/${id}/enable`,
+  mcpDisable: (id: string) => `/api/v1/mcp/servers/${id}/disable`,
+  mcpHealth: (id: string) => `/api/v1/mcp/servers/${id}/health`,
+  packages: '/api/v1/packages',
+  packagesInstall: '/api/v1/packages/install',
+  package: (id: string) => `/api/v1/packages/${id}`,
+  packageRollback: (id: string) => `/api/v1/packages/${id}/rollback`,
+  packageEnable: (id: string) => `/api/v1/packages/${id}/enable`,
+  packageDisable: (id: string) => `/api/v1/packages/${id}/disable`,
 } as const;
 
 /** 免鉴权路径（与 internal/api/router.go 的 publicPaths 保持一致）。 */
@@ -472,4 +486,92 @@ export interface SessionLeaseDTO {
   /** 毫秒；0 = 无租约 */
   expires_at?: number;
   heartbeat_at?: number;
+}
+
+
+/* ============ 阶段 E：外部插件与工具市场 DTO ============ */
+
+/** MCP Server 视图（env/headers 只回键名不回值——安全边界）。 */
+export interface MCPServerViewDTO {
+  id: string;
+  name: string;
+  transport: 'stdio' | 'sse' | 'http';
+  command?: string;
+  args?: string[];
+  env_keys?: string[];
+  cwd?: string;
+  url?: string;
+  header_keys?: string[];
+  enabled: boolean;
+  timeout_ms: number;
+  max_output: number;
+  default_risk: string;
+  allow_tools?: string[];
+  deny_tools?: string[];
+  health_interval_s: number;
+  state?: 'ready' | 'degraded' | 'failed' | 'disabled';
+  calls?: number;
+  failures?: number;
+  tool_count?: number;
+  last_error?: string;
+}
+
+/** MCP Server 创建/更新入参（env/headers 明文进、密文出库）。 */
+export interface MCPServerInputDTO {
+  name: string;
+  transport: 'stdio' | 'sse' | 'http';
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  cwd?: string;
+  url?: string;
+  headers?: Record<string, string>;
+  enabled?: boolean;
+  timeout_ms?: number;
+  max_output?: number;
+  default_risk?: 'readonly' | 'write' | 'command' | 'danger';
+  allow_tools?: string[];
+  deny_tools?: string[];
+  health_interval_s?: number;
+}
+
+/** 联通测试结果（工具清单 + 耗时 + Server 自述）。 */
+export interface MCPTestResultDTO {
+  tool_names: string[];
+  elapsed_ms: number;
+  server_info?: string;
+}
+
+/** 健康详情。 */
+export interface MCPHealthDTO {
+  id: string;
+  name: string;
+  transport: string;
+  state: string;
+  last_error?: string;
+  calls: number;
+  failures: number;
+  tool_count: number;
+}
+
+/** 本地工具包视图（trust = signed | unsigned）。 */
+export interface PackageViewDTO {
+  id: string;
+  version: string;
+  previous_version?: string;
+  name: string;
+  trust: 'signed' | 'unsigned';
+  namespace: string;
+  enabled: boolean;
+  description?: string;
+  tool_names?: string[];
+  state?: string;
+  last_error?: string;
+}
+
+/** 安装结果。 */
+export interface PackageInstallResultDTO {
+  view: PackageViewDTO;
+  signed: boolean;
+  tools: number;
 }

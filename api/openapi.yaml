@@ -752,6 +752,218 @@ paths:
                         level: { type: string }
                         text: { type: string }
                   limit: { type: integer }
+  # ============ 阶段 E：外部插件与工具市场 ============
+  /api/v1/mcp/servers:
+    get:
+      tags: [mcp]
+      summary: MCP Server 列表（配置 + 运行态；env/headers 只回键名不回值）
+      responses:
+        "200":
+          description: Server 列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/MCPServerView" }
+        "503": { description: 外部插件子系统未接入 }
+    post:
+      tags: [mcp]
+      summary: 新增 MCP Server（?start=true 时立即启动；cloud 形态 stdio 被拒）
+      parameters:
+        - { name: start, in: query, schema: { type: boolean, default: false } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MCPServerInput" }
+      responses:
+        "201":
+          description: 已创建
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MCPServerView" }
+        "400": { description: 参数非法 }
+        "503": { description: 外部插件子系统未接入 }
+  /api/v1/mcp/test:
+    post:
+      tags: [mcp]
+      summary: 联通测试（配置可未落库）：建连→握手→tools/list→清理；可读失败原因
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MCPServerInput" }
+      responses:
+        "200":
+          description: 测试结果（工具清单 + 耗时 + Server 自述）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MCPTestResult" }
+        "400": { description: 参数非法 }
+        "502": { description: 连接/握手/协议失败（可读原因） }
+  /api/v1/mcp/servers/{id}:
+    get:
+      tags: [mcp]
+      summary: 单个 Server 视图
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: 视图
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MCPServerView" }
+        "404": { description: 不存在 }
+    put:
+      tags: [mcp]
+      summary: 全量更新（变更后需显式 reload 生效）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/MCPServerInput" }
+      responses:
+        "200":
+          description: 已更新
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MCPServerView" }
+        "404": { description: 不存在 }
+    delete:
+      tags: [mcp]
+      summary: 删除（先注销工具再关连接）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: 已删除 }
+        "404": { description: 不存在 }
+  /api/v1/mcp/servers/{id}/reload:
+    post:
+      tags: [mcp]
+      summary: 热重载（原子替换；新连接失败保留旧连接）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: 已重载 }
+        "404": { description: 不存在 }
+  /api/v1/mcp/servers/{id}/enable:
+    post:
+      tags: [mcp]
+      summary: 启用并启动注册
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: 已启用 }
+        "404": { description: 不存在 }
+  /api/v1/mcp/servers/{id}/disable:
+    post:
+      tags: [mcp]
+      summary: 停用（注销工具 + 关连接）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: 已停用 }
+        "404": { description: 不存在 }
+  /api/v1/mcp/servers/{id}/health:
+    get:
+      tags: [mcp]
+      summary: 健康详情（状态/最近错误/调用数/失败数/工具数）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: 状态
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MCPHealth" }
+        "404": { description: 不存在 }
+  /api/v1/packages:
+    get:
+      tags: [packages]
+      summary: 已安装工具包列表
+      responses:
+        "200":
+          description: 包列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/PackageView" }
+        "503": { description: 外部插件子系统未接入 }
+  /api/v1/packages/install:
+    post:
+      tags: [packages]
+      summary: 安装本地工具包 zip（签名校验 + 信任策略；未签名默认被拒）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties:
+                path: { type: string, description: 服务端本地 zip 路径 }
+      responses:
+        "201":
+          description: 安装结果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  view: { $ref: "#/components/schemas/PackageView" }
+                  signed: { type: boolean }
+                  tools: { type: integer }
+        "400": { description: 参数非法 }
+        "409": { description: 同版本已安装 }
+        "400": { description: 包格式/签名/信任策略拒绝（可读原因） }
+  /api/v1/packages/{id}:
+    delete:
+      tags: [packages]
+      summary: 卸载（注销工具 + 清目录 + 删行，索引一致）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: 已卸载 }
+        "404": { description: 不存在 }
+  /api/v1/packages/{id}/rollback:
+    post:
+      tags: [packages]
+      summary: 回滚到上一版本（旧版本目录在升级时保留）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: 回滚后视图
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PackageView" }
+        "404": { description: 不存在 }
+  /api/v1/packages/{id}/enable:
+    post:
+      tags: [packages]
+      summary: 启用（重连注册）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: 已启用 }
+  /api/v1/packages/{id}/disable:
+    post:
+      tags: [packages]
+      summary: 禁用（注销工具，保留安装）
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: 已禁用 }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -817,6 +1029,88 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/ErrorBody" }
   schemas:
+    # ============ 阶段 E：外部插件与工具市场 DTO ============
+    MCPServerView:
+      type: object
+      description: MCP Server 视图（env/headers 只回键名不回值——安全边界）
+      properties:
+        id: { type: string }
+        name: { type: string }
+        transport: { type: string, enum: [stdio, sse, http] }
+        command: { type: string }
+        args: { type: array, items: { type: string } }
+        env_keys: { type: array, items: { type: string } }
+        cwd: { type: string }
+        url: { type: string }
+        header_keys: { type: array, items: { type: string } }
+        enabled: { type: boolean }
+        timeout_ms: { type: integer }
+        max_output: { type: integer }
+        default_risk: { type: string }
+        allow_tools: { type: array, items: { type: string } }
+        deny_tools: { type: array, items: { type: string } }
+        health_interval_s: { type: integer }
+        state: { type: string, enum: [ready, degraded, failed, disabled] }
+        calls: { type: integer }
+        failures: { type: integer }
+        tool_count: { type: integer }
+        last_error: { type: string }
+    MCPServerInput:
+      type: object
+      required: [name, transport]
+      properties:
+        name: { type: string }
+        transport: { type: string, enum: [stdio, sse, http] }
+        command: { type: string }
+        args: { type: array, items: { type: string } }
+        env:
+          type: object
+          description: 键值明文进、密文出库；API 响应永不回值
+          additionalProperties: { type: string }
+        cwd: { type: string }
+        url: { type: string }
+        headers:
+          type: object
+          additionalProperties: { type: string }
+        enabled: { type: boolean }
+        timeout_ms: { type: integer }
+        max_output: { type: integer }
+        default_risk: { type: string, enum: [readonly, write, command, danger] }
+        allow_tools: { type: array, items: { type: string } }
+        deny_tools: { type: array, items: { type: string } }
+        health_interval_s: { type: integer }
+    MCPTestResult:
+      type: object
+      properties:
+        tool_names: { type: array, items: { type: string } }
+        elapsed_ms: { type: integer }
+        server_info: { type: string }
+    MCPHealth:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        transport: { type: string }
+        state: { type: string }
+        last_error: { type: string }
+        calls: { type: integer }
+        failures: { type: integer }
+        tool_count: { type: integer }
+    PackageView:
+      type: object
+      description: 本地工具包视图（trust = signed | unsigned；builtin 不入库）
+      properties:
+        id: { type: string }
+        version: { type: string }
+        previous_version: { type: string }
+        name: { type: string }
+        trust: { type: string, enum: [signed, unsigned] }
+        namespace: { type: string, example: "pkg:demo" }
+        enabled: { type: boolean }
+        description: { type: string }
+        tool_names: { type: array, items: { type: string } }
+        state: { type: string }
+        last_error: { type: string }
     ErrorBody:
       type: object
       required: [error]

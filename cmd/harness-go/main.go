@@ -31,6 +31,8 @@ import (
 	"harness-go/internal/device"
 	"harness-go/internal/events"
 	"harness-go/internal/llm"
+	"harness-go/internal/market"
+	"harness-go/internal/mcp"
 	"harness-go/internal/memory"
 	"harness-go/internal/observ"
 	"harness-go/internal/prompt"
@@ -191,6 +193,45 @@ func run() error {
 	)
 	for _, warn := range toolReg.Warnings() {
 		logger.Warn("工具注入软上限告警（不阻断启动）", "detail", warn)
+	}
+
+	// ⑦''' E：外部插件子系统（MCP 三传输 + 本地工具包，mcp.enabled 总开关）。
+	//
+	// 失败隔离：单个 Server/包 连接失败只记日志并标 failed（状态机在 manager 内），
+	// 绝不阻断启动与对话主链路（docs/MCP接入设计.md M2）。安全边界：
+	// cloud 形态 stdio 硬拒（Validate）；未签名包默认拒绝安装（出口标准）。
+	var mcpSvc *service.MCPService
+	var pkgSvc *service.PackageService
+	if cfg.MCP.Enabled {
+		trustedKeys, kErr := market.ParsePublicKeys(cfg.MCP.TrustedKeys)
+		if kErr != nil {
+			return kErr
+		}
+		mcpMgr := mcp.NewManager(mcp.Options{
+			ClientName:    "harness-go",
+			ClientVersion: version,
+			Logger:        logger,
+		}, mcp.DeploymentPolicy{Mode: string(cfg.Deployment.Mode), AllowStdio: cfg.MCP.AllowStdio})
+		mcpSvc = service.NewMCPService(service.MCPServiceOptions{
+			Main:     mainStore,
+			Manager:  mcpMgr,
+			Registry: toolReg,
+			Cipher:   secretCipher,
+			Dep:      mcp.DeploymentPolicy{Mode: string(cfg.Deployment.Mode), AllowStdio: cfg.MCP.AllowStdio},
+			Logger:   logger,
+		})
+		pkgSvc = service.NewPackageService(service.PackageServiceOptions{
+			Main:          mainStore,
+			Manager:       mcpMgr,
+			Registry:      toolReg,
+			DataDir:       dataDir,
+			TrustedKeys:   trustedKeys,
+			AllowUnsigned: cfg.MCP.AllowUnsigned,
+			Logger:        logger,
+		})
+		mcpSvc.StartAll(ctx)
+		pkgSvc.RestoreAll(ctx)
+		defer mcpMgr.StopAll()
 	}
 
 	// ⑦'' C-6：会话租约管理器（跨端单写者）。
@@ -381,6 +422,8 @@ func run() error {
 		Settings:    settingsSvc,
 		Logs:        logSvc,
 		Devices:     deviceSvc,
+		MCP:         mcpSvc,
+		Packages:    pkgSvc,
 		DeviceWS:    deviceWSHandler(deviceGateway),
 		Bus:         bus,
 		Auth:        authSvc,

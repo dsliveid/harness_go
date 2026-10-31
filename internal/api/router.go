@@ -81,6 +81,25 @@ func NewRouter(d Deps) http.Handler {
 	mux.HandleFunc("GET /api/v1/tools/injection", h.toolsInjection)
 	mux.HandleFunc("PATCH /api/v1/tools/tiers", h.patchToolTiers)
 
+	// 阶段 E：外部插件与工具市场
+	mux.HandleFunc("GET /api/v1/mcp/servers", h.listMCPServers)
+	mux.HandleFunc("POST /api/v1/mcp/servers", h.createMCPServer)
+	mux.HandleFunc("POST /api/v1/mcp/test", h.testMCPServer)
+	mux.HandleFunc("GET /api/v1/mcp/servers/{id}", h.getMCPServer)
+	mux.HandleFunc("PUT /api/v1/mcp/servers/{id}", h.updateMCPServer)
+	mux.HandleFunc("DELETE /api/v1/mcp/servers/{id}", h.deleteMCPServer)
+	mux.HandleFunc("POST /api/v1/mcp/servers/{id}/reload", h.reloadMCPServer)
+	mux.HandleFunc("POST /api/v1/mcp/servers/{id}/enable", h.enableMCPServer)
+	mux.HandleFunc("POST /api/v1/mcp/servers/{id}/disable", h.disableMCPServer)
+	mux.HandleFunc("GET /api/v1/mcp/servers/{id}/health", h.mcpServerHealth)
+
+	mux.HandleFunc("GET /api/v1/packages", h.listPackages)
+	mux.HandleFunc("POST /api/v1/packages/install", h.installPackage)
+	mux.HandleFunc("DELETE /api/v1/packages/{id}", h.uninstallPackage)
+	mux.HandleFunc("POST /api/v1/packages/{id}/rollback", h.rollbackPackage)
+	mux.HandleFunc("POST /api/v1/packages/{id}/enable", h.enablePackage)
+	mux.HandleFunc("POST /api/v1/packages/{id}/disable", h.disablePackage)
+
 	// 设备（阶段 C：多端协同 HALO M5）——配对 / 列表 / 吊销 / 长连接
 	mux.HandleFunc("POST /api/v1/devices/pair-codes", h.createPairCode)
 	mux.HandleFunc("POST /api/v1/devices/pair", h.pairDevice)

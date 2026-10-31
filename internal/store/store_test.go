@@ -41,8 +41,8 @@ func TestOpenMainCreatesSchema(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v != 3 {
-		t.Fatalf("主库 schema 版本期望 3，得到 %d", v)
+	if v != 4 {
+		t.Fatalf("主库 schema 版本期望 4，得到 %d", v)
 	}
 }
 

@@ -274,6 +274,87 @@ func (r *Registry) Specs() []toolapi.Spec {
 	return out
 }
 
+// UnregisterPlugin 注销插件及其全部工具（阶段 E：卸载/禁用/重载路径）。
+//
+// 语义：正在执行的调用允许完成（调用方持有 Tool 引用）；
+// 注销后 Resolve/Risk 立即 miss，注入集合在下一个 Run 生效（保护前缀缓存）。
+// 插件不存在的视为已注销（幂等，返回 nil）。
+func (r *Registry) UnregisterPlugin(pluginID string) error {
+	r.mu.Lock()
+	pe, ok := r.plugins[pluginID]
+	if !ok {
+		r.mu.Unlock()
+		return nil
+	}
+	removed := make(map[string]struct{}, len(pe.tools))
+	for _, name := range pe.tools {
+		removed[name] = struct{}{}
+		delete(r.tools, name)
+	}
+	delete(r.plugins, pluginID)
+	kept := r.order[:0]
+	for _, name := range r.order {
+		if _, gone := removed[name]; gone {
+			continue
+		}
+		kept = append(kept, name)
+	}
+	r.order = kept
+	r.refreshWarningsLocked()
+	r.mu.Unlock()
+	// 在锁外执行 Stop：插件可能做 IO，避免长时间持锁
+	_ = pe.plugin.Stop(context.Background())
+	return nil
+}
+
+// SetPluginHealth 更新插件健康态（阶段 E：MCP 熔断/恢复联动注入集合）。
+//
+// unavailable / degraded 的插件工具被移出**注入集合**（InjectedSpecs），
+// 但仍注册、仍可被显式调用（宽进严出：熔断≠禁用）。
+func (r *Registry) SetPluginHealth(pluginID string, h toolapi.Health) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if h.CheckedAt.IsZero() {
+		h.CheckedAt = r.opts.Now()
+	}
+	for _, e := range r.tools {
+		if e.pluginID == pluginID {
+			e.health = h
+		}
+	}
+}
+
+// PluginHealth 返回插件健康态快照（未注册返回 unavailable）。
+func (r *Registry) PluginHealth(pluginID string) toolapi.Health {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, e := range r.tools {
+		if e.pluginID == pluginID {
+			return e.health
+		}
+	}
+	return toolapi.Health{Status: toolapi.HealthUnavailable}
+}
+
+// InjectedSpecs 返回**当前应注入**的工具规格：health 为 unavailable/degraded
+// 的插件（如 MCP Server 熔断）整体移出注入集合（docs/MCP接入设计.md §6）。
+// 已注册但被移出的工具仍可被调用（Resolve 不受影响——宽进严出）。
+func (r *Registry) InjectedSpecs() []toolapi.Spec {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]toolapi.Spec, 0, len(r.order))
+	for _, name := range r.order {
+		e := r.tools[name]
+		if e.health.Status == toolapi.HealthUnavailable || e.health.Status == toolapi.HealthDegraded {
+			continue
+		}
+		s := e.spec
+		s.Tier = r.tierLocked(e)
+		out = append(out, s)
+	}
+	return out
+}
+
 // SetOverrides 设置 tier 覆盖（来自主库 settings.tools.tiers，仅允许已知工具名）。
 func (r *Registry) SetOverrides(over map[string]toolapi.Tier) {
 	clean := make(map[string]toolapi.Tier, len(over))
