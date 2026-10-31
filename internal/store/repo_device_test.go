@@ -75,15 +75,15 @@ func TestMainDevicesMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 0004_market.sql 落地后主库版本为 4。
-	if v != 4 {
-		t.Fatalf("主库 schema 版本期望 4，得到 %d", v)
+	if v != 5 {
+		t.Fatalf("主库 schema 版本期望 5，得到 %d", v)
 	}
 	req, err := RequiredSchemaVersion("main")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if req != 4 {
-		t.Fatalf("RequiredSchemaVersion(main) 期望 4，得到 %d", req)
+	if req != 5 {
+		t.Fatalf("RequiredSchemaVersion(main) 期望 5，得到 %d", req)
 	}
 }
 
@@ -119,16 +119,16 @@ func TestSessionApprovalAuditMigration(t *testing.T) {
 	).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
-	if n != 9 {
-		t.Fatalf("会话库表数量期望 9，得到 %d", n)
+	if n != 12 {
+		t.Fatalf("会话库表数量期望 12，得到 %d", n)
 	}
 
 	v, err := SchemaVersion(ctx, sdb.conn())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v != 2 {
-		t.Fatalf("会话库 schema 版本期望 2，得到 %d", v)
+	if v != 4 {
+		t.Fatalf("会话库 schema 版本期望 4，得到 %d", v)
 	}
 }
 
@@ -601,12 +601,12 @@ func TestMigrationUpgradeFromV1(t *testing.T) {
 	if err != nil {
 		t.Fatalf("主库增量迁移失败: %v", err)
 	}
-	// v1 库升级：0002_devices + 0003_retrieval + 0004_market 共 3 个增量迁移。
-	if applied != 3 {
-		t.Fatalf("主库增量迁移应应用 3 个，得到 %d", applied)
+	// v1 库升级：0002_devices + 0003_retrieval + 0004_market + 0005_snapshots 共 4 个增量迁移。
+	if applied != 4 {
+		t.Fatalf("主库增量迁移应应用 4 个，得到 %d", applied)
 	}
-	if v, _ := SchemaVersion(ctx, mdb); v != 4 {
-		t.Fatalf("主库升级后版本期望 4，得到 %d", v)
+	if v, _ := SchemaVersion(ctx, mdb); v != 5 {
+		t.Fatalf("主库升级后版本期望 5，得到 %d", v)
 	}
 	var title string
 	if err := mdb.QueryRowContext(ctx, `SELECT title FROM sessions WHERE id='old-s1'`).Scan(&title); err != nil {
@@ -649,7 +649,7 @@ func TestMigrationUpgradeFromV1(t *testing.T) {
 		 VALUES('ap-1','r-1','te-1','{}','allow_once',1)`); err != nil {
 		t.Fatal(err)
 	}
-	if applied, err := applyMigrations(ctx, sdb, "session"); err != nil || applied != 1 {
+	if applied, err := applyMigrations(ctx, sdb, "session"); err != nil || applied != 3 {
 		t.Fatalf("会话库增量迁移失败: applied=%d err=%v", applied, err)
 	}
 	// 旧审批行保留，新列默认 NULL

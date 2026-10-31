@@ -39,6 +39,7 @@ import (
 	"harness-go/internal/retrieval"
 	"harness-go/internal/secret"
 	"harness-go/internal/service"
+	"harness-go/internal/snapshot"
 	"harness-go/internal/store"
 	"harness-go/internal/tokenizer"
 	"harness-go/internal/tools"
@@ -273,6 +274,8 @@ func run() error {
 		Main:       mainStore,
 		ToolRefs:   toolRunner.PromptRefs,
 		SystemBase: defaultSystemBase,
+		// G：SOP 动态源（sop 插件落盘 .harness/sop/*.md 后下一轮生效）
+		SOPFunc: func() []string { return sopBodies(toolHost) },
 	})
 	toolHost.SetChildRunner(childRunner)
 	toolHost.SetCommandRunner(hostimpl.NewCommandRunner(hostimpl.CommandOptions{
@@ -339,12 +342,60 @@ func run() error {
 		},
 		// D-3：记忆召回（L0/L1 稳定前缀 + L2/L3 检索置尾）
 		Memory: memoryStore,
+		// G：SOP 动态源（sop 插件唯一真源 <ws>/.harness/sop/*.md，全量注入）
+		SOPFunc: func() []string { return sopBodies(toolHost) },
 		// C-7：高风险审批是否仅限执行端设备确认（默认 false = 只审计不阻断）
 		StrictApprovalDevice: cfg.Devices.StrictApprovalDevice,
 	})
 	if n, rErr := runSvc.RecoverInterrupted(ctx); rErr == nil && n > 0 {
 		logger.Warn("已将未完成 Run 置为 interrupted（不做断点续跑）", "count", n)
 	}
+
+	// ⑩'' G：S10 快照回滚 + 长任务状态机 + 会话导出包（Host 能力注入）。
+	//   - 快照：全局 CAS（data/snapshots/blobs）+ 主库锚点行；fs 插件写入前/后
+	//     经 Host.Snapshots 登记 before/after，回滚服务物理写回（与写事务一致）。
+	//   - 长任务：会话库 tasks/task_checkpoints；检查点 = Run + 快照引用原子登记。
+	//   - 导出包：data/sessions/<sid>/bundle/；导入恢复为新会话（沙箱内路径）。
+	snapStore, sErr := snapshot.New(snapshot.Options{
+		Main:          mainStore,
+		DataDir:       dataDir,
+		WorkspaceRoot: workDir,
+	})
+	if sErr != nil {
+		return fmt.Errorf("初始化快照存储失败: %w", sErr)
+	}
+	sessionSvc.SetDeletedHook(func(hctx context.Context, sid string) {
+		if _, fErr := snapStore.ForgetSession(hctx, sid); fErr != nil {
+			logger.Warn("清理会话快照行失败", "session", sid, "err", fErr)
+			return
+		}
+		if n, gErr := snapStore.GC(hctx); gErr == nil && n > 0 {
+			logger.Info("已回收零引用快照内容", "blobs", n)
+		}
+	})
+	taskMgr := service.NewTaskManager(service.TaskManagerOptions{
+		Sessions:  sessionStore,
+		Snapshots: snapStore,
+		RunStop: func(hctx context.Context, _ string, runID string) error {
+			return runSvc.StopRun(hctx, runID)
+		},
+	})
+	bundleSvc := service.NewBundleService(service.BundleServiceOptions{
+		Main:          mainStore,
+		Sessions:      sessionStore,
+		DataDir:       dataDir,
+		WorkspaceRoot: workDir,
+	})
+	rollbackSvc := service.NewRollbackService(service.RollbackServiceOptions{
+		Main:      mainStore,
+		Sessions:  sessionStore,
+		Snapshots: snapStore,
+	})
+	toolHost.SetSnapshots(snapStore)
+	toolHost.SetTasks(taskMgr)
+	toolHost.SetBundles(bundleSvc)
+	logger.Info("阶段 G 能力已接线", "snapshots", "global-cas", "long_task", "state-machine", "bundles", "zip")
+
 	maintenanceSvc := service.NewMaintenanceService(mainStore, sessionStore, runSvc, gate.PendingCount)
 	toolSvc := service.NewToolService(toolRunner, mainStore)
 	toolSvc.LoadOverrides(ctx)
@@ -445,6 +496,7 @@ func run() error {
 		Devices:     deviceSvc,
 		MCP:         mcpSvc,
 		Packages:    pkgSvc,
+		Rollback:    rollbackSvc,
 		DeviceWS:    deviceWSHandler(deviceGateway),
 		Bus:         bus,
 		Auth:        authSvc,

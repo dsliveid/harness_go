@@ -12,6 +12,7 @@ package main
 //   core:        fs(6) + command(1) + todo(2)          —— 全量定义注入
 //   deferred:    file_outline/plan/decision/webfetch/growth —— 仅名称索引
 //   on_demand:   skill_save/memory/browser/subagent/collaborator —— 零注入，UI 启用
+// 阶段 G 追加（deferred）：long-task(3) + sop(2) + session-bundle(2)
 
 import (
 	"context"
@@ -25,9 +26,12 @@ import (
 	"harness-go/internal/plugins/fs"
 	"harness-go/internal/plugins/growth"
 	"harness-go/internal/plugins/image"
+	"harness-go/internal/plugins/longtask"
 	"harness-go/internal/plugins/memory"
 	"harness-go/internal/plugins/plan"
+	"harness-go/internal/plugins/sessionbundle"
 	"harness-go/internal/plugins/skill"
+	"harness-go/internal/plugins/sop"
 	"harness-go/internal/plugins/subagent"
 	"harness-go/internal/plugins/todo"
 	"harness-go/internal/plugins/webfetch"
@@ -54,6 +58,10 @@ var builtinFactories = []toolapi.Factory{
 	browser.Factory(),  // requires=chromium，缺失显式降级
 	subagent.Factory(), // Host.Spawn 嵌套 Run
 	collaborator.Factory(),
+	// —— 阶段 G（deferred） ——
+	longtask.Factory(),      // Host.Tasks 长任务状态机入口
+	sop.Factory(),           // .harness/sop 全量注入 + 硬上限
+	sessionbundle.Factory(), // Host.Bundles 会话导出包入口
 }
 
 // registerBuiltins 装配全部内置插件，返回 (成功数, 失败数)。

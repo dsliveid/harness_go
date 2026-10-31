@@ -23,8 +23,12 @@ type RunServiceOptions struct {
 	Sessions   *store.SessionStore
 	Engine     *agent.Engine
 	SystemBase string
-	SOP        []string
-	Tools      []prompt.ToolRef
+	// SOP 静态 SOP 注入（启动期固定；测试/降级用）。
+	SOP []string
+	// SOPFunc 动态 SOP 源（阶段 G：sop 插件落盘 <ws>/.harness/sop/*.md 后
+	// 下一轮生效）。非 nil 时优先于静态 SOP。返回空切片表示项目无 SOP。
+	SOPFunc func() []string
+	Tools   []prompt.ToolRef
 	// ToolRefs 动态工具注入（优先于静态 Tools）：每轮重新取，
 	// 保证 PATCH /tools/tiers 改档后「下一轮对话生效」。
 	ToolRefs func() []prompt.ToolRef
@@ -49,6 +53,7 @@ type RunService struct {
 	engine     *agent.Engine
 	systemBase string
 	sop        []string
+	sopFunc    func() []string
 	tools      []prompt.ToolRef
 	toolRefs   func() []prompt.ToolRef
 	gate       *approval.Gate
@@ -71,6 +76,7 @@ func NewRunService(opts RunServiceOptions) *RunService {
 		engine:         opts.Engine,
 		systemBase:     opts.SystemBase,
 		sop:            opts.SOP,
+		sopFunc:        opts.SOPFunc,
 		tools:          opts.Tools,
 		toolRefs:       opts.ToolRefs,
 		gate:           opts.Gate,
@@ -87,6 +93,14 @@ func (s *RunService) currentTools() []prompt.ToolRef {
 		return s.toolRefs()
 	}
 	return s.tools
+}
+
+// currentSOP 返回本轮 SOP 全量注入（动态源优先；空 = 项目未配置 SOP）。
+func (s *RunService) currentSOP() []string {
+	if s.sopFunc != nil {
+		return s.sopFunc()
+	}
+	return s.sop
 }
 
 // selectTools 动态检索本轮需注入全量定义的 deferred 工具（D-2）。
@@ -196,7 +210,7 @@ func (s *RunService) CreateRunAs(ctx context.Context, sessionID, userInput, mode
 		ModelRef:        modelRef,
 		AccessMode:      approval.AccessMode(normalizeAccessMode(sess.AccessMode)),
 		SystemBase:      s.systemBase,
-		SOP:             s.sop,
+		SOP:             s.currentSOP(),
 		ProjectSummary:  "",
 		Tools:           s.currentTools(),
 		ActiveTools:     s.selectTools(ctx, userInput),

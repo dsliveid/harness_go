@@ -1,0 +1,26 @@
+{
+  "id": "session-bundle",
+  "name": "会话导出",
+  "description": "会话打包与恢复：导出为 zip（manifest + 消息/Run/工具事件 + blob），或从导出包恢复为新会话（打包执行体在内核，本插件只做工具入口）",
+  "version": "1.0.0",
+  "kind": "builtin",
+  "default_tier": "deferred",
+  "protocol_version": 1,
+  "requires": ["fs_read", "fs_write"],
+  "tools": [
+    {
+      "name": "export_session",
+      "description": "导出会话为 bundle zip（落 data/sessions/<sid>/bundle/，返回绝对路径与包大小）",
+      "schema_json": {"type":"object","properties":{"session_id":{"type":"string","description":"目标会话（缺省 = 当前会话）"}}},
+      "tier": "deferred",
+      "risk": "write"
+    },
+    {
+      "name": "import_session",
+      "description": "从 bundle zip 恢复为新会话：路径可用 export_session 返回的绝对路径，或工作区内相对路径",
+      "schema_json": {"type":"object","properties":{"zip_path":{"type":"string","description":"导出包路径（绝对=data 目录下；相对=工作区内）"}},"required":["zip_path"]},
+      "tier": "deferred",
+      "risk": "write"
+    }
+  ]
+}

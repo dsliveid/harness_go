@@ -45,6 +45,8 @@ type ChildRunnerOptions struct {
 	ToolRefs   func() []prompt.ToolRef
 	SystemBase string
 	SOP        []string
+	// SOPFunc 动态 SOP 源（阶段 G；非 nil 时优先于静态 SOP）。
+	SOPFunc func() []string
 	// MaxDepth 深度上限（<=0 用默认 2）。
 	MaxDepth int
 	// MaxConcurrent 同会话在途上限（<=0 用默认 4）。
@@ -54,7 +56,9 @@ type ChildRunnerOptions struct {
 // ChildRunner 嵌套 Run 派生器。
 type ChildRunner struct {
 	opts ChildRunnerOptions
-	mu   sync.Mutex
+	// sopFunc 动态 SOP 源缓存（构造期固化，避免每轮读盘的锁竞争面）。
+	sopFunc func() []string
+	mu      sync.Mutex
 	// parentOf childRunID → parentRunID（深度链）
 	parentOf map[string]string
 	// active 同会话在途计数
@@ -75,11 +79,20 @@ func NewChildRunner(opts ChildRunnerOptions) *ChildRunner {
 	}
 	return &ChildRunner{
 		opts:        opts,
+		sopFunc:     opts.SOPFunc,
 		parentOf:    make(map[string]string),
 		active:      make(map[string]int),
 		live:        make(map[string]*childRun),
 		cancelFuncs: make(map[string]context.CancelFunc),
 	}
+}
+
+// currentSOP 返回子 Run 的 SOP 注入（动态源优先）。
+func (r *ChildRunner) currentSOP() []string {
+	if r.sopFunc != nil {
+		return r.sopFunc()
+	}
+	return r.opts.SOP
 }
 
 // childRun 子 Run 句柄。
@@ -198,7 +211,7 @@ func (r *ChildRunner) Spawn(ctx context.Context, req toolapi.SpawnRequest) (tool
 		ModelRef:   modelRef,
 		AccessMode: accessMode,
 		SystemBase: r.opts.SystemBase,
-		SOP:        r.opts.SOP,
+		SOP:        r.currentSOP(),
 		LockKey:    spawnLockKey(req.SessionID, run.ID),
 	}
 	if r.opts.ToolRefs != nil {

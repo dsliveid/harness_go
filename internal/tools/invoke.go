@@ -62,7 +62,15 @@ func (r *Runner) Run(ctx context.Context, req agent.ToolRunRequest) (agent.ToolR
 		return failure(model.ToolError, runErr.Error()), nil
 	}
 
-	res, invokeErr := tool.Invoke(ctx, &toolapi.Call{
+	// G：把调用锚点（session/run/tool_event）注入 ctx——快照存储据此把
+	// before/after 快照与工具事件关联，回滚服务才能按消息/轮次/工具级定位。
+	callCtx := toolapi.WithCallInfo(ctx, toolapi.CallInfo{
+		SessionID:   req.SessionID,
+		RunID:       req.RunID,
+		ToolEventID: req.ToolEventID,
+	})
+
+	res, invokeErr := tool.Invoke(callCtx, &toolapi.Call{
 		CallID:      req.ToolName + ":" + req.ToolEventID,
 		RunID:       req.RunID,
 		SessionID:   req.SessionID,

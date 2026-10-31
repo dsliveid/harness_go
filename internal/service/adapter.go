@@ -36,8 +36,10 @@ func (a *sessionDBAdapter) AppendMessage(ctx context.Context, m *model.Message) 
 	return a.sdb.Messages().Append(ctx, m)
 }
 
+// ListMessages 只回**未置灰**消息（阶段 G：消息级回滚置灰的消息保留在库，
+// 但不进引擎上下文；API 消息列表走 SessionService.Messages，包含置灰消息）。
 func (a *sessionDBAdapter) ListMessages(ctx context.Context, afterSeq int64, limit int) ([]model.Message, error) {
-	return a.sdb.Messages().List(ctx, afterSeq, limit)
+	return a.sdb.Messages().ListVisible(ctx, afterSeq, limit)
 }
 
 func (a *sessionDBAdapter) GetRun(ctx context.Context, id string) (*model.Run, error) {

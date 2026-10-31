@@ -16,9 +16,24 @@ import (
 
 	"harness-go/internal/events"
 	"harness-go/internal/llm"
+	"harness-go/internal/plugins/sop"
 	"harness-go/internal/service"
 	"harness-go/pkg/toolapi"
 )
+
+// ============ SOP 动态注入（阶段 G） ============
+
+// sopBodies 读取 sop 插件的唯一真源（<ws>/.harness/sop/*.md）正文列表。
+// 返回值进 prompt.Input.SOP（系统提示「## 项目规范（SOP）」段，全量注入）；
+// 项目未配置 SOP 时返回空切片（不注入该段）。
+func sopBodies(host toolapi.Host) []string {
+	entries := sop.LoadAll(host)
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, e.Body)
+	}
+	return out
+}
 
 // ============ LLM 适配：llm.Provider(ChatStream) → toolapi.LLM(Chat) ============
 

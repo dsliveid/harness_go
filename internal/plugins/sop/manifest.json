@@ -1,0 +1,26 @@
+{
+  "id": "sop",
+  "name": "项目规范",
+  "description": "项目级 SOP（Markdown 流程规范）：落盘 .harness/sop/ 并全量注入系统提示（≤6 条 × ≤150 token 硬上限，超限拒绝写入——D10 口径）",
+  "version": "1.0.0",
+  "kind": "builtin",
+  "default_tier": "deferred",
+  "protocol_version": 1,
+  "requires": ["fs_read", "fs_write"],
+  "tools": [
+    {
+      "name": "list_sops",
+      "description": "列出项目 SOP 条目（标题/大小/估算 token；SOP 已全量注入系统提示，读取正文请用 read_file）",
+      "schema_json": {"type":"object","properties":{}},
+      "tier": "deferred",
+      "risk": "readonly"
+    },
+    {
+      "name": "save_sop",
+      "description": "保存（或删除）一条 SOP：title 必填，content 为 Markdown 正文；硬上限 ≤6 条 × 每条 ≤150 token，超限显式拒绝（不静默截断）；delete=true 删除条目",
+      "schema_json": {"type":"object","properties":{"title":{"type":"string","description":"SOP 标题（必填，作为条目 ID）"},"content":{"type":"string","description":"Markdown 正文（delete=true 时可省略）"},"delete":{"type":"boolean","description":"true = 删除该条目"}},"required":["title"]},
+      "tier": "deferred",
+      "risk": "write"
+    }
+  ]
+}

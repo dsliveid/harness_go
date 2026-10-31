@@ -1,0 +1,33 @@
+{
+  "id": "long-task",
+  "name": "长任务",
+  "description": "长任务状态机入口：登记任务、暂停/恢复/取消、按快照生成检查点与回滚（状态机与检查点在内核，本插件只做工具入口）",
+  "version": "1.0.0",
+  "kind": "builtin",
+  "default_tier": "deferred",
+  "protocol_version": 1,
+  "requires": ["fs_write"],
+  "tools": [
+    {
+      "name": "start_long_task",
+      "description": "登记一个长任务（状态机在内核，跨轮次可查；声明 checkpoint 用 paths 后才能生成检查点）",
+      "schema_json": {"type":"object","properties":{"title":{"type":"string","description":"任务标题（必填）"},"steps":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"title":{"type":"string"}},"required":["title"]},"description":"任务步骤骨架（可选）"},"paths":{"type":"array","items":{"type":"string"},"description":"任务会改动的文件清单（声明后 checkpoint_long_task 才能快照；工作区相对路径）"}},"required":["title"]},
+      "tier": "deferred",
+      "risk": "write"
+    },
+    {
+      "name": "checkpoint_long_task",
+      "description": "为长任务生成检查点（= 当前 Run + 任务声明文件的快照引用，原子登记）",
+      "schema_json": {"type":"object","properties":{"task_id":{"type":"string","description":"任务 ID（start_long_task 返回）"},"note":{"type":"string","description":"检查点备注（可选）"}},"required":["task_id"]},
+      "tier": "deferred",
+      "risk": "write"
+    },
+    {
+      "name": "long_task_control",
+      "description": "长任务控制：action ∈ pause|resume|cancel|complete|failed|get|list|checkpoints|rollback（rollback 需 checkpoint_id）",
+      "schema_json": {"type":"object","properties":{"action":{"type":"string","enum":["pause","resume","cancel","complete","failed","get","list","checkpoints","rollback"],"description":"控制动作"},"task_id":{"type":"string","description":"任务 ID（get/checkpoints/rollback 必填）"},"checkpoint_id":{"type":"string","description":"检查点 ID（rollback 必填）"},"note":{"type":"string","description":"complete/failed 的备注（可选）"}},"required":["action"]},
+      "tier": "deferred",
+      "risk": "write"
+    }
+  ]
+}

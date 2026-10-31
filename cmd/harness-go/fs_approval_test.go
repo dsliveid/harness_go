@@ -25,6 +25,7 @@ import (
 	"harness-go/internal/plugins/fs"
 	"harness-go/internal/prompt"
 	"harness-go/internal/service"
+	"harness-go/internal/snapshot"
 	"harness-go/internal/store"
 	"harness-go/internal/tokenizer"
 	"harness-go/internal/tools"
@@ -68,7 +69,7 @@ func (s *presetStream) Recv() (llm.Chunk, error) {
 
 func (s *presetStream) Close() error { return nil }
 
-// fsApprovalEnv §10-4/5 测试环境（真实 fs 插件 + 审批闸门 + 沙箱工作区）。
+// fsApprovalEnv §10-4/5 测试环境（真实 fs 插件 + 审批闸门 + 沙箱工作区 + 快照存储）。
 type fsApprovalEnv struct {
 	engine    *agent.Engine
 	main      *store.MainStore
@@ -78,6 +79,8 @@ type fsApprovalEnv struct {
 	toolReg   *registry.Registry
 	sessionID string
 	gate      *approval.Gate
+	snaps     *snapshot.Store
+	dataDir   string
 }
 
 func newFSApprovalEnv(t *testing.T, gateTimeout time.Duration, rounds [][]llm.Chunk) *fsApprovalEnv {
@@ -99,6 +102,12 @@ func newFSApprovalEnv(t *testing.T, gateTimeout time.Duration, rounds [][]llm.Ch
 
 	toolReg := registry.New(registry.Options{CoreSoftLimit: 8, DeferredSoftLimit: 60})
 	toolHost := hostimpl.New(hostimpl.Options{WorkDir: dir})
+	// G：fs 写入强制「先快照后落盘」——测试环境与生产装配同口径接真实快照存储。
+	snaps, err := snapshot.New(snapshot.Options{Main: main, DataDir: dir, WorkspaceRoot: dir})
+	if err != nil {
+		t.Fatalf("快照存储初始化失败: %v", err)
+	}
+	toolHost.SetSnapshots(snaps)
 	if err := toolReg.RegisterFactory(ctx, fs.Factory(), toolHost, nil); err != nil {
 		t.Fatalf("fs 插件装配失败: %v", err)
 	}
@@ -134,6 +143,7 @@ func newFSApprovalEnv(t *testing.T, gateTimeout time.Duration, rounds [][]llm.Ch
 	return &fsApprovalEnv{
 		engine: engine, main: main, sessions: sessions, toolHost: toolHost,
 		provider: provider, toolReg: toolReg, sessionID: sess.ID, gate: gate,
+		snaps: snaps, dataDir: dir,
 	}
 }
 

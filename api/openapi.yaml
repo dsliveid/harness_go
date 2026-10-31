@@ -274,6 +274,89 @@ paths:
                   items:
                     type: array
                     items: { $ref: "#/components/schemas/Message" }
+  /api/v1/sessions/{sid}/rollback:
+    parameters:
+      - $ref: "#/components/parameters/SessionID"
+    post:
+      tags: [sessions]
+      summary: 物理回滚（G/S10：文件写回 + 消息级置灰；每次回滚登记审计事件）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mode]
+              properties:
+                mode:
+                  type: string
+                  enum: [tool, turn, message]
+                  description: 回滚粒度（工具事件 / 一轮 Run / 回滚到消息）
+                tool_event_id: { type: string, description: mode=tool 必填 }
+                run_id: { type: string, description: mode=turn 必填 }
+                message_seq: { type: integer, format: int64, description: mode=message 必填（该 seq 起的消息置灰） }
+      responses:
+        "200":
+          description: 回滚事件（affected=快照对，restored=物理写回结果）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Rollback" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+  /api/v1/sessions/{sid}/rollbacks:
+    parameters:
+      - $ref: "#/components/parameters/SessionID"
+    get:
+      tags: [sessions]
+      summary: 回滚事件列表（时间倒序，reapply 依据）
+      responses:
+        "200":
+          description: 回滚事件
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Rollback" }
+  /api/v1/sessions/{sid}/rollbacks/{rid}/reapply:
+    parameters:
+      - $ref: "#/components/parameters/SessionID"
+      - name: rid
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [sessions]
+      summary: 撤销一次回滚（恢复 after 快照 + 恢复置灰消息；不可重复执行）
+      responses:
+        "200":
+          description: 更新后的回滚事件
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Rollback" }
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /api/v1/sessions/{sid}/snapshots:
+    parameters:
+      - $ref: "#/components/parameters/SessionID"
+    get:
+      tags: [sessions]
+      summary: 会话快照锚点（时间倒序；fs 写入 before/after 与长任务检查点）
+      responses:
+        "200":
+          description: 快照锚点
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Snapshot" }
   /api/v1/sessions/{sid}/runs:
     parameters:
       - $ref: "#/components/parameters/SessionID"
@@ -965,6 +1048,57 @@ paths:
         "200": { description: 已禁用 }
 
 components:
+  Rollback:
+    type: object
+    description: 一次回滚事件（审计 + reapply 依据；G/S10）
+    properties:
+      id: { type: string }
+      mode: { type: string, enum: [tool, turn, message] }
+      target: { type: string, description: 工具事件 ID / run_id / 消息 seq（文本） }
+      affected:
+        type: array
+        description: 参与回滚的工具事件快照对
+        items:
+          type: object
+          properties:
+            tool_event_id: { type: string }
+            run_id: { type: string }
+            snapshot_before: { type: string }
+            snapshot_after: { type: string }
+            paths: { type: array, items: { type: string } }
+      hidden_from_seq: { type: integer, format: int64, description: 消息级回滚的置灰起点（0=未置灰） }
+      restored:
+        type: array
+        description: 物理写回结果
+        items:
+          type: object
+          properties:
+            path: { type: string }
+            action: { type: string, enum: [restored, deleted] }
+            bytes: { type: integer, format: int64 }
+      created_at: { type: integer, format: int64 }
+      reapplied_at: { type: integer, format: int64, nullable: true }
+  Snapshot:
+    type: object
+    description: 全局快照锚点行（内容本体在 data/snapshots/blobs CAS；G/S10）
+    properties:
+      id: { type: string }
+      session_id: { type: string }
+      run_id: { type: string }
+      tool_event_id: { type: string }
+      task_id: { type: string }
+      kind: { type: string, enum: [before, after, checkpoint] }
+      paths:
+        type: array
+        items:
+          type: object
+          properties:
+            path: { type: string }
+            hash: { type: string, description: 全局 CAS 内容哈希（absent=true 时为空） }
+            size: { type: integer, format: int64 }
+            absent: { type: boolean, description: true = 快照时文件不存在（恢复即删除） }
+      size: { type: integer, format: int64 }
+      created_at: { type: integer, format: int64 }
   securitySchemes:
     bearerAuth:
       type: http

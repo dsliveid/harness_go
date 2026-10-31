@@ -115,6 +115,34 @@ func invokeListDir(ctx context.Context, host toolapi.Host, call *toolapi.Call) (
 	return pluginkit.TextResult("%s", strings.TrimRight(b.String(), "\n")), nil
 }
 
+// anchorSnapshots 写入前登记 before 锚点快照（S10 铁律：**先快照后落盘**，
+// 与文件写事务一致——快照失败拒绝写入，否则回滚会丢内容）。
+func anchorSnapshots(ctx context.Context, host toolapi.Host, tool, path string) (*toolapi.SnapshotRef, *toolapi.Result) {
+	st := host.Snapshots()
+	if st == nil {
+		return nil, pluginkit.ErrorResult("%s: 快照存储未接线（内核未注入 Host.Snapshots），拒绝写入以防回滚丢内容", tool)
+	}
+	reg, ok := st.(toolapi.SnapshotRegistrar)
+	if !ok {
+		return nil, pluginkit.ErrorResult("%s: 快照存储不支持锚点登记，拒绝写入", tool)
+	}
+	b, err := reg.CreateAnchored(ctx, []string{path}, toolapi.SnapshotOpt{Kind: "before"})
+	if err != nil {
+		return nil, pluginkit.ErrorResult("%s: 写入前快照失败（拒绝写入）: %v", tool, err)
+	}
+	return &b, nil
+}
+
+// registerAfterSnapshot 写入成功后登记 after 锚点（reapply 方向）。
+// 失败返回错误描述（调用方必须显式回错，不得静默）。
+func registerAfterSnapshot(ctx context.Context, host toolapi.Host, path, beforeID string) (map[string]any, string) {
+	after, err := host.Snapshots().(toolapi.SnapshotRegistrar).CreateAnchored(ctx, []string{path}, toolapi.SnapshotOpt{Kind: "after"})
+	if err != nil {
+		return nil, err.Error()
+	}
+	return map[string]any{"before": beforeID, "after": after.ID}, ""
+}
+
 // invokeWriteFile 写入（创建或覆盖）+ diff。
 func invokeWriteFile(ctx context.Context, host toolapi.Host, call *toolapi.Call) (*toolapi.Result, error) {
 	var args struct {
@@ -136,9 +164,17 @@ func invokeWriteFile(ctx context.Context, host toolapi.Host, call *toolapi.Call)
 			old = string(data)
 		}
 	}
+	before, eRes := anchorSnapshots(ctx, host, "write_file", args.Path)
+	if eRes != nil {
+		return eRes, nil
+	}
 	newContent := strings.ReplaceAll(args.Content, "\r\n", "\n")
 	if err := ws.WriteFile(ctx, args.Path, []byte(newContent), 0o644); err != nil {
 		return pluginkit.ErrorResult("write_file: 写入 %s 失败: %v", args.Path, err), nil
+	}
+	snaps, snapErr := registerAfterSnapshot(ctx, host, args.Path, before.ID)
+	if snapErr != "" {
+		return pluginkit.ErrorResult("write_file: 内容已写入 %s，但写入后快照登记失败（该写入可回滚、不可 reapply）: %s", args.Path, snapErr), nil
 	}
 	d := pluginkit.BuildFileDiff(args.Path, old, newContent)
 	verb := "已写入"
@@ -146,7 +182,7 @@ func invokeWriteFile(ctx context.Context, host toolapi.Host, call *toolapi.Call)
 		verb = "已覆盖"
 	}
 	content := fmt.Sprintf("%s %s（+%d/-%d 行）\n\n%s", verb, args.Path, d.Additions, d.Deletions, pluginkit.UnifiedDiff(d))
-	res := pluginkit.DataResult(content, map[string]any{"diff": d})
+	res := pluginkit.DataResult(content, map[string]any{"diff": d, "snapshots": snaps})
 	return res, nil
 }
 
@@ -181,12 +217,20 @@ func invokeEditFile(ctx context.Context, host toolapi.Host, call *toolapi.Call) 
 		return pluginkit.ErrorResult("edit_file: old_string 在 %s 中命中 %d 次，必须唯一（扩大上下文或改用 write_file）", args.Path, count), nil
 	}
 	newText := strings.Replace(text, args.OldString, args.NewString, 1)
+	before, eRes := anchorSnapshots(ctx, host, "edit_file", args.Path)
+	if eRes != nil {
+		return eRes, nil
+	}
 	if err := ws.WriteFile(ctx, args.Path, []byte(newText), 0o644); err != nil {
 		return pluginkit.ErrorResult("edit_file: 写回 %s 失败: %v", args.Path, err), nil
 	}
+	snaps, snapErr := registerAfterSnapshot(ctx, host, args.Path, before.ID)
+	if snapErr != "" {
+		return pluginkit.ErrorResult("edit_file: 内容已写回 %s，但写入后快照登记失败（该编辑可回滚、不可 reapply）: %s", args.Path, snapErr), nil
+	}
 	d := pluginkit.BuildFileDiff(args.Path, text, newText)
 	content := fmt.Sprintf("已编辑 %s（+%d/-%d 行）\n\n%s", args.Path, d.Additions, d.Deletions, pluginkit.UnifiedDiff(d))
-	return pluginkit.DataResult(content, map[string]any{"diff": d}), nil
+	return pluginkit.DataResult(content, map[string]any{"diff": d, "snapshots": snaps}), nil
 }
 
 // invokeGlob 模式匹配（支持 ** 跨目录）。

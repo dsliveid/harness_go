@@ -15,11 +15,18 @@ import (
 type SessionService struct {
 	main     *store.MainStore
 	sessions *store.SessionStore
+	// onDeleted 可选钩子：删除会话后清理跨会话副产物（阶段 G：全局快照行）。
+	onDeleted func(ctx context.Context, sessionID string)
 }
 
 // NewSessionService 创建会话用例。
 func NewSessionService(main *store.MainStore, sessions *store.SessionStore) *SessionService {
 	return &SessionService{main: main, sessions: sessions}
+}
+
+// SetDeletedHook 注入会话删除后的清理钩子（快照服务：ForgetSession + GC）。
+func (s *SessionService) SetDeletedHook(fn func(ctx context.Context, sessionID string)) {
+	s.onDeleted = fn
 }
 
 // Create 新建会话（**只写主库，不建会话库文件**；首次发消息时才建）。
@@ -68,6 +75,9 @@ func (s *SessionService) Delete(ctx context.Context, id string) error {
 	}
 	if err := s.sessions.DeleteSessionDir(id); err != nil {
 		return fmt.Errorf("service: 会话行已删除，但目录清理失败（孤儿待启动清理）: %w", err)
+	}
+	if s.onDeleted != nil {
+		s.onDeleted(ctx, id)
 	}
 	return nil
 }

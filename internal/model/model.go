@@ -131,7 +131,9 @@ type Message struct {
 	AttachmentsJSON json.RawMessage `json:"attachments,omitempty"`
 	TokenCount      int             `json:"token_count"`
 	UsageJSON       json.RawMessage `json:"usage,omitempty"`
-	CreatedAt       int64           `json:"created_at"`
+	// Hidden 消息已随某次消息级回滚置灰（保留供审计；上下文组装排除；阶段 G）。
+	Hidden    bool  `json:"hidden,omitempty"`
+	CreatedAt int64 `json:"created_at"`
 }
 
 // Run 运行（会话库）。

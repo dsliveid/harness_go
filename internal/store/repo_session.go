@@ -53,7 +53,7 @@ func (r *MessageRepo) Append(ctx context.Context, m *model.Message) error {
 }
 
 const messageColumns = `id, seq, run_id, role, content, reasoning, tool_calls_json,
-	tool_call_id, attachments_json, token_count, usage_json, created_at`
+	tool_call_id, attachments_json, token_count, usage_json, created_at, hidden`
 
 func scanMessage(sc interface{ Scan(...any) error }) (model.Message, error) {
 	var (
@@ -64,9 +64,10 @@ func scanMessage(sc interface{ Scan(...any) error }) (model.Message, error) {
 		toolID   sql.NullString
 		attach   sql.NullString
 		usage    sql.NullString
+		hidden   int
 	)
 	err := sc.Scan(&m.ID, &m.Seq, &runID, &m.Role, &m.Content, &reason,
-		&toolCall, &toolID, &attach, &m.TokenCount, &usage, &m.CreatedAt)
+		&toolCall, &toolID, &attach, &m.TokenCount, &usage, &m.CreatedAt, &hidden)
 	if err != nil {
 		return model.Message{}, err
 	}
@@ -88,6 +89,7 @@ func scanMessage(sc interface{ Scan(...any) error }) (model.Message, error) {
 	if usage.Valid {
 		m.UsageJSON = json.RawMessage(usage.String)
 	}
+	m.Hidden = hidden != 0
 	return m, nil
 }
 
@@ -112,6 +114,52 @@ func (r *MessageRepo) List(ctx context.Context, afterSeq int64, limit int) ([]mo
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+// ListVisible 只读未置灰消息（阶段 G：引擎组装上下文用；
+// 置灰消息保留在库里供审计与 reapply，但不进模型上下文）。
+func (r *MessageRepo) ListVisible(ctx context.Context, afterSeq int64, limit int) ([]model.Message, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	rows, err := r.s.conn().QueryContext(ctx,
+		`SELECT `+messageColumns+` FROM messages WHERE seq > ? AND hidden = 0 ORDER BY seq ASC LIMIT ?`,
+		afterSeq, limit)
+	if err != nil {
+		return nil, fmt.Errorf("store: 读取可见消息失败: %w", err)
+	}
+	defer rows.Close()
+	out := make([]model.Message, 0, limit)
+	for rows.Next() {
+		m, err := scanMessage(rows)
+		if err != nil {
+			return nil, fmt.Errorf("store: 解析消息行失败: %w", err)
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// SetHiddenFrom 把 seq >= from 的消息置灰，返回受影响行数（消息级回滚）。
+func (r *MessageRepo) SetHiddenFrom(ctx context.Context, from int64) (int64, error) {
+	res, err := r.s.conn().ExecContext(ctx,
+		`UPDATE messages SET hidden = 1 WHERE seq >= ? AND hidden = 0`, from)
+	if err != nil {
+		return 0, fmt.Errorf("store: 置灰消息失败: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// ClearHiddenFrom 把 seq >= from 的置灰消息恢复可见（reapply）。
+func (r *MessageRepo) ClearHiddenFrom(ctx context.Context, from int64) (int64, error) {
+	res, err := r.s.conn().ExecContext(ctx,
+		`UPDATE messages SET hidden = 0 WHERE seq >= ? AND hidden = 1`, from)
+	if err != nil {
+		return 0, fmt.Errorf("store: 恢复置灰消息失败: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
 }
 
 // Count 会话内消息数。
@@ -268,6 +316,25 @@ func (r *RunRepo) Transition(ctx context.Context, id string, to model.RunStatus,
 }
 
 // ListUnfinished 列出未完成 Run（启动恢复用）。
+// List 全量运行（导出包用；时间正序）。
+func (r *RunRepo) List(ctx context.Context) ([]model.Run, error) {
+	rows, err := r.s.conn().QueryContext(ctx,
+		`SELECT `+runColumns+` FROM runs ORDER BY created_at ASC, id ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("store: 查询 Run 失败: %w", err)
+	}
+	defer rows.Close()
+	var out []model.Run
+	for rows.Next() {
+		run, err := scanRun(rows)
+		if err != nil {
+			return nil, fmt.Errorf("store: 解析 Run 行失败: %w", err)
+		}
+		out = append(out, run)
+	}
+	return out, rows.Err()
+}
+
 func (r *RunRepo) ListUnfinished(ctx context.Context) ([]model.Run, error) {
 	rows, err := r.s.conn().QueryContext(ctx,
 		`SELECT `+runColumns+` FROM runs

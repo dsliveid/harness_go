@@ -21,28 +21,29 @@ func TestOpenMainCreatesSchema(t *testing.T) {
 	}
 	defer m.Close()
 
-	// 主库普通表应有 14 张：
+	// 主库普通表应有 16 张：
 	//   0001 的 6 张（sessions/users/api_tokens/providers/settings/schema_migrations）
 	// + 0002 的设备 4 张（devices/device_pair_codes/capabilities/session_leases）
 	// + 0003 的检索 4 张（retrieval_docs/retrieval_vectors/index_meta + FTS5 虚表 retrieval_fts）
+	// + 0005 的快照 2 张（snapshots/snapshot_blobs）
 	// 注：FTS5 external content 模式的影子表（_data/_idx/_docsize/_config）同样以 table 类型登记，
-	// 故这里用「至少 14」断言，具体影子表数量随 SQLite 版本可能变化。
+	// 故这里用「至少 16」断言，具体影子表数量随 SQLite 版本可能变化。
 	var n int
 	if err := m.conn().QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`,
 	).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
-	if n < 14 {
-		t.Fatalf("主库表数量期望至少 14，得到 %d", n)
+	if n < 16 {
+		t.Fatalf("主库表数量期望至少 16，得到 %d", n)
 	}
 
 	v, err := SchemaVersion(ctx, m.conn())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v != 4 {
-		t.Fatalf("主库 schema 版本期望 4，得到 %d", v)
+	if v != 5 {
+		t.Fatalf("主库 schema 版本期望 5，得到 %d", v)
 	}
 }
 
@@ -102,15 +103,16 @@ func TestSessionDBCreatedLazily(t *testing.T) {
 		t.Fatalf("Acquire 后应创建会话库文件: %v", err)
 	}
 
-	// 会话库应有 9 张表（session_meta/messages/runs/tool_events/approvals/approval_rules/blobs/session_settings/schema_migrations）
+	// 会话库应有 12 张表（session_meta/messages/runs/tool_events/approvals/approval_rules/blobs/session_settings/schema_migrations
+	// + 0004 的 tasks/task_checkpoints/rollbacks）
 	var n int
 	if err := sdb.conn().QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`,
 	).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
-	if n != 9 {
-		t.Fatalf("会话库表数量期望 9，得到 %d", n)
+	if n != 12 {
+		t.Fatalf("会话库表数量期望 12，得到 %d", n)
 	}
 
 	// 多端预埋字段必须存在

@@ -33,6 +33,8 @@ type Host interface {
 	Tasks() TaskManager
 	// Snapshots 文件快照与回滚引用。
 	Snapshots() SnapshotStore
+	// Bundles 会话导出包（session-bundle 插件入口；内核执行体在 service 层）。
+	Bundles() BundleStore
 }
 
 // Entry 工作区条目。
@@ -261,8 +263,10 @@ type TaskSpec struct {
 
 // TaskCheckpoint 检查点（Run + 快照引用的原子登记）。
 type TaskCheckpoint struct {
+	TaskID     string    `json:"task_id"`
 	RunID      string    `json:"run_id"`
 	SnapshotID string    `json:"snapshot_id"`
+	Note       string    `json:"note,omitempty"`
 	CreatedAt  time.Time `json:"created_at"`
 }
 
@@ -284,6 +288,39 @@ type TaskManager interface {
 	Checkpoint(ctx context.Context, id string) (TaskCheckpoint, error)
 }
 
+// TaskSummary 长任务摘要（跨进程重启后的持久态视图，ListSession 用）。
+type TaskSummary struct {
+	ID        string    `json:"id"`
+	Title     string    `json:"title"`
+	State     TaskState `json:"state"`
+	RunID     string    `json:"run_id,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// 以下为**可选扩展接口**（阶段 G 新增，向后兼容：内核实装可选支持，插件按需断言）。
+
+// TaskNoteCheckpointer 支持带备注的检查点（未实装时插件退回 Checkpoint）。
+type TaskNoteCheckpointer interface {
+	CheckpointNote(ctx context.Context, id, note string) (TaskCheckpoint, error)
+}
+
+// TaskLister 支持按会话列出任务（含重启后从库中恢复的持久态）。
+type TaskLister interface {
+	ListSession(ctx context.Context, sessionID string) ([]TaskSummary, error)
+}
+
+// TaskCheckpointReader 支持读取任务的历史检查点（rollback 前先列出）。
+type TaskCheckpointReader interface {
+	Checkpoints(ctx context.Context, taskID string) ([]TaskCheckpoint, error)
+}
+
+// TaskFinisher 支持把任务推进到终态（completed / failed；long-task 插件的
+// complete_long_task 动作用）。
+type TaskFinisher interface {
+	Finish(ctx context.Context, id string, to TaskState, note string) error
+}
+
 // SnapshotRef 快照引用（全局 CAS，跨会话去重）。
 type SnapshotRef struct {
 	ID        string    `json:"id"`
@@ -297,4 +334,43 @@ type SnapshotStore interface {
 	Create(ctx context.Context, paths []string) (SnapshotRef, error)
 	Restore(ctx context.Context, ref SnapshotRef) error
 	List(ctx context.Context) ([]SnapshotRef, error)
+}
+
+// SnapshotOpt 锚点快照的登记语义（SnapshotRegistrar 用）。
+type SnapshotOpt struct {
+	// Kind 快照语义：before（写入前）/ after（写入后）/ checkpoint（长任务检查点）。
+	// 空值按 before 处理（保守：可回滚的方向优先）。
+	Kind string
+	// TaskID 长任务检查点来源（kind=checkpoint 时由 TaskManager 填写）。
+	TaskID string
+}
+
+// SnapshotRegistrar 锚点快照登记（SnapshotStore 的可选扩展）。
+//
+// fs 插件 write_file/edit_file **必须**先登记 before 快照再落盘（插件体系设计
+// §10.1：与文件写事务一致）；写入成功后再登记 after 快照，revert & reapply
+// 才有两个方向可走。内核实装同时实现 SnapshotStore 与本接口。
+type SnapshotRegistrar interface {
+	CreateAnchored(ctx context.Context, paths []string, opt SnapshotOpt) (SnapshotRef, error)
+}
+
+// BundleInfo 会话导出包信息。
+type BundleInfo struct {
+	SessionID string    `json:"session_id"`
+	Title     string    `json:"title,omitempty"`
+	Path      string    `json:"path"`
+	Size      int64     `json:"size"`
+	Messages  int       `json:"messages"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// BundleStore 会话导出包（session-bundle 插件的内核执行体）。
+//
+// Export 生成 `data/sessions/<sid>/bundle/` 下的 zip（manifest + messages/runs/
+// tool_events + blobs）；Import 从导出包恢复为**新会话**（ID 重新生成，原
+// run_id/message_id 保留，blob 按内容哈希原样落新会话 CAS）。
+type BundleStore interface {
+	Export(ctx context.Context, sessionID string) (BundleInfo, error)
+	Import(ctx context.Context, zipPath string) (BundleInfo, error)
+	List(ctx context.Context, sessionID string) ([]BundleInfo, error)
 }

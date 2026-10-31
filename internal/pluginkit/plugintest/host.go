@@ -26,8 +26,19 @@ type Host struct {
 	ExecFn func(ctx context.Context, req toolapi.CommandRequest) (toolapi.CommandResult, error)
 	// SpawnFn 可注入的嵌套 Run 桩（nil = 未接线错误）。
 	SpawnFn func(ctx context.Context, req toolapi.SpawnRequest) (toolapi.ChildRun, error)
+	// TaskFn 可注入的长任务状态机（nil = 内存桩）。
+	TaskFn func() toolapi.TaskManager
+	// SnapshotFn 可注入的快照存储（nil = tempdir 文件桩）。
+	SnapshotFn func() toolapi.SnapshotStore
+	// BundleFn 可注入的会话导出包（nil = 内存记录桩）。
+	BundleFn func() toolapi.BundleStore
 	// ProgressCh 收集 tool.progress 推送（nil = 不收集）。
 	ProgressCh chan string
+
+	// —— 阶段 G 桩（懒初始化，跨工具调用保持状态） ——
+	snap   *snapStub
+	task   *taskStub
+	bundle *bundleStub
 }
 
 // New 创建假 Host（工作区 = 临时目录）。
@@ -70,11 +81,30 @@ func (h *Host) Config() toolapi.Config { return emptyConfig{} }
 // Spawn 实现 toolapi.Host。
 func (h *Host) Spawn() toolapi.ChildRunner { return spawnAdapter{h} }
 
-// Tasks 实现 toolapi.Host（G 阶段）。
-func (h *Host) Tasks() toolapi.TaskManager { return nil }
+// Tasks 实现 toolapi.Host（内存桩：测试可用 TaskFn 覆写）。
+func (h *Host) Tasks() toolapi.TaskManager {
+	if h.TaskFn != nil {
+		return h.TaskFn()
+	}
+	return h.taskStub()
+}
 
-// Snapshots 实现 toolapi.Host（G 阶段）。
-func (h *Host) Snapshots() toolapi.SnapshotStore { return nil }
+// Snapshots 实现 toolapi.Host（文件桩：tempdir CAS + 内存索引，
+// 语义与 internal/snapshot 一致——fs 插件的快照登记测试在真实文件上跑）。
+func (h *Host) Snapshots() toolapi.SnapshotStore {
+	if h.SnapshotFn != nil {
+		return h.SnapshotFn()
+	}
+	return h.snapshotStub()
+}
+
+// Bundles 实现 toolapi.Host（内存记录桩：测试可用 BundleFn 覆写）。
+func (h *Host) Bundles() toolapi.BundleStore {
+	if h.BundleFn != nil {
+		return h.BundleFn()
+	}
+	return h.bundleStub()
+}
 
 // ---------- toolapi.Workspace ----------
 

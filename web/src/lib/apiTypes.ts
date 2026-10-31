@@ -308,6 +308,12 @@ export const API_PATHS = {
   deviceWS: '/api/v1/devices/ws',
   /** C-6：会话租约（跨端写者归属） */
   sessionLease: (sid: string) => `/api/v1/sessions/${sid}/lease`,
+  /* 阶段 G：快照回滚（S10 消息/轮次/工具级 revert & reapply） */
+  rollback: (sid: string) => `/api/v1/sessions/${sid}/rollback`,
+  rollbacks: (sid: string) => `/api/v1/sessions/${sid}/rollbacks`,
+  rollbackReapply: (sid: string, rid: string) =>
+    `/api/v1/sessions/${sid}/rollbacks/${rid}/reapply`,
+  sessionSnapshots: (sid: string) => `/api/v1/sessions/${sid}/snapshots`,
   /* 阶段 E：外部插件与工具市场 */
   mcpServers: '/api/v1/mcp/servers',
   mcpServer: (id: string) => `/api/v1/mcp/servers/${id}`,
@@ -574,4 +580,63 @@ export interface PackageInstallResultDTO {
   view: PackageViewDTO;
   signed: boolean;
   tools: number;
+}
+
+/* ============ 阶段 G：快照回滚（与 openapi.yaml schemas 对应） ============ */
+
+/** 单路径快照绑定（hash 为空且 absent=true 表示快照时文件不存在）。 */
+export interface SnapshotBinding {
+  path: string;
+  hash?: string;
+  size?: number;
+  absent?: boolean;
+}
+
+/** 全局快照锚点行（内容本体在 data/snapshots/blobs CAS）。 */
+export interface Snapshot {
+  id: string;
+  session_id?: string;
+  run_id?: string;
+  tool_event_id?: string;
+  task_id?: string;
+  kind: 'before' | 'after' | 'checkpoint';
+  paths: SnapshotBinding[];
+  size: number;
+  created_at: number;
+}
+
+/** 参与回滚的工具事件快照对。 */
+export interface RollbackAffected {
+  tool_event_id: string;
+  run_id?: string;
+  snapshot_before?: string;
+  snapshot_after?: string;
+  paths?: string[];
+}
+
+/** 单路径物理写回结果。 */
+export interface RollbackRestored {
+  path: string;
+  action: 'restored' | 'deleted';
+  bytes?: number;
+}
+
+/** 一次回滚事件（审计 + reapply 依据）。 */
+export interface Rollback {
+  id: string;
+  mode: 'tool' | 'turn' | 'message';
+  target: string;
+  affected?: RollbackAffected[];
+  hidden_from_seq?: number;
+  restored?: RollbackRestored[];
+  created_at: number;
+  reapplied_at?: number | null;
+}
+
+/** 物理回滚请求（mode 与对应目标字段配套）。 */
+export interface RevertRequest {
+  mode: 'tool' | 'turn' | 'message';
+  tool_event_id?: string;
+  run_id?: string;
+  message_seq?: number;
 }

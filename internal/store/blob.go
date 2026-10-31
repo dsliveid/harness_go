@@ -179,6 +179,12 @@ func RecordBlob(ctx context.Context, tx *sql.Tx, ref BlobRef) error {
 	return nil
 }
 
+// RecordBlobStandalone 在会话库登记 blob（自带事务；导出包导入用，
+// 与业务写入共用「先文件后库」顺序——调用方必须已把文件落进 CAS）。
+func (s *SessionDB) RecordBlobStandalone(ctx context.Context, ref BlobRef) error {
+	return s.withTx(ctx, func(tx *sql.Tx) error { return RecordBlob(ctx, tx, ref) })
+}
+
 // CleanupTmp 清理残留的 .part 文件（启动时调用，防半写残留）。
 func CleanupTmp(tmpDir string) (int, error) {
 	entries, err := os.ReadDir(tmpDir)

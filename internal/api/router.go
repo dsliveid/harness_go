@@ -50,6 +50,11 @@ func NewRouter(d Deps) http.Handler {
 	mux.HandleFunc("PATCH /api/v1/sessions/{sid}", h.renameSession)
 	mux.HandleFunc("DELETE /api/v1/sessions/{sid}", h.deleteSession)
 	mux.HandleFunc("GET /api/v1/sessions/{sid}/messages", h.listMessages)
+	// 阶段 G：快照回滚（S10 消息/轮次/工具级 revert & reapply）
+	mux.HandleFunc("POST /api/v1/sessions/{sid}/rollback", h.createRollback)
+	mux.HandleFunc("GET /api/v1/sessions/{sid}/rollbacks", h.listRollbacks)
+	mux.HandleFunc("POST /api/v1/sessions/{sid}/rollbacks/{rid}/reapply", h.reapplyRollback)
+	mux.HandleFunc("GET /api/v1/sessions/{sid}/snapshots", h.listSessionSnapshots)
 	// 会话租约（C-6）：跨端写者归属与 epoch，前端用于展示「谁在写」
 	mux.HandleFunc("GET /api/v1/sessions/{sid}/lease", h.getSessionLease)
 

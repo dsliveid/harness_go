@@ -37,6 +37,12 @@ type Options struct {
 	Events toolapi.Events
 	// ChildRunner 嵌套 Run 派生器（F：subagent/collaborator；后置注入打破构造环）。
 	ChildRunner toolapi.ChildRunner
+	// Tasks 长任务状态机（G：long-task；SetTasks 注入）。
+	Tasks toolapi.TaskManager
+	// Snapshots 快照存储（G：fs 写入前/后登记；SetSnapshots 注入）。
+	Snapshots toolapi.SnapshotStore
+	// Bundles 会话导出包（G：session-bundle；SetBundles 注入）。
+	Bundles toolapi.BundleStore
 	// CommandEnvWhitelist 子进程继承的宿主环境变量键。
 	CommandEnvWhitelist []string
 }
@@ -122,11 +128,38 @@ func (h *Host) SetLLM(l toolapi.LLM) { h.opts.Models = l }
 // SetEvents 后置注入事件发布（阶段 F）。
 func (h *Host) SetEvents(e toolapi.Events) { h.opts.Events = e }
 
-// Tasks 实现 toolapi.Host（阶段 G 填实）。
-func (h *Host) Tasks() toolapi.TaskManager { return taskManagerStub{} }
+// Tasks 实现 toolapi.Host（阶段 G 填实；未注入时诚实报错）。
+func (h *Host) Tasks() toolapi.TaskManager {
+	if h.opts.Tasks == nil {
+		return taskManagerStub{}
+	}
+	return h.opts.Tasks
+}
 
-// Snapshots 实现 toolapi.Host（阶段 G 填实）。
-func (h *Host) Snapshots() toolapi.SnapshotStore { return snapshotStoreStub{} }
+// SetTasks 后置注入长任务状态机（阶段 G）。
+func (h *Host) SetTasks(m toolapi.TaskManager) { h.opts.Tasks = m }
+
+// Snapshots 实现 toolapi.Host（阶段 G 填实；未注入时诚实报错）。
+func (h *Host) Snapshots() toolapi.SnapshotStore {
+	if h.opts.Snapshots == nil {
+		return snapshotStoreStub{}
+	}
+	return h.opts.Snapshots
+}
+
+// SetSnapshots 后置注入快照存储（阶段 G）。
+func (h *Host) SetSnapshots(st toolapi.SnapshotStore) { h.opts.Snapshots = st }
+
+// Bundles 实现 toolapi.Host（阶段 G 填实；未注入时诚实报错）。
+func (h *Host) Bundles() toolapi.BundleStore {
+	if h.opts.Bundles == nil {
+		return bundlesStub{}
+	}
+	return h.opts.Bundles
+}
+
+// SetBundles 后置注入会话导出包服务（阶段 G）。
+func (h *Host) SetBundles(b toolapi.BundleStore) { h.opts.Bundles = b }
 
 // ============ Workspace（沙箱实现） ============
 
@@ -388,6 +421,20 @@ func (snapshotStoreStub) Restore(context.Context, toolapi.SnapshotRef) error {
 }
 
 func (snapshotStoreStub) List(context.Context) ([]toolapi.SnapshotRef, error) {
+	return nil, nil
+}
+
+type bundlesStub struct{}
+
+func (bundlesStub) Export(context.Context, string) (toolapi.BundleInfo, error) {
+	return toolapi.BundleInfo{}, fmt.Errorf("%w: 会话导出（Host.Bundles）阶段 G 填实", toolapi.ErrNotImplemented)
+}
+
+func (bundlesStub) Import(context.Context, string) (toolapi.BundleInfo, error) {
+	return toolapi.BundleInfo{}, fmt.Errorf("%w: 会话导入（Host.Bundles）阶段 G 填实", toolapi.ErrNotImplemented)
+}
+
+func (bundlesStub) List(context.Context, string) ([]toolapi.BundleInfo, error) {
 	return nil, nil
 }
 
