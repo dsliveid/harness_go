@@ -105,6 +105,11 @@ type RunRequest struct {
 	MemoryCore string
 	// MemoryTail 记忆动态块（D-3：L2/L3 检索命中），置尾注入；预算降级第①级的省略对象。
 	MemoryTail string
+	// LockKey 会话锁键（阶段 F 嵌套 Run）：空 = 按 SessionID 加锁（默认）；
+	// 非空 = 用它做锁键。子 Run 传入「sessionID|spawn|<runID>」绕开父 Run 持有的
+	// 会话锁（同一 goroutine 链上父等待子，若同键必死锁）；父阻塞等待期间
+	// 双方不并发追加消息（seq 安全性不变），子与子之间天然互斥（键唯一）。
+	LockKey string
 	// LeaseHolder 会话租约持有者（阶段 C-6）：设备 ID；空串 = 服务端本地执行面。
 	// 端侧发起 Run 时由 service 层填入该设备 ID，抢占旧端 epoch+1 并推送 lease.revoked。
 	LeaseHolder string
@@ -121,8 +126,14 @@ func (e *Engine) Execute(ctx context.Context, req RunRequest) error {
 		return errors.New("agent: RunID 与 SessionID 不能为空")
 	}
 
-	// ① per-session 串行：同一会话的 Run 排队执行（保证消息 seq 与上下文一致）
-	unlock := e.lockSession(req.SessionID)
+	// ① per-session 串行：同一会话的 Run 排队执行（保证消息 seq 与上下文一致）。
+	// 嵌套 Run（F）：LockKey 非空时以它为锁键（子 Run 绕开父持有的会话锁，
+	// 父在 Wait 中阻塞、不并发追加，seq 安全性由「父等待子」的串行性保证）。
+	lockKey := req.LockKey
+	if strings.TrimSpace(lockKey) == "" {
+		lockKey = req.SessionID
+	}
+	unlock := e.lockSession(lockKey)
 	defer unlock()
 
 	// ② 全局并发闸门：满则排队等待（超并发不拒绝，符合架构 §3.2）

@@ -1,0 +1,26 @@
+{
+  "id": "browser",
+  "name": "浏览器",
+  "description": "无头浏览器（Chromium 系；requires 探测，缺失时工具显式不可用），抓取动态渲染页面的文本快照",
+  "version": "1.0.0",
+  "kind": "builtin",
+  "default_tier": "on_demand",
+  "protocol_version": 1,
+  "requires": ["chromium"],
+  "tools": [
+    {
+      "name": "browser_text",
+      "description": "无头打开 URL 并提取渲染后的可见文本（适用于 JS 渲染页面；需本机 Chromium 系浏览器）",
+      "schema_json": {"type":"object","properties":{"url":{"type":"string","description":"完整 URL（http/https）"},"wait_ms":{"type":"integer","description":"渲染等待毫秒（默认 1500）"}},"required":["url"]},
+      "tier": "on_demand",
+      "risk": "readonly"
+    },
+    {
+      "name": "browser_probe",
+      "description": "探测本机是否具备无头浏览器能力（返回可执行文件路径或缺失说明）",
+      "schema_json": {"type":"object","properties":{}},
+      "tier": "on_demand",
+      "risk": "readonly"
+    }
+  ]
+}

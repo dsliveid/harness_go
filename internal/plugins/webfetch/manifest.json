@@ -1,0 +1,19 @@
+{
+  "id": "webfetch",
+  "name": "网页抓取",
+  "description": "抓取 HTTP(S) 页面并提取正文文本，用于查阅在线文档与资料",
+  "version": "1.0.0",
+  "kind": "builtin",
+  "default_tier": "deferred",
+  "protocol_version": 1,
+  "requires": ["net"],
+  "tools": [
+    {
+      "name": "web_fetch",
+      "description": "抓取 URL（仅 http/https；私有网段默认拦截；返回正文文本，上限 32KB）",
+      "schema_json": {"type":"object","properties":{"url":{"type":"string","description":"完整 URL"},"max_chars":{"type":"integer","description":"返回文本上限（默认 16000 字符）"}},"required":["url"]},
+      "tier": "deferred",
+      "risk": "readonly"
+    }
+  ]
+}

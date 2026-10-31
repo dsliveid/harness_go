@@ -1,0 +1,19 @@
+{
+  "id": "subagent",
+  "name": "子代理",
+  "description": "派生嵌套 Run 处理独立子任务（真实 Run 落库可观测；禁递归：子不能再派生）",
+  "version": "1.0.0",
+  "kind": "builtin",
+  "default_tier": "on_demand",
+  "protocol_version": 1,
+  "requires": ["llm"],
+  "tools": [
+    {
+      "name": "spawn_subagent",
+      "description": "派生子代理执行独立子任务并等待结果（阻塞至子 Run 终态；深度上限 2，禁递归；同会话在途上限 4）",
+      "schema_json": {"type":"object","properties":{"task":{"type":"string","description":"子任务描述（应自包含：子代理看不到父对话）"},"model_ref":{"type":"string","description":"可选模型（默认继承会话配置）"}},"required":["task"]},
+      "tier": "on_demand",
+      "risk": "write"
+    }
+  ]
+}

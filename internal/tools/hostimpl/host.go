@@ -35,6 +35,10 @@ type Options struct {
 	Blobs toolapi.Blobs
 	// Events 事件发布（per-Run）。
 	Events toolapi.Events
+	// ChildRunner 嵌套 Run 派生器（F：subagent/collaborator；后置注入打破构造环）。
+	ChildRunner toolapi.ChildRunner
+	// CommandEnvWhitelist 子进程继承的宿主环境变量键。
+	CommandEnvWhitelist []string
 }
 
 // Host toolapi.Host 实现。
@@ -98,8 +102,25 @@ func (h *Host) Events() toolapi.Events {
 // Config 实现 toolapi.Host。
 func (h *Host) Config() toolapi.Config { return h.cfg }
 
-// Spawn 实现 toolapi.Host（阶段 F 填实）。
-func (h *Host) Spawn() toolapi.ChildRunner { return childRunnerStub{} }
+// Spawn 实现 toolapi.ChildRunner（阶段 F 填实；未注入时诚实报错）。
+func (h *Host) Spawn() toolapi.ChildRunner {
+	if h.opts.ChildRunner == nil {
+		return childRunnerStub{}
+	}
+	return h.opts.ChildRunner
+}
+
+// SetChildRunner 后置注入嵌套 Run 派生器（构造环：host → registry → engine → host）。
+func (h *Host) SetChildRunner(cr toolapi.ChildRunner) { h.opts.ChildRunner = cr }
+
+// SetCommandRunner 后置注入命令执行器（阶段 F）。
+func (h *Host) SetCommandRunner(cr toolapi.CommandRunner) { h.opts.Commands = cr }
+
+// SetLLM 后置注入模型调用（阶段 F）。
+func (h *Host) SetLLM(l toolapi.LLM) { h.opts.Models = l }
+
+// SetEvents 后置注入事件发布（阶段 F）。
+func (h *Host) SetEvents(e toolapi.Events) { h.opts.Events = e }
 
 // Tasks 实现 toolapi.Host（阶段 G 填实）。
 func (h *Host) Tasks() toolapi.TaskManager { return taskManagerStub{} }
@@ -337,7 +358,7 @@ func (eventsStub) Publish(context.Context, string, string, any) error {
 type childRunnerStub struct{}
 
 func (childRunnerStub) Spawn(context.Context, toolapi.SpawnRequest) (toolapi.ChildRun, error) {
-	return nil, fmt.Errorf("%w: 嵌套 Run（Host.Spawn）阶段 F 填实", toolapi.ErrNotImplemented)
+	return nil, fmt.Errorf("%w: 嵌套 Run 未接线（subagent 不可用）", toolapi.ErrNotImplemented)
 }
 
 func (childRunnerStub) Get(string) (toolapi.ChildRun, bool) { return nil, false }

@@ -71,6 +71,12 @@ type CommandRequest struct {
 	Dir     string            `json:"dir,omitempty"` // 相对工作区根
 	Env     map[string]string `json:"env,omitempty"`
 	Timeout time.Duration     `json:"timeout,omitempty"`
+	// ToolEventID 关联的 tool_events 主键（进度事件回传用；向后兼容新增字段）。
+	ToolEventID string `json:"tool_event_id,omitempty"`
+	// Progress 实时输出回调（stdout/stderr 合并行，节流由实现方负责；nil = 不需要流式）。
+	// 需求 §10-4「执行命令（实时输出）」：实现方应把增量输出经 Events 以
+	// tool.progress 事件推给前端。
+	Progress func(chunk string) `json:"-"`
 }
 
 // CommandResult 命令执行结果。

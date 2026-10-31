@@ -1,0 +1,32 @@
+{
+  "id": "skill",
+  "name": "技能",
+  "description": "可复用流程技能库（.harness/skills/<name>/SKILL.md），读侧按需加载、写侧沉淀经验",
+  "version": "1.0.0",
+  "kind": "builtin",
+  "default_tier": "deferred",
+  "protocol_version": 1,
+  "tools": [
+    {
+      "name": "skill_list",
+      "description": "列出全部技能（名称 + 描述首行）",
+      "schema_json": {"type":"object","properties":{}},
+      "tier": "deferred",
+      "risk": "readonly"
+    },
+    {
+      "name": "skill_read",
+      "description": "读取技能全文（SKILL.md 正文）",
+      "schema_json": {"type":"object","properties":{"name":{"type":"string","description":"技能名（目录名）"}},"required":["name"]},
+      "tier": "deferred",
+      "risk": "readonly"
+    },
+    {
+      "name": "skill_save",
+      "description": "沉淀/更新技能（写 .harness/skills/<name>/SKILL.md；标题行 + 正文步骤）",
+      "schema_json": {"type":"object","properties":{"name":{"type":"string","description":"技能名（小写字母数字连字符）"},"description":{"type":"string","description":"一行描述（何时该用）"},"body":{"type":"string","description":"步骤正文（Markdown）"}},"required":["name","description","body"]},
+      "tier": "on_demand",
+      "risk": "write"
+    }
+  ]
+}

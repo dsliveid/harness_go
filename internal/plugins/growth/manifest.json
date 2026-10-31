@@ -1,0 +1,32 @@
+{
+  "id": "growth",
+  "name": "成长",
+  "description": "轻量成长记录（经验教训沉淀与应用），落 .harness/memory/growth/，不建状态机",
+  "version": "1.0.0",
+  "kind": "builtin",
+  "default_tier": "deferred",
+  "protocol_version": 1,
+  "tools": [
+    {
+      "name": "record_growth",
+      "description": "记录一条成长（教训/经验，附带适用场景标签）",
+      "schema_json": {"type":"object","properties":{"lesson":{"type":"string","description":"经验教训正文"},"context":{"type":"string","description":"适用场景（如：前端改动后）"}},"required":["lesson"]},
+      "tier": "deferred",
+      "risk": "write"
+    },
+    {
+      "name": "list_growths",
+      "description": "列出成长记录（未应用在前，最近在前）",
+      "schema_json": {"type":"object","properties":{"limit":{"type":"integer"}}},
+      "tier": "deferred",
+      "risk": "readonly"
+    },
+    {
+      "name": "apply_growth",
+      "description": "标记一条成长为已应用（把教训固化进流程后归档）",
+      "schema_json": {"type":"object","properties":{"id":{"type":"integer","description":"记录编号（list_growths 输出的序号）"}},"required":["id"]},
+      "tier": "deferred",
+      "risk": "write"
+    }
+  ]
+}

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 
+	"harness-go/internal/retrieval"
 	"harness-go/internal/secret"
 )
 
@@ -335,4 +336,17 @@ func (r *PackagesRepo) SetEnabled(ctx context.Context, id string, enabled bool) 
 		return fmt.Errorf("store: 工具包 %s 不存在", id)
 	}
 	return nil
+}
+
+// UpsertMemoryDoc 记忆文件同步的便捷入口（kind = memory_l0/l2/l3，key = 层/文件名）。
+// 幂等：同内容只刷新 last_ref_at。
+func (s *MainStore) UpsertMemoryDoc(ctx context.Context, kind, key, title, body string, importance float64) (bool, error) {
+	_, changed, err := s.Retrieval().UpsertDoc(ctx, retrieval.Doc{
+		Kind:       retrieval.Kind(kind),
+		Key:        key,
+		Title:      title,
+		Body:       body,
+		Importance: importance,
+	})
+	return changed, err
 }

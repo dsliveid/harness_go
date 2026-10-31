@@ -1,0 +1,19 @@
+{
+  "id": "collaborator",
+  "name": "协作者",
+  "description": "以指定角色视角征询第二意见（派生嵌套 Run，角色约束注入输入前缀）",
+  "version": "1.0.0",
+  "kind": "builtin",
+  "default_tier": "on_demand",
+  "protocol_version": 1,
+  "requires": ["llm"],
+  "tools": [
+    {
+      "name": "ask_collaborator",
+      "description": "以指定角色（如 reviewer/architect/tester）征询第二意见并等待回复（禁递归）",
+      "schema_json": {"type":"object","properties":{"role":{"type":"string","description":"协作者角色"},"question":{"type":"string","description":"征询的问题（应自包含上下文）"},"model_ref":{"type":"string","description":"可选模型"}},"required":["role","question"]},
+      "tier": "on_demand",
+      "risk": "write"
+    }
+  ]
+}

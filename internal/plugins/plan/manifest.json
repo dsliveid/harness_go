@@ -1,0 +1,25 @@
+{
+  "id": "plan",
+  "name": "执行计划",
+  "description": "维护结构化执行计划（步骤与完成状态），用于复杂任务的显式规划",
+  "version": "1.0.0",
+  "kind": "builtin",
+  "default_tier": "deferred",
+  "protocol_version": 1,
+  "tools": [
+    {
+      "name": "plan_set",
+      "description": "设置/更新执行计划（标题 + 步骤列表，步骤可标记完成）",
+      "schema_json": {"type":"object","properties":{"title":{"type":"string"},"steps":{"type":"array","items":{"type":"object","properties":{"title":{"type":"string"},"done":{"type":"boolean"}},"required":["title"]}}},"required":["title","steps"]},
+      "tier": "deferred",
+      "risk": "write"
+    },
+    {
+      "name": "plan_get",
+      "description": "读取当前执行计划",
+      "schema_json": {"type":"object","properties":{}},
+      "tier": "deferred",
+      "risk": "readonly"
+    }
+  ]
+}

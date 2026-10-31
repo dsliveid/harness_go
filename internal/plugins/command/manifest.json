@@ -1,0 +1,19 @@
+{
+  "id": "command",
+  "name": "命令执行",
+  "description": "在工作区内执行 shell 命令（实时流式输出、超时硬杀、输出上限），用于构建、测试与脚本化操作",
+  "version": "1.0.0",
+  "kind": "builtin",
+  "default_tier": "core",
+  "protocol_version": 1,
+  "requires": ["process"],
+  "tools": [
+    {
+      "name": "run_command",
+      "description": "执行命令（工作区内；实时输出经 tool.progress 推送；非零退出码与 stderr 完整回传供自我纠正）",
+      "schema_json": {"type":"object","properties":{"cmd":{"type":"string","description":"可执行文件名（PATH 查找）"},"args":{"type":"array","items":{"type":"string"},"description":"参数列表（不经 shell 解释，防注入）"},"dir":{"type":"string","description":"工作目录（相对工作区根，默认根）"},"timeout_s":{"type":"integer","description":"超时秒数（默认 60，上限 600）"}},"required":["cmd"]},
+      "tier": "core",
+      "risk": "command"
+    }
+  ]
+}

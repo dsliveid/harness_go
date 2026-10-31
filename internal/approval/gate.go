@@ -289,3 +289,14 @@ func containsString(haystack, needle string) bool {
 	}
 	return false
 }
+
+// PendingIDs 返回待决审批 ID（管理端点与测试用；快照语义）。
+func (g *Gate) PendingIDs() []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	out := make([]string, 0, len(g.pending))
+	for id := range g.pending {
+		out = append(out, id)
+	}
+	return out
+}

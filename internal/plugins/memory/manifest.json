@@ -1,0 +1,25 @@
+{
+  "id": "memory",
+  "name": "记忆",
+  "description": "记忆写侧：把结论沉淀为工作区记忆文件（.harness/memory/），启动时同步进检索索引（memory_l0/l2/l3），供 D-3 检索召回",
+  "version": "1.0.0",
+  "kind": "builtin",
+  "default_tier": "on_demand",
+  "protocol_version": 1,
+  "tools": [
+    {
+      "name": "memory_write",
+      "description": "写入一条记忆（layer: core=核心约束 / notes=情景结论 / archive=档案事实；标题一行 + 正文）",
+      "schema_json": {"type":"object","properties":{"layer":{"type":"string","enum":["core","notes","archive"],"description":"记忆层"},"title":{"type":"string","description":"一行标题"},"body":{"type":"string","description":"正文"},"importance":{"type":"number","description":"重要性 0~1（默认 0.5）"}},"required":["layer","title","body"]},
+      "tier": "on_demand",
+      "risk": "write"
+    },
+    {
+      "name": "memory_list",
+      "description": "列出工作区记忆文件",
+      "schema_json": {"type":"object","properties":{"layer":{"type":"string","enum":["core","notes","archive"]}}},
+      "tier": "on_demand",
+      "risk": "readonly"
+    }
+  ]
+}

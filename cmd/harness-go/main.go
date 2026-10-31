@@ -165,6 +165,8 @@ func run() error {
 	if wErr != nil {
 		return fmt.Errorf("获取工作区根目录失败: %w", wErr)
 	}
+	// Host 受控能力注入（F）：命令执行 / 模型调用 / 事件 / 嵌套 Run。
+	// ChildRunner 依赖引擎（引擎又依赖工具注册表），构造后经 SetChildRunner 后置注入。
 	toolHost := hostimpl.New(hostimpl.Options{WorkDir: workDir})
 	pluginOK, pluginFail := registerBuiltins(ctx, toolReg, toolHost, nil, logger)
 	toolRouter := router.New(router.Options{
@@ -263,6 +265,25 @@ func run() error {
 	if err != nil {
 		return err
 	}
+
+	// ⑧' F：Host 能力接线（命令执行 / LLM / 事件 / 嵌套 Run）+ 记忆文件同步。
+	childRunner := service.NewChildRunner(service.ChildRunnerOptions{
+		Sessions:   sessionStore,
+		Engine:     engine,
+		Main:       mainStore,
+		ToolRefs:   toolRunner.PromptRefs,
+		SystemBase: defaultSystemBase,
+	})
+	toolHost.SetChildRunner(childRunner)
+	toolHost.SetCommandRunner(hostimpl.NewCommandRunner(hostimpl.CommandOptions{
+		Root:         workDir,
+		EnvWhitelist: commandEnvWhitelist,
+	}))
+	toolHost.SetLLM(&llmAdapter{resolver: modelResolver})
+	toolHost.SetEvents(&eventsAdapter{bus: bus})
+	syncMemoryFiles(ctx, workDir, mainStore, func(msg string, args ...any) {
+		logger.Info(msg, args...)
+	})
 
 	// ⑨ 认证：账号引导 + 令牌（明文仅出现一次）
 	authSvc := auth.NewService(auth.Options{

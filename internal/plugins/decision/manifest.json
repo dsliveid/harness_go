@@ -1,0 +1,25 @@
+{
+  "id": "decision",
+  "name": "决策记录",
+  "description": "记录关键决策（背景/选项/结论/理由）供后续回溯，落 .harness/decisions.jsonl",
+  "version": "1.0.0",
+  "kind": "builtin",
+  "default_tier": "deferred",
+  "protocol_version": 1,
+  "tools": [
+    {
+      "name": "decision_record",
+      "description": "记录一条关键决策",
+      "schema_json": {"type":"object","properties":{"title":{"type":"string","description":"决策标题"},"context":{"type":"string","description":"背景"},"choice":{"type":"string","description":"选定的方案"},"alternatives":{"type":"array","items":{"type":"string"},"description":"被否决的备选"},"reason":{"type":"string","description":"理由"}},"required":["title","choice"]},
+      "tier": "deferred",
+      "risk": "write"
+    },
+    {
+      "name": "decision_list",
+      "description": "列出历史决策（最近在前，默认 20 条）",
+      "schema_json": {"type":"object","properties":{"limit":{"type":"integer"}}},
+      "tier": "deferred",
+      "risk": "readonly"
+    }
+  ]
+}

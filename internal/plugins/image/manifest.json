@@ -1,0 +1,25 @@
+{
+  "id": "image",
+  "name": "图片",
+  "description": "图片文件的落盘校验与读取（PNG/JPEG/GIF/WebP 魔数校验）；图像生成/识别需图像模型槽位（能力路由属后续增强）",
+  "version": "1.0.0",
+  "kind": "builtin",
+  "default_tier": "on_demand",
+  "protocol_version": 1,
+  "tools": [
+    {
+      "name": "save_image",
+      "description": "把 base64 图片数据写入工作区（PNG/JPEG/GIF/WebP 魔数校验，非法即拒）",
+      "schema_json": {"type":"object","properties":{"path":{"type":"string","description":"目标相对路径"},"data_base64":{"type":"string","description":"图片二进制的 base64"},"mime":{"type":"string","enum":["image/png","image/jpeg","image/gif","image/webp"],"description":"图片类型"}},"required":["path","data_base64","mime"]},
+      "tier": "on_demand",
+      "risk": "write"
+    },
+    {
+      "name": "read_image_meta",
+      "description": "读取工作区图片的元信息（格式/尺寸/大小，不经像素识别）",
+      "schema_json": {"type":"object","properties":{"path":{"type":"string"}},"required":["path"]},
+      "tier": "on_demand",
+      "risk": "readonly"
+    }
+  ]
+}
