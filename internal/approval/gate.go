@@ -11,6 +11,7 @@ package approval
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -55,6 +56,27 @@ type Request struct {
 	ArgsJSON    string
 	AccessMode  AccessMode
 	Rules       []Rule
+
+	// RequestedByDevice 发起本次 Run 的执行端设备（阶段 C-7 跨端仲裁）。
+	// 空串 = 服务端本地执行面（与 model.SessionLease.DeviceID 语义一致）。
+	RequestedByDevice string
+	// RequiredDeviceID 必须由该设备确认的审批（高风险 + 执行端为设备时填充）。
+	// 空串 = 未绑定设备，任何已鉴权通道均可决策（默认形态）。
+	RequiredDeviceID string
+}
+
+// DeviceCheck 跨端审批仲裁的校验结论（服务端决定是否放行本次决策）。
+type DeviceCheck struct {
+	// Known 审批项是否仍在等待中（false = 不存在/已处理/已超时）。
+	Known bool
+	// RequiredDeviceID 绑定的执行端设备（空 = 未绑定，不做限制）。
+	RequiredDeviceID string
+	// RequestedByDevice 发起侧设备（审计用）。
+	RequestedByDevice string
+	// Allowed 是否允许本次决策（strict=false 时只要 Known 即为 true）。
+	Allowed bool
+	// Reason 拒绝原因（回传给调用方，同时进审计）。
+	Reason string
 }
 
 // Verdict 判定结论。
@@ -80,6 +102,9 @@ type Gate struct {
 type waiter struct {
 	ch     chan Decision
 	reason string
+	// requestedBy / required 跨端归属（阶段 C-7）：仅用于仲裁与审计，不参与自动放行判定。
+	requestedBy string
+	required    string
 }
 
 // NewGate 创建闸门；timeout<=0 用 5min。
@@ -126,6 +151,15 @@ func (g *Gate) Evaluate(req Request) Verdict {
 
 // Register 登记一个待决审批，返回决策通道。
 func (g *Gate) Register(approvalID string) (<-chan Decision, error) {
+	return g.RegisterWithDevice(approvalID, "", "")
+}
+
+// RegisterWithDevice 登记待决审批并记录跨端归属（阶段 C-7 审批跨端仲裁）。
+//
+// requestedBy = 发起本次 Run 的执行端设备（空串 = 服务端本地执行面）；
+// required   = 必须由该设备确认的设备 ID（空串 = 不绑定，任何已鉴权通道均可决策）。
+// 归属信息只用于仲裁与审计，**不影响 Evaluate 的自动放行判定**。
+func (g *Gate) RegisterWithDevice(approvalID, requestedBy, required string) (<-chan Decision, error) {
 	if approvalID == "" {
 		return nil, fmt.Errorf("approval: approvalID 不能为空")
 	}
@@ -134,9 +168,44 @@ func (g *Gate) Register(approvalID string) (<-chan Decision, error) {
 	if _, exists := g.pending[approvalID]; exists {
 		return nil, fmt.Errorf("approval: %s 已在等待中", approvalID)
 	}
-	w := &waiter{ch: make(chan Decision, 1)}
+	w := &waiter{
+		ch:          make(chan Decision, 1),
+		requestedBy: strings.TrimSpace(requestedBy),
+		required:    strings.TrimSpace(required),
+	}
 	g.pending[approvalID] = w
 	return w.ch, nil
+}
+
+// CheckDevice 跨端审批仲裁：判定 deviceID 是否有权决策该审批项。
+//
+// strict=false（默认）→ 只做审计，恒 Allowed（避免把浏览器端用户锁死）；
+// strict=true 且审批绑定了 RequiredDeviceID → 仅该设备可决策，其余一律拒绝。
+// Known=false 表示审批项不存在/已处理/已超时（由调用方翻译成 approval.not_found）。
+func (g *Gate) CheckDevice(approvalID, deviceID string, strict bool) DeviceCheck {
+	g.mu.Lock()
+	w, ok := g.pending[approvalID]
+	var requester, required string
+	if ok {
+		requester, required = w.requestedBy, w.required
+	}
+	g.mu.Unlock()
+
+	chk := DeviceCheck{Known: ok, RequiredDeviceID: required, RequestedByDevice: requester}
+	if !ok {
+		chk.Reason = "审批请求不存在或已处理"
+		return chk
+	}
+	if !strict || required == "" {
+		chk.Allowed = true
+		return chk
+	}
+	if strings.TrimSpace(deviceID) == required {
+		chk.Allowed = true
+		return chk
+	}
+	chk.Reason = fmt.Sprintf("该审批需由执行端设备 %s 确认", required)
+	return chk
 }
 
 // Resolve 提交决策（由 API 层调用）。返回是否命中待决项。

@@ -25,6 +25,9 @@ type Deps struct {
 	Providers   *service.ProviderService
 	Settings    *service.SettingsService
 	Logs        *service.LogService
+	Devices     *service.DeviceService
+	// DeviceWS 设备长连接网关（阶段 C-3；nil 时 /devices/ws 返回 503 device.disabled）
+	DeviceWS    http.Handler
 	Bus         *events.Bus
 	Auth        *auth.Service
 	AuthConfig  AuthConfig
@@ -119,6 +122,9 @@ func (h *handlers) listMessages(w http.ResponseWriter, r *http.Request) {
 type createRunReq struct {
 	Input    string `json:"input"`
 	ModelRef string `json:"model_ref"`
+	// DeviceID 执行端设备（阶段 C-6，可选）：非空表示该 Run 以该设备为会话租约持有者，
+	// 抢占旧端 epoch+1 并推送 lease.revoked；缺省/空串 = 服务端本地执行面。
+	DeviceID string `json:"device_id,omitempty"`
 }
 
 func (h *handlers) createRun(w http.ResponseWriter, r *http.Request) {
@@ -127,7 +133,7 @@ func (h *handlers) createRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, err)
 		return
 	}
-	run, err := h.d.Runs.CreateRun(r.Context(), r.PathValue("sid"), req.Input, req.ModelRef)
+	run, err := h.d.Runs.CreateRunAs(r.Context(), r.PathValue("sid"), req.Input, req.ModelRef, req.DeviceID)
 	if err != nil {
 		writeError(w, r, err)
 		return

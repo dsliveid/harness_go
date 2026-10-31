@@ -27,9 +27,15 @@ type RunServiceOptions struct {
 	// ToolRefs 动态工具注入（优先于静态 Tools）：每轮重新取，
 	// 保证 PATCH /tools/tiers 改档后「下一轮对话生效」。
 	ToolRefs func() []prompt.ToolRef
+	// ToolSelector 动态工具检索（D-2）：按本轮输入从索引召回 deferred 工具，
+	// 命中者本轮注入全量定义。为 nil 时退化为「deferred 只进索引」（与 D 之前行为一致）。
+	ToolSelector ToolSelector
 	// Gate 审批闸门（B-3）：引擎登记的待决项由本服务经 DecideApproval 提交，
 	// 不注入时审批端点返回 unavailable（不静默成功）。
 	Gate *approval.Gate
+	// StrictApprovalDevice 高风险审批是否**仅限执行端设备**确认（C-7 跨端仲裁）。
+	// 默认 false：只做审计不阻断（避免把浏览器端用户锁死）。
+	StrictApprovalDevice bool
 }
 
 // RunService Run 用例：创建（异步执行）/ 停止 / 查询 / 启动恢复。
@@ -42,6 +48,10 @@ type RunService struct {
 	tools      []prompt.ToolRef
 	toolRefs   func() []prompt.ToolRef
 	gate       *approval.Gate
+	// toolSelector 动态工具检索（D-2）；nil 表示不做动态检索。
+	toolSelector ToolSelector
+	// strictApproval 跨端审批仲裁是否强制「执行端设备确认」（C-7）。
+	strictApproval bool
 
 	mu      sync.Mutex
 	cancels map[string]context.CancelFunc
@@ -50,15 +60,17 @@ type RunService struct {
 // NewRunService 创建 Run 用例。
 func NewRunService(opts RunServiceOptions) *RunService {
 	return &RunService{
-		main:       opts.Main,
-		sessions:   opts.Sessions,
-		engine:     opts.Engine,
-		systemBase: opts.SystemBase,
-		sop:        opts.SOP,
-		tools:      opts.Tools,
-		toolRefs:   opts.ToolRefs,
-		gate:       opts.Gate,
-		cancels:    make(map[string]context.CancelFunc),
+		main:           opts.Main,
+		sessions:       opts.Sessions,
+		engine:         opts.Engine,
+		systemBase:     opts.SystemBase,
+		sop:            opts.SOP,
+		tools:          opts.Tools,
+		toolRefs:       opts.ToolRefs,
+		gate:           opts.Gate,
+		toolSelector:   opts.ToolSelector,
+		strictApproval: opts.StrictApprovalDevice,
+		cancels:        make(map[string]context.CancelFunc),
 	}
 }
 
@@ -70,10 +82,32 @@ func (s *RunService) currentTools() []prompt.ToolRef {
 	return s.tools
 }
 
+// selectTools 动态检索本轮需注入全量定义的 deferred 工具（D-2）。
+//
+// 返回 nil 表示「不做动态提升」—— 此时 Builder 的行为与 D 之前完全一致
+// （deferred 只进索引），保证未装配检索时零回归。
+func (s *RunService) selectTools(ctx context.Context, userInput string) []string {
+	if s.toolSelector == nil {
+		return nil
+	}
+	return s.toolSelector.SelectForPrompt(ctx, userInput, s.currentTools())
+}
+
 // CreateRun 写入用户消息 + 创建 Run(pending) + 异步执行。
 //
 // 返回后 Run 可能仍在 pending/running —— 调用方拿 run_id 去订阅 SSE。
 func (s *RunService) CreateRun(ctx context.Context, sessionID, userInput, modelRef string) (*model.Run, error) {
+	return s.CreateRunAs(ctx, sessionID, userInput, modelRef, "")
+}
+
+// CreateRunAs 同 CreateRun，但显式声明**执行端设备**（阶段 C-6）。
+//
+// deviceID 非空表示该 Run 由端侧发起/驱动：引擎会以它为会话租约持有者，
+// 抢占旧端（epoch+1）并推送 lease.revoked。空串 = 服务端本地执行面。
+//
+// 只做传递不做校验：设备合法性由 WS 网关/执行面路由保证，这里校验会引入
+// 「服务端 Run 被设备表状态卡住」的隐性耦合。
+func (s *RunService) CreateRunAs(ctx context.Context, sessionID, userInput, modelRef, deviceID string) (*model.Run, error) {
 	if userInput == "" {
 		return nil, invalidArg("用户输入不能为空")
 	}
@@ -111,11 +145,16 @@ func (s *RunService) CreateRun(ctx context.Context, sessionID, userInput, modelR
 	_ = s.main.Sessions().TouchMessage(ctx, sessionID, userMsg.CreatedAt)
 
 	// ③ 创建 Run（pending）
+	executor := model.ExecutorServer
+	if deviceID != "" {
+		executor = model.ExecutorDevice
+	}
 	run := &model.Run{
 		ID:        newID(),
 		Status:    model.RunPending,
 		ModelRef:  modelRef,
-		Executor:  model.ExecutorServer,
+		Executor:  executor,
+		DeviceID:  deviceID,
 		CreatedAt: store.NowMillis(),
 	}
 	if err := sdb.Runs().Create(ctx, run); err != nil {
@@ -127,15 +166,18 @@ func (s *RunService) CreateRun(ctx context.Context, sessionID, userInput, modelR
 	s.registerCancel(run.ID, cancel)
 
 	req := agent.RunRequest{
-		RunID:          run.ID,
-		SessionID:      sessionID,
-		UserInput:      userInput,
-		ModelRef:       modelRef,
-		AccessMode:     approval.AccessMode(normalizeAccessMode(sess.AccessMode)),
-		SystemBase:     s.systemBase,
-		SOP:            s.sop,
-		ProjectSummary: "",
-		Tools:          s.currentTools(),
+		RunID:           run.ID,
+		SessionID:       sessionID,
+		UserInput:       userInput,
+		ModelRef:        modelRef,
+		AccessMode:      approval.AccessMode(normalizeAccessMode(sess.AccessMode)),
+		SystemBase:      s.systemBase,
+		SOP:             s.sop,
+		ProjectSummary:  "",
+		Tools:           s.currentTools(),
+		ActiveTools:     s.selectTools(ctx, userInput),
+		LeaseHolder:     deviceID, // C-6：空串 = 服务端本地执行面
+		RequesterDevice: deviceID, // C-7：审批跨端仲裁的发起端来源
 	}
 	go func() {
 		defer func() {
@@ -195,6 +237,16 @@ func (s *RunService) RunningCount() int {
 // 校验顺序：决策合法 → Run 归属与状态（waiting_approval）→ 审批项存在 → Gate 命中。
 // 「本会话允许」额外写入会话级审批规则；任何一步不满足都返回明确错误码，绝不静默成功。
 func (s *RunService) DecideApproval(ctx context.Context, sessionID, runID, approvalID, decision, reason string) error {
+	return s.DecideApprovalFromDevice(ctx, sessionID, runID, approvalID, decision, reason, "")
+}
+
+// DecideApprovalFromDevice 带决策端身份的审批决策（阶段 C-7 跨端仲裁）。
+//
+// deviceID 为空 = 浏览器/本地管理端。strict_approval_device=true 且该审批被绑定到
+// 执行端设备（danger 风险 + 端侧发起）时，非该设备的决策一律 403 approval.device_mismatch；
+// 仲裁在 Gate 提交前完成，被拒时待决项**不被消费**（审批仍可被正确设备确认）。
+func (s *RunService) DecideApprovalFromDevice(ctx context.Context, sessionID, runID, approvalID,
+	decision, reason, deviceID string) error {
 	if s.gate == nil {
 		return apperr.New(apperr.CodeUnavailable, "审批闸门未启用")
 	}
@@ -226,6 +278,15 @@ func (s *RunService) DecideApproval(ctx context.Context, sessionID, runID, appro
 		return wrapStoreErr(err, apperr.CodeApprovalNotFound, "审批请求不存在")
 	}
 
+	// 跨端仲裁（C-7）：strict 模式下非执行端设备的决策直接 403，且**不消费**待决项。
+	chk := s.gate.CheckDevice(approvalID, deviceID, s.strictApproval)
+	if !chk.Known {
+		return apperr.New(apperr.CodeApprovalNotFound, "审批请求不存在或已处理")
+	}
+	if !chk.Allowed {
+		return apperr.New(apperr.CodeApprovalDeviceMismatch, "%s", chk.Reason)
+	}
+
 	// Gate 提交：未命中说明已被处理或已超时（超时已按拒绝落库）
 	if !s.gate.Resolve(approvalID, d) {
 		return apperr.New(apperr.CodeApprovalNotFound, "审批请求不存在或已处理")
@@ -238,7 +299,16 @@ func (s *RunService) DecideApproval(ctx context.Context, sessionID, runID, appro
 		}
 	}
 	// 审计落库（best-effort：决策已生效，审计失败不回滚决策）
-	_ = sdb.Approvals().Decide(ctx, approvalID, runID, ev.ID, string(d), reason)
+	// C-7：同时记「谁发起 / 谁决策」，供跨端审计与 UI 回放。
+	_ = sdb.Approvals().DecideWithDevices(ctx, store.ApprovalDecision{
+		ID:                approvalID,
+		RunID:             runID,
+		ToolEventID:       ev.ID,
+		Decision:          string(d),
+		Reason:            reason,
+		RequestedByDevice: chk.RequestedByDevice,
+		DecidedByDevice:   deviceID,
+	})
 	return nil
 }
 

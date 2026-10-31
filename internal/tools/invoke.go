@@ -22,9 +22,10 @@ import (
 //
 // 落库与事件由引擎既有路径负责（tool_events 只在引擎里写），Runner 不碰存储。
 type Runner struct {
-	reg    *registry.Registry
-	router *router.Router
-	limits loader.Limits
+	reg     *registry.Registry
+	router  *router.Router
+	limits  loader.Limits
+	devices DeviceExecutor // 可为 nil（未接设备域 = 只用本地执行）
 }
 
 // NewRunner 创建执行适配器。
@@ -40,12 +41,23 @@ var (
 
 // Run 实现 agent.ToolRunner。
 //
+// 执行面路由（C-5，多端协同 HALO）：
+//  1. spec.Executor ∈ {device, any} 且有在线设备 → 端侧派发（结果 untrusted）
+//  2. 端侧不可用（无设备/断连/写帧失败）→ **静默降级**本地执行（不变量 5，用户无感）
+//  3. 端侧真实执行过（含失败/超时）→ 直接采用端侧终态，**不重跑**（避免二次副作用）
+//  4. spec.Executor == server（或降级后）→ 本地执行（结果 trusted）
+//
 // 失败一律通过 Status/Error 表达（不返回 error），保证引擎只落一次 tool_events。
 func (r *Runner) Run(ctx context.Context, req agent.ToolRunRequest) (agent.ToolRunResult, error) {
 	tool, spec, err := r.reg.Resolve(req.ToolName)
 	if err != nil {
 		return failure(model.ToolError, "工具未注册: "+req.ToolName), nil
 	}
+	// ① 端侧优先（executor ∈ {device, any}）：不可用则返回 ok=false 继续走本地
+	if res, ok := r.tryDevice(ctx, spec, req); ok {
+		return res, nil
+	}
+	// ② 本地执行面判定（端侧降级也须过本端能力/依赖校验，不绕开宽进严出）
 	if runErr := r.router.CanRun(spec); runErr != nil {
 		return failure(model.ToolError, runErr.Error()), nil
 	}
@@ -89,9 +101,11 @@ func (r *Runner) Run(ctx context.Context, req agent.ToolRunRequest) (agent.ToolR
 		return failure(model.ToolError, "工具结果序列化失败: "+marshalErr.Error()), nil
 	}
 	return agent.ToolRunResult{
-		Status:     model.ToolOK,
-		ResultJSON: string(raw),
-		ResultBlob: res.BlobRef,
+		Status:      model.ToolOK,
+		ResultJSON:  string(raw),
+		ResultBlob:  res.BlobRef,
+		Executor:    model.ExecutorServer,
+		SourceTrust: model.TrustTrusted,
 	}, nil
 }
 
@@ -148,7 +162,12 @@ func toPromptTier(t toolapi.Tier) prompt.Tier {
 	}
 }
 
-// failure 构造失败结果。
+// failure 构造失败结果（本地执行面的失败，故 server + trusted）。
 func failure(status model.ToolEventStatus, msg string) agent.ToolRunResult {
-	return agent.ToolRunResult{Status: status, Error: msg}
+	return agent.ToolRunResult{
+		Status:      status,
+		Error:       msg,
+		Executor:    model.ExecutorServer,
+		SourceTrust: model.TrustTrusted,
+	}
 }

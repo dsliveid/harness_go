@@ -347,15 +347,21 @@ func (r *ToolEventRepo) Insert(ctx context.Context, ev *model.ToolEvent) error {
 	return nil
 }
 
-// Finish 结束工具调用（写结果与终态）。
+// Finish 结束工具调用（写结果、终态与执行面归属）。
+//
+// exec 为执行面元信息（C-5）：端侧执行落 device/untrusted，静默降级落 server/trusted。
+// 空字段按 Normalized 兜底，保证 C 阶段之前的行为不变（server + trusted）。
 func (r *ToolEventRepo) Finish(ctx context.Context, id string, status model.ToolEventStatus,
-	result json.RawMessage, resultBlob, errMsg string) error {
+	result json.RawMessage, resultBlob, errMsg string, exec model.ToolEventExec) error {
+	e := exec.Normalized()
 	res, err := r.s.conn().ExecContext(ctx,
 		`UPDATE tool_events SET status=?, result_json=?, result_blob=?,
-		        error=COALESCE(?, error), ended_at=?
+		        error=COALESCE(?, error), ended_at=?,
+		        executor=?, device_id=?, source_trust=?
 		 WHERE id=?`,
 		string(status), rawOrNil(result), nullIfEmpty(resultBlob),
-		nullIfEmpty(errMsg), NowMillis(), id)
+		nullIfEmpty(errMsg), NowMillis(),
+		string(e.Executor), nullIfEmpty(e.DeviceID), string(e.SourceTrust), id)
 	if err != nil {
 		return fmt.Errorf("store: 更新工具事件失败: %w", err)
 	}
@@ -502,20 +508,91 @@ func (s *SessionDB) Approvals() *ApprovalRepo { return &ApprovalRepo{s: s} }
 
 // Decide 记录一次审批决策（id 复用审批 ID = 工具事件 ID，幂等覆盖）。
 func (r *ApprovalRepo) Decide(ctx context.Context, id, runID, toolEventID, decision, reason string) error {
-	if id == "" || runID == "" {
+	return r.DecideWithDevices(ctx, ApprovalDecision{
+		ID: id, RunID: runID, ToolEventID: toolEventID,
+		Decision: decision, Reason: reason,
+	})
+}
+
+// ApprovalDecision 一次审批决策的完整审计记录（阶段 C-7 跨端仲裁）。
+//
+// RequestedByDevice / DecidedByDevice 为空串时写 NULL（表示服务端本地执行面），
+// 因此既有的两参数式调用（Decide）行为完全不变。
+type ApprovalDecision struct {
+	ID          string
+	RunID       string
+	ToolEventID string
+	Decision    string
+	Reason      string
+	// RequestedByDevice 发起该审批的执行端设备（空 = 服务端本地）。
+	RequestedByDevice string
+	// DecidedByDevice 实际做出决策的设备（空 = 浏览器/本地管理端）。
+	DecidedByDevice string
+}
+
+// DecideWithDevices 记录决策并落库跨端审计列（requested_by_device / decided_by_device）。
+func (r *ApprovalRepo) DecideWithDevices(ctx context.Context, d ApprovalDecision) error {
+	if d.ID == "" || d.RunID == "" {
 		return errors.New("store: 审批记录缺少必要字段")
 	}
 	now := NowMillis()
 	_, err := r.s.conn().ExecContext(ctx,
-		`INSERT INTO approvals(id, run_id, tool_event_id, request_json, decision, reason, requested_at, decided_at)
-		 VALUES(?,?,?,'{}',?,?,?,?)
+		`INSERT INTO approvals(id, run_id, tool_event_id, request_json, decision, reason,
+		                       requested_at, decided_at, requested_by_device, decided_by_device)
+		 VALUES(?,?,?,'{}',?,?,?,?,?,?)
 		 ON CONFLICT(id) DO UPDATE SET decision=excluded.decision,
-		   reason=excluded.reason, decided_at=excluded.decided_at`,
-		id, runID, toolEventID, decision, nullIfEmpty(reason), now, now)
+		   reason=excluded.reason, decided_at=excluded.decided_at,
+		   requested_by_device=COALESCE(excluded.requested_by_device, requested_by_device),
+		   decided_by_device=excluded.decided_by_device`,
+		d.ID, d.RunID, d.ToolEventID, d.Decision, nullIfEmpty(d.Reason), now, now,
+		nullIfEmpty(d.RequestedByDevice), nullIfEmpty(d.DecidedByDevice))
 	if err != nil {
 		return fmt.Errorf("store: 记录审批决策失败: %w", err)
 	}
 	return nil
+}
+
+// ApprovalRecord 审批决策审计记录（阶段 C-7：谁发起 / 谁决策）。
+type ApprovalRecord struct {
+	ID                string `json:"id"`
+	RunID             string `json:"run_id"`
+	ToolEventID       string `json:"tool_event_id"`
+	Decision          string `json:"decision"`
+	Reason            string `json:"reason"`
+	RequestedAt       int64  `json:"requested_at"`
+	DecidedAt         int64  `json:"decided_at"`
+	RequestedByDevice string `json:"requested_by_device"` // 空 = 服务端本地执行面
+	DecidedByDevice   string `json:"decided_by_device"`   // 空 = 浏览器/本地管理端
+}
+
+// Get 按 ID 读取审批审计记录（不存在返回 ErrNotFound；供 UI 回放与测试断言）。
+func (r *ApprovalRepo) Get(ctx context.Context, id string) (*ApprovalRecord, error) {
+	var (
+		rec      ApprovalRecord
+		decision sql.NullString
+		reason   sql.NullString
+		decided  sql.NullInt64
+		reqDev   sql.NullString
+		decDev   sql.NullString
+	)
+	err := r.s.conn().QueryRowContext(ctx,
+		`SELECT id, run_id, tool_event_id, decision, reason, requested_at, decided_at,
+		        requested_by_device, decided_by_device
+		   FROM approvals WHERE id=?`, id).
+		Scan(&rec.ID, &rec.RunID, &rec.ToolEventID, &decision, &reason, &rec.RequestedAt,
+			&decided, &reqDev, &decDev)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store: 查询审批记录失败: %w", err)
+	}
+	rec.Decision = decision.String
+	rec.Reason = reason.String
+	rec.DecidedAt = decided.Int64
+	rec.RequestedByDevice = reqDev.String
+	rec.DecidedByDevice = decDev.String
+	return &rec, nil
 }
 
 // nullIfEmpty 空串写 NULL（便于 COALESCE 语义）。

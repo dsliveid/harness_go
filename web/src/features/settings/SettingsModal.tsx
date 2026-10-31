@@ -1,5 +1,5 @@
 import { useEffect, type ReactNode } from 'react'
-import { Cpu, Globe, Shield, BarChart3, FileText } from 'lucide-react'
+import { Cpu, Globe, Shield, BarChart3, FileText, MonitorSmartphone } from 'lucide-react'
 import { useUI } from '../../stores/uiStore'
 import { useSettings } from '../../stores/settingsStore'
 import { Button, Modal, ScrollFade } from '../../components/ui'
@@ -8,12 +8,14 @@ import { ModelSettingsSection } from './ModelSettingsSection'
 import { NetworkPanel } from './NetworkPanel'
 import { SopPanel } from './SopPanel'
 import { LogsPanel, TokenStatsPanel } from './StatsLogsPanel'
+import { DevicePanel } from '../devices/DevicePanel'
 
-type Tab = 'models' | 'network' | 'sop' | 'tokenstats' | 'logs'
+type Tab = 'models' | 'network' | 'devices' | 'sop' | 'tokenstats' | 'logs'
 
 const NAV_MAIN: Array<{ key: Tab; label: string; icon: ReactNode }> = [
   { key: 'models', label: '模型设置', icon: <Cpu size={14} className="text-accent shrink-0" /> },
   { key: 'network', label: '网络代理', icon: <Globe size={14} className="text-sky-400 shrink-0" /> },
+  { key: 'devices', label: '设备', icon: <MonitorSmartphone size={14} className="text-emerald-400 shrink-0" /> },
   { key: 'sop', label: 'Agent SOP', icon: <Shield size={14} className="text-purple-400 shrink-0" /> },
 ]
 
@@ -85,6 +87,7 @@ export function SettingsModal() {
         <div className="flex-1 min-w-0 min-h-0 overflow-y-auto p-4 sm:p-5">
           {tab === 'models' && <ModelSettingsSection />}
           {tab === 'network' && <NetworkPanel />}
+          {tab === 'devices' && <DevicePanel />}
           {tab === 'sop' && <SopPanel />}
           {tab === 'tokenstats' && <TokenStatsPanel />}
           {tab === 'logs' && <LogsPanel />}

@@ -359,7 +359,8 @@ func TestToolEventRepo(t *testing.T) {
 		t.Fatalf("默认字段错误: %+v", list[0])
 	}
 
-	if err := repo.Finish(ctx, "e1", model.ToolOK, json.RawMessage(`{"ok":true}`), "", ""); err != nil {
+	if err := repo.Finish(ctx, "e1", model.ToolOK, json.RawMessage(`{"ok":true}`), "", "",
+		model.ToolEventExec{}); err != nil {
 		t.Fatalf("结束工具事件失败: %v", err)
 	}
 	list, _ = repo.ListByRun(ctx, "r1")
@@ -368,5 +369,55 @@ func TestToolEventRepo(t *testing.T) {
 	}
 	if string(list[0].ResultJSON) != `{"ok":true}` {
 		t.Fatalf("结果未写入: %s", list[0].ResultJSON)
+	}
+}
+
+// 执行面归属回写（C-5）：Finish 必须能改写 executor / device_id / source_trust。
+func TestToolEventFinishExecutor(t *testing.T) {
+	ctx, _, ss := newTestStores(t)
+	sdb, err := ss.Acquire(ctx, "sess-tool-exec")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := sdb.ToolEvents()
+
+	ev := &model.ToolEvent{ID: "e2", RunID: "r2", ToolName: "fs_read",
+		ArgsJSON: json.RawMessage(`{"path":"a"}`), Risk: model.RiskReadonly}
+	if err := repo.Insert(ctx, ev); err != nil {
+		t.Fatalf("记录工具事件失败: %v", err)
+	}
+
+	// 端侧执行：device + untrusted
+	if err := repo.Finish(ctx, "e2", model.ToolOK, json.RawMessage(`{"content":"x"}`), "", "",
+		model.ToolEventExec{
+			Executor:    model.ExecutorDevice,
+			DeviceID:    "dev-7",
+			SourceTrust: model.TrustUntrusted,
+		}); err != nil {
+		t.Fatalf("结束工具事件失败: %v", err)
+	}
+	list, err := repo.ListByRun(ctx, "r2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("应有 1 条事件，得到 %d", len(list))
+	}
+	got := list[0]
+	if got.Executor != model.ExecutorDevice || got.DeviceID != "dev-7" ||
+		got.SourceTrust != model.TrustUntrusted {
+		t.Fatalf("执行面归属未回写: executor=%q device=%q trust=%q",
+			got.Executor, got.DeviceID, got.SourceTrust)
+	}
+
+	// 静默降级：零值兜底 server + trusted，且 device_id 清空
+	if err := repo.Finish(ctx, "e2", model.ToolOK, json.RawMessage(`{"content":"y"}`), "", "",
+		model.ToolEventExec{}); err != nil {
+		t.Fatalf("结束工具事件失败: %v", err)
+	}
+	list, _ = repo.ListByRun(ctx, "r2")
+	got = list[0]
+	if got.Executor != model.ExecutorServer || got.SourceTrust != model.TrustTrusted || got.DeviceID != "" {
+		t.Fatalf("零值应兜底 server/trusted 且清空 device_id: %+v", got)
 	}
 }

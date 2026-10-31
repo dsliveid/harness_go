@@ -77,7 +77,7 @@ func (f *fakeSessionDB) InsertToolEvent(_ context.Context, ev *model.ToolEvent) 
 	return nil
 }
 
-func (f *fakeSessionDB) FinishToolEvent(_ context.Context, id string, status model.ToolEventStatus, resultJSON, blob, errMsg string) error {
+func (f *fakeSessionDB) FinishToolEvent(_ context.Context, id string, status model.ToolEventStatus, resultJSON, blob, errMsg string, exec ToolEventExec) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, ev := range f.toolEvents {
@@ -86,6 +86,10 @@ func (f *fakeSessionDB) FinishToolEvent(_ context.Context, id string, status mod
 			ev.ResultJSON = json.RawMessage(resultJSON)
 			ev.ResultBlob = blob
 			ev.Error = errMsg
+			e := exec.Normalized()
+			ev.Executor = e.Executor
+			ev.DeviceID = e.DeviceID
+			ev.SourceTrust = e.SourceTrust
 			return nil
 		}
 	}
@@ -362,6 +366,58 @@ func TestEngineToolCallRoundTrip(t *testing.T) {
 	}
 	if sdb.messages[2].Content != "工具已执行" {
 		t.Fatalf("第 3 条内容错误: %q", sdb.messages[2].Content)
+	}
+}
+
+// 执行面归属落库（C-5）：端侧结果必须 voice executor=device / device_id / source_trust=untrusted。
+func TestEngineToolEventExecutorPersisted(t *testing.T) {
+	provider := &fakeProvider{rounds: [][]llm.Chunk{
+		{
+			{ToolCall: &llm.ToolCallDelta{Index: 0, ID: "call_1", Name: "fs_read"}},
+			{ToolCall: &llm.ToolCallDelta{Index: 0, ArgumentsDelta: `{"path":"a.txt"}`}},
+		},
+		{{Delta: "读到了"}},
+	}}
+	tools := &fakeTools{result: ToolRunResult{
+		Status:      model.ToolOK,
+		ResultJSON:  `{"content":"端侧内容"}`,
+		Executor:    model.ExecutorDevice,
+		DeviceID:    "dev-9",
+		SourceTrust: model.TrustUntrusted,
+	}}
+	eng, sdb, _, _ := newTestEngine(t, provider, func(d *Deps) { d.Tools = tools })
+
+	if err := eng.Execute(context.Background(), baseRunRequest()); err != nil {
+		t.Fatalf("Execute 失败: %v", err)
+	}
+	if len(sdb.toolEvents) != 1 {
+		t.Fatalf("应有 1 条工具事件，得到 %d", len(sdb.toolEvents))
+	}
+	ev := sdb.toolEvents[0]
+	if ev.Executor != model.ExecutorDevice || ev.DeviceID != "dev-9" {
+		t.Fatalf("执行面归属未落库: executor=%q device_id=%q", ev.Executor, ev.DeviceID)
+	}
+	if ev.SourceTrust != model.TrustUntrusted {
+		t.Fatalf("端侧结果必须落 untrusted（不变量 4），得到 %q", ev.SourceTrust)
+	}
+}
+
+// 静默降级落库（C-5）：本地执行 → server + trusted（且不得因降级产生用户可见错误）。
+func TestEngineToolEventDegradedDefaults(t *testing.T) {
+	provider := &fakeProvider{rounds: [][]llm.Chunk{
+		{{ToolCall: &llm.ToolCallDelta{Index: 0, ID: "call_1", Name: "echo"}}},
+		{{Delta: "完成"}},
+	}}
+	// 执行面字段留零值（等价于未接设备域 / 降级本地）
+	tools := &fakeTools{result: ToolRunResult{Status: model.ToolOK, ResultJSON: `{"ok":true}`}}
+	eng, sdb, _, _ := newTestEngine(t, provider, func(d *Deps) { d.Tools = tools })
+
+	if err := eng.Execute(context.Background(), baseRunRequest()); err != nil {
+		t.Fatalf("Execute 失败: %v", err)
+	}
+	ev := sdb.toolEvents[0]
+	if ev.Executor != model.ExecutorServer || ev.SourceTrust != model.TrustTrusted || ev.DeviceID != "" {
+		t.Fatalf("零值应兜底为 server/trusted 且无 device_id，得到 %+v", ev)
 	}
 }
 

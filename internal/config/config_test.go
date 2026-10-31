@@ -31,6 +31,17 @@ func TestDefaultValues(t *testing.T) {
 	if !c.Auth.SSOEnabled || c.Auth.SSOMode != SSOPlain {
 		t.Fatalf("local 形态下 SSO 应默认开启且为 plain: %+v", c.Auth)
 	}
+	// 阶段 C 设备域默认值（铁律：配对 TTL 120s / 心跳 15s / 离线 45s / 任务 600s）
+	if !c.Devices.Enabled {
+		t.Fatalf("设备域应默认启用: %+v", c.Devices)
+	}
+	if c.Devices.PairTTLS != 120 || c.Devices.HeartbeatS != 15 ||
+		c.Devices.OfflineAfterS != 45 || c.Devices.TaskTTLS != 600 {
+		t.Fatalf("设备域默认值错误: %+v", c.Devices)
+	}
+	if c.Devices.StrictApprovalDevice {
+		t.Fatal("strict_approval_device 应默认 false（只审计不阻断）")
+	}
 }
 
 // 优先级：flag > env > 文件 > 默认

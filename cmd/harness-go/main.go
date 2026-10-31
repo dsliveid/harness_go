@@ -28,10 +28,12 @@ import (
 	"harness-go/internal/approval"
 	"harness-go/internal/auth"
 	"harness-go/internal/config"
+	"harness-go/internal/device"
 	"harness-go/internal/events"
 	"harness-go/internal/llm"
 	"harness-go/internal/observ"
 	"harness-go/internal/prompt"
+	"harness-go/internal/retrieval"
 	"harness-go/internal/secret"
 	"harness-go/internal/service"
 	"harness-go/internal/store"
@@ -180,6 +182,18 @@ func run() error {
 		logger.Warn("工具注入软上限告警（不阻断启动）", "detail", warn)
 	}
 
+	// ⑦'' C-6：会话租约管理器（跨端单写者）。
+	//
+	// 必须在引擎之前构造（引擎 Execute 需要它），而推送 lease.revoked 依赖 WS 网关的
+	// 在线连接表 → 用 SetHub 后置注入，打破「引擎 → 租约 → 网关 → 服务 → 引擎」的
+	// 构造期循环。设备域关闭时保持 nil：引擎只走本地 mutex，行为与 C 阶段前一致。
+	var deviceLeases *device.LeaseManager
+	var leasePort agent.LeaseManager
+	if cfg.Devices.Enabled {
+		deviceLeases = service.NewLeaseAdapter(mainStore, nil)
+		leasePort = deviceLeases
+	}
+
 	// ⑧ 引擎
 	engine, err := agent.New(agent.Deps{
 		Sessions:      service.NewSessionProvider(sessionStore),
@@ -190,6 +204,7 @@ func run() error {
 		Tools:         toolRunner,
 		Catalog:       toolRunner,
 		Gate:          gate,
+		Leases:        leasePort,
 		MaxConcurrent: 8,
 		MaxSteps:      20,
 	})
@@ -236,6 +251,17 @@ func run() error {
 		ToolRefs: toolRunner.PromptRefs,
 		// B-3：审批决策端点需经同一闸门提交（引擎在此登记待决项）
 		Gate: gate,
+		// D-2：动态工具检索 —— deferred 档平时只进索引（~18 token/条），
+		// 本轮命中者才注入全量定义。检索通道失败时自动降级为「核心集 + 最近使用」，
+		// 绝不让索引问题阻断对话（宽进严出：未注入的工具仍可执行）。
+		ToolSelector: &service.RetrievalToolSelector{
+			Repo:    mainStore.Retrieval(),
+			Kind:    retrieval.KindTool,
+			TopK:    cfg.Tools.DynamicTopK,
+			MinTopK: cfg.Tools.DynamicMinTopK,
+		},
+		// C-7：高风险审批是否仅限执行端设备确认（默认 false = 只审计不阻断）
+		StrictApprovalDevice: cfg.Devices.StrictApprovalDevice,
 	})
 	if n, rErr := runSvc.RecoverInterrupted(ctx); rErr == nil && n > 0 {
 		logger.Warn("已将未完成 Run 置为 interrupted（不做断点续跑）", "count", n)
@@ -252,6 +278,80 @@ func run() error {
 	settingsSvc := service.NewSettingsService(mainStore)
 	logSvc := service.NewLogService(filepath.Join(dataDir, "app.log"), 500)
 
+	// ⑩'' C-2：设备域（配对 / 列表 / 吊销）。配置来自 config.Devices 段。
+	// C-6：deviceLeases 已在引擎构造前建立（⑦''），这里注入到用例层。
+	deviceSvc := service.NewDeviceService(service.DeviceServiceOptions{
+		Main:           mainStore,
+		Enabled:        cfg.Devices.Enabled,
+		PairTTL:        time.Duration(cfg.Devices.PairTTLS) * time.Second,
+		Heartbeat:      time.Duration(cfg.Devices.HeartbeatS) * time.Second,
+		OfflineAfter:   time.Duration(cfg.Devices.OfflineAfterS) * time.Second,
+		TaskTTL:        time.Duration(cfg.Devices.TaskTTLS) * time.Second,
+		StrictApproval: cfg.Devices.StrictApprovalDevice,
+		Leases:         deviceLeases,
+	})
+	if cfg.Devices.Enabled {
+		logger.Info("设备域已启用",
+			"pair_ttl_s", cfg.Devices.PairTTLS,
+			"heartbeat_s", cfg.Devices.HeartbeatS,
+			"offline_after_s", cfg.Devices.OfflineAfterS,
+			"task_ttl_s", cfg.Devices.TaskTTLS)
+	}
+
+	// ⑩''' C-3：WS 网关（在线注册表 + 心跳超时判定 + 升级/读写循环）。
+	// 在线状态落库通过 Hub 回调交给 deviceSvc（同主库、单条 UPDATE，无跨库事务）。
+	//
+	// C-4：OnOffline 组合回调——先落库 offline，再让派发器**立即**收敛该设备的在途任务
+	// （离线立即降级，绝不等到 deadline）。dispatcher 在 hub 之后构造，故用闭包前置引用。
+	var deviceDispatcher *device.Dispatcher
+	deviceHub := device.NewHub(device.HubOptions{
+		Log:          logger,
+		OfflineAfter: time.Duration(cfg.Devices.OfflineAfterS) * time.Second,
+		OnOnline:     deviceSvc.MarkOnline,
+		OnHeartbeat:  deviceSvc.RecordHeartbeat,
+		OnOffline: func(octx context.Context, deviceID string) {
+			deviceSvc.MarkOffline(octx, deviceID)
+			if deviceDispatcher != nil {
+				if n := deviceDispatcher.FailDevice(deviceID, device.TaskErrorOffline); n > 0 {
+					logger.Warn("设备离线，在途端侧任务已降级", "device_id", deviceID, "tasks", n)
+				}
+			}
+		},
+	})
+	var deviceGateway *device.Gateway
+	if cfg.Devices.Enabled {
+		deviceHub.Start(ctx)
+		// 吊销设备时断开其长连接（后置注入，打破构造期循环依赖）
+		deviceSvc.SetDisconnector(deviceHub)
+		// C-6：租约管理器接入在线连接表 → 抢占时向旧端推送 lease.revoked
+		if deviceLeases != nil {
+			deviceLeases.SetHub(deviceHub)
+		}
+		// C-4：任务派发器（task.dispatch / progress / result）
+		deviceDispatcher = device.NewDispatcher(device.DispatcherOptions{
+			Log:     logger,
+			Hub:     deviceHub,
+			TaskTTL: deviceSvc.TaskTTL(),
+		})
+		deviceGateway = device.NewGateway(device.GatewayOptions{
+			Log:          logger,
+			Hub:          deviceHub,
+			Authenticate: deviceSvc.Authenticate,
+			Heartbeat:    deviceSvc.Heartbeat(),
+			OfflineAfter: deviceSvc.OfflineAfter(),
+			Handler:      deviceDispatcher.HandleFrame,
+			PendingCount: deviceDispatcher.PendingCount,
+		})
+		// C-5：执行面路由接线——device 优先，不可用则静默降级本地（不变量 5）。
+		// 仅在设备域启用时注入；未启用时 toolRunner 的 devices 为 nil，行为与 C 之前完全一致。
+		toolRunner.SetDeviceExecutor(newDeviceTaskExecutor(
+			deviceHub, deviceDispatcher, publishDeviceProgress(bus)))
+		logger.Info("执行面路由已接线（端侧优先，缺失静默降级）",
+			"ws_path", service.DeviceWSPath, "task_ttl_s", cfg.Devices.TaskTTLS)
+		logger.Info("设备长连接网关已就绪",
+			"ws_path", service.DeviceWSPath, "task_ttl_s", cfg.Devices.TaskTTLS)
+	}
+
 	// ⑪ 路由
 	httpHandler := api.NewRouter(api.Deps{
 		Version:     version,
@@ -263,6 +363,8 @@ func run() error {
 		Providers:   providerSvc,
 		Settings:    settingsSvc,
 		Logs:        logSvc,
+		Devices:     deviceSvc,
+		DeviceWS:    deviceWSHandler(deviceGateway),
 		Bus:         bus,
 		Auth:        authSvc,
 		AuthConfig: api.AuthConfig{
@@ -310,15 +412,30 @@ func run() error {
 		logger.Info("收到退出信号，开始优雅关闭（最长 30s）")
 	}
 
-	// ⑬ 优雅关闭：停止接收 → 等待在途请求 → 停止插件 → 关闭存储
+	// ⑬ 优雅关闭：停止接收 → 等待在途请求 → 断开设备长连接 → 停止插件 → 关闭存储
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	if sErr := server.Shutdown(shutdownCtx); sErr != nil {
 		logger.Error("HTTP 优雅关闭失败", "err", sErr)
 	}
+	// 先关 WS（长连接不会被 Shutdown 等待），再停插件与存储
+	deviceHub.CloseAll("服务端关闭")
+	if deviceDispatcher != nil {
+		// 在途端侧任务全部收敛为降级（等不到端侧结果了），避免 Run 悬空
+		deviceDispatcher.Close(device.FrameCodeServerClosing)
+	}
 	toolReg.Stop(shutdownCtx)
 	logger.Info("已退出")
 	return nil
+}
+
+// deviceWSHandler 把网关包装为可 nil 的 http.Handler（未启用设备域时返回 nil，
+// 由 api 层 handler 直接回 503 device.disabled，避免路由指向空指针）。
+func deviceWSHandler(g *device.Gateway) http.Handler {
+	if g == nil {
+		return nil
+	}
+	return g
 }
 
 // buildProvider 按环境变量构造 provider；未配置则回退 fake（便于端到端验证）。

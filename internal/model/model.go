@@ -63,6 +63,7 @@ type Executor string
 
 const (
 	ExecutorServer  Executor = "server"
+	ExecutorDevice  Executor = "device"
 	ExecutorDesktop Executor = "desktop"
 	ExecutorMobile  Executor = "mobile"
 	ExecutorBrowser Executor = "browser"
@@ -227,4 +228,29 @@ type ToolEvent struct {
 	Error       string          `json:"error,omitempty"`
 	StartedAt   *int64          `json:"started_at,omitempty"`
 	EndedAt     *int64          `json:"ended_at,omitempty"`
+}
+
+// ToolEventExec 工具事件的执行面元信息（落库 executor / device_id / source_trust）。
+//
+// 用于「终态回写」时补充执行面归属：执行面的最终归属由实际执行者决定
+// （端侧 → device/untrusted；静默降级 → server/trusted），因此必须在 Finish 阶段回写，
+// 不能只在 Insert（pending）阶段写死 server。
+type ToolEventExec struct {
+	Executor    Executor
+	DeviceID    string
+	SourceTrust TrustLevel
+}
+
+// Normalized 补默认值：空 executor → server，空 trust → trusted。
+//
+// 端侧结果**必须**显式置 TrustUntrusted（不变量 4），不能依赖此默认值。
+func (e ToolEventExec) Normalized() ToolEventExec {
+	out := e
+	if out.Executor == "" {
+		out.Executor = ExecutorServer
+	}
+	if out.SourceTrust == "" {
+		out.SourceTrust = TrustTrusted
+	}
+	return out
 }

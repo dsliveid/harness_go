@@ -56,6 +56,11 @@ func (r *statusRecorder) Flush() {
 	}
 }
 
+// Unwrap 暴露底层 ResponseWriter：coder/websocket 的升级依赖 http.Hijacker，
+// 它通过 Unwrap 逐层向下查找（同 http.ResponseController 语义）。
+// **缺此方法会导致 WS 升级失败并返回 501**。
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
 // Recover 捕获 panic → 500，不向客户端泄露堆栈。
 func Recover(log *slog.Logger) Middleware {
 	return func(next http.Handler) http.Handler {

@@ -18,17 +18,22 @@ import { SseClient } from './sse'
 import {
   API_PATHS,
   type ChangePasswordRequest,
+  type CreateDevicePairCodeRequest,
   type CreateRunResponse,
+  type DeviceListResponse,
+  type DeviceDTO,
   type LogLine,
   type LoginRequest,
   type LoginResponse,
   type Message as ApiMessage,
+  type PairCodeDTO,
   type ProviderDTO,
   type ProviderInput,
   type ProviderTestResult,
   type Run as ApiRun,
   type RunStatus as ApiRunStatus,
   type Session as ApiSession,
+  type SessionLeaseDTO,
   type SSORequest,
   type ToolEvent as ApiToolEvent,
   type ToolInjection,
@@ -153,6 +158,15 @@ export interface ApiClient {
   patchSettings(patch: Record<string, unknown>): Promise<Record<string, unknown>>
   getStats(): Promise<Record<string, unknown>>
   getLogs(params?: { limit?: number; level?: string }): Promise<LogLine[]>
+  // 设备与多端协同（阶段 C）
+  /** 生成 6 位一次性配对码（TTL 由 devices.pair_ttl_s 决定，默认 120s） */
+  createDevicePairCode(req?: CreateDevicePairCodeRequest): Promise<PairCodeDTO>
+  /** 设备列表（含离线/已吊销与能力项；不回传令牌摘要） */
+  listDevices(): Promise<DeviceListResponse>
+  /** 吊销设备（令牌立即失效并断开长连接） */
+  revokeDevice(id: string): Promise<void>
+  /** 会话租约（无租约 = active=true / epoch=0 / holder=''，不是错误） */
+  getSessionLease(sessionId: string): Promise<SessionLeaseDTO>
 }
 
 /* ============ HTTP 基础设施 ============ */
@@ -300,6 +314,48 @@ const mockToolsSnapshot = (): ToolSnapshot => {
     overrides: {},
     generated_at: new Date().toISOString(),
   }
+}
+
+/* ============ 阶段 C：设备（mock 样例数据） ============ */
+
+/**
+ * mock 设备样例：形态与真实 `GET /api/v1/devices` 一致（不回传令牌摘要）。
+ * 仅用于 mock 模式下 UI 自检，**不参与任何真机逻辑**。
+ */
+function mockDeviceList(): DeviceDTO[] {
+  const now = Date.now()
+  return [
+    {
+      id: 'dev-mock-desktop',
+      name: '桌面端 · Windows',
+      kind: 'desktop',
+      platform: 'windows',
+      status: 'online',
+      capabilities_hash: 'sha256:mock-1',
+      protocol_version: 1,
+      app_version: '0.1.0',
+      paired_at: now - 3_600_000,
+      last_seen_at: now - 8_000,
+      revoked_at: undefined,
+      capabilities: [
+        { device_id: 'dev-mock-desktop', name: 'run_command', version: '1', updated_at: now - 8_000 },
+        { device_id: 'dev-mock-desktop', name: 'read_file', version: '1', updated_at: now - 8_000 },
+      ],
+    },
+    {
+      id: 'dev-mock-mobile',
+      name: '移动端 · Android',
+      kind: 'mobile',
+      platform: 'android',
+      status: 'offline',
+      capabilities_hash: 'sha256:mock-2',
+      protocol_version: 1,
+      app_version: '0.1.0',
+      paired_at: now - 86_400_000,
+      last_seen_at: now - 5_400_000,
+      capabilities: [{ device_id: 'dev-mock-mobile', name: 'fetch_web_page', version: '1', updated_at: now - 5_400_000 }],
+    },
+  ]
 }
 
 export const mockApi: ApiClient = {
@@ -465,6 +521,27 @@ export const mockApi: ApiClient = {
   },
   async getLogs() {
     return []
+  },
+
+  // ---- 阶段 C：设备（mock 走内存样例，与真实端点同签名） ----
+  async createDevicePairCode(req) {
+    return {
+      code: String(Math.floor(100000 + Math.random() * 900000)),
+      expires_at: Date.now() + 120_000,
+      ttl_s: 120,
+      device_name: req?.name,
+      device_kind: req?.kind,
+    }
+  },
+  async listDevices() {
+    return { items: mockDeviceList(), pair_ttl_s: 120, heartbeat_s: 15, offline_after_s: 45 }
+  },
+  async revokeDevice(id) {
+    const d = mockDeviceList().find((x) => x.id === id)
+    if (!d) throw new ApiError('设备不存在', 'device.not_found', 404)
+  },
+  async getSessionLease(sessionId) {
+    return { session_id: sessionId, holder: '', holder_kind: 'server', epoch: 0, active: true }
   },
 }
 
@@ -770,6 +847,24 @@ export const realApi: ApiClient = {
     const path = q.toString() ? `${API_PATHS.logs}?${q}` : API_PATHS.logs
     const res = await request<{ items: LogLine[] }>(path, { headers: authHeaders() })
     return res.items ?? []
+  },
+
+  // ---- 阶段 C：设备与多端协同 ----
+  async createDevicePairCode(req) {
+    return request<PairCodeDTO>(API_PATHS.devicePairCodes, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify(req ?? {}),
+    })
+  },
+  async listDevices() {
+    return request<DeviceListResponse>(API_PATHS.devices, { headers: authHeaders() })
+  },
+  async revokeDevice(id) {
+    await request<void>(API_PATHS.device(id), { method: 'DELETE', headers: authHeaders() })
+  },
+  async getSessionLease(sessionId) {
+    return request<SessionLeaseDTO>(API_PATHS.sessionLease(sessionId), { headers: authHeaders() })
   },
 }
 

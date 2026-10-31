@@ -15,6 +15,7 @@ import (
 	"harness-go/internal/agent"
 	"harness-go/internal/approval"
 	"harness-go/internal/auth"
+	"harness-go/internal/device"
 	"harness-go/internal/events"
 	"harness-go/internal/llm"
 	"harness-go/internal/observ"
@@ -27,6 +28,13 @@ import (
 
 // newTestServer 组装完整链路（store → agent → service → api）用于端到端测试。
 func newTestServer(t *testing.T) (*httptest.Server, string) {
+	t.Helper()
+	srv, token, _ := newTestServerWithDevices(t)
+	return srv, token
+}
+
+// newTestServerWithDevices 同 newTestServer，但额外返回设备用例（C-6 租约端点测试需要直接操作租约）。
+func newTestServerWithDevices(t *testing.T) (*httptest.Server, string, *service.DeviceService) {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -46,6 +54,10 @@ func newTestServer(t *testing.T) (*httptest.Server, string) {
 	provider := llm.NewFakeProvider()
 	provider.Delay = 0
 
+	// 阶段 C-6：会话租约管理器（引擎在 Execute 中 Acquire/Renew/Release）。
+	// Hub 由下方 SetHub 后置注入，打破「引擎 → 租约 → 网关」的构造期循环。
+	deviceLeases := service.NewLeaseAdapter(mainStore, nil)
+
 	engine, err := agent.New(agent.Deps{
 		Sessions: service.NewSessionProvider(sessionStore),
 		Summary:  service.NewSummaryWriter(mainStore),
@@ -56,6 +68,7 @@ func newTestServer(t *testing.T) (*httptest.Server, string) {
 			MaxSOP:           6,
 		}),
 		Gate:     gate,
+		Leases:   deviceLeases,
 		MaxSteps: 5,
 	})
 	if err != nil {
@@ -90,6 +103,30 @@ func newTestServer(t *testing.T) (*httptest.Server, string) {
 	providerSvc := service.NewProviderService(service.ProviderServiceOptions{Main: mainStore, Cipher: cipher})
 	settingsSvc := service.NewSettingsService(mainStore)
 	logSvc := service.NewLogService("", 100)
+	// 阶段 C-2：设备域（配对 / 列表 / 吊销），TTL 120s
+	// 阶段 C-6：会话租约（Hub 由 SetHub 后置注入，打破构造期循环）
+	deviceSvc := service.NewDeviceService(service.DeviceServiceOptions{
+		Main:    mainStore,
+		Enabled: true,
+		PairTTL: 120 * time.Second,
+		Leases:  deviceLeases,
+	})
+	// 阶段 C-3：WS 网关（在线注册表 + 心跳超时 + 升级/读写循环）
+	deviceHub := device.NewHub(device.HubOptions{
+		OfflineAfter: 45 * time.Second,
+		OnOnline:     deviceSvc.MarkOnline,
+		OnHeartbeat:  deviceSvc.RecordHeartbeat,
+		OnOffline:    deviceSvc.MarkOffline,
+	})
+	deviceSvc.SetDisconnector(deviceHub)
+	// C-6：租约管理器接入在线连接表（抢占时向旧端推送 lease.revoked）
+	deviceLeases.SetHub(deviceHub)
+	deviceGW := device.NewGateway(device.GatewayOptions{
+		Hub:          deviceHub,
+		Authenticate: deviceSvc.Authenticate,
+		Heartbeat:    15 * time.Second,
+		OfflineAfter: 45 * time.Second,
+	})
 
 	logger := observ.NewLogger("error", "text", io.Discard)
 	router := NewRouter(Deps{
@@ -101,6 +138,8 @@ func newTestServer(t *testing.T) (*httptest.Server, string) {
 		Providers:   providerSvc,
 		Settings:    settingsSvc,
 		Logs:        logSvc,
+		Devices:     deviceSvc,
+		DeviceWS:    deviceGW,
 		Bus:         bus,
 		Auth:        tokenSvc,
 		AuthConfig: AuthConfig{
@@ -116,11 +155,12 @@ func newTestServer(t *testing.T) (*httptest.Server, string) {
 	srv := httptest.NewServer(router)
 	t.Cleanup(func() {
 		srv.Close()
+		deviceHub.CloseAll("测试结束")
 		bus.Close()
 		_ = sessionStore.Close()
 		_ = mainStore.Close()
 	})
-	return srv, plain
+	return srv, plain, deviceSvc
 }
 
 type testResolver struct{ provider llm.Provider }

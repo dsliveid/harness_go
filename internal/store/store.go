@@ -1,7 +1,8 @@
 // Package store 实现数据持久化：主库（跨会话）+ 每会话一库 + 会话级 CAS。
 //
 // 设计要点（docs/数据存储方案.md v2.0）：
-//   - 主库 data/main.db：sessions / users / api_tokens / providers / settings
+//   - 主库 data/main.db：sessions / users / api_tokens / providers / settings；
+//     设备域（阶段 C）：devices / device_pair_codes / capabilities / session_leases
 //   - 会话库 data/sessions/<sid>/session.db：messages / runs / tool_events / approvals / ...
 //   - 会话级 blob：data/sessions/<sid>/blobs/<xx>/<sha256>（无全局 ref_count）
 //   - 零跨库事务：所有事务都在单库内完成；跨库一致性靠"最终一致"（摘要回写）

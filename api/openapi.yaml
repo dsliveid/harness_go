@@ -290,6 +290,11 @@ paths:
               properties:
                 input: { type: string }
                 model_ref: { type: string }
+                device_id:
+                  type: string
+                  description: |
+                    执行端设备（C-6，可选）。非空表示该 Run 以该设备为会话租约持有者，
+                    抢占旧端并使其 epoch+1 且收到 `lease.revoked`；缺省/空串 = 服务端本地执行面。
       responses:
         "202":
           description: 已受理
@@ -420,6 +425,144 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "503":
           $ref: "#/components/responses/ToolUnavailable"
+  # ===== 阶段 C：设备与多端协同（HALO M5） =====
+  /api/v1/devices/pair-codes:
+    post:
+      tags: [devices]
+      summary: 生成 6 位配对码（TTL 120s，一次性消费）
+      description: |
+        管理端签发配对码，端侧凭码配对。有效期由 `devices.pair_ttl_s` 决定（默认 120s）。
+        设备域关闭时返回 503 `device.disabled`。
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, description: 预置设备名提示（端侧可覆盖） }
+                kind: { $ref: "#/components/schemas/DeviceKind" }
+      responses:
+        "201":
+          description: 配对码已生成
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PairCode" }
+        "503":
+          $ref: "#/components/responses/DeviceUnavailable"
+  /api/v1/devices/pair:
+    post:
+      tags: [devices]
+      summary: 端侧凭码配对，换取 device_token（**免用户鉴权**，凭码即凭据）
+      description: |
+        配对码不存在 / 已消费 / 已过期 / 格式非法，**一律**返回 401 `device.pair_code_invalid`
+        （防枚举，不区分具体原因）。同一来源失败 6 次/分钟 → 429 `rate_limited`。
+        device_token 明文仅在此响应中出现一次，服务端只存 sha256。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code: { type: string, description: 6 位数字配对码 }
+                name: { type: string }
+                kind: { $ref: "#/components/schemas/DeviceKind" }
+                platform: { type: string, description: 如 windows / darwin / linux }
+                app_version: { type: string }
+                capabilities:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      name: { type: string }
+                      version: { type: string }
+      responses:
+        "201":
+          description: 配对成功
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PairResult" }
+        "401":
+          description: 配对码无效（不存在/已消费/已过期均同码）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorBody" }
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/DeviceUnavailable"
+  /api/v1/devices:
+    get:
+      tags: [devices]
+      summary: 设备列表（含离线/已吊销与能力项；**不回传令牌摘要**）
+      responses:
+        "200":
+          description: 设备列表
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeviceList" }
+        "503":
+          $ref: "#/components/responses/DeviceUnavailable"
+  /api/v1/devices/{did}:
+    delete:
+      tags: [devices]
+      summary: 吊销设备（令牌立即失效并断开长连接）
+      description: 已吊销或不存在均返回 404 `device.not_found`（幂等语义外的不可重复成功）。
+      parameters:
+        - { name: did, in: path, required: true, schema: { type: string } }
+      responses:
+        "204":
+          description: 已吊销
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/DeviceUnavailable"
+  /api/v1/devices/ws:
+    get:
+      tags: [devices]
+      summary: 设备长连接（端 → 服出站 WS 升级；**免用户鉴权**，凭 device_token）
+      description: |
+        鉴权**在升级前**完成（`devices.token_hash` + 未吊销），失败返回 **401 JSON 而非 101**。
+        令牌经 query `?token=` 传递（WS 无法自定义请求头）；access log 的 query 白名单不含 `token`，
+        故设备令牌永不落日志。帧格式见 docs/protocols.md §6。
+        心跳：端每 `heartbeat_s`(默认 15s) 发 `ping{load, capabilities_hash, protocol_version}`，
+        服务端回 `pong{server_time, pending}` 并刷新 `last_seen_at`；`offline_after_s`(默认 45s) 无帧判离线。
+        协议不兼容（服务端支持 N / N-1）→ 回 `error{code: "device.protocol_mismatch"}` 后关闭连接。
+      parameters:
+        - name: token
+          in: query
+          required: true
+          schema: { type: string }
+          description: 配对时下发的 device_token 明文（仅端侧使用，浏览器端请勿持有）
+      responses:
+        "101":
+          description: 已升级为 WebSocket（`task.dispatch` / `task.progress` / `task.result` / `lease.revoked`）
+        "401":
+          description: 设备令牌无效或已吊销
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorBody" }
+        "503":
+          $ref: "#/components/responses/DeviceUnavailable"
+  /api/v1/sessions/{sid}/lease:
+    parameters:
+      - $ref: "#/components/parameters/SessionID"
+    get:
+      tags: [sessions]
+      summary: 查询会话租约（跨端写者归属 / epoch）
+      description: |
+        **无租约不是 404**：语义为「当前无跨端写者，服务端本地可写」，
+        以 `active=true / epoch=0 / holder=""` 返回，前端可直接展示而无需分支。
+      responses:
+        "200":
+          description: 租约视图
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionLease" }
+        "503":
+          $ref: "#/components/responses/DeviceUnavailable"
   /api/v1/settings/maintenance:
     get:
       tags: [ops]
@@ -668,6 +811,11 @@ components:
       content:
         application/json:
           schema: { $ref: "#/components/schemas/ErrorBody" }
+    DeviceUnavailable:
+      description: 设备域未接入或被配置关闭（`device.disabled`）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorBody" }
   schemas:
     ErrorBody:
       type: object
@@ -868,6 +1016,12 @@ components:
           type: string
           enum: [allow_once, allow_session, deny]
         reason: { type: string, description: 拒绝原因（会作为工具结果回传模型） }
+        device_id:
+          type: string
+          description: |
+            决策端设备 ID（C-7 跨端仲裁）。端侧 Runner 决策时填自身 device_id；浏览器/管理端留空
+            表示服务端本地执行面。`devices.strict_approval_device=true` 时若与审批要求设备不一致
+            返回 403 `approval.device_mismatch`。也可经 query `?device_id=` 传入（body 优先）。
     ApprovalDecisionResponse:
       type: object
       properties:
@@ -915,3 +1069,88 @@ components:
           type: object
           description: 键到任意 JSON 片段（白名单键见 service.settingsWhitelist）
           additionalProperties: true
+    # ===== 阶段 C 设备（HALO M5） =====
+    DeviceKind:
+      type: string
+      enum: [desktop, tablet, mobile, cli, browser]
+    DeviceStatus:
+      type: string
+      enum: [online, offline, revoked]
+    Capability:
+      type: object
+      required: [name]
+      properties:
+        device_id: { type: string }
+        name: { type: string }
+        version: { type: string }
+        updated_at: { type: integer, format: int64, description: Unix 毫秒 }
+    PairCode:
+      type: object
+      required: [code, expires_at, ttl_s]
+      properties:
+        code: { type: string, description: 6 位数字，一次性消费 }
+        expires_at: { type: integer, format: int64, description: Unix 毫秒 }
+        ttl_s: { type: integer, description: 有效期（秒），默认 120 }
+        device_name: { type: string }
+        device_kind: { $ref: "#/components/schemas/DeviceKind" }
+    PairResult:
+      type: object
+      required: [device_id, device_token, ws_path, protocol_version]
+      properties:
+        device_id: { type: string }
+        device_token:
+          type: string
+          description: 明文仅此一次返回（前缀 hgd_），服务端只存 sha256
+        ws_path: { type: string, description: 端侧长连接路径（出站 WS） }
+        protocol_version: { type: integer, description: 设备协议版本，支持 N / N-1 }
+    Device:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        kind: { $ref: "#/components/schemas/DeviceKind" }
+        platform: { type: string }
+        status: { $ref: "#/components/schemas/DeviceStatus" }
+        capabilities_hash: { type: string, description: 能力集合摘要（顺序无关） }
+        protocol_version: { type: integer }
+        app_version: { type: string }
+        load: { description: 端侧负载快照（JSON） }
+        paired_at: { type: integer, format: int64 }
+        last_seen_at: { type: integer, format: int64 }
+        revoked_at: { type: integer, format: int64 }
+        created_at: { type: integer, format: int64 }
+        updated_at: { type: integer, format: int64 }
+        capabilities:
+          type: array
+          items: { $ref: "#/components/schemas/Capability" }
+    DeviceList:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Device" }
+        pair_ttl_s: { type: integer, description: 配对码有效期（秒） }
+        heartbeat_s: { type: integer, description: 端侧 ping 间隔（秒） }
+        offline_after_s: { type: integer, description: 无帧判离线阈值（秒） }
+    SessionLease:
+      type: object
+      description: 会话租约视图（C-6）。无租约 = active=true / epoch=0 / holder=""。
+      required: [session_id, holder, holder_kind, epoch, active]
+      properties:
+        session_id: { type: string }
+        holder:
+          type: string
+          description: 写者归属设备 ID；空串表示服务端本地执行面
+        holder_kind:
+          type: string
+          enum: [server, device]
+          description: executor 语义，便于前端直接展示
+        epoch:
+          type: integer
+          format: int64
+          description: 写者纪元（换人或过期接管 +1；同持有者续期不变）
+        active:
+          type: boolean
+          description: 当前是否仍有效（false = 无写者或已过期，**不是错误**）
+        expires_at: { type: integer, format: int64, description: 毫秒；0 = 无租约 }
+        heartbeat_at: { type: integer, format: int64, description: 毫秒；0 = 无租约 }

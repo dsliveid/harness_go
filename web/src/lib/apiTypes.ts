@@ -146,6 +146,8 @@ export interface Run {
 export interface CreateRunRequest {
   input: string;
   model_ref?: string;
+  /** C-6：执行端设备（可选）。非空 = 该设备成为会话租约持有者（抢占旧端 epoch+1） */
+  device_id?: string;
 }
 
 export interface CreateRunResponse {
@@ -297,10 +299,24 @@ export const API_PATHS = {
   settings: '/api/v1/settings',
   stats: '/api/v1/stats',
   logs: '/api/v1/logs',
+  /* 阶段 C：设备（配对 / 列表 / 长连接 / 吊销） */
+  devices: '/api/v1/devices',
+  device: (did: string) => `/api/v1/devices/${did}`,
+  devicePairCodes: '/api/v1/devices/pair-codes',
+  devicePair: '/api/v1/devices/pair',
+  /** C-3：端侧出站 WS（鉴权走 query `?token=`，浏览器端不持有设备令牌） */
+  deviceWS: '/api/v1/devices/ws',
+  /** C-6：会话租约（跨端写者归属） */
+  sessionLease: (sid: string) => `/api/v1/sessions/${sid}/lease`,
 } as const;
 
 /** 免鉴权路径（与 internal/api/router.go 的 publicPaths 保持一致）。 */
-export const PUBLIC_PATHS = [API_PATHS.authLogin, API_PATHS.authSSO] as const;
+export const PUBLIC_PATHS = [
+  API_PATHS.authLogin,
+  API_PATHS.authSSO,
+  // 端侧配对：凭码即凭据（一次性 + TTL 120s + 失败限流）
+  API_PATHS.devicePair,
+] as const;
 
 /* ============ B-3 / B-4 新增 DTO（与 openapi.yaml schemas 对应） ============ */
 
@@ -311,6 +327,8 @@ export interface ApprovalDecisionRequest {
   decision: ApprovalDecision;
   /** 拒绝原因（会作为工具结果回传模型） */
   reason?: string;
+  /** C-7：决策端设备 ID。端侧 Runner 决策时填自身 device_id；浏览器端留空 = 服务端本地 */
+  device_id?: string;
 }
 
 export interface ApprovalDecisionResponse {
@@ -364,4 +382,94 @@ export interface LogLine {
 export interface LogsResponse {
   items: LogLine[];
   limit: number;
+}
+
+/* ============ 阶段 C：设备（HALO M5，与 openapi.yaml 设备段对应） ============ */
+
+export type DeviceKind = 'desktop' | 'tablet' | 'mobile' | 'cli' | 'browser';
+export type DeviceStatus = 'online' | 'offline' | 'revoked';
+
+/** 设备能力项（(device_id, name) 唯一）。 */
+export interface CapabilityDTO {
+  device_id?: string;
+  name: string;
+  version?: string;
+  updated_at?: number;
+}
+
+/** 6 位一次性配对码（TTL 默认 120s）。 */
+export interface PairCodeDTO {
+  code: string;
+  /** Unix 毫秒 */
+  expires_at: number;
+  ttl_s: number;
+  device_name?: string;
+  device_kind?: DeviceKind;
+}
+
+/** 配对成功结果：device_token 明文仅此一次返回（服务端只存 sha256）。 */
+export interface PairResultDTO {
+  device_id: string;
+  device_token: string;
+  /** 端侧出站长连接路径 */
+  ws_path: string;
+  protocol_version: number;
+}
+
+export interface DeviceDTO {
+  id: string;
+  name: string;
+  kind: DeviceKind;
+  platform?: string;
+  status: DeviceStatus;
+  capabilities_hash?: string;
+  protocol_version?: number;
+  app_version?: string;
+  paired_at?: number;
+  last_seen_at?: number;
+  revoked_at?: number;
+  capabilities?: CapabilityDTO[];
+}
+
+export interface DeviceListResponse {
+  items: DeviceDTO[];
+  pair_ttl_s: number;
+  heartbeat_s: number;
+  offline_after_s: number;
+}
+
+/** C-2：签发配对码请求（name/kind 仅作端侧默认值提示，可被端侧覆盖）。 */
+export interface CreateDevicePairCodeRequest {
+  name?: string;
+  kind?: DeviceKind;
+}
+
+/** C-2：端侧凭码配对请求（`code` 必填；其余为设备自述信息）。 */
+export interface DevicePairRequest {
+  code: string;
+  name?: string;
+  kind?: DeviceKind;
+  /** 如 windows / darwin / linux */
+  platform?: string;
+  app_version?: string;
+  capabilities?: Array<{ name: string; version?: string }>;
+}
+
+/**
+ * C-6：会话租约视图（GET /sessions/{sid}/lease）。
+ *
+ * 语义铁律：**无租约不是 404** —— `active=true / epoch=0 / holder=''` 表示「无跨端写者，
+ * 服务端本地可写」，前端可直接展示而无需要分支。
+ */
+export interface SessionLeaseDTO {
+  session_id: string;
+  /** 写者归属设备 ID；空串 = 服务端本地执行面 */
+  holder: string;
+  holder_kind: 'server' | 'device';
+  /** 写者纪元：换人或过期接管 +1，同持有者续期不变 */
+  epoch: number;
+  active: boolean;
+  /** 毫秒；0 = 无租约 */
+  expires_at?: number;
+  heartbeat_at?: number;
 }

@@ -176,3 +176,73 @@ func TestAwaitUnknownApprovalDenies(t *testing.T) {
 		t.Fatalf("未知审批应拒绝并给原因: %s / %s", d, reason)
 	}
 }
+
+// ============ C-7：审批跨端仲裁 ============
+
+// 非 strict 模式只做审计：绑定设备也允许任意通道决策（避免把浏览器端用户锁死）。
+func TestCheckDeviceNonStrictOnlyAudits(t *testing.T) {
+	g := NewGate(time.Second)
+	if _, err := g.RegisterWithDevice("ap-1", "dev-1", "dev-1"); err != nil {
+		t.Fatal(err)
+	}
+	for _, deviceID := range []string{"", "dev-1", "dev-other"} {
+		chk := g.CheckDevice("ap-1", deviceID, false)
+		if !chk.Known || !chk.Allowed {
+			t.Fatalf("非 strict 模式应放行（device=%q）：%+v", deviceID, chk)
+		}
+		if chk.RequiredDeviceID != "dev-1" || chk.RequestedByDevice != "dev-1" {
+			t.Fatalf("审计信息缺失：%+v", chk)
+		}
+	}
+}
+
+// strict 模式：绑定设备的审批只允许该设备决策，其余一律拒绝且不消费待决项。
+func TestCheckDeviceStrictRejectsMismatch(t *testing.T) {
+	g := NewGate(time.Second)
+	if _, err := g.RegisterWithDevice("ap-2", "dev-9", "dev-9"); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, deviceID := range []string{"", "dev-other"} {
+		chk := g.CheckDevice("ap-2", deviceID, true)
+		if !chk.Known {
+			t.Fatal("审批项应仍在等待中")
+		}
+		if chk.Allowed {
+			t.Fatalf("strict 模式非执行端设备必须拒绝（device=%q）", deviceID)
+		}
+		if chk.Reason == "" {
+			t.Fatal("拒绝必须给出原因")
+		}
+	}
+	// 被拒后待决项仍存在，正确设备仍可决策
+	if chk := g.CheckDevice("ap-2", "dev-9", true); !chk.Allowed {
+		t.Fatalf("执行端设备应放行：%+v", chk)
+	}
+	if !g.Resolve("ap-2", AllowOnce) {
+		t.Fatal("待决项不应被前面的拒绝消费掉")
+	}
+}
+
+// 未绑定设备（required 为空）时 strict 模式也不限制。
+func TestCheckDeviceStrictWithoutRequired(t *testing.T) {
+	g := NewGate(time.Second)
+	if _, err := g.RegisterWithDevice("ap-3", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if chk := g.CheckDevice("ap-3", "dev-any", true); !chk.Allowed {
+		t.Fatalf("未绑定设备不应限制：%+v", chk)
+	}
+}
+
+// 未知审批项 Known=false（由 service 翻译为 approval.not_found）。
+func TestCheckDeviceUnknown(t *testing.T) {
+	g := NewGate(time.Second)
+	chk := g.CheckDevice("nope", "dev-1", true)
+	if chk.Known || chk.Allowed {
+		t.Fatalf("未知审批项不应放行：%+v", chk)
+	}
+	if chk.Reason == "" {
+		t.Fatal("未知审批项应给出原因")
+	}
+}

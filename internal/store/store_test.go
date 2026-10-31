@@ -21,23 +21,28 @@ func TestOpenMainCreatesSchema(t *testing.T) {
 	}
 	defer m.Close()
 
-	// 主库应有 6 张表（sessions/users/api_tokens/providers/settings/schema_migrations）
+	// 主库普通表应有 14 张：
+	//   0001 的 6 张（sessions/users/api_tokens/providers/settings/schema_migrations）
+	// + 0002 的设备 4 张（devices/device_pair_codes/capabilities/session_leases）
+	// + 0003 的检索 4 张（retrieval_docs/retrieval_vectors/index_meta + FTS5 虚表 retrieval_fts）
+	// 注：FTS5 external content 模式的影子表（_data/_idx/_docsize/_config）同样以 table 类型登记，
+	// 故这里用「至少 14」断言，具体影子表数量随 SQLite 版本可能变化。
 	var n int
 	if err := m.conn().QueryRowContext(ctx,
 		`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`,
 	).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
-	if n != 6 {
-		t.Fatalf("主库表数量期望 6，得到 %d", n)
+	if n < 14 {
+		t.Fatalf("主库表数量期望至少 14，得到 %d", n)
 	}
 
 	v, err := SchemaVersion(ctx, m.conn())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v != 1 {
-		t.Fatalf("主库 schema 版本期望 1，得到 %d", v)
+	if v != 3 {
+		t.Fatalf("主库 schema 版本期望 3，得到 %d", v)
 	}
 }
 

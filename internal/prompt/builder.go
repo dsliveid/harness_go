@@ -50,8 +50,12 @@ type Input struct {
 	ProjectSummary string        // 项目约束摘要（3 行内）
 	History        []llm.Message // 历史消息（不含本轮输入）
 	Tools          []ToolRef     // 全部候选工具（由调用方按白名单/风险过滤）
-	DynamicTail    string        // 动态内容（检索结果/运行时锚注），**必须置尾**
-	UserInput      string        // 本轮用户输入
+	// ActiveTools 本轮经动态检索命中、需要「注入全量定义」的 deferred 工具名（D-2）。
+	// 铁律：这只是「注入深度」的提升，不改变工具能否被调用 ——
+	// 未列出的 deferred 工具仍可执行（宽进严出），只是模型看不到其 schema。
+	ActiveTools []string
+	DynamicTail string // 动态内容（检索结果/运行时锚注），**必须置尾**
+	UserInput   string // 本轮用户输入
 }
 
 // Breakdown token 四段明细（UI 与日志都要可见）。
@@ -67,12 +71,15 @@ type Breakdown struct {
 type BuildResult struct {
 	Request         llm.ChatRequest
 	Breakdown       Breakdown
-	InjectedCore    []string // 全量注入的工具名
+	InjectedCore    []string // 全量注入的工具名（core 档 + 检索命中的 deferred）
 	IndexedDeferred []string // 只进索引的工具名
 	SkippedOnDemand []string // 完全未注入的工具名
-	Estimated       bool     // 计数是否为估算（UI 需标注 ≈）
-	OverBudget      bool     // 超出总预算（上层决定压缩或明确报错，禁止静默截断）
-	DroppedHistory  int      // 因预算裁剪掉的历史消息数
+	// PromotedTools 本轮由动态检索「提升为全量注入」的 deferred 工具名（D-2）。
+	// 与 InjectedCore 的差集即为命中项，便于 /tools/injection 展示命中来源。
+	PromotedTools  []string
+	Estimated      bool // 计数是否为估算（UI 需标注 ≈）
+	OverBudget     bool // 超出总预算（上层决定压缩或明确报错，禁止静默截断）
+	DroppedHistory int  // 因预算裁剪掉的历史消息数
 }
 
 // Limits 预算与注入限制。
@@ -115,6 +122,14 @@ func (b *Builder) CounterName() string { return b.counter.Name() }
 func (b *Builder) Build(in Input) BuildResult {
 	core, deferred, onDemand := splitTools(in.Tools)
 
+	// D-2：把动态检索命中的 deferred 工具提升为「全量定义注入」。
+	// 这是 Token 治理的主收益点：deferred 档平时只占 ~18 token/条的索引成本，
+	// 命中后才付出全量 schema 成本，避免 50 个工具每轮都全量注入（≈16k token）。
+	//
+	// 铁律（宽进严出）：未命中的 deferred 工具**仍然可执行**，只是模型看不到其 schema；
+	// 本函数只影响「注入深度」，绝不影响「能否调用」。
+	deferred, promoted := promoteActive(deferred, in.ActiveTools)
+
 	// deferred 索引截断（超出上限只保留前 N 条，并计入结果便于告警）
 	if len(deferred) > b.limits.MaxDeferredIndex {
 		deferred = deferred[:b.limits.MaxDeferredIndex]
@@ -146,9 +161,18 @@ func (b *Builder) Build(in Input) BuildResult {
 		msgs = append(msgs, llm.Message{Role: llm.RoleUser, Content: userContent})
 	}
 
-	toolSpecs := make([]llm.ToolSpec, 0, len(core))
-	coreNames := make([]string, 0, len(core))
+	toolSpecs := make([]llm.ToolSpec, 0, len(core)+len(promoted))
+	coreNames := make([]string, 0, len(core)+len(promoted))
 	for _, t := range core {
+		toolSpecs = append(toolSpecs, llm.ToolSpec{
+			Name:        t.Name,
+			Description: t.Description,
+			InputSchema: t.InputSchema,
+		})
+		coreNames = append(coreNames, t.Name)
+	}
+	// 命中提升的工具与 core 一样注入全量定义（模型才能正确构造参数）。
+	for _, t := range promoted {
 		toolSpecs = append(toolSpecs, llm.ToolSpec{
 			Name:        t.Name,
 			Description: t.Description,
@@ -180,6 +204,7 @@ func (b *Builder) Build(in Input) BuildResult {
 		InjectedCore:    coreNames,
 		IndexedDeferred: deferredNames,
 		SkippedOnDemand: onDemandNames,
+		PromotedTools:   promotedNames(promoted),
 		Estimated:       b.counter.Estimated(),
 		OverBudget:      overBudget,
 		DroppedHistory:  dropped,
@@ -248,6 +273,48 @@ func (b *Builder) computeBreakdown(system string, history []llm.Message, tools [
 		Input:   inputTokens,
 		Total:   sysTokens + histTokens + toolTokens + inputTokens,
 	}
+}
+
+// promoteActive 把动态检索命中的 deferred 工具从「索引档」提升为「全量注入档」。
+//
+// 返回 (剩余仍只进索引的 deferred, 被提升的工具)。
+// 匹配用工具名精确相等（大小写敏感，与 registry 的键一致）。
+// ActiveTools 中的未知名字被静默忽略 —— 检索结果可能来自过期索引，
+// 不能因为索引里有而注册表里没有就报错（宽进严出的另一半：宁可少注入不可失败）。
+func promoteActive(deferred []ToolRef, active []string) (rest, promoted []ToolRef) {
+	if len(deferred) == 0 || len(active) == 0 {
+		return deferred, nil
+	}
+	want := make(map[string]struct{}, len(active))
+	for _, n := range active {
+		if n = strings.TrimSpace(n); n != "" {
+			want[n] = struct{}{}
+		}
+	}
+	if len(want) == 0 {
+		return deferred, nil
+	}
+	rest = make([]ToolRef, 0, len(deferred))
+	for _, t := range deferred {
+		if _, ok := want[t.Name]; ok {
+			promoted = append(promoted, t)
+			continue
+		}
+		rest = append(rest, t)
+	}
+	return rest, promoted
+}
+
+// promotedNames 提取提升工具名（保序）。
+func promotedNames(tools []ToolRef) []string {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(tools))
+	for _, t := range tools {
+		out = append(out, t.Name)
+	}
+	return out
 }
 
 func splitTools(tools []ToolRef) (core, deferred, onDemand []ToolRef) {

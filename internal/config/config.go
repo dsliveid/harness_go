@@ -77,6 +77,24 @@ type StorageConfig struct {
 type ToolsConfig struct {
 	CoreSoftLimit     int `yaml:"core_soft_limit"`     // 默认 8
 	DeferredSoftLimit int `yaml:"deferred_soft_limit"` // 默认 60
+	// DynamicTopK 动态检索每轮注入全量定义的 deferred 工具条数（D-2/D11 推荐 4~8）。
+	DynamicTopK int `yaml:"dynamic_top_k"` // 默认 6
+	// DynamicMinTopK 预算降级（topK 减半）时允许的最小条数。
+	// 不得为 0：砍到 0 会让按需工具完全不可见，退化成比全量注入更糟的形态。
+	DynamicMinTopK int `yaml:"dynamic_min_top_k"` // 默认 2
+}
+
+// DevicesConfig 多端协同（HALO）设备域参数。
+//
+// 默认值对齐 docs/开发实施计划.md 阶段 C：配对码 TTL 120s、心跳 15s、
+// 45s（3×心跳）无帧判离线、任务派发默认 600s 超时。
+type DevicesConfig struct {
+	Enabled              bool `yaml:"enabled"`                // 设备域总开关（关闭时端点返回 unavailable）
+	PairTTLS             int  `yaml:"pair_ttl_s"`             // 配对码有效期（秒）
+	HeartbeatS           int  `yaml:"heartbeat_s"`            // 端侧 ping 间隔（秒）
+	OfflineAfterS        int  `yaml:"offline_after_s"`        // 无帧判离线阈值（秒）
+	TaskTTLS             int  `yaml:"task_ttl_s"`             // 任务派发超时（秒）
+	StrictApprovalDevice bool `yaml:"strict_approval_device"` // 高风险审批是否仅限执行端设备确认
 }
 
 // LogConfig 日志。
@@ -93,6 +111,7 @@ type Config struct {
 	Auth       AuthConfig       `yaml:"auth"`
 	Storage    StorageConfig    `yaml:"storage"`
 	Tools      ToolsConfig      `yaml:"tools"`
+	Devices    DevicesConfig    `yaml:"devices"`
 	Log        LogConfig        `yaml:"log"`
 
 	// ConfigFile 实际加载的配置文件路径（空 = 未使用文件）
@@ -118,8 +137,21 @@ func Default() Config {
 			IdleEvictMin:    10,
 			BlobGCGraceH:    24,
 		},
-		Tools: ToolsConfig{CoreSoftLimit: 8, DeferredSoftLimit: 60},
-		Log:   LogConfig{Level: "info", Format: "text"},
+		Tools: ToolsConfig{
+			CoreSoftLimit:     8,
+			DeferredSoftLimit: 60,
+			DynamicTopK:       6, // D11 推荐 4~8 的中位
+			DynamicMinTopK:    2,
+		},
+		Devices: DevicesConfig{
+			Enabled:              true,
+			PairTTLS:             120, // 铁律：配对码 TTL 120s
+			HeartbeatS:           15,
+			OfflineAfterS:        45, // 3 × heartbeat
+			TaskTTLS:             600,
+			StrictApprovalDevice: false, // 默认只审计不阻断
+		},
+		Log: LogConfig{Level: "info", Format: "text"},
 	}
 }
 
@@ -246,6 +278,12 @@ func applyEnv(cfg *Config, env func(string) string) error {
 		{"HARNESS_DATA_QUOTA_GB", intVal(&cfg.Storage.DataQuotaGB)},
 		{"HARNESS_CORE_SOFT_LIMIT", intVal(&cfg.Tools.CoreSoftLimit)},
 		{"HARNESS_DEFERRED_SOFT_LIMIT", intVal(&cfg.Tools.DeferredSoftLimit)},
+		{"HARNESS_DEVICES_ENABLED", boolVal(&cfg.Devices.Enabled)},
+		{"HARNESS_DEVICES_PAIR_TTL_S", intVal(&cfg.Devices.PairTTLS)},
+		{"HARNESS_DEVICES_HEARTBEAT_S", intVal(&cfg.Devices.HeartbeatS)},
+		{"HARNESS_DEVICES_OFFLINE_AFTER_S", intVal(&cfg.Devices.OfflineAfterS)},
+		{"HARNESS_DEVICES_TASK_TTL_S", intVal(&cfg.Devices.TaskTTLS)},
+		{"HARNESS_DEVICES_STRICT_APPROVAL", boolVal(&cfg.Devices.StrictApprovalDevice)},
 	}
 	for _, b := range bindings {
 		v := env(b.key)
@@ -323,6 +361,18 @@ func (c *Config) Validate() error {
 	}
 	if c.Auth.SessionTTLH <= 0 {
 		return errors.New("config: auth.session_ttl_h 必须 > 0")
+	}
+	if c.Devices.PairTTLS <= 0 {
+		return errors.New("config: devices.pair_ttl_s 必须 > 0")
+	}
+	if c.Devices.HeartbeatS <= 0 {
+		return errors.New("config: devices.heartbeat_s 必须 > 0")
+	}
+	if c.Devices.OfflineAfterS <= 0 {
+		return errors.New("config: devices.offline_after_s 必须 > 0")
+	}
+	if c.Devices.TaskTTLS <= 0 {
+		return errors.New("config: devices.task_ttl_s 必须 > 0")
 	}
 	switch strings.ToLower(c.Log.Level) {
 	case "debug", "info", "warn", "error":

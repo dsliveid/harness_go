@@ -52,12 +52,12 @@ func (a *sessionDBAdapter) InsertToolEvent(ctx context.Context, ev *model.ToolEv
 	return a.sdb.ToolEvents().Insert(ctx, ev)
 }
 
-func (a *sessionDBAdapter) FinishToolEvent(ctx context.Context, id string, status model.ToolEventStatus, resultJSON, resultBlob, errMsg string) error {
+func (a *sessionDBAdapter) FinishToolEvent(ctx context.Context, id string, status model.ToolEventStatus, resultJSON, resultBlob, errMsg string, exec agent.ToolEventExec) error {
 	var raw json.RawMessage
 	if resultJSON != "" {
 		raw = json.RawMessage(resultJSON)
 	}
-	return a.sdb.ToolEvents().Finish(ctx, id, status, raw, resultBlob, errMsg)
+	return a.sdb.ToolEvents().Finish(ctx, id, status, raw, resultBlob, errMsg, exec)
 }
 
 func (a *sessionDBAdapter) ApprovalRules(ctx context.Context) ([]approval.Rule, error) {

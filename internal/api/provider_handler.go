@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 
 	"harness-go/internal/model"
 )
@@ -14,25 +15,37 @@ import (
 type decideApprovalReq struct {
 	Decision string `json:"decision"` // allow_once | allow_session | deny
 	Reason   string `json:"reason"`
+	// DeviceID 决策端设备 ID（阶段 C-7 跨端仲裁）：端侧 Runner 决策时填自身 device_id；
+	// 浏览器/管理端留空表示服务端本地执行面。strict_approval_device=true 时用于校验。
+	DeviceID string `json:"device_id"`
 }
 
 // decideApproval 提交审批决策：POST /api/v1/sessions/{sid}/runs/{rid}/approvals/{aid}/decide
+//
+// device_id 也可通过 query `?device_id=` 传入（端侧 WS 通道复用同一端点时更自然）；
+// body 优先（显式声明强于隐式 query）。
 func (h *handlers) decideApproval(w http.ResponseWriter, r *http.Request) {
 	var req decideApprovalReq
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, r, err)
 		return
 	}
-	err := h.d.Runs.DecideApproval(r.Context(),
-		r.PathValue("sid"), r.PathValue("rid"), r.PathValue("aid"), req.Decision, req.Reason)
+	deviceID := strings.TrimSpace(req.DeviceID)
+	if deviceID == "" {
+		deviceID = strings.TrimSpace(r.URL.Query().Get("device_id"))
+	}
+	err := h.d.Runs.DecideApprovalFromDevice(r.Context(),
+		r.PathValue("sid"), r.PathValue("rid"), r.PathValue("aid"),
+		req.Decision, req.Reason, deviceID)
 	if err != nil {
 		writeError(w, r, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"approval_id": r.PathValue("aid"),
-		"decision":    req.Decision,
-		"status":      "accepted",
+		"approval_id":       r.PathValue("aid"),
+		"decision":          req.Decision,
+		"status":            "accepted",
+		"decided_by_device": deviceID,
 	})
 }
 

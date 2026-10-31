@@ -17,7 +17,7 @@ interface UIState {
   settingsOpen: boolean
   advancedOpen: boolean
   advancedTab: 'workspace' | 'archive' | 'data' | 'theme'
-  settingsTab: 'models' | 'network' | 'sop' | 'tokenstats' | 'logs'
+  settingsTab: 'models' | 'network' | 'devices' | 'sop' | 'tokenstats' | 'logs'
   panel: SidePanel
   /** 当前打开的子进程对话 id（panel === 'subagent'） */
   subagentId: string | null

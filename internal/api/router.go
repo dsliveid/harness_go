@@ -10,6 +10,10 @@ import (
 var publicPaths = []string{
 	"/api/v1/auth/login",
 	"/api/v1/auth/sso",
+	// 端侧配对：端侧尚无用户令牌，配对码本身即凭据（一次性 + TTL 120s + 失败限流）
+	"/api/v1/devices/pair",
+	// 设备长连接：端侧无用户账号，由**设备令牌**在升级前独立鉴权（C-3）
+	"/api/v1/devices/ws",
 }
 
 // NewRouter 构建路由（标准库 ServeMux，Go 1.22+ 路径参数）。
@@ -46,6 +50,8 @@ func NewRouter(d Deps) http.Handler {
 	mux.HandleFunc("PATCH /api/v1/sessions/{sid}", h.renameSession)
 	mux.HandleFunc("DELETE /api/v1/sessions/{sid}", h.deleteSession)
 	mux.HandleFunc("GET /api/v1/sessions/{sid}/messages", h.listMessages)
+	// 会话租约（C-6）：跨端写者归属与 epoch，前端用于展示「谁在写」
+	mux.HandleFunc("GET /api/v1/sessions/{sid}/lease", h.getSessionLease)
 
 	// Run（嵌套在会话下：分库架构中 Run 必然属于某个会话，避免跨库查找）
 	mux.HandleFunc("POST /api/v1/sessions/{sid}/runs", h.createRun)
@@ -74,6 +80,14 @@ func NewRouter(d Deps) http.Handler {
 	mux.HandleFunc("GET /api/v1/tools", h.listTools)
 	mux.HandleFunc("GET /api/v1/tools/injection", h.toolsInjection)
 	mux.HandleFunc("PATCH /api/v1/tools/tiers", h.patchToolTiers)
+
+	// 设备（阶段 C：多端协同 HALO M5）——配对 / 列表 / 吊销 / 长连接
+	mux.HandleFunc("POST /api/v1/devices/pair-codes", h.createPairCode)
+	mux.HandleFunc("POST /api/v1/devices/pair", h.pairDevice)
+	mux.HandleFunc("GET /api/v1/devices", h.listDevices)
+	mux.HandleFunc("DELETE /api/v1/devices/{did}", h.revokeDevice)
+	// 设备长连接（C-3 WS 网关）：设备令牌在升级前独立鉴权，不走用户令牌中间件
+	mux.HandleFunc("GET /api/v1/devices/ws", h.deviceWS)
 
 	return Chain(mux,
 		Recover(d.Log),

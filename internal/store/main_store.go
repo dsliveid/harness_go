@@ -11,7 +11,8 @@ import (
 // MainStore 主库：跨会话共享数据。
 //
 // 表：sessions / users / api_tokens / providers / settings / schema_migrations
-// 铁律：不对外暴露 *sql.DB，仓储方法在 repo_main.go 中实现。
+// + 阶段 C 设备域：devices / device_pair_codes / capabilities / session_leases
+// 铁律：不对外暴露 *sql.DB，仓储方法在 repo_main.go / repo_provider.go / repo_device.go 中实现。
 type MainStore struct {
 	db   *sql.DB
 	path string

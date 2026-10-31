@@ -65,10 +65,26 @@ const (
 	CodePluginDegraded  Code = "plugin.degraded"
 )
 
-// 审批（B-3：审批决策端点）
+// 审批（B-3：审批决策端点 / C-7：跨端仲裁）
 const (
 	CodeApprovalNotFound      Code = "approval.not_found"
 	CodeApprovalAlreadyDecide Code = "approval.already_decided"
+	// CodeApprovalDeviceMismatch 审批绑定了执行端设备，决策方不是该设备（strict 模式）
+	CodeApprovalDeviceMismatch Code = "approval.device_mismatch"
+)
+
+// 设备与多端协同（阶段 C / 多端协同 HALO M5）
+const (
+	// CodeDevicePairCodeInvalid 配对码不存在 / 已消费 / 已过期（三者统一，防枚举）
+	CodeDevicePairCodeInvalid Code = "device.pair_code_invalid"
+	// CodeDeviceNotFound 设备不存在
+	CodeDeviceNotFound Code = "device.not_found"
+	// CodeDeviceRevoked 设备已吊销（令牌立即失效）
+	CodeDeviceRevoked Code = "device.revoked"
+	// CodeDeviceProtocolMismatch 端侧协议版本不兼容（支持 N / N-1）
+	CodeDeviceProtocolMismatch Code = "device.protocol_mismatch"
+	// CodeDeviceDisabled 设备域被配置关闭
+	CodeDeviceDisabled Code = "device.disabled"
 )
 
 // Error 统一错误类型。
@@ -175,21 +191,22 @@ func StatusFor(code Code) int {
 	case CodeInvalidArgument, CodeToolBadArgs, CodeAuthPasswordPolicy:
 		return http.StatusBadRequest
 	case CodeUnauthorized, CodeAuthInvalidCredentials, CodeAuthSignExpired,
-		CodeAuthSessionExpired:
+		CodeAuthSessionExpired, CodeDevicePairCodeInvalid, CodeDeviceRevoked:
 		return http.StatusUnauthorized
-	case CodeForbidden, CodeAuthSSODisabled, CodeToolDenied:
+	case CodeForbidden, CodeAuthSSODisabled, CodeToolDenied, CodeApprovalDeviceMismatch:
 		return http.StatusForbidden
 	case CodeNotFound, CodeSessionNotFound, CodeRunNotFound, CodeToolNotFound,
-		CodeApprovalNotFound:
+		CodeApprovalNotFound, CodeDeviceNotFound:
 		return http.StatusNotFound
-	case CodeConflict, CodeRunStateConflict, CodeApprovalAlreadyDecide:
+	case CodeConflict, CodeRunStateConflict, CodeApprovalAlreadyDecide,
+		CodeDeviceProtocolMismatch:
 		return http.StatusConflict
 	case CodeRateLimited, CodeAuthRateLimited:
 		return http.StatusTooManyRequests
 	case CodeStorageBlobTooLarge:
 		return http.StatusRequestEntityTooLarge
 	case CodeUnavailable, CodeToolUnavailable, CodePluginDegraded,
-		CodeStorageSessionPoolClosed, CodeRunConcurrencyFull:
+		CodeStorageSessionPoolClosed, CodeRunConcurrencyFull, CodeDeviceDisabled:
 		return http.StatusServiceUnavailable
 	default:
 		return http.StatusInternalServerError
