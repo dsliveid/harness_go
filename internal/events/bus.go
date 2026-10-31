@@ -83,8 +83,11 @@ const (
 
 // Subscriber 事件订阅者。
 type Subscriber struct {
-	ID    int64
+	ID int64
+	// RunID 归属 Run；全局订阅（SubscribeAll）时为 "*"。
 	RunID string
+	// Global true = 全局订阅（收到所有 Run 的新事件，不补发历史）。
+	Global bool
 
 	ch     chan Event
 	once   sync.Once
@@ -143,6 +146,7 @@ type Bus struct {
 	subBuf   int
 	nextSub  int64
 	runs     map[string]*runLog
+	allSubs  map[int64]*Subscriber // 全局订阅（Webhook 分发用，P1）
 }
 
 // NewBus 创建总线。ringSize<=0 用 500，subBuf<=0 用 256。
@@ -153,7 +157,8 @@ func NewBus(ringSize, subBuf int) *Bus {
 	if subBuf <= 0 {
 		subBuf = 256
 	}
-	return &Bus{ringSize: ringSize, subBuf: subBuf, runs: make(map[string]*runLog)}
+	return &Bus{ringSize: ringSize, subBuf: subBuf, runs: make(map[string]*runLog),
+		allSubs: make(map[int64]*Subscriber)}
 }
 
 // Publish 发布事件（分配 seq 并广播给所有订阅者）。
@@ -194,6 +199,13 @@ func (b *Bus) Publish(runID string, typ Type, payload any) (Event, error) {
 		if !sub.trySend(ev) {
 			sub.close(ReasonSlowConsumer)
 			delete(rl.subs, id)
+		}
+	}
+	// 全局订阅同口径广播（慢消费者断开）
+	for id, sub := range b.allSubs {
+		if !sub.trySend(ev) {
+			sub.close(ReasonSlowConsumer)
+			delete(b.allSubs, id)
 		}
 	}
 	return ev, nil
@@ -252,7 +264,7 @@ func (b *Bus) Subscribe(runID string, fromSeq int64) (*Subscriber, error) {
 	return sub, nil
 }
 
-// Unsubscribe 取消订阅（幂等）。
+// Unsubscribe 取消订阅（幂等；per-Run 与全局订阅同路径）。
 func (b *Bus) Unsubscribe(sub *Subscriber) {
 	if sub == nil {
 		return
@@ -262,7 +274,26 @@ func (b *Bus) Unsubscribe(sub *Subscriber) {
 	if rl, ok := b.runs[sub.RunID]; ok {
 		delete(rl.subs, sub.ID)
 	}
+	if sub.Global {
+		delete(b.allSubs, sub.ID)
+	}
 	sub.close(ReasonRunClosed)
+}
+
+// SubscribeAll 全局订阅（P1 Webhook 分发用）：**只要新事件、不补发历史**
+// （全局源无 per-Run 续传语义），慢消费者缓冲满即断开。
+func (b *Bus) SubscribeAll() *Subscriber {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.nextSub++
+	sub := &Subscriber{
+		ID:     b.nextSub,
+		RunID:  "*",
+		Global: true,
+		ch:     make(chan Event, b.subBuf),
+	}
+	b.allSubs[sub.ID] = sub
+	return sub
 }
 
 // CloseRun 关闭某个 Run 的事件源（Run 进入终态后调用）。

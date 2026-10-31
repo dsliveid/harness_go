@@ -41,8 +41,8 @@ func TestRetrievalMigration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v != 5 {
-		t.Fatalf("主库 schema 版本期望 5，得到 %d", v)
+	if v != 6 {
+		t.Fatalf("主库 schema 版本期望 6，得到 %d", v)
 	}
 }
 

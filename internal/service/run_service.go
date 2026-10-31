@@ -142,6 +142,12 @@ func (s *RunService) CreateRun(ctx context.Context, sessionID, userInput, modelR
 // 只做传递不做校验：设备合法性由 WS 网关/执行面路由保证，这里校验会引入
 // 「服务端 Run 被设备表状态卡住」的隐性耦合。
 func (s *RunService) CreateRunAs(ctx context.Context, sessionID, userInput, modelRef, deviceID string) (*model.Run, error) {
+	return s.CreateRunWithSystem(ctx, sessionID, userInput, modelRef, deviceID, "")
+}
+
+// CreateRunWithSystem 同 CreateRunAs，但允许覆盖本轮 SystemBase（P1 OpenAI 兼容端点：
+// 客户端 system 消息优先）。空串 = 服务默认系统提示（行为不变）。
+func (s *RunService) CreateRunWithSystem(ctx context.Context, sessionID, userInput, modelRef, deviceID, systemBase string) (*model.Run, error) {
 	if userInput == "" {
 		return nil, invalidArg("用户输入不能为空")
 	}
@@ -203,13 +209,17 @@ func (s *RunService) CreateRunAs(ctx context.Context, sessionID, userInput, mode
 	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	s.registerCancel(run.ID, cancel)
 
+	system := s.systemBase
+	if strings.TrimSpace(systemBase) != "" {
+		system = systemBase
+	}
 	req := agent.RunRequest{
 		RunID:           run.ID,
 		SessionID:       sessionID,
 		UserInput:       userInput,
 		ModelRef:        modelRef,
 		AccessMode:      approval.AccessMode(normalizeAccessMode(sess.AccessMode)),
-		SystemBase:      s.systemBase,
+		SystemBase:      system,
 		SOP:             s.currentSOP(),
 		ProjectSummary:  "",
 		Tools:           s.currentTools(),

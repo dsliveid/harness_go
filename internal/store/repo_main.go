@@ -31,12 +31,15 @@ func (r *SessionRepo) Create(ctx context.Context, sess *model.Session) error {
 	if sess.AccessMode == "" {
 		sess.AccessMode = "confirm"
 	}
+	if sess.Source == "" {
+		sess.Source = "ui"
+	}
 	_, err := r.s.conn().ExecContext(ctx,
 		`INSERT INTO sessions(id, title, workspace_path, access_mode, model_ref, user_id,
-		                     created_at, updated_at)
-		 VALUES(?,?,?,?,?,?,?,?)`,
+		                     created_at, updated_at, source)
+		 VALUES(?,?,?,?,?,?,?,?,?)`,
 		sess.ID, sess.Title, sess.WorkspacePath, sess.AccessMode, sess.ModelRef, sess.UserID,
-		sess.CreatedAt, sess.UpdatedAt)
+		sess.CreatedAt, sess.UpdatedAt, sess.Source)
 	if err != nil {
 		return fmt.Errorf("store: 创建会话失败: %w", err)
 	}
@@ -45,7 +48,7 @@ func (r *SessionRepo) Create(ctx context.Context, sess *model.Session) error {
 
 const sessionColumns = `id, title, workspace_path, access_mode, model_ref, user_id,
 	message_count, last_message_at, total_tokens, last_run_status,
-	created_at, updated_at, deleted_at`
+	created_at, updated_at, deleted_at, source`
 
 func scanSession(sc interface{ Scan(...any) error }) (model.Session, error) {
 	var (
@@ -53,10 +56,11 @@ func scanSession(sc interface{ Scan(...any) error }) (model.Session, error) {
 		lastMsg sql.NullInt64
 		status  sql.NullString
 		deleted sql.NullInt64
+		source  sql.NullString
 	)
 	err := sc.Scan(&s.ID, &s.Title, &s.WorkspacePath, &s.AccessMode, &s.ModelRef, &s.UserID,
 		&s.MessageCount, &lastMsg, &s.TotalTokens, &status,
-		&s.CreatedAt, &s.UpdatedAt, &deleted)
+		&s.CreatedAt, &s.UpdatedAt, &deleted, &source)
 	if err != nil {
 		return model.Session{}, err
 	}
@@ -70,6 +74,10 @@ func scanSession(sc interface{ Scan(...any) error }) (model.Session, error) {
 	if deleted.Valid {
 		v := deleted.Int64
 		s.DeletedAt = &v
+	}
+	s.Source = source.String
+	if s.Source == "" {
+		s.Source = "ui"
 	}
 	return s, nil
 }
@@ -97,7 +105,7 @@ func (r *SessionRepo) List(ctx context.Context, limit, offset int) ([]model.Sess
 		offset = 0
 	}
 	rows, err := r.s.conn().QueryContext(ctx,
-		`SELECT `+sessionColumns+` FROM sessions WHERE deleted_at IS NULL
+		`SELECT `+sessionColumns+` FROM sessions WHERE deleted_at IS NULL AND source='ui'
 		 ORDER BY updated_at DESC LIMIT ? OFFSET ?`, limit, offset)
 	if err != nil {
 		return nil, fmt.Errorf("store: 列出会话失败: %w", err)

@@ -391,6 +391,23 @@ func run() error {
 		Sessions:  sessionStore,
 		Snapshots: snapStore,
 	})
+
+	// ⑩''' P1：Webhook 事件订阅（HMAC 签名 + 白名单 + 重试退避）+ OpenAI 兼容端点。
+	webhookSvc := service.NewWebhookService(service.WebhookServiceOptions{
+		Main:   mainStore,
+		Cipher: secretCipher,
+		Bus:    bus,
+		Logger: logger,
+	})
+	webhookSvc.Start(ctx)
+	defer webhookSvc.Stop()
+	openaiSvc := service.NewOpenAICompatService(service.OpenAICompatServiceOptions{
+		Main:     mainStore,
+		Sessions: sessionStore,
+		Runs:     runSvc,
+		Bus:      bus,
+	})
+
 	toolHost.SetSnapshots(snapStore)
 	toolHost.SetTasks(taskMgr)
 	toolHost.SetBundles(bundleSvc)
@@ -497,6 +514,8 @@ func run() error {
 		MCP:         mcpSvc,
 		Packages:    pkgSvc,
 		Rollback:    rollbackSvc,
+		Webhooks:    webhookSvc,
+		OpenAI:      openaiSvc,
 		DeviceWS:    deviceWSHandler(deviceGateway),
 		Bus:         bus,
 		Auth:        authSvc,

@@ -50,6 +50,18 @@ func NewRouter(d Deps) http.Handler {
 	mux.HandleFunc("PATCH /api/v1/sessions/{sid}", h.renameSession)
 	mux.HandleFunc("DELETE /api/v1/sessions/{sid}", h.deleteSession)
 	mux.HandleFunc("GET /api/v1/sessions/{sid}/messages", h.listMessages)
+	// P1：Webhook 事件订阅管理（需求 §4.4）
+	mux.HandleFunc("GET /api/v1/webhooks", h.listWebhooks)
+	mux.HandleFunc("POST /api/v1/webhooks", h.createWebhook)
+	mux.HandleFunc("DELETE /api/v1/webhooks/{id}", h.deleteWebhook)
+	mux.HandleFunc("POST /api/v1/webhooks/{id}/enable", h.setWebhookEnabled(true))
+	mux.HandleFunc("POST /api/v1/webhooks/{id}/disable", h.setWebhookEnabled(false))
+	mux.HandleFunc("POST /api/v1/webhooks/{id}/test", h.testWebhook)
+
+	// P1：OpenAI 兼容端点（需求 §4.3；Bearer API Token 鉴权沿用全局中间件）
+	mux.HandleFunc("GET /v1/models", h.listOpenAIModels)
+	mux.HandleFunc("POST /v1/chat/completions", h.createOpenAIChatCompletion)
+
 	// 阶段 G：快照回滚（S10 消息/轮次/工具级 revert & reapply）
 	mux.HandleFunc("POST /api/v1/sessions/{sid}/rollback", h.createRollback)
 	mux.HandleFunc("GET /api/v1/sessions/{sid}/rollbacks", h.listRollbacks)

@@ -176,7 +176,7 @@ func (e *Engine) Execute(ctx context.Context, req RunRequest) error {
 	if err := e.transition(ctx, sdb, req.RunID, model.RunRunning, "", "", ""); err != nil {
 		return err
 	}
-	e.publishStatus(req.RunID, model.RunRunning, "", "", "")
+	e.publishStatus(req.RunID, req.SessionID, model.RunRunning, "", "", "")
 
 	final, stopReason, errCode, errMsg, tokens := e.loop(ctx, sdb, req)
 
@@ -184,7 +184,7 @@ func (e *Engine) Execute(ctx context.Context, req RunRequest) error {
 		// 终态迁移失败不掩盖原始错误
 		return fmt.Errorf("agent: 终态迁移失败: %w (原始状态=%s)", err, final)
 	}
-	e.publishStatus(req.RunID, final, stopReason, errCode, errMsg)
+	e.publishStatus(req.RunID, req.SessionID, final, stopReason, errCode, errMsg)
 	e.deps.Events.CloseRun(req.RunID)
 
 	// ③ 摘要回写主库（**不同事务、最终一致**；失败只影响列表新鲜度）
@@ -202,6 +202,13 @@ func (e *Engine) Execute(ctx context.Context, req RunRequest) error {
 func (e *Engine) loop(ctx context.Context, sdb SessionDB, req RunRequest) (
 	final model.RunStatus, stopReason, errCode, errMsg string, tokens int64,
 ) {
+	// P1：per-Run 用量累计，返回前统一回写 runs 表（取消路径也记账——
+	// WithoutCancel 保证写入不被请求取消吞掉）。
+	var runPrompt, runCompletion int64
+	defer func() {
+		_ = sdb.AddRunUsage(context.WithoutCancel(ctx), req.RunID, runPrompt, runCompletion)
+	}()
+
 	history, err := e.loadHistory(ctx, sdb)
 	if err != nil {
 		return model.RunFailed, "", "history_load_failed", err.Error(), 0
@@ -251,6 +258,8 @@ func (e *Engine) loop(ctx context.Context, sdb SessionDB, req RunRequest) (
 
 		out, status, code, failMsg, used := e.streamOnce(ctx, req, provider, res)
 		tokens += used
+		runPrompt += out.promptTokens
+		runCompletion += out.completionTokens
 		if status != "" { // 非空表示本轮异常终止
 			return status, "", code, failMsg, tokens
 		}
@@ -310,6 +319,10 @@ func (e *Engine) loop(ctx context.Context, sdb SessionDB, req RunRequest) (
 type streamOutcome struct {
 	content   string
 	toolCalls []llm.ToolCall
+	// promptTokens / completionTokens 本轮流式用量（P1：随终态回写 runs 表，
+	// OpenAI 兼容端点与 UI 的 usage 以此为准）。
+	promptTokens     int64
+	completionTokens int64
 }
 
 // streamOnce 执行一轮模型调用并消费流。
@@ -363,6 +376,8 @@ func (e *Engine) streamOnce(ctx context.Context, req RunRequest, provider llm.Pr
 		}
 		if ch.Usage != nil {
 			tokens += int64(ch.Usage.TotalTokens)
+			out.promptTokens += int64(ch.Usage.PromptTokens)
+			out.completionTokens += int64(ch.Usage.CompletionTokens)
 		}
 		if ch.ToolCall != nil {
 			a, ok := accs[ch.ToolCall.Index]
@@ -470,6 +485,7 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 			"tool_name":     tc.Name,
 			"risk":          string(risk),
 			"reason":        reason,
+			"session_id":    req.SessionID,
 			// 新增字段（协议向后兼容，仅新增不改形状）：前端据此显示「需在端侧确认」
 			"requested_by_device": requester,
 			"required_device_id":  required,
@@ -555,6 +571,7 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 		"status":        string(result.Status),
 		"result":        result.ResultJSON,
 		"error":         result.Error,
+		"session_id":    req.SessionID,
 		// 新增字段（协议向后兼容，仅新增不改形状）：前端可据此显示「端侧执行」徽标
 		"executor":     string(execInfo.Executor),
 		"device_id":    execInfo.DeviceID,
@@ -600,8 +617,8 @@ func (e *Engine) publish(runID string, typ events.Type, payload any) {
 	_, _ = e.deps.Events.Publish(runID, typ, payload)
 }
 
-func (e *Engine) publishStatus(runID string, status model.RunStatus, stopReason, errCode, errMsg string) {
-	payload := map[string]any{"status": string(status)}
+func (e *Engine) publishStatus(runID, sessionID string, status model.RunStatus, stopReason, errCode, errMsg string) {
+	payload := map[string]any{"status": string(status), "session_id": sessionID}
 	if stopReason != "" {
 		payload["stop_reason"] = stopReason
 	}

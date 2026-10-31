@@ -31,6 +31,9 @@ type Deps struct {
 	Packages *service.PackageService
 	// Rollback 快照回滚（阶段 G / S10；nil 时相关端点返回 unavailable）
 	Rollback *service.RollbackService
+	// Webhooks / OpenAI 接入增强（P1；nil 时相关端点返回 unavailable）
+	Webhooks *service.WebhookService
+	OpenAI   *service.OpenAICompatService
 	// DeviceWS 设备长连接网关（阶段 C-3；nil 时 /devices/ws 返回 503 device.disabled）
 	DeviceWS    http.Handler
 	Bus         *events.Bus

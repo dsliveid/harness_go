@@ -308,6 +308,15 @@ export const API_PATHS = {
   deviceWS: '/api/v1/devices/ws',
   /** C-6：会话租约（跨端写者归属） */
   sessionLease: (sid: string) => `/api/v1/sessions/${sid}/lease`,
+  /* P1：Webhook 事件订阅 */
+  webhooks: '/api/v1/webhooks',
+  webhook: (id: string) => `/api/v1/webhooks/${id}`,
+  webhookEnable: (id: string) => `/api/v1/webhooks/${id}/enable`,
+  webhookDisable: (id: string) => `/api/v1/webhooks/${id}/disable`,
+  webhookTest: (id: string) => `/api/v1/webhooks/${id}/test`,
+  /* P1：OpenAI 兼容端点 */
+  openAIModels: '/v1/models',
+  openAIChat: '/v1/chat/completions',
   /* 阶段 G：快照回滚（S10 消息/轮次/工具级 revert & reapply） */
   rollback: (sid: string) => `/api/v1/sessions/${sid}/rollback`,
   rollbacks: (sid: string) => `/api/v1/sessions/${sid}/rollbacks`,
@@ -639,4 +648,23 @@ export interface RevertRequest {
   tool_event_id?: string;
   run_id?: string;
   message_seq?: number;
+}
+
+/* ============ P1：Webhook 订阅（与 openapi.yaml schemas 对应） ============ */
+
+/** Webhook 订阅（secret 只写不读）。 */
+export interface Webhook {
+  id: string;
+  url: string;
+  has_secret: boolean;
+  events: string[];
+  enabled: boolean;
+  created_at: number;
+}
+
+/** Webhook 创建入参。 */
+export interface WebhookCreateInput {
+  url: string;
+  secret?: string;
+  events?: string[];
 }

@@ -137,7 +137,8 @@ func UserID(ctx context.Context) string {
 	return ""
 }
 
-// Auth 鉴权：/api/** 必须携带有效令牌；publicPaths 中的路径放行（如登录、SSO）。
+// Auth 鉴权：/api/** 与 /v1/**（OpenAI 兼容端点，P1）必须携带有效令牌；
+// publicPaths 中的路径放行（如登录、SSO）。
 func Auth(verify TokenVerifier, publicPaths ...string) Middleware {
 	public := make(map[string]bool, len(publicPaths))
 	for _, p := range publicPaths {
@@ -145,7 +146,9 @@ func Auth(verify TokenVerifier, publicPaths ...string) Middleware {
 	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if !strings.HasPrefix(r.URL.Path, "/api/") || public[r.URL.Path] {
+			protected := strings.HasPrefix(r.URL.Path, "/api/") ||
+				strings.HasPrefix(r.URL.Path, "/v1/")
+			if !protected || public[r.URL.Path] {
 				next.ServeHTTP(w, r)
 				return
 			}

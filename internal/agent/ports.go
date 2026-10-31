@@ -33,6 +33,9 @@ type SessionDB interface {
 
 	ApprovalRules(ctx context.Context) ([]approval.Rule, error)
 	AddApprovalRule(ctx context.Context, toolName, pattern string) error
+
+	// AddRunUsage 回写单次 Run 的 token 用量（P1：runs 表预埋列的落点）。
+	AddRunUsage(ctx context.Context, runID string, promptTokens, completionTokens int64) error
 }
 
 // SummaryWriter 主库摘要回写（**与会话库不同事务，最终一致**）。

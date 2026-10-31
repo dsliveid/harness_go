@@ -103,12 +103,14 @@ const (
 
 // Session 会话（主库）。
 type Session struct {
-	ID            string    `json:"id"`
-	Title         string    `json:"title"`
-	WorkspacePath string    `json:"workspace_path"`
-	AccessMode    string    `json:"access_mode"`
-	ModelRef      string    `json:"model_ref"`
-	UserID        string    `json:"user_id"`
+	ID            string `json:"id"`
+	Title         string `json:"title"`
+	WorkspacePath string `json:"workspace_path"`
+	AccessMode    string `json:"access_mode"`
+	ModelRef      string `json:"model_ref"`
+	UserID        string `json:"user_id"`
+	// Source 会话来源：ui（默认）/ openai（OpenAI 兼容端点的隐藏会话，P1）。
+	Source        string    `json:"source,omitempty"`
 	MessageCount  int64     `json:"message_count"`
 	LastMessageAt *int64    `json:"last_message_at,omitempty"`
 	TotalTokens   int64     `json:"total_tokens"`

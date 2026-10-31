@@ -75,15 +75,15 @@ func TestMainDevicesMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 0004_market.sql 落地后主库版本为 4。
-	if v != 5 {
-		t.Fatalf("主库 schema 版本期望 5，得到 %d", v)
+	if v != 6 {
+		t.Fatalf("主库 schema 版本期望 6，得到 %d", v)
 	}
 	req, err := RequiredSchemaVersion("main")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if req != 5 {
-		t.Fatalf("RequiredSchemaVersion(main) 期望 5，得到 %d", req)
+	if req != 6 {
+		t.Fatalf("RequiredSchemaVersion(main) 期望 6，得到 %d", req)
 	}
 }
 
@@ -601,12 +601,12 @@ func TestMigrationUpgradeFromV1(t *testing.T) {
 	if err != nil {
 		t.Fatalf("主库增量迁移失败: %v", err)
 	}
-	// v1 库升级：0002_devices + 0003_retrieval + 0004_market + 0005_snapshots 共 4 个增量迁移。
-	if applied != 4 {
-		t.Fatalf("主库增量迁移应应用 4 个，得到 %d", applied)
+	// v1 库升级：0002_devices + 0003_retrieval + 0004_market + 0005_snapshots + 0006_webhooks 共 5 个增量迁移。
+	if applied != 5 {
+		t.Fatalf("主库增量迁移应应用 5 个，得到 %d", applied)
 	}
-	if v, _ := SchemaVersion(ctx, mdb); v != 5 {
-		t.Fatalf("主库升级后版本期望 5，得到 %d", v)
+	if v, _ := SchemaVersion(ctx, mdb); v != 6 {
+		t.Fatalf("主库升级后版本期望 6，得到 %d", v)
 	}
 	var title string
 	if err := mdb.QueryRowContext(ctx, `SELECT title FROM sessions WHERE id='old-s1'`).Scan(&title); err != nil {

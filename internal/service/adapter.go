@@ -78,6 +78,11 @@ func (a *sessionDBAdapter) AddApprovalRule(ctx context.Context, toolName, patter
 	return a.sdb.ApprovalRules().Add(ctx, toolName, pattern)
 }
 
+// AddRunUsage 回写单次 Run 的 token 用量（P1）。
+func (a *sessionDBAdapter) AddRunUsage(ctx context.Context, runID string, promptTokens, completionTokens int64) error {
+	return a.sdb.Runs().AddUsage(ctx, runID, promptTokens, completionTokens)
+}
+
 // NewSummaryWriter 把 store.MainStore 适配成 agent.SummaryWriter。
 func NewSummaryWriter(m *store.MainStore) agent.SummaryWriter {
 	return &summaryWriter{m: m}

@@ -354,6 +354,17 @@ func (r *RunRepo) ListUnfinished(ctx context.Context) ([]model.Run, error) {
 	return out, rows.Err()
 }
 
+// AddUsage 累加单次 Run 的 token 用量（P1：引擎终态回写；预埋列的落点）。
+func (r *RunRepo) AddUsage(ctx context.Context, runID string, promptTokens, completionTokens int64) error {
+	_, err := r.s.conn().ExecContext(ctx,
+		`UPDATE runs SET input_tokens = input_tokens + ?, output_tokens = output_tokens + ? WHERE id = ?`,
+		promptTokens, completionTokens, runID)
+	if err != nil {
+		return fmt.Errorf("store: 回写 Run 用量失败: %w", err)
+	}
+	return nil
+}
+
 // FailOpenRuns 把未完成 Run 置为 interrupted（进程重启恢复，ADR-009 不做续跑）。
 func (r *RunRepo) FailOpenRuns(ctx context.Context, reason string) (int, error) {
 	if reason == "" {

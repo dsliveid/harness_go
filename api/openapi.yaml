@@ -274,6 +274,152 @@ paths:
                   items:
                     type: array
                     items: { $ref: "#/components/schemas/Message" }
+  /api/v1/webhooks:
+    get:
+      tags: [webhooks]
+      summary: Webhook 订阅列表（secret 脱敏，只回 has_secret；P1）
+      responses:
+        "200":
+          description: 订阅列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Webhook" }
+    post:
+      tags: [webhooks]
+      summary: 新增订阅（url + secret(HMAC) + 事件白名单；P1）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url: { type: string }
+                secret: { type: string, description: HMAC-SHA256 签名密钥（明文只出现一次） }
+                events:
+                  type: array
+                  items: { type: string, enum: [run.completed, run.failed, run.interrupted, approval.requested, tool.failed] }
+                  description: 白名单（空 = 全部一期事件）
+      responses:
+        "201":
+          description: 订阅（脱敏）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Webhook" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+  /api/v1/webhooks/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    delete:
+      tags: [webhooks]
+      summary: 删除订阅
+      responses:
+        "204": { description: 已删除 }
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/v1/webhooks/{id}/enable:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [webhooks]
+      summary: 启用订阅
+      responses:
+        "204": { description: 已启用 }
+  /api/v1/webhooks/{id}/disable:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [webhooks]
+      summary: 停用订阅
+      responses:
+        "204": { description: 已停用 }
+  /api/v1/webhooks/{id}/test:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { type: string }
+    post:
+      tags: [webhooks]
+      summary: 联通测试（同步投递一条 webhook.test 事件，不重试）
+      responses:
+        "200":
+          description: 投递结果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: integer }
+                  ok: { type: boolean }
+  /v1/models:
+    get:
+      tags: [openai-compat]
+      summary: OpenAI 兼容模型清单（enabled providers 聚合 + default；P1）
+      responses:
+        "200":
+          description: OpenAI list 形状
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  object: { type: string }
+                  data:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        object: { type: string }
+                        created: { type: integer }
+                        owned_by: { type: string }
+  /v1/chat/completions:
+    post:
+      tags: [openai-compat]
+      summary: OpenAI 兼容对话补全（stream:true 为 OpenAI chunk SSE；X-Session-ID 复用会话，否则映射隐藏会话；P1）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [messages]
+              properties:
+                model: { type: string }
+                messages:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      role: { type: string, enum: [system, user, assistant] }
+                      content: { type: string }
+                stream: { type: boolean }
+                stream_options:
+                  type: object
+                  properties:
+                    include_usage: { type: boolean }
+      responses:
+        "200":
+          description: 非流式为 chat.completion；流式为 text/event-stream（data: chunk / [DONE]）
+        "400":
+          $ref: "#/components/responses/BadRequest"
   /api/v1/sessions/{sid}/rollback:
     parameters:
       - $ref: "#/components/parameters/SessionID"
@@ -1098,6 +1244,19 @@ components:
             size: { type: integer, format: int64 }
             absent: { type: boolean, description: true = 快照时文件不存在（恢复即删除） }
       size: { type: integer, format: int64 }
+      created_at: { type: integer, format: int64 }
+  Webhook:
+    type: object
+    description: Webhook 订阅（P1；secret 只写不读）
+    properties:
+      id: { type: string }
+      url: { type: string }
+      has_secret: { type: boolean }
+      events:
+        type: array
+        items: { type: string }
+        description: 白名单（空 = 全部一期事件）
+      enabled: { type: boolean }
       created_at: { type: integer, format: int64 }
   securitySchemes:
     bearerAuth:

@@ -28,6 +28,8 @@ type fakeSessionDB struct {
 	seq        int64
 }
 
+func (f *fakeSessionDB) AddRunUsage(_ context.Context, _ string, _, _ int64) error { return nil }
+
 func (f *fakeSessionDB) AppendMessage(_ context.Context, m *model.Message) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
