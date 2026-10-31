@@ -100,6 +100,11 @@ type RunRequest struct {
 	// 铁律：只影响「注入深度」，不影响「能否执行」（宽进严出）——
 	// 未列出的 deferred 工具仍可被调用，只是模型看不到其 schema。
 	ActiveTools []string
+	// MemoryCore 记忆常驻块（D-3：L0 核心约束 + L1 项目摘要），进 system 稳定前缀。
+	// 由 service 层每 Run 召回一次后传入；引擎只透传不解释。
+	MemoryCore string
+	// MemoryTail 记忆动态块（D-3：L2/L3 检索命中），置尾注入；预算降级第①级的省略对象。
+	MemoryTail string
 	// LeaseHolder 会话租约持有者（阶段 C-6）：设备 ID；空串 = 服务端本地执行面。
 	// 端侧发起 Run 时由 service 层填入该设备 ID，抢占旧端 epoch+1 并推送 lease.revoked。
 	LeaseHolder string
@@ -207,8 +212,25 @@ func (e *Engine) loop(ctx context.Context, sdb SessionDB, req RunRequest) (
 			History:        history,
 			Tools:          req.Tools,
 			ActiveTools:    req.ActiveTools,
+			MemoryCore:     req.MemoryCore,
+			MemoryTail:     req.MemoryTail,
 			UserInput:      userInput,
 		})
+
+		// D-4 预算闸门：降级后仍超预算 → 明确失败该 Run（严禁静默截断）。
+		// 降级动作本身已记录在 res.Degrade，这里发非致命事件供前端/日志观察。
+		if len(res.Degrade) > 0 {
+			e.publish(req.RunID, events.TypeError, map[string]any{
+				"scope":   "budget_gate",
+				"code":    "agent.budget_degrade",
+				"message": strings.Join(degradeDetails(res.Degrade), "；"),
+				"level":   int(res.Degrade[len(res.Degrade)-1].Level),
+			})
+		}
+		if res.OverBudget {
+			return model.RunFailed, "", "budget_exhausted",
+				"上下文超出总预算，五级降级用尽后仍超限（严禁静默截断）", tokens
+		}
 
 		provider, modelName, err := e.deps.Models.Resolve(ctx, req.ModelRef)
 		if err != nil {
@@ -532,6 +554,17 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 		payload = result.Error
 	}
 	return toolMessage(tc, payload), false
+}
+
+// degradeDetails 提取降级动作明细（事件 payload 用）。
+func degradeDetails(actions []prompt.DegradeAction) []string {
+	out := make([]string, 0, len(actions))
+	for _, a := range actions {
+		if a.Detail != "" {
+			out = append(out, prompt.LevelName(a.Level)+"："+a.Detail)
+		}
+	}
+	return out
 }
 
 // loadHistory 载入会话历史并转成 llm.Message。

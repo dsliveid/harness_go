@@ -54,6 +54,13 @@ type Input struct {
 	// 铁律：这只是「注入深度」的提升，不改变工具能否被调用 ——
 	// 未列出的 deferred 工具仍可执行（宽进严出），只是模型看不到其 schema。
 	ActiveTools []string
+	// MemoryCore 记忆常驻块（D-3：L0 核心约束 + L1 项目三行摘要）。
+	// 随会话稳定 → 进 system **稳定前缀**（在 deferred 索引段之前），可被前缀缓存。
+	// 预算降级第①级**不省略**它（L0 是硬约束，省略会改变模型行为边界）。
+	MemoryCore string
+	// MemoryTail 记忆动态块（D-3：L2 情景 digest + L3 档案命中）。
+	// 每轮随查询变化 → **必须置尾**（与 DynamicTail 同级），是预算降级第①级的省略对象。
+	MemoryTail  string
 	DynamicTail string // 动态内容（检索结果/运行时锚注），**必须置尾**
 	UserInput   string // 本轮用户输入
 }
@@ -80,6 +87,9 @@ type BuildResult struct {
 	Estimated      bool // 计数是否为估算（UI 需标注 ≈）
 	OverBudget     bool // 超出总预算（上层决定压缩或明确报错，禁止静默截断）
 	DroppedHistory int  // 因预算裁剪掉的历史消息数
+	// Degrade 预算降级动作记录（D-4）：空 = 本轮未降级；
+	// 非空时逐档记录实际动作（可观测铁律：每一级降级都必须可见）。
+	Degrade []DegradeAction
 }
 
 // Limits 预算与注入限制。
@@ -148,10 +158,12 @@ func (b *Builder) Build(in Input) BuildResult {
 		history, dropped = b.trimHistory(history, b.limits.MaxHistory)
 	}
 
-	// 动态段必须置尾：拼到本轮 user 消息正文前，绝不进 system（否则前缀缓存全废）
+	// 动态段必须置尾：记忆块（L2/L3）与运行时动态内容按序拼接在本轮 user 消息正文前，
+	// 绝不进 system（否则前缀缓存全废）。
+	tail := joinTails(in.MemoryTail, in.DynamicTail)
 	userContent := in.UserInput
-	if in.DynamicTail != "" {
-		userContent = in.DynamicTail + "\n\n" + in.UserInput
+	if tail != "" {
+		userContent = tail + "\n\n" + in.UserInput
 	}
 
 	msgs := make([]llm.Message, 0, len(history)+1)
@@ -225,6 +237,13 @@ func (b *Builder) buildSystem(in Input, sop []string, deferred []ToolRef) string
 	if in.ProjectSummary != "" {
 		sb.WriteString("\n## 项目约束\n")
 		sb.WriteString(strings.TrimSpace(in.ProjectSummary))
+		sb.WriteString("\n")
+	}
+	if in.MemoryCore != "" {
+		// 记忆常驻块放 deferred 索引段**之前**：索引段随检索命中变化，
+		// 记忆块随会话稳定，越靠前可缓存前缀越长。
+		sb.WriteString("\n## 核心记忆\n")
+		sb.WriteString(strings.TrimSpace(in.MemoryCore))
 		sb.WriteString("\n")
 	}
 	if len(deferred) > 0 {
@@ -366,6 +385,17 @@ func firstLine(s string) string {
 		return string(r[:60]) + "…"
 	}
 	return s
+}
+
+// joinTails 拼接动态尾段（跳过空段，保序）。动态内容之间以空行分隔。
+func joinTails(parts ...string) string {
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return strings.Join(out, "\n\n")
 }
 
 func maxInt(a, b int) int {

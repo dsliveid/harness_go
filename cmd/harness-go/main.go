@@ -31,6 +31,7 @@ import (
 	"harness-go/internal/device"
 	"harness-go/internal/events"
 	"harness-go/internal/llm"
+	"harness-go/internal/memory"
 	"harness-go/internal/observ"
 	"harness-go/internal/prompt"
 	"harness-go/internal/retrieval"
@@ -123,11 +124,21 @@ func run() error {
 	defer bus.Close()
 
 	// ⑤ 上下文组装
+	// D-4 预算：max_total>0 时历史段按 history_ratio 预裁（正常裁剪，有计数），
+	// 剩余超限部分由 BudgetGate 五级降级处理（降级用尽即明确报错）。
+	maxHistory := 0
+	if cfg.Budget.MaxTotal > 0 {
+		maxHistory = int(float64(cfg.Budget.MaxTotal) * cfg.Budget.HistoryRatio)
+	}
 	tokenizers := tokenizer.NewRegistry()
 	builder := prompt.NewBuilder(tokenizers.For(""), prompt.Limits{
+		MaxTotal:         cfg.Budget.MaxTotal,
+		MaxHistory:       maxHistory,
 		MaxDeferredIndex: cfg.Tools.DeferredSoftLimit,
 		MaxSOP:           6,
 	})
+	// D-4 预算闸门：包装组装器串五级降级。max_total=0 时直通零开销（行为不变）。
+	gatedBuilder := service.NewBudgetGate(builder, cfg.Budget.MaxTotal, cfg.Tools.DynamicMinTopK)
 
 	// ⑥ 模型 provider（未配置真实端点时回退 fake，便于端到端验证）
 	provider, providerDesc := buildProvider(logger)
@@ -200,7 +211,7 @@ func run() error {
 		Summary:       service.NewSummaryWriter(mainStore),
 		Events:        bus,
 		Models:        modelResolver,
-		Builder:       builder,
+		Builder:       gatedBuilder,
 		Tools:         toolRunner,
 		Catalog:       toolRunner,
 		Gate:          gate,
@@ -242,6 +253,10 @@ func run() error {
 
 	// ⑩ 用例层
 	sessionSvc := service.NewSessionService(mainStore, sessionStore)
+	// D-3 记忆四层：四层全部落主库检索表（kind = memory_l0/l1/l2/l3），
+	// 复用 retrieval_docs / retrieval_vectors 与 FTS5 触发器，零新增迁移。
+	// embedding 未配置时向量通道自动停用（诚实降级：召回走关键词 + 衰减 + 重要性）。
+	memoryStore := memory.New(memory.Options{Repo: mainStore.Retrieval()})
 	runSvc := service.NewRunService(service.RunServiceOptions{
 		Main:       mainStore,
 		Sessions:   sessionStore,
@@ -260,6 +275,8 @@ func run() error {
 			TopK:    cfg.Tools.DynamicTopK,
 			MinTopK: cfg.Tools.DynamicMinTopK,
 		},
+		// D-3：记忆召回（L0/L1 稳定前缀 + L2/L3 检索置尾）
+		Memory: memoryStore,
 		// C-7：高风险审批是否仅限执行端设备确认（默认 false = 只审计不阻断）
 		StrictApprovalDevice: cfg.Devices.StrictApprovalDevice,
 	})

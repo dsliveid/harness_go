@@ -22,6 +22,11 @@ type Kind string
 const (
 	// KindTool 工具索引（deferred 档按需注入的候选池）。
 	KindTool Kind = "tool"
+	// KindMemoryL0 记忆核心层（用户偏好/硬约束/项目身份，常驻全量注入 ≤800 token）。
+	// D-3 落地新增：0003 迁移的 kind 列无 CHECK 约束，加类别不需迁移。
+	KindMemoryL0 Kind = "memory_l0"
+	// KindMemoryL1 记忆项目层（技术栈/约定/避坑，注入 3 行摘要 + 按需拉全文）。
+	KindMemoryL1 Kind = "memory_l1"
 	// KindMemoryL2 记忆情景层（digest 碎记，向量检索主战场）。
 	KindMemoryL2 Kind = "memory_l2"
 	// KindMemoryL3 记忆档案层（全量文档，检索后按 path:line 引用）。
@@ -31,11 +36,16 @@ const (
 // Valid 判断类别是否为已知值。
 func (k Kind) Valid() bool {
 	switch k {
-	case KindTool, KindMemoryL2, KindMemoryL3:
+	case KindTool, KindMemoryL0, KindMemoryL1, KindMemoryL2, KindMemoryL3:
 		return true
 	default:
 		return false
 	}
+}
+
+// MemoryKinds 返回全部记忆类别（L0→L3 有序，供遍历与差集清理）。
+func MemoryKinds() []Kind {
+	return []Kind{KindMemoryL0, KindMemoryL1, KindMemoryL2, KindMemoryL3}
 }
 
 // ErrDimMismatch 向量维度不一致（换模型未重建索引时的显式错误，禁止静默跳过）。

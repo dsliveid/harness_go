@@ -46,6 +46,13 @@ func TestDefaultValues(t *testing.T) {
 	if c.Devices.StrictApprovalDevice {
 		t.Fatal("strict_approval_device 应默认 false（只审计不阻断）")
 	}
+	// 阶段 D-4 预算闸门默认值：默认不限预算（闸门直通），历史占比 0.6
+	if c.Budget.MaxTotal != 0 {
+		t.Fatalf("max_total 默认应为 0（不限），得到 %d", c.Budget.MaxTotal)
+	}
+	if c.Budget.HistoryRatio != 0.6 {
+		t.Fatalf("history_ratio 默认应为 0.6，得到 %v", c.Budget.HistoryRatio)
+	}
 }
 
 // 优先级：flag > env > 文件 > 默认
@@ -131,6 +138,11 @@ func TestValidateRejectsBadValues(t *testing.T) {
 		{"devices.pair_ttl_s=0", func(c *Config) { c.Devices.PairTTLS = 0 }},
 		{"devices.heartbeat_s=0", func(c *Config) { c.Devices.HeartbeatS = 0 }},
 		{"devices.task_ttl_s=0", func(c *Config) { c.Devices.TaskTTLS = 0 }},
+		// 阶段 D-4 预算闸门：负预算 = 配了假闸门；比例越界 = 历史段挤占或失控
+		{"budget.max_total 负数", func(c *Config) { c.Budget.MaxTotal = -1 }},
+		{"budget.history_ratio=0", func(c *Config) { c.Budget.HistoryRatio = 0 }},
+		{"budget.history_ratio>1", func(c *Config) { c.Budget.HistoryRatio = 1.5 }},
+		{"budget.history_ratio 负数", func(c *Config) { c.Budget.HistoryRatio = -0.1 }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -230,5 +242,35 @@ tools:
 	}
 	if _, err := Load(Options{Args: []string{"-config", cfgPath}, Env: envMap(nil)}); err == nil {
 		t.Fatal("期望 dynamic_min_top_k=0 被拒绝，实际加载成功")
+	}
+}
+
+// 阶段 D-4 预算闸门：环境变量覆盖 + 合法边界。
+func TestBudgetEnvOverride(t *testing.T) {
+	cfg, err := Load(Options{
+		Args: []string{},
+		Env: envMap(map[string]string{
+			"HARNESS_BUDGET_MAX_TOTAL":     "32000",
+			"HARNESS_BUDGET_HISTORY_RATIO": "0.5",
+		}),
+	})
+	if err != nil {
+		t.Fatalf("加载配置失败: %v", err)
+	}
+	if cfg.Budget.MaxTotal != 32000 {
+		t.Fatalf("HARNESS_BUDGET_MAX_TOTAL 未生效，得到 %d", cfg.Budget.MaxTotal)
+	}
+	if cfg.Budget.HistoryRatio != 0.5 {
+		t.Fatalf("HARNESS_BUDGET_HISTORY_RATIO 未生效，得到 %v", cfg.Budget.HistoryRatio)
+	}
+}
+
+// 合法边界：max_total=0（不限）与 history_ratio 恰好 1.0 都必须通过。
+func TestBudgetBoundaryAccepted(t *testing.T) {
+	c := Default()
+	c.Budget.MaxTotal = 0
+	c.Budget.HistoryRatio = 1
+	if err := c.Validate(); err != nil {
+		t.Fatalf("history_ratio=1.0 应被接受（历史段可占满预算），实际被拒: %v", err)
 	}
 }

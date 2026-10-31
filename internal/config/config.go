@@ -106,6 +106,23 @@ type DevicesConfig struct {
 	StrictApprovalDevice bool `yaml:"strict_approval_device"` // 高风险审批是否仅限执行端设备确认
 }
 
+// BudgetConfig 预算闸门（阶段 D-4）参数。
+//
+// 契约：
+//   - MaxTotal = 0 表示不限预算，闸门直通（零开销，行为与 D-4 之前完全一致）；
+//   - MaxTotal > 0 时超出即触发五级降级（省记忆 → topK 减半 → 常驻工具降到 4
+//     → 旧工具结果转引用 → 强制压缩），五级用尽仍超则 Run 明确失败
+//     （budget_exhausted），**严禁静默截断**；
+//   - HistoryRatio 是历史段占总预算的比例上限（映射 prompt.Limits.MaxHistory），
+//     超出部分由 Builder 从最旧开始裁剪（这是预算内的正常裁剪，有 DroppedHistory 计数，
+//     与「降级用尽后的明确报错」是两条路径）。
+//
+// 两者均在 Validate 中硬校验，非法值直接拒绝加载，不做静默兜底。
+type BudgetConfig struct {
+	MaxTotal     int     `yaml:"max_total"`     // 总 token 预算，0 = 不限（默认）
+	HistoryRatio float64 `yaml:"history_ratio"` // 历史段占比上限 (0,1]，默认 0.6
+}
+
 // LogConfig 日志。
 type LogConfig struct {
 	Level  string `yaml:"level"`  // debug | info | warn | error
@@ -121,6 +138,7 @@ type Config struct {
 	Storage    StorageConfig    `yaml:"storage"`
 	Tools      ToolsConfig      `yaml:"tools"`
 	Devices    DevicesConfig    `yaml:"devices"`
+	Budget     BudgetConfig     `yaml:"budget"`
 	Log        LogConfig        `yaml:"log"`
 
 	// ConfigFile 实际加载的配置文件路径（空 = 未使用文件）
@@ -159,6 +177,10 @@ func Default() Config {
 			OfflineAfterS:        45, // 3 × heartbeat
 			TaskTTLS:             600,
 			StrictApprovalDevice: false, // 默认只审计不阻断
+		},
+		Budget: BudgetConfig{
+			MaxTotal:     0,   // 默认不限预算（闸门直通）；配置后超限走五级降级
+			HistoryRatio: 0.6, // 历史段占比上限，仅 MaxTotal>0 时生效
 		},
 		Log: LogConfig{Level: "info", Format: "text"},
 	}
@@ -266,6 +288,16 @@ func applyEnv(cfg *Config, env func(string) string) error {
 			return nil
 		}
 	}
+	floatVal := func(dst *float64) func(string) error {
+		return func(v string) error {
+			f, err := strconv.ParseFloat(v, 64)
+			if err != nil {
+				return fmt.Errorf("需要数值，得到 %q", v)
+			}
+			*dst = f
+			return nil
+		}
+	}
 	strVal := func(dst *string) func(string) error {
 		return func(v string) error { *dst = v; return nil }
 	}
@@ -295,6 +327,8 @@ func applyEnv(cfg *Config, env func(string) string) error {
 		{"HARNESS_DEVICES_OFFLINE_AFTER_S", intVal(&cfg.Devices.OfflineAfterS)},
 		{"HARNESS_DEVICES_TASK_TTL_S", intVal(&cfg.Devices.TaskTTLS)},
 		{"HARNESS_DEVICES_STRICT_APPROVAL", boolVal(&cfg.Devices.StrictApprovalDevice)},
+		{"HARNESS_BUDGET_MAX_TOTAL", intVal(&cfg.Budget.MaxTotal)},
+		{"HARNESS_BUDGET_HISTORY_RATIO", floatVal(&cfg.Budget.HistoryRatio)},
 	}
 	for _, b := range bindings {
 		v := env(b.key)
@@ -404,6 +438,14 @@ func (c *Config) Validate() error {
 	}
 	if c.Devices.TaskTTLS <= 0 {
 		return errors.New("config: devices.task_ttl_s 必须 > 0")
+	}
+	// 阶段 D-4 预算闸门：负预算会让「超限判定」永远不触发，等于配置了假闸门；
+	// 比例越界同理（<=0 历史段无上限吃光预算，>1 历史段挤掉系统提示与工具）。
+	if c.Budget.MaxTotal < 0 {
+		return errors.New("config: budget.max_total 不能为负（0 = 不限预算）")
+	}
+	if c.Budget.HistoryRatio <= 0 || c.Budget.HistoryRatio > 1 {
+		return fmt.Errorf("config: budget.history_ratio 必须在 (0,1] 区间，得到 %v", c.Budget.HistoryRatio)
 	}
 	switch strings.ToLower(c.Log.Level) {
 	case "debug", "info", "warn", "error":

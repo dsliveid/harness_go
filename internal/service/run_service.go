@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 
 	"harness-go/internal/agent"
@@ -30,6 +31,9 @@ type RunServiceOptions struct {
 	// ToolSelector 动态工具检索（D-2）：按本轮输入从索引召回 deferred 工具，
 	// 命中者本轮注入全量定义。为 nil 时退化为「deferred 只进索引」（与 D 之前行为一致）。
 	ToolSelector ToolSelector
+	// Memory 记忆四层召回源（D-3）：每 Run 召回一次 L0/L1 常驻块与 L2/L3 检索块。
+	// 为 nil 时不注入记忆（行为与 D-3 之前一致）。召回失败降级为空块，不阻断对话。
+	Memory MemorySource
 	// Gate 审批闸门（B-3）：引擎登记的待决项由本服务经 DecideApproval 提交，
 	// 不注入时审批端点返回 unavailable（不静默成功）。
 	Gate *approval.Gate
@@ -50,6 +54,8 @@ type RunService struct {
 	gate       *approval.Gate
 	// toolSelector 动态工具检索（D-2）；nil 表示不做动态检索。
 	toolSelector ToolSelector
+	// memory 记忆四层召回源（D-3）；nil 表示不注入记忆。
+	memory MemorySource
 	// strictApproval 跨端审批仲裁是否强制「执行端设备确认」（C-7）。
 	strictApproval bool
 
@@ -69,6 +75,7 @@ func NewRunService(opts RunServiceOptions) *RunService {
 		toolRefs:       opts.ToolRefs,
 		gate:           opts.Gate,
 		toolSelector:   opts.ToolSelector,
+		memory:         opts.Memory,
 		strictApproval: opts.StrictApprovalDevice,
 		cancels:        make(map[string]context.CancelFunc),
 	}
@@ -91,6 +98,19 @@ func (s *RunService) selectTools(ctx context.Context, userInput string) []string
 		return nil
 	}
 	return s.toolSelector.SelectForPrompt(ctx, userInput, s.currentTools())
+}
+
+// recallMemory 记忆召回（D-3）。失败返回空块并继续（不阻断对话），
+// 错误经返回值上抛的调用方（CreateRunAs）直接丢弃 —— 与 TouchMessage 摘要回写同口径。
+func (s *RunService) recallMemory(ctx context.Context, userInput string) (core, tail string) {
+	if s.memory == nil || strings.TrimSpace(userInput) == "" {
+		return "", ""
+	}
+	core, tail, err := s.memory.RecallBlocks(ctx, userInput)
+	if err != nil {
+		return "", "" // 召回降级：空块不阻断 Run（MemorySource 契约）
+	}
+	return core, tail
 }
 
 // CreateRun 写入用户消息 + 创建 Run(pending) + 异步执行。
@@ -161,7 +181,11 @@ func (s *RunService) CreateRunAs(ctx context.Context, sessionID, userInput, mode
 		return nil, err
 	}
 
-	// ④ 异步执行：脱离 HTTP 请求 ctx（否则请求一结束 Run 就被取消）
+	// ④ 记忆召回（D-3）：每 Run 一次，core 进稳定前缀、tail 置尾。
+	// 召回失败降级为空块（记忆是优化项，绝不阻断对话 —— 与工具检索同口径）。
+	memCore, memTail := s.recallMemory(ctx, userInput)
+
+	// ⑤ 异步执行：脱离 HTTP 请求 ctx（否则请求一结束 Run 就被取消）
 	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	s.registerCancel(run.ID, cancel)
 
@@ -176,6 +200,8 @@ func (s *RunService) CreateRunAs(ctx context.Context, sessionID, userInput, mode
 		ProjectSummary:  "",
 		Tools:           s.currentTools(),
 		ActiveTools:     s.selectTools(ctx, userInput),
+		MemoryCore:      memCore,
+		MemoryTail:      memTail,
 		LeaseHolder:     deviceID, // C-6：空串 = 服务端本地执行面
 		RequesterDevice: deviceID, // C-7：审批跨端仲裁的发起端来源
 	}
