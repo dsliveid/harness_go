@@ -74,6 +74,15 @@ type StorageConfig struct {
 }
 
 // ToolsConfig 工具注入（软上限仅告警，不阻断启动）。
+//
+// 契约（已冻结，后续并行开发以此签名为准）：
+//   - CoreSoftLimit / DeferredSoftLimit 是**软上限**，仅告警不阻断启动（D11 修定）。
+//   - DynamicTopK 是每轮动态检索注入全量定义的 deferred 工具条数（D11 推荐 4~8）。
+//   - DynamicMinTopK 是预算降级（topK 减半）时允许的最小条数，**必须 > 0**：
+//     砍到 0 会让按需工具完全不可见，退化成比全量注入更糟的形态。
+//
+// 两者均在 Validate 中硬校验，非法值直接拒绝加载，不做静默兜底
+// （静默兜底会让 `config.yaml` 里写错的值看起来"生效了"，实际却被改写）。
 type ToolsConfig struct {
 	CoreSoftLimit     int `yaml:"core_soft_limit"`     // 默认 8
 	DeferredSoftLimit int `yaml:"deferred_soft_limit"` // 默认 60
@@ -278,6 +287,8 @@ func applyEnv(cfg *Config, env func(string) string) error {
 		{"HARNESS_DATA_QUOTA_GB", intVal(&cfg.Storage.DataQuotaGB)},
 		{"HARNESS_CORE_SOFT_LIMIT", intVal(&cfg.Tools.CoreSoftLimit)},
 		{"HARNESS_DEFERRED_SOFT_LIMIT", intVal(&cfg.Tools.DeferredSoftLimit)},
+		{"HARNESS_DYNAMIC_TOPK", intVal(&cfg.Tools.DynamicTopK)},
+		{"HARNESS_DYNAMIC_MIN_TOPK", intVal(&cfg.Tools.DynamicMinTopK)},
 		{"HARNESS_DEVICES_ENABLED", boolVal(&cfg.Devices.Enabled)},
 		{"HARNESS_DEVICES_PAIR_TTL_S", intVal(&cfg.Devices.PairTTLS)},
 		{"HARNESS_DEVICES_HEARTBEAT_S", intVal(&cfg.Devices.HeartbeatS)},
@@ -362,6 +373,19 @@ func (c *Config) Validate() error {
 	if c.Auth.SessionTTLH <= 0 {
 		return errors.New("config: auth.session_ttl_h 必须 > 0")
 	}
+	// 阶段 D-2 动态工具注入：两个参数直接决定「模型每轮看得见多少工具」，
+	// 取值非法会让 Token 治理静默失效，故一律硬拒绝而非兜底。
+	if c.Tools.DynamicTopK <= 0 {
+		return errors.New("config: tools.dynamic_top_k 必须 > 0（0 会让按需工具完全不可见）")
+	}
+	if c.Tools.DynamicMinTopK <= 0 {
+		return errors.New("config: tools.dynamic_min_top_k 必须 > 0（降级不得把按需工具砍到 0）")
+	}
+	if c.Tools.DynamicMinTopK > c.Tools.DynamicTopK {
+		// 归一化会把它压成 DynamicTopK，但那是掩盖配置错误：用户写了自相矛盾的值。
+		return fmt.Errorf("config: tools.dynamic_min_top_k(%d) 不能大于 tools.dynamic_top_k(%d)",
+			c.Tools.DynamicMinTopK, c.Tools.DynamicTopK)
+	}
 	if c.Devices.PairTTLS <= 0 {
 		return errors.New("config: devices.pair_ttl_s 必须 > 0")
 	}
@@ -370,6 +394,13 @@ func (c *Config) Validate() error {
 	}
 	if c.Devices.OfflineAfterS <= 0 {
 		return errors.New("config: devices.offline_after_s 必须 > 0")
+	}
+	// offline_after_s 是「多久没收到帧就判离线」的阈值，heartbeat_s 是端侧主动 ping 的间隔。
+	// 若前者不大于后者，端侧在两次心跳的正常间隙里就会被判离线，表现为反复上下线；
+	// 推荐值 3×heartbeat（与默认 15s/45s 一致），这里只硬性要求必须留出余量。
+	if c.Devices.OfflineAfterS <= c.Devices.HeartbeatS {
+		return fmt.Errorf("config: devices.offline_after_s(%d) 必须大于 devices.heartbeat_s(%d)，否则端侧会在两次心跳间被判反复上下线",
+			c.Devices.OfflineAfterS, c.Devices.HeartbeatS)
 	}
 	if c.Devices.TaskTTLS <= 0 {
 		return errors.New("config: devices.task_ttl_s 必须 > 0")

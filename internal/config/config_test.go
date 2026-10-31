@@ -28,6 +28,10 @@ func TestDefaultValues(t *testing.T) {
 	if c.Tools.CoreSoftLimit != 8 || c.Tools.DeferredSoftLimit != 60 {
 		t.Fatalf("工具软上限默认错误: %+v", c.Tools)
 	}
+	// 阶段 D-2 动态注入默认值（D11 推荐 4~8 取中位 6；降级下限 2 不得为 0）
+	if c.Tools.DynamicTopK != 6 || c.Tools.DynamicMinTopK != 2 {
+		t.Fatalf("动态工具注入默认值错误（应为 top_k=6 / min_top_k=2）: %+v", c.Tools)
+	}
 	if !c.Auth.SSOEnabled || c.Auth.SSOMode != SSOPlain {
 		t.Fatalf("local 形态下 SSO 应默认开启且为 plain: %+v", c.Auth)
 	}
@@ -107,6 +111,26 @@ func TestValidateRejectsBadValues(t *testing.T) {
 		{"max_blob_mb=0", func(c *Config) { c.Storage.MaxBlobMB = 0 }},
 		{"非法日志级别", func(c *Config) { c.Log.Level = "verbose" }},
 		{"空 addr", func(c *Config) { c.Server.Addr = "" }},
+		// 阶段 D-2：动态工具注入参数（0 或自相矛盾一律拒绝）
+		{"dynamic_top_k=0", func(c *Config) { c.Tools.DynamicTopK = 0 }},
+		{"dynamic_top_k 负数", func(c *Config) { c.Tools.DynamicTopK = -1 }},
+		{"dynamic_min_top_k=0", func(c *Config) { c.Tools.DynamicMinTopK = 0 }},
+		{"dynamic_min > dynamic_top", func(c *Config) {
+			c.Tools.DynamicTopK = 4
+			c.Tools.DynamicMinTopK = 6
+		}},
+		// 阶段 C 设备域：离线阈值必须大于心跳间隔，否则端侧反复上下线
+		{"offline_after == heartbeat", func(c *Config) {
+			c.Devices.HeartbeatS = 15
+			c.Devices.OfflineAfterS = 15
+		}},
+		{"offline_after < heartbeat", func(c *Config) {
+			c.Devices.HeartbeatS = 30
+			c.Devices.OfflineAfterS = 10
+		}},
+		{"devices.pair_ttl_s=0", func(c *Config) { c.Devices.PairTTLS = 0 }},
+		{"devices.heartbeat_s=0", func(c *Config) { c.Devices.HeartbeatS = 0 }},
+		{"devices.task_ttl_s=0", func(c *Config) { c.Devices.TaskTTLS = 0 }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -148,5 +172,63 @@ func TestEnsureDataDir(t *testing.T) {
 	}
 	if fi, err := os.Stat(abs); err != nil || !fi.IsDir() {
 		t.Fatalf("数据目录未创建: %v", err)
+	}
+}
+
+// 阶段 D-2 动态工具注入参数：环境变量须能覆盖默认值并生效（契约可配）。
+func TestDynamicTopKEnvOverride(t *testing.T) {
+	cfg, err := Load(Options{
+		Args: []string{},
+		Env: envMap(map[string]string{
+			"HARNESS_DYNAMIC_TOPK":     "8",
+			"HARNESS_DYNAMIC_MIN_TOPK": "4",
+		}),
+	})
+	if err != nil {
+		t.Fatalf("加载配置失败: %v", err)
+	}
+	if cfg.Tools.DynamicTopK != 8 {
+		t.Fatalf("HARNESS_DYNAMIC_TOPK 未生效，得到 %d", cfg.Tools.DynamicTopK)
+	}
+	if cfg.Tools.DynamicMinTopK != 4 {
+		t.Fatalf("HARNESS_DYNAMIC_MIN_TOPK 未生效，得到 %d", cfg.Tools.DynamicMinTopK)
+	}
+}
+
+// 阶段 C/D 契约：出厂默认值必须能通过 Validate（防止把校验条件写反，
+// 出现「默认配置自己都加载不了」的低级故障）。
+func TestDefaultConfigValidates(t *testing.T) {
+	c := Default()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("默认配置应当合法，实际被拒: %v", err)
+	}
+}
+
+// 合法边界：offline_after_s 刚好比 heartbeat_s 大 1 必须通过
+// （校验只要求「大于」，不该隐含 3× 之类的强假设）。
+func TestDevicesOfflineAfterBoundaryAccepted(t *testing.T) {
+	c := Default()
+	c.Devices.HeartbeatS = 15
+	c.Devices.OfflineAfterS = 16
+	if err := c.Validate(); err != nil {
+		t.Fatalf("offline_after_s 仅比 heartbeat_s 大 1 应被接受，实际被拒: %v", err)
+	}
+}
+
+// 阶段 D-2：YAML 中把 dynamic_min_top_k 写成 0 必须被拒绝，
+// 而不是被 selector.normalize() 静默改写（静默兜底会掩盖配置错误）。
+func TestDynamicTopKYamlZeroRejected(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	yaml := `
+tools:
+  dynamic_top_k: 6
+  dynamic_min_top_k: 0
+`
+	if err := os.WriteFile(cfgPath, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(Options{Args: []string{"-config", cfgPath}, Env: envMap(nil)}); err == nil {
+		t.Fatal("期望 dynamic_min_top_k=0 被拒绝，实际加载成功")
 	}
 }
