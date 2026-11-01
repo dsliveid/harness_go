@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"harness-go/internal/apperr"
@@ -89,25 +90,65 @@ func (h *handlers) getSession(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, sess)
 }
 
-type renameSessionReq struct {
-	Title string `json:"title"`
+// updateSessionReq PATCH /api/v1/sessions/{sid} 入参（均可选）：
+// title 非空时重命名；model_ref 用指针区分「未传」与「显式清空（未选择模型）」；
+// access_mode 非空时更新访问模式（confirm/full，切换即时生效）。
+type updateSessionReq struct {
+	Title      string  `json:"title"`
+	ModelRef   *string `json:"model_ref"`
+	AccessMode string  `json:"access_mode"`
 }
 
 func (h *handlers) renameSession(w http.ResponseWriter, r *http.Request) {
-	var req renameSessionReq
+	var req updateSessionReq
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, r, err)
 		return
 	}
-	if err := h.d.Sessions.Rename(r.Context(), r.PathValue("sid"), req.Title); err != nil {
-		writeError(w, r, err)
-		return
+	if req.Title != "" {
+		if err := h.d.Sessions.Rename(r.Context(), r.PathValue("sid"), req.Title); err != nil {
+			writeError(w, r, err)
+			return
+		}
+	}
+	if req.ModelRef != nil {
+		if err := h.d.Sessions.UpdateModel(r.Context(), r.PathValue("sid"), *req.ModelRef); err != nil {
+			writeError(w, r, err)
+			return
+		}
+	}
+	if strings.TrimSpace(req.AccessMode) != "" {
+		if err := h.d.Sessions.SetAccessMode(r.Context(), r.PathValue("sid"), req.AccessMode); err != nil {
+			writeError(w, r, err)
+			return
+		}
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *handlers) deleteSession(w http.ResponseWriter, r *http.Request) {
 	if err := h.d.Sessions.Delete(r.Context(), r.PathValue("sid")); err != nil {
+		writeError(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// archiveSession 归档会话：POST /api/v1/sessions/{sid}/archive（204；幂等）。
+//
+// 状态落主库 sessions.archived_at（0007 迁移），对齐桌面端「归档中心」：
+// 侧栏默认列表不再显示，归档中心可查看/取消归档，删除语义不变。
+func (h *handlers) archiveSession(w http.ResponseWriter, r *http.Request) {
+	if err := h.d.Sessions.Archive(r.Context(), r.PathValue("sid")); err != nil {
+		writeError(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// unarchiveSession 取消归档：POST /api/v1/sessions/{sid}/unarchive（204；幂等）。
+func (h *handlers) unarchiveSession(w http.ResponseWriter, r *http.Request) {
+	if err := h.d.Sessions.Unarchive(r.Context(), r.PathValue("sid")); err != nil {
 		writeError(w, r, err)
 		return
 	}
@@ -168,6 +209,29 @@ func (h *handlers) stopRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// guidanceReq 运行中引导入参。
+type guidanceReq struct {
+	Input string `json:"input"`
+}
+
+// guideRun 运行中引导：POST /api/v1/sessions/{sid}/runs/{rid}/guidance
+//
+// 用户消息立即落库（响应返回该消息，前端就地追加），引擎在轮次边界回灌上下文——
+// 当前流结束后模型即看到该引导。Run 不在运行中 → 409。
+func (h *handlers) guideRun(w http.ResponseWriter, r *http.Request) {
+	var req guidanceReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, r, err)
+		return
+	}
+	msg, err := h.d.Runs.Guidance(r.Context(), r.PathValue("sid"), r.PathValue("rid"), req.Input)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, msg)
 }
 
 func (h *handlers) listToolEvents(w http.ResponseWriter, r *http.Request) {

@@ -1,4 +1,4 @@
-import { useEffect, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { Cpu, Globe, Shield, BarChart3, FileText, MonitorSmartphone } from 'lucide-react'
 import { useUI } from '../../stores/uiStore'
 import { useSettings } from '../../stores/settingsStore'
@@ -27,16 +27,43 @@ const NAV_EXTRA: Array<{ key: Tab; label: string; icon: ReactNode }> = [
 // 程序设置弹窗：对齐桌面端 SettingsModal（模型/工具/网络/SOP + Token 统计/日志查询）。
 export function SettingsModal() {
   const { settingsOpen, settingsTab, setSettings, toast } = useUI()
-  const { beginEdit, endEdit } = useSettings()
+  const { beginEdit, endEdit, applyDraft, settings, draft } = useSettings()
+  const [saving, setSaving] = useState(false)
 
   useEffect(() => {
     if (settingsOpen) beginEdit()
   }, [settingsOpen, beginEdit])
 
-  const close = (commit: boolean) => {
-    endEdit(commit)
+  // 是否有待应用的改动（决定「应用」按钮可用性），与桌面端 ModalActions 的 canApply 一致
+  const dirty = draft !== null && JSON.stringify(draft) !== JSON.stringify(settings)
+
+  // 取消：丢弃草稿并关闭
+  const cancel = () => {
+    endEdit(false)
     setSettings(false)
-    if (commit) toast('success', '设置已保存（原型模拟）')
+  }
+
+  // 应用：只保存生效，不关闭弹窗
+  const apply = async () => {
+    setSaving(true)
+    try {
+      await applyDraft()
+      toast('success', '设置已应用')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  // 保存：保存并关闭
+  const save = async () => {
+    setSaving(true)
+    try {
+      endEdit(true)
+      setSettings(false)
+      toast('success', '设置已保存')
+    } finally {
+      setSaving(false)
+    }
   }
 
   if (!settingsOpen) return null
@@ -54,14 +81,17 @@ export function SettingsModal() {
   return (
     <Modal
       open={settingsOpen}
-      onClose={() => close(false)}
+      onClose={cancel}
       title="程序设置"
       width="max-w-4xl"
       height="h-[min(620px,92dvh)] sm:h-[min(620px,86dvh)]"
       footer={
         <>
-          <Button variant="ghost" onClick={() => close(false)}>取消</Button>
-          <Button variant="primary" onClick={() => close(true)}>保存修改</Button>
+          <Button variant="ghost" onClick={cancel} disabled={saving}>取消</Button>
+          <Button variant="outline" onClick={() => void apply()} disabled={saving || !dirty}>
+            {saving ? '处理中…' : '应用'}
+          </Button>
+          <Button variant="primary" onClick={() => void save()} disabled={saving}>保存</Button>
         </>
       }
     >

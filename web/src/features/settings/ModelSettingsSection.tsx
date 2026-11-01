@@ -1,10 +1,10 @@
 import { useState } from 'react'
-import { ChevronDown, ChevronRight, ChevronUp, Trash2, X, RotateCw, Plus, Cpu, Check } from 'lucide-react'
+import { ChevronDown, ChevronRight, ChevronUp, Trash2, X, RotateCw, Plus, Cpu, Check, Eye, EyeOff, Copy } from 'lucide-react'
 import type { Provider, RequestProtocol } from '../../types'
 import { useUI } from '../../stores/uiStore'
 import {
   addModel, addProvider, removeModel, removeProvider, updateModel, updateProvider,
-  useSettings, type AppSettings, type CapSlot,
+  PROVIDER_KEY_MASK, useSettings, type AppSettings, type CapSlot,
 } from '../../stores/settingsStore'
 import { fetchProviderModels } from '../../mock/settingsData'
 import { api, apiMode } from '../../lib/api'
@@ -18,7 +18,7 @@ const CAP_SLOTS: Array<{ key: CapSlot; label: string; hint: string }> = [
   { key: 'decision', label: 'decision', hint: '决策判断' },
 ]
 
-const MODEL_CAPS: Array<Provider['models'][number]['capabilities'][number]> = ['chat', 'reasoning', 'vision', 'image', 'decision']
+const MODEL_CAPS: Array<Provider['models'][number]['capabilities'][number]> = ['chat', 'vision', 'image', 'decision']
 
 // 请求协议选项（对齐桌面端 RequestProtocol 下拉）
 const PROTOCOL_OPTIONS: Array<{ value: RequestProtocol; label: string }> = [
@@ -33,8 +33,14 @@ export function ModelSettingsSection() {
   const { draft, patchDraft } = useSettings()
   const { toast } = useUI()
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
-  const [tested, setTested] = useState<Record<string, 'ok' | 'testing'>>({})
+  // 连接测试三态：testing 测试中 / ok 可用 / fail 不可用（不可再用 ok 掩盖失败）
+  const [tested, setTested] = useState<Record<string, 'ok' | 'fail' | 'testing'>>({})
+  const [testMsg, setTestMsg] = useState<Record<string, string>>({})
+  // 密钥显示：revealedKey 缓存服务端拉回的明文，避免每次切换都重复请求
   const [showKey, setShowKey] = useState<Record<string, boolean>>({})
+  const [revealedKey, setRevealedKey] = useState<Record<string, string>>({})
+  // 复制成功态（1.5s 后自动复位）
+  const [copied, setCopied] = useState<Record<string, boolean>>({})
   // 获取模型列表：拉取中 / 已拉取结果 / 面板展开 / 搜索关键字 / 输入框中的模型 ID
   const [fetching, setFetching] = useState<Record<string, boolean>>({})
   const [fetched, setFetched] = useState<Record<string, string[]>>({})
@@ -47,6 +53,7 @@ export function ModelSettingsSection() {
   const patch = (fn: (cur: AppSettings) => AppSettings) => patchDraft(fn)
   const toggleExpand = (id: string) => setExpanded((e) => ({ ...e, [id]: !e[id] }))
 
+  // 连接测试：失败必须显式落到 fail 态（旧实现把失败也置 ok，会误导用户以为可用）
   const handleTest = async (p: Provider) => {
     if (tested[p.id] === 'testing') return
     if (!p.baseUrl.trim()) {
@@ -54,45 +61,136 @@ export function ModelSettingsSection() {
       return
     }
     setTested((t) => ({ ...t, [p.id]: 'testing' }))
+    setTestMsg((m) => ({ ...m, [p.id]: '' }))
     // mock 模式：demo 的模拟延迟；real 模式：由服务端用该厂商发一次极小请求
     if (apiMode === 'mock') {
       setTimeout(() => {
         setTested((t) => ({ ...t, [p.id]: 'ok' }))
+        setTestMsg((m) => ({ ...m, [p.id]: '模拟 218ms' }))
         toast('success', `${p.name} 连接成功（模拟 218ms）`)
       }, 500)
       return
     }
     try {
-      const res = await api.testProvider(p.id)
+      // 所见即所测：把草稿当前值（未保存的模型 / Base URL / 刚输入的密钥）一并传给后端，
+      // 「添加模型未保存」「新厂商未落库」也能按界面所见直接测；掩码占位不得当密钥回传
+      const res = await api.testProvider(p.id, {
+        model: p.models[0]?.id,
+        base_url: p.baseUrl,
+        models: p.models.map((m) => m.id),
+        ...(p.apiKeyMasked && p.apiKeyMasked !== PROVIDER_KEY_MASK ? { api_key: p.apiKeyMasked } : {}),
+      })
       if (res.ok) {
         setTested((t) => ({ ...t, [p.id]: 'ok' }))
+        setTestMsg((m) => ({ ...m, [p.id]: `${res.latency_ms}ms` }))
         toast('success', `${p.name} 连接成功（${res.latency_ms}ms）`)
       } else {
-        setTested((t) => ({ ...t, [p.id]: 'ok' }))
-        toast('error', `${p.name} 连接失败：${res.error || res.code || '未知错误'}`)
+        const reason = res.error || res.code || '未知错误'
+        setTested((t) => ({ ...t, [p.id]: 'fail' }))
+        setTestMsg((m) => ({ ...m, [p.id]: reason }))
+        toast('error', `${p.name} 连接失败：${reason}`)
       }
     } catch (e) {
-      setTested((t) => ({ ...t, [p.id]: 'ok' }))
       const msg = e instanceof Error ? e.message : '网络异常'
-      toast('error', `连接测试失败：${msg}${p.id.startsWith('pv-') ? '（请先保存后再测试）' : ''}`)
+      setTested((t) => ({ ...t, [p.id]: 'fail' }))
+      setTestMsg((m) => ({ ...m, [p.id]: msg }))
+      // 新建厂商尚未落库（id 为本地临时值）时后端必 404，给出可操作提示
+      const hint = p.id.startsWith('pv-') ? '（该厂商尚未保存，请先点「应用」）' : ''
+      toast('error', `连接测试失败：${msg}${hint}`)
     }
   }
 
-  // 模拟 GET {baseUrl}/models：按厂商名匹配目录，600ms 延迟
-  const handleFetchModels = (p: Provider) => {
+  // 获取模型列表：real 模式真实请求上游 /models；失败直接报错，绝不回退本地样例
+  const handleFetchModels = async (p: Provider) => {
     if (fetching[p.id]) return
     if (!p.baseUrl.trim()) {
       toast('warn', '请先填写该厂商的 Base URL')
       return
     }
     setFetching((f) => ({ ...f, [p.id]: true }))
-    setTimeout(() => {
-      const list = fetchProviderModels({ name: p.name, baseUrl: p.baseUrl })
+    if (apiMode === 'mock') {
+      setTimeout(() => {
+        const list = fetchProviderModels({ name: p.name, baseUrl: p.baseUrl })
+        setFetched((m) => ({ ...m, [p.id]: list }))
+        setMenuOpen((o) => ({ ...o, [p.id]: true }))
+        setFetching((f) => ({ ...f, [p.id]: false }))
+        toast('success', `成功获取 ${list.length} 个模型`)
+      }, 600)
+      return
+    }
+    try {
+      const res = await api.listProviderModels(p.id)
+      const list = res.items ?? []
       setFetched((m) => ({ ...m, [p.id]: list }))
       setMenuOpen((o) => ({ ...o, [p.id]: true }))
-      setFetching((f) => ({ ...f, [p.id]: false }))
       toast('success', `成功获取 ${list.length} 个模型`)
-    }, 600)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : '网络异常'
+      // 失败时清空本地缓存，避免残留上一次的清单被误当作本次结果
+      setFetched((m) => ({ ...m, [p.id]: [] }))
+      setMenuOpen((o) => ({ ...o, [p.id]: false }))
+      const hint = p.id.startsWith('pv-') ? '（该厂商尚未保存，请先点「应用」）' : ''
+      toast('error', `获取模型列表失败：${msg}${hint}`)
+    } finally {
+      setFetching((f) => ({ ...f, [p.id]: false }))
+    }
+  }
+
+  // 切换密钥显示：首次显示时向服务端拉明文（列表接口恒脱敏，明文只能走 secret 端点）
+  const toggleKey = async (p: Provider) => {
+    const next = !showKey[p.id]
+    setShowKey((s) => ({ ...s, [p.id]: next }))
+    if (!next) return
+    if (revealedKey[p.id] !== undefined) return
+    if (!p.apiKeyMasked) return // 未配置密钥，无需拉取
+    if (apiMode === 'mock') {
+      setRevealedKey((k) => ({ ...k, [p.id]: 'sk-mock-demo-key' }))
+      return
+    }
+    try {
+      const res = await api.revealProviderKey(p.id)
+      setRevealedKey((k) => ({ ...k, [p.id]: res.api_key ?? '' }))
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : '网络异常'
+      setShowKey((s) => ({ ...s, [p.id]: false }))
+      toast('error', `读取密钥失败：${msg}`)
+    }
+  }
+
+  // 复制密钥：优先用已拉回的明文，未拉过则先拉再复制
+  const copyKey = async (p: Provider) => {
+    if (!p.apiKeyMasked) {
+      toast('warn', '该厂商尚未配置 API Key')
+      return
+    }
+    let key = revealedKey[p.id]
+    if (key === undefined) {
+      if (apiMode === 'mock') {
+        key = 'sk-mock-demo-key'
+      } else {
+        try {
+          const res = await api.revealProviderKey(p.id)
+          key = res.api_key ?? ''
+          setRevealedKey((k) => ({ ...k, [p.id]: key as string }))
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : '网络异常'
+          toast('error', `读取密钥失败：${msg}`)
+          return
+        }
+      }
+    }
+    if (!key) {
+      toast('warn', '该厂商尚未配置 API Key')
+      return
+    }
+    try {
+      await navigator.clipboard.writeText(key)
+      setCopied((c) => ({ ...c, [p.id]: true }))
+      setTimeout(() => setCopied((c) => ({ ...c, [p.id]: false })), 1500)
+      toast('success', 'API Key 已复制到剪贴板')
+    } catch {
+      toast('error', '复制失败，请手动选择文本复制')
+    }
   }
 
   const handleSelectFetched = (p: Provider, name: string) => {
@@ -185,18 +283,43 @@ export function ModelSettingsSection() {
                           onChange={(e) => patch((cur) => updateProvider(cur, p.id, { baseUrl: e.target.value }))} />
                       </Field>
                     </div>
-                    <Field label="API Key" hint="保存后仅以掩码形式展示（原型模拟）">
+                    <Field label="API Key" hint="已保存的密钥可点眼睛图标查看明文、点复制图标一键复制">
                       <div className="flex items-center gap-2">
                         <input
                           className={`${inputCls} font-mono`}
                           type={showKey[p.id] ? 'text' : 'password'}
-                          value={p.apiKeyMasked}
+                          value={showKey[p.id] ? (revealedKey[p.id] ?? '') : p.apiKeyMasked}
                           placeholder="sk-..."
-                          onChange={(e) => patch((cur) => updateProvider(cur, p.id, { apiKeyMasked: e.target.value }))}
+                          readOnly={showKey[p.id]}
+                          onChange={(e) => {
+                            // 明文态下编辑即视为替换密钥（已拉回的明文不再是真值）
+                            patch((cur) => updateProvider(cur, p.id, { apiKeyMasked: e.target.value }))
+                            setRevealedKey((k) => {
+                              const next = { ...k }
+                              delete next[p.id]
+                              return next
+                            })
+                          }}
                         />
-                        <Button size="sm" variant="ghost" onClick={() => setShowKey((s) => ({ ...s, [p.id]: !s[p.id] }))} className="shrink-0">
-                          {showKey[p.id] ? '隐藏' : '显示'}
-                        </Button>
+                        <button
+                          type="button"
+                          className="shrink-0 w-8 h-8 rounded-lg bg-panel2 hover:bg-panel3 border border-edge text-inkdim hover:text-ink flex items-center justify-center transition-colors"
+                          title={showKey[p.id] ? '隐藏密钥' : '显示密钥明文'}
+                          onClick={() => void toggleKey(p)}
+                        >
+                          {showKey[p.id] ? <EyeOff size={14} /> : <Eye size={14} />}
+                        </button>
+                        <button
+                          type="button"
+                          className={`shrink-0 w-8 h-8 rounded-lg bg-panel2 hover:bg-panel3 border border-edge flex items-center justify-center transition-colors ${
+                            copied[p.id] ? 'text-ok' : 'text-inkdim hover:text-ink'
+                          } ${p.apiKeyMasked ? '' : 'opacity-40 cursor-not-allowed'}`}
+                          title={p.apiKeyMasked ? '复制 API Key' : '尚未配置 API Key'}
+                          disabled={!p.apiKeyMasked}
+                          onClick={() => void copyKey(p)}
+                        >
+                          {copied[p.id] ? <Check size={14} /> : <Copy size={14} />}
+                        </button>
                       </div>
                     </Field>
 
@@ -212,9 +335,15 @@ export function ModelSettingsSection() {
                         {tested[p.id] === 'testing' ? '测试中…' : '连接测试'}
                       </Button>
                       {tested[p.id] === 'ok' && (
-                        <span className="text-ok text-[12px] flex items-center gap-1 font-medium">
+                        <span className="text-ok text-[12px] flex items-center gap-1 font-medium" title={testMsg[p.id]}>
                           <Check size={12} />
-                          <span>可用</span>
+                          <span>可用{testMsg[p.id] ? `（${testMsg[p.id]}）` : ''}</span>
+                        </span>
+                      )}
+                      {tested[p.id] === 'fail' && (
+                        <span className="text-err text-[12px] flex items-center gap-1 font-medium" title={testMsg[p.id]}>
+                          <X size={12} />
+                          <span className="max-w-[220px] truncate">不可用{testMsg[p.id] ? `：${testMsg[p.id]}` : ''}</span>
                         </span>
                       )}
                     </div>
@@ -317,7 +446,7 @@ export function ModelSettingsSection() {
                           onClick={() => {
                             if (menuOpen[p.id]) { setMenuOpen((o) => ({ ...o, [p.id]: false })); return }
                             if (list.length > 0) setMenuOpen((o) => ({ ...o, [p.id]: true }))
-                            else handleFetchModels(p)
+                            else void handleFetchModels(p)
                           }}
                           title={menuOpen[p.id] ? '收起可用模型' : '获取模型列表'}
                         >
@@ -409,6 +538,8 @@ export function ModelSettingsSection() {
                 >
                   {candidates.length === 0 && <option value="">（暂无候选模型）</option>}
                   {candidates.map((c) => <option key={c.ref} value={c.ref}>{c.label}</option>)}
+                  {/* chat 槽位也允许空值：未显式设置时如实显示，避免 select 静默展示首个候选造成「已设默认」假象 */}
+                  {key === 'chat' && <option value="">（未设置）</option>}
                   {key !== 'chat' && <option value="">跟随全局</option>}
                 </select>
                 <span className="text-[11px] text-inkfaint w-44 shrink-0 hidden sm:block">{hint}</span>

@@ -75,15 +75,15 @@ func TestMainDevicesMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 0004_market.sql 落地后主库版本为 4。
-	if v != 6 {
-		t.Fatalf("主库 schema 版本期望 6，得到 %d", v)
+	if v != 7 {
+		t.Fatalf("主库 schema 版本期望 7，得到 %d", v)
 	}
 	req, err := RequiredSchemaVersion("main")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if req != 6 {
-		t.Fatalf("RequiredSchemaVersion(main) 期望 6，得到 %d", req)
+	if req != 7 {
+		t.Fatalf("RequiredSchemaVersion(main) 期望 7，得到 %d", req)
 	}
 }
 
@@ -602,10 +602,10 @@ func TestMigrationUpgradeFromV1(t *testing.T) {
 		t.Fatalf("主库增量迁移失败: %v", err)
 	}
 	// v1 库升级：0002_devices + 0003_retrieval + 0004_market + 0005_snapshots + 0006_webhooks 共 5 个增量迁移。
-	if applied != 5 {
-		t.Fatalf("主库增量迁移应应用 5 个，得到 %d", applied)
+	if applied != 6 {
+		t.Fatalf("主库增量迁移应应用 6 个，得到 %d", applied)
 	}
-	if v, _ := SchemaVersion(ctx, mdb); v != 6 {
+	if v, _ := SchemaVersion(ctx, mdb); v != 7 {
 		t.Fatalf("主库升级后版本期望 6，得到 %d", v)
 	}
 	var title string

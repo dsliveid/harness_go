@@ -82,3 +82,4 @@ demo/serve.err.log
 *.zip
 *.tar
 *.tar.gz
+dist

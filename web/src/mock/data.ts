@@ -53,8 +53,8 @@ export const providers: Provider[] = [
   {
     id: 'deepseek', name: 'DeepSeek', baseUrl: 'https://api.deepseek.com/v1', enabled: true, apiKeyMasked: 'sk-****9f2c',
     models: [
-      { id: 'deepseek-chat', contextLimit: 64000, capabilities: ['chat', 'reasoning'], protocol: 'chat_completions' },
-      { id: 'deepseek-reasoner', contextLimit: 64000, capabilities: ['chat', 'reasoning'], protocol: 'chat_completions' },
+      { id: 'deepseek-chat', contextLimit: 1000000, capabilities: ['chat'], protocol: 'chat_completions' },
+      { id: 'deepseek-reasoner', contextLimit: 1000000, capabilities: ['chat'], protocol: 'chat_completions' },
     ],
   },
   {
@@ -66,7 +66,7 @@ export const providers: Provider[] = [
   },
   {
     id: 'claude', name: 'Anthropic', baseUrl: 'https://api.anthropic.com', enabled: false, apiKeyMasked: 'sk-ant-****77de',
-    models: [{ id: 'claude-sonnet-4', contextLimit: 200000, capabilities: ['chat', 'reasoning', 'vision'], protocol: 'messages' }],
+    models: [{ id: 'claude-sonnet-4', contextLimit: 200000, capabilities: ['chat', 'vision'], protocol: 'messages' }],
   },
 ]
 
@@ -597,7 +597,7 @@ export const dataGrants: DataScopeGrant[] = [
 
 // ---------------- 运行态 ----------------
 export const runningSessionId = 's1'
-export const contextLimit = 64000
+export const contextLimit = 1000000
 export const usedTokens = 18700
 
 // ---------------- 长会话（用于验证虚拟列表：320 条消息 / 160 轮） ----------------

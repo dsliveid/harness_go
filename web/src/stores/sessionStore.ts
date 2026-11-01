@@ -7,9 +7,31 @@ import {
 } from '../mock/data'
 import { api, apiMode } from '../lib/api'
 import { useUI } from './uiStore'
+import { useSettings } from './settingsStore'
 
 /** 项目所属工作空间（缺省视为内置服务端空间） */
 export const wsOfProject = (p: Project) => p.workspaceId ?? DEFAULT_WORKSPACE_ID
+
+/**
+ * 新会话的初始模型（不存在「默认模型」这个模糊选项，落到具体模型或空）：
+ *  ① 同一作用域内最近的会话：项目对话看同项目最新一条，纯对话看上一条纯对话；
+ *  ② 设置 → 能力模型槽位 chat（全局默认对话模型，需仍在启用厂商列表内）；
+ *  ③ 兜底：mock 用演示模型；real 为空串 = 未选择（发送时会提示先选模型）。
+ */
+function inheritModelRef(sessions: Session[], projectId?: string): string {
+  const scope = sessions.filter((s) => (projectId ? s.projectId === projectId : !s.projectId))
+  const inherited = scope.find((s) => !s.archivedAt && s.modelRef)?.modelRef
+  if (inherited) return inherited
+  const { providers, capabilityModels } = useSettings.getState().settings
+  const chatSlot = capabilityModels?.chat ?? ''
+  if (chatSlot) {
+    const pid = chatSlot.slice(0, chatSlot.indexOf('/'))
+    const mid = chatSlot.slice(chatSlot.indexOf('/') + 1)
+    const p = providers.find((x) => x.id === pid)
+    if (p?.enabled && p.models.some((m) => m.id === mid)) return chatSlot
+  }
+  return apiMode === 'mock' ? 'deepseek/deepseek-chat' : ''
+}
 
 /** 会话所属工作空间：优先自身 workspaceId，其次按项目推导，纯对话缺省内置空间 */
 export const wsOfSession = (s: Session, projects: Project[]) =>
@@ -167,18 +189,24 @@ export const useSessions = create<SessionState>((set, get) => ({
       workspaceId: proj ? wsOfProject(proj) : get().activeWorkspaceId,
       workspacePath: proj?.path,
       accessMode: 'confirm',
-      // mock 用演示默认模型；real 交给服务端（未配置厂商时为空，运行时回退 default provider）
-      modelRef: apiMode === 'mock' ? 'deepseek/deepseek-chat' : '',
+      // 新会话模型：沿用同作用域最近会话的选择，其次全局 chat 槽位；为空 = 未选择
+      modelRef: inheritModelRef(get().sessions, projectId),
       updatedAt: Date.now(),
     }
     set((st) => ({ sessions: [s, ...st.sessions], currentId: id }))
     if (apiMode === 'real') {
-      // 先乐观插入（同步返回 id 供调用方 select），再以服务端返回的会话替换本地壳
+      // 先乐观插入（同步返回 id 供调用方 select），再以服务端返回的会话替换本地壳；
+      // 模型选择随会话一并落库（服务端 Session.model_ref），工作区路径同步落库
+      // （sessions.workspace_path，为「工具按会话路由工作区」预留运行时锚点）。
+      // 服务端会话没有项目/客户端空间概念：替换时保留本地归属，否则会话掉回纯对话作用域，
+      // 会破坏「同项目内继承最近模型」的分组。
       void api
-        .createSession({ title: s.title })
+        .createSession({ title: s.title, modelRef: s.modelRef, workspacePath: s.workspacePath })
         .then((created) => {
           set((st) => ({
-            sessions: st.sessions.map((x) => (x.id === id ? created : x)),
+            sessions: st.sessions.map((x) =>
+              x.id === id ? { ...created, projectId: x.projectId, workspaceId: x.workspaceId } : x,
+            ),
             currentId: st.currentId === id ? created.id : st.currentId,
           }))
         })
@@ -213,17 +241,36 @@ export const useSessions = create<SessionState>((set, get) => ({
       void api.deleteSession(id).catch(() => useUI.getState().toast('error', '删除会话失败'))
     }
   },
-  archive: (id) =>
+  archive: (id) => {
     set((s) => ({
       sessions: s.sessions.map((x) => (x.id === id ? { ...x, archivedAt: Date.now() } : x)),
       currentId: s.currentId === id ? (s.sessions.find((x) => x.id !== id && !x.archivedAt)?.id ?? s.currentId) : s.currentId,
-    })),
-  unarchive: (id) =>
-    set((s) => ({ sessions: s.sessions.map((x) => (x.id === id ? { ...x, archivedAt: undefined } : x)) })),
-  setAccessMode: (id, accessMode) =>
-    set((s) => ({ sessions: s.sessions.map((x) => (x.id === id ? { ...x, accessMode } : x)) })),
-  setModel: (id, modelRef) =>
-    set((s) => ({ sessions: s.sessions.map((x) => (x.id === id ? { ...x, modelRef } : x)) })),
+    }))
+    if (apiMode === 'real') {
+      // 归档落库：刷新/重启后归档中心仍完整（失败仅提示，本地状态已更新）
+      void api.archiveSession(id).catch(() => useUI.getState().toast('error', '归档会话失败'))
+    }
+  },
+  unarchive: (id) => {
+    set((s) => ({ sessions: s.sessions.map((x) => (x.id === id ? { ...x, archivedAt: undefined } : x)) }))
+    if (apiMode === 'real') {
+      void api.unarchiveSession(id).catch(() => useUI.getState().toast('error', '取消归档失败'))
+    }
+  },
+  setAccessMode: (id, accessMode) => {
+    set((s) => ({ sessions: s.sessions.map((x) => (x.id === id ? { ...x, accessMode } : x)) }))
+    if (apiMode === 'real') {
+      // 访问模式落库：引擎每次审批实时重读，运行中切换立即生效（对齐桌面端语义）
+      void api.setSessionAccessMode(id, accessMode).catch(() => useUI.getState().toast('error', '保存访问模式失败'))
+    }
+  },
+  setModel: (id, modelRef) => {
+    set((s) => ({ sessions: s.sessions.map((x) => (x.id === id ? { ...x, modelRef } : x)) }))
+    if (apiMode === 'real') {
+      // 会话级模型落库：重载 / 换端后仍生效（失败不影响本地选择）
+      void api.setSessionModel(id, modelRef).catch(() => useUI.getState().toast('error', '保存模型选择失败'))
+    }
+  },
 
   createProject: (name, path) => {
     const id = `p-${Date.now()}`

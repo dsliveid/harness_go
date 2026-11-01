@@ -2,6 +2,7 @@ import { create } from 'zustand'
 import type { ModelInfo, Provider } from '../types'
 import { defaultModels, providers as mockProviders } from '../mock/data'
 import { api, apiMode } from '../lib/api'
+import { DEFAULT_CONTEXT_LIMIT } from '../lib/context'
 import type { ProviderDTO, ProviderInput } from '../lib/apiTypes'
 import { useUI } from './uiStore'
 
@@ -22,6 +23,9 @@ export interface AppSettings {
 
 /** 已配置密钥时的输入框掩码占位（提交时若仍等于该值，表示「不修改密钥」） */
 export const PROVIDER_KEY_MASK = '••••••••'
+
+/** 服务端持久化的默认对话模型键（settings 白名单；值为 providerID/modelID 引用） */
+const DEFAULT_MODEL_KEY = 'agent.default_model'
 
 const initialSettings: AppSettings = {
   // real 模式的厂商来自主库 providers 表（loadProviders 拉取）；mock 沿用 demo 样例
@@ -47,7 +51,7 @@ function toUiProvider(d: ProviderDTO): Provider {
     apiKeyMasked: d.has_api_key ? PROVIDER_KEY_MASK : '',
     models: (d.models ?? []).map((id) => ({
       id,
-      contextLimit: 64000,
+      contextLimit: DEFAULT_CONTEXT_LIMIT,
       capabilities: ['chat'],
       protocol: 'chat_completions',
     })),
@@ -107,6 +111,15 @@ async function syncProvidersToServer(prev: Provider[], next: Provider[]): Promis
   return changed
 }
 
+/** 持久化默认对话模型（chat 槽位 → settings.agent.default_model；内存态刷新即丢，必须落库） */
+async function syncDefaultModelToServer(modelRef: string): Promise<void> {
+  try {
+    await api.patchSettings({ [DEFAULT_MODEL_KEY]: modelRef })
+  } catch {
+    useUI.getState().toast('error', '保存默认对话模型失败')
+  }
+}
+
 interface SettingsState {
   /** 已提交生效的设置 */
   settings: AppSettings
@@ -117,6 +130,14 @@ interface SettingsState {
   endEdit: (commit: boolean) => void
   /** 对草稿做函数式修改（面板统一入口） */
   patchDraft: (fn: (d: AppSettings) => AppSettings) => void
+  /**
+   * 「应用」语义（对齐桌面端 ModalActions）：提交草稿使其生效，但**不结束编辑**。
+   *
+   * 与 endEdit(true) 的差异：提交后立刻用最新设置重开草稿，弹窗保持打开，
+   * 用户可继续改下一项；real 模式会等服务端同步完成再重开草稿，
+   * 保证界面回到「已落库」的真值（厂商 id / 密钥掩码都以服务端为准）。
+   */
+  applyDraft: () => Promise<void>
   /**
    * 直接生效的内置工具启停（「高级 → 工具 → 系统内置」无「保存」按钮，改动立即落库；
    * 若当前正在编辑草稿，则同步草稿避免出现「改了但没保存」的错觉）
@@ -139,7 +160,8 @@ export const useSettings = create<SettingsState>((set, get) => ({
     if (!draft) return
     set(commit ? { settings: draft, draft: null } : { draft: null })
     if (!commit || apiMode !== 'real') return
-    // 厂商/模型改动立即落库：差异提交后再拉回服务端真值（密钥只回掩码）
+    // 默认对话模型落库（内存态刷新即丢）+ 厂商差异提交后再拉回服务端真值（密钥只回掩码）
+    void syncDefaultModelToServer(draft.capabilityModels?.chat ?? '')
     void syncProvidersToServer(settings.providers, draft.providers).then((changed) => {
       if (changed) void get().loadProviders()
     })
@@ -159,12 +181,49 @@ export const useSettings = create<SettingsState>((set, get) => ({
             : (list[0]?.id ?? ''),
         },
       }))
+      // 恢复持久化的默认对话模型（agent.default_model）：须命中启用厂商，否则视为未设置
+      try {
+        const items = await api.getSettings()
+        const ref = typeof items[DEFAULT_MODEL_KEY] === 'string' ? (items[DEFAULT_MODEL_KEY] as string) : ''
+        if (ref) {
+          const sep = ref.indexOf('/')
+          const pid = sep > 0 ? ref.slice(0, sep) : ''
+          const mid = sep > 0 ? ref.slice(sep + 1) : ''
+          const p = list.find((x) => x.id === pid)
+          if (p?.enabled && p.models.some((m) => m.id === mid)) {
+            set((s) => ({
+              settings: { ...s.settings, capabilityModels: { ...s.settings.capabilityModels, chat: ref } },
+            }))
+          }
+        }
+      } catch {
+        /* 设置读取失败不阻塞厂商加载 */
+      }
     } catch {
       /* 服务未起/网络异常：保留现有列表，避免把已配置厂商清空 */
     }
   },
   patchDraft: (fn) =>
     set((s) => (s.draft ? { draft: fn(s.draft) } : s)),
+
+  // 「应用」：提交草稿 → 同步服务端 → 用最新真值重开草稿（弹窗不关）
+  applyDraft: async () => {
+    const { draft, settings } = get()
+    if (!draft) return
+    set({ settings: draft })
+    if (apiMode !== 'real') {
+      // mock：直接用提交后的设置重开草稿
+      set({ draft: structuredClone(get().settings) })
+      return
+    }
+    // real：默认对话模型落库 + 差异提交厂商，再拉回服务端真值后重开草稿
+    void syncDefaultModelToServer(draft.capabilityModels?.chat ?? '')
+    const changed = await syncProvidersToServer(settings.providers, draft.providers)
+    if (changed) {
+      await get().loadProviders()
+    }
+    set((s) => ({ draft: structuredClone(s.settings) }))
+  },
   setDisabledTools: (next) =>
     set((s) => ({
       settings: { ...s.settings, disabledTools: next },
@@ -212,7 +271,7 @@ export function addModel(d: AppSettings, providerId: string, modelId?: string): 
   const p = d.providers.find((x) => x.id === providerId)!
   // 已存在同 ID 模型则不重复添加
   if (p.models.some((m) => m.id === id)) return d
-  const m: ModelInfo = { id, contextLimit: 64000, capabilities: ['chat'], protocol: 'chat_completions' }
+  const m: ModelInfo = { id, contextLimit: DEFAULT_CONTEXT_LIMIT, capabilities: ['chat'], protocol: 'chat_completions' }
   return updateProvider(d, providerId, { models: [...p.models, m] })
 }
 

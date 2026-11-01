@@ -258,10 +258,23 @@ func run() error {
 		Builder:       gatedBuilder,
 		Tools:         toolRunner,
 		Catalog:       toolRunner,
+		RiskOverride:  toolRunner.RiskFor,
 		Gate:          gate,
 		Leases:        leasePort,
 		MaxConcurrent: 8,
 		MaxSteps:      20,
+		// 访问模式切换即时生效（对齐桌面端）：每次审批决策前实时重读会话行；
+		// 读取失败回落 Run 启动快照（引擎内空值回落 confirm，与 normalizeAccessMode 同口径）。
+		AccessModeProvider: func(ctx context.Context, sessionID string) (approval.AccessMode, error) {
+			sess, err := mainStore.Sessions().Get(ctx, sessionID)
+			if err != nil {
+				return "", err
+			}
+			if sess.AccessMode == "" {
+				return approval.ModeConfirm, nil
+			}
+			return approval.AccessMode(sess.AccessMode), nil
+		},
 	})
 	if err != nil {
 		return err

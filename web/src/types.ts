@@ -73,6 +73,8 @@ export interface ToolCall {
   status: ToolStatus
   risk: Risk
   result?: string
+  /** 实时增量输出（run_command 等长任务执行中，来自 tool.progress 事件；结束以 result 为准） */
+  liveOutput?: string
   diff?: FileDiff
   durationMs?: number
   deniedReason?: string
@@ -202,7 +204,7 @@ export type RequestProtocol = 'chat_completions' | 'messages' | 'response' | 'sy
 export interface ModelInfo {
   id: string
   contextLimit: number
-  capabilities: Array<'chat' | 'vision' | 'image' | 'decision' | 'reasoning'>
+  capabilities: Array<'chat' | 'vision' | 'image' | 'decision'>
   /** 该模型的请求协议，缺省视为 chat_completions（OpenAI 兼容） */
   protocol: RequestProtocol
 }

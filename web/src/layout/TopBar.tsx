@@ -35,14 +35,21 @@ export function TopBar() {
   const fmtTime = (t?: number | null) =>
     t ? new Date(t).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '—'
 
-  const models = providers.filter((p) => p.enabled).flatMap((p) => p.models.map((m) => ({ ref: `${p.id}/${m.id}`, name: m.id, limit: m.contextLimit })))
+  const models = providers.filter((p) => p.enabled).flatMap((p) => p.models.map((m) => ({ ref: `${p.id}/${m.id}`, name: m.id, limit: m.contextLimit, providerName: p.name })))
   const currentModel = models.find((m) => m.ref === s?.modelRef)
-  // 会话当前 modelRef 不在已配置列表里（未配置厂商 / 厂商被禁用）时补一个占位项，
-  // 否则受控 select 的 value 无匹配 option，界面上会显示为空白（real 模式未配厂商时即为空串）。
+  // 没有「默认模型」这种模糊选项：未选择就是未选择（空值显示占位「请先选择模型」）。
+  // 会话的 modelRef 不在已启用厂商列表（厂商被禁用/删除）时补原样占位项，避免受控 select 显示空白。
   const modelChoices =
-    !s || models.some((m) => m.ref === s.modelRef)
+    !s || !s.modelRef || models.some((m) => m.ref === s.modelRef)
       ? models
-      : [{ ref: s.modelRef, name: s.modelRef || '默认模型', limit: 0 }, ...models]
+      : [{ ref: s.modelRef, name: s.modelRef, limit: 0, providerName: '' }, ...models]
+  // 按厂商分组渲染 <optgroup>（对齐桌面端「顶栏模型选择按厂商分组切换」）；
+  // 同名模型（如不同厂商都配了 deepseek-chat）不再无法区分归属。
+  const orphanChoice = modelChoices.find((m) => !m.providerName && m.ref === s?.modelRef)
+  const grouped = providers
+    .filter((p) => p.enabled && p.models.length > 0)
+    .map((p) => ({ name: p.name, items: modelChoices.filter((m) => m.providerName === p.name) }))
+    .filter((g) => g.items.length > 0)
   // 标题恒为当前会话标题（对话区常驻，定时任务/插件市场以弹窗呈现，不再改写标题）
   const pageTitle = s?.title ?? '新对话'
 
@@ -92,15 +99,33 @@ export function TopBar() {
               <Bot size={13} />
             </span>
             <select
-              className="h-8 pl-6 pr-6 max-w-[96px] sm:max-w-[200px] rounded-lg bg-panel2 text-[12px] font-medium text-ink outline-none cursor-pointer appearance-none hover:bg-panel3 transition-all focus:ring-1 focus:ring-accent/40"
+              className={`h-8 pl-6 pr-6 max-w-[96px] sm:max-w-[200px] rounded-lg bg-panel2 text-[12px] font-medium outline-none cursor-pointer appearance-none hover:bg-panel3 transition-all focus:ring-1 focus:ring-accent/40 ${
+                s.modelRef ? 'text-ink' : 'text-warn'
+              }`}
               value={s.modelRef}
               onChange={(e) => setModel(s.id, e.target.value)}
               title="会话级模型（切换不影响其他会话）"
             >
-              {modelChoices.map((m) => (
-                <option key={m.ref} value={m.ref} className="bg-panel text-ink py-1">
-                  {m.name}
+              {/* 未选择模型时显示醒目占位；发送消息会被拦截提示 */}
+              {!s.modelRef && (
+                <option value="" className="bg-panel text-warn">
+                  请先选择模型
                 </option>
+              )}
+              {/* 会话原 modelRef 已不在启用厂商列表（厂商被禁用/删除）→ 保留为孤立占位项 */}
+              {orphanChoice && (
+                <option key={orphanChoice.ref} value={orphanChoice.ref} className="bg-panel text-ink py-1">
+                  {orphanChoice.name}
+                </option>
+              )}
+              {grouped.map((g) => (
+                <optgroup key={g.name} label={g.name}>
+                  {g.items.map((m) => (
+                    <option key={m.ref} value={m.ref} className="bg-panel text-ink py-1">
+                      {m.name}
+                    </option>
+                  ))}
+                </optgroup>
               ))}
             </select>
             <span className="absolute right-2 pointer-events-none text-inkfaint">

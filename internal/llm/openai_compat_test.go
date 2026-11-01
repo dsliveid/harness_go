@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -408,5 +409,231 @@ func TestErrorRetryableClassification(t *testing.T) {
 	}
 	if !IsRetryable(fmt.Errorf("plain error")) {
 		t.Fatal("未知错误保守视为可重试")
+	}
+}
+
+// modelListServer 构造假上游：仅对 path 返回 body（其余 404），并记录命中的 path。
+func modelListServer(t *testing.T, path, body string) (*httptest.Server, *[]string) {
+	t.Helper()
+	var hits []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits = append(hits, r.URL.Path)
+		if r.URL.Path != path {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"error":"not found"}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &hits
+}
+
+// TestListModelsOpenAIShape OpenAI 形状 {"data":[{"id":...}]}：一次命中，模型名去重保序。
+func TestListModelsOpenAIShape(t *testing.T) {
+	srv, hits := modelListServer(t, "/v1/models",
+		`{"data":[{"id":"deepseek-chat"},{"id":"deepseek-reasoner"},{"id":"deepseek-chat"}]}`)
+	p, err := NewOpenAICompat(OpenAICompatConfig{BaseURL: srv.URL + "/v1"})
+	if err != nil {
+		t.Fatalf("构造适配器失败: %v", err)
+	}
+	list, err := p.ListModels(context.Background())
+	if err != nil {
+		t.Fatalf("获取模型列表失败: %v", err)
+	}
+	want := []string{"deepseek-chat", "deepseek-reasoner"}
+	if len(list) != len(want) || list[0] != want[0] || list[1] != want[1] {
+		t.Fatalf("期望 %v，得到 %v", want, list)
+	}
+	if len(*hits) != 1 || (*hits)[0] != "/v1/models" {
+		t.Fatalf("期望只命中 /v1/models，实际命中 %v", *hits)
+	}
+}
+
+// TestListModelsOllamaShape Ollama 形状 {"models":[{"name":...}]}（/api/tags）。
+func TestListModelsOllamaShape(t *testing.T) {
+	srv, hits := modelListServer(t, "/api/tags",
+		`{"models":[{"name":"qwen2.5:7b"},{"model":"llama3.1:8b"}]}`)
+	// base 不含 /v1 → 会先试 /models、/v1/models，都 404，最后 /api/tags 命中
+	p, err := NewOpenAICompat(OpenAICompatConfig{BaseURL: srv.URL})
+	if err != nil {
+		t.Fatalf("构造适配器失败: %v", err)
+	}
+	list, err := p.ListModels(context.Background())
+	if err != nil {
+		t.Fatalf("获取模型列表失败: %v", err)
+	}
+	if len(list) != 2 || list[0] != "qwen2.5:7b" || list[1] != "llama3.1:8b" {
+		t.Fatalf("期望 Ollama 两种字段都能取到，得到 %v", list)
+	}
+	if len(*hits) != 3 {
+		t.Fatalf("期望依次尝试 3 个候选，实际 %v", *hits)
+	}
+}
+
+// TestListModelsFallbackCandidates base 未含 /v1：首个 /models 404 后应回退 /v1/models 成功。
+func TestListModelsFallbackCandidates(t *testing.T) {
+	var hits []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits = append(hits, r.URL.Path)
+		if r.URL.Path != "/v1/models" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"data":[{"id":"gpt-4o"}]}`)
+	}))
+	t.Cleanup(srv.Close)
+	p, err := NewOpenAICompat(OpenAICompatConfig{BaseURL: srv.URL + "/"})
+	if err != nil {
+		t.Fatalf("构造适配器失败: %v", err)
+	}
+	list, err := p.ListModels(context.Background())
+	if err != nil {
+		t.Fatalf("获取模型列表失败: %v", err)
+	}
+	if len(list) != 1 || list[0] != "gpt-4o" {
+		t.Fatalf("期望回退到 /v1/models 取到 gpt-4o，得到 %v", list)
+	}
+	if len(hits) != 2 || hits[0] != "/models" || hits[1] != "/v1/models" {
+		t.Fatalf("候选顺序应为 /models → /v1/models，实际 %v", hits)
+	}
+}
+
+// TestListModelsAllCandidatesFail 全部候选失败：必须报错（不得回退本地样例），且错误含状态码。
+func TestListModelsAllCandidatesFail(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"error":"invalid api key"}`)
+	}))
+	t.Cleanup(srv.Close)
+	p, err := NewOpenAICompat(OpenAICompatConfig{BaseURL: srv.URL})
+	if err != nil {
+		t.Fatalf("构造适配器失败: %v", err)
+	}
+	list, err := p.ListModels(context.Background())
+	if err == nil {
+		t.Fatalf("全部候选失败必须报错，却返回列表 %v", list)
+	}
+	if len(list) != 0 {
+		t.Fatalf("失败时不得返回任何兜底模型，得到 %v", list)
+	}
+	msg := AsError(err).Message
+	if !strings.Contains(msg, "401") {
+		t.Fatalf("聚合错误应包含 HTTP 状态，实际: %s", msg)
+	}
+}
+
+// TestListModelsStripsEndpointSuffix 误把 /chat/completions 填进 Base URL 时仍能取到列表。
+func TestListModelsStripsEndpointSuffix(t *testing.T) {
+	srv, _ := modelListServer(t, "/v1/models", `{"data":[{"id":"qwen-max"}]}`)
+	p, err := NewOpenAICompat(OpenAICompatConfig{BaseURL: srv.URL + "/v1/chat/completions"})
+	if err != nil {
+		t.Fatalf("构造适配器失败: %v", err)
+	}
+	list, err := p.ListModels(context.Background())
+	if err != nil {
+		t.Fatalf("剥离 /chat/completions 后应成功: %v", err)
+	}
+	if len(list) != 1 || list[0] != "qwen-max" {
+		t.Fatalf("期望 qwen-max，得到 %v", list)
+	}
+}
+
+// TestNormalizeModelsBase Base URL 规整规则。
+func TestNormalizeModelsBase(t *testing.T) {
+	cases := map[string]string{
+		"https://api.deepseek.com/v1/":                   "https://api.deepseek.com/v1",
+		"https://api.deepseek.com/v1/chat/completions":   "https://api.deepseek.com/v1",
+		"https://api.anthropic.com/v1/messages":          "https://api.anthropic.com/v1",
+		"https://x.openai.azure.com/openai/v1/responses": "https://x.openai.azure.com/openai/v1",
+		"  https://a.com/v1/models  ":                    "https://a.com/v1/models",
+		"":                                               "",
+	}
+	for in, want := range cases {
+		if got := normalizeModelsBase(in); got != want {
+			t.Fatalf("normalizeModelsBase(%q) = %q，期望 %q", in, got, want)
+		}
+	}
+}
+
+// TestChatStreamSendsSessionHeaders 会话路由头（对齐桌面端 llm.rs）：
+// opencode zen 等网关强制要求 x-opencode-session / x-session-id（缺失直接 400 MissingSessionID），
+// 因此 chat 请求必须默认携带；显式 SessionID 生效，ExtraHeaders 可覆盖。
+func TestChatStreamSendsSessionHeaders(t *testing.T) {
+	var got http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n")
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	doOne := func(p *OpenAICompat) {
+		t.Helper()
+		stream, err := p.ChatStream(context.Background(), ChatRequest{Model: "m", Stream: true})
+		if err != nil {
+			t.Fatalf("ChatStream 失败: %v", err)
+		}
+		if _, err := stream.Recv(); err != nil && err != EOF {
+			t.Fatalf("Recv 失败: %v", err)
+		}
+		_ = stream.Close()
+	}
+
+	// ① 未显式配置：自动生成 sess-<32hex>，两个头一致
+	p := newTestProvider(t, srv.URL, 5*time.Second)
+	doOne(p)
+	sid := got.Get("x-opencode-session")
+	if !strings.HasPrefix(sid, "sess-") || len(sid) != len("sess-")+32 {
+		t.Fatalf("应自动生成 sess-<32hex> 会话 ID，得到 %q", sid)
+	}
+	if got.Get("x-session-id") != sid {
+		t.Fatalf("x-session-id 应与 x-opencode-session 一致：%q ≠ %q", got.Get("x-session-id"), sid)
+	}
+
+	// ② 显式 SessionID：原样发送
+	p2, err := NewOpenAICompat(OpenAICompatConfig{BaseURL: srv.URL, SessionID: "sess-fixed-123"})
+	if err != nil {
+		t.Fatalf("构造适配器失败: %v", err)
+	}
+	doOne(p2)
+	if got.Get("x-opencode-session") != "sess-fixed-123" || got.Get("x-session-id") != "sess-fixed-123" {
+		t.Fatalf("显式 SessionID 未生效：%q / %q", got.Get("x-opencode-session"), got.Get("x-session-id"))
+	}
+
+	// ③ ExtraHeaders 优先级最高（可覆盖内置会话头）
+	p3, err := NewOpenAICompat(OpenAICompatConfig{
+		BaseURL:      srv.URL,
+		ExtraHeaders: map[string]string{"x-opencode-session": "sess-override"},
+	})
+	if err != nil {
+		t.Fatalf("构造适配器失败: %v", err)
+	}
+	doOne(p3)
+	if got.Get("x-opencode-session") != "sess-override" {
+		t.Fatalf("ExtraHeaders 应可覆盖会话头，得到 %q", got.Get("x-opencode-session"))
+	}
+	if got.Get("x-session-id") != p3.sessionID {
+		t.Fatalf("未被覆盖的 x-session-id 应保持适配器值：%q ≠ %q", got.Get("x-session-id"), p3.sessionID)
+	}
+}
+
+// TestNewSessionID 会话 ID 生成规则：sess- 前缀 + 32 位十六进制，且全局唯一。
+func TestNewSessionID(t *testing.T) {
+	seen := make(map[string]struct{})
+	for i := 0; i < 100; i++ {
+		id := NewSessionID()
+		if !strings.HasPrefix(id, "sess-") || len(id) != len("sess-")+32 {
+			t.Fatalf("会话 ID 形状错误: %q", id)
+		}
+		if _, dup := seen[id]; dup {
+			t.Fatalf("会话 ID 重复: %q", id)
+		}
+		seen[id] = struct{}{}
 	}
 }

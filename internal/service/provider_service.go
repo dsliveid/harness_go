@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -39,6 +40,18 @@ type ProviderTestResult struct {
 	Model     string `json:"model"`
 	Error     string `json:"error,omitempty"`
 	Code      string `json:"code,omitempty"`
+}
+
+// ProviderModelsResult 上游模型清单（「获取模型列表」）。
+type ProviderModelsResult struct {
+	Items []string `json:"items"`
+	Count int      `json:"count"`
+}
+
+// ProviderSecretResult 厂商密钥明文（「显示密钥 / 复制密钥」）。
+type ProviderSecretResult struct {
+	APIKey string `json:"api_key"`
+	HasKey bool   `json:"has_key"`
 }
 
 // List 列出厂商（密钥脱敏）。
@@ -134,26 +147,53 @@ func (s *ProviderService) Delete(ctx context.Context, id string) error {
 	return wrapStoreErr(s.main.Providers().Delete(ctx, id), apperr.CodeNotFound, "厂商不存在")
 }
 
+// ProviderTestInput 连通测试入参。
+//
+// 除 Model 外还接受 BaseURL/APIKey/Models 草稿覆盖：前端把「尚未保存」的当前值
+// 一并传来，实现所见即所测——
+//   - 厂商未落库（草稿 id / 已删除）：只要有 base_url 就按请求配置直接测；
+//   - 已落库：非空覆盖字段优先于库内值（api_key 仅本次测试使用，不落库、不进日志）。
+type ProviderTestInput struct {
+	Model   string   `json:"model"`
+	BaseURL string   `json:"base_url"`
+	APIKey  string   `json:"api_key"`
+	Models  []string `json:"models"`
+}
+
 // Test 连通测试：用该厂商配置发一次极小 chat 请求，返回延迟与错误。
 //
 // 刻意不返回上游响应体（防泄漏配额/账号信息），只回错误码 + 简短原因。
-func (s *ProviderService) Test(ctx context.Context, id, modelRef string) (ProviderTestResult, error) {
+// 覆盖语义见 ProviderTestInput；测试本身不产生任何落库副作用。
+func (s *ProviderService) Test(ctx context.Context, id string, in ProviderTestInput) (ProviderTestResult, error) {
 	p, err := s.main.Providers().Get(ctx, id)
-	if err != nil {
+	switch {
+	case err == nil:
+		// 已落库：草稿里改过但未保存的字段以请求覆盖为准
+		if strings.TrimSpace(in.BaseURL) != "" {
+			p.BaseURL = strings.TrimRight(strings.TrimSpace(in.BaseURL), "/")
+		}
+		if in.Models != nil {
+			p.Models = in.Models
+		}
+	case errors.Is(err, store.ErrNotFound) && strings.TrimSpace(in.BaseURL) != "":
+		// 未落库厂商：凭请求配置直接测（所见即所测），不落库
+		p = &model.Provider{
+			ID:      id,
+			Name:    "未保存厂商",
+			BaseURL: strings.TrimRight(strings.TrimSpace(in.BaseURL), "/"),
+			Models:  in.Models,
+		}
+	default:
 		return ProviderTestResult{}, wrapStoreErr(err, apperr.CodeNotFound, "厂商不存在")
 	}
-	key := ""
-	if len(p.APIKeyEnc) > 0 {
-		if s.cipher == nil {
-			return ProviderTestResult{}, apperr.New(apperr.CodeUnavailable, "服务未启用密钥，无法读取 api_key")
+
+	key := strings.TrimSpace(in.APIKey)
+	if key == "" {
+		if key, err = s.decryptKey(p); err != nil {
+			return ProviderTestResult{}, err
 		}
-		raw, dErr := s.cipher.Decrypt(p.APIKeyEnc)
-		if dErr != nil {
-			return ProviderTestResult{}, apperr.Wrap(dErr, apperr.CodeInvalidArgument, "api_key 解密失败")
-		}
-		key = string(raw)
 	}
-	name := modelRef
+	name := strings.TrimSpace(in.Model)
 	if name == "" && len(p.Models) > 0 {
 		name = p.Models[0]
 	}
@@ -203,6 +243,75 @@ func (s *ProviderService) Test(ctx context.Context, id, modelRef string) (Provid
 		Model:     name,
 		LatencyMS: time.Since(start).Milliseconds(),
 	}, nil
+}
+
+// ListModels 拉取该厂商在上游的真实模型清单（「获取模型列表」）。
+//
+// 与 Test 一样需要解密密钥；差异在于这里不发 chat 请求而是读模型目录。
+// 上游全部候选失败时**原样上抛可读错误**（不返回任何本地兜底清单），
+// 让前端明确告知用户「未获取到模型 + 原因」，避免假成功。
+func (s *ProviderService) ListModels(ctx context.Context, id string) (ProviderModelsResult, error) {
+	p, err := s.main.Providers().Get(ctx, id)
+	if err != nil {
+		return ProviderModelsResult{}, wrapStoreErr(err, apperr.CodeNotFound, "厂商不存在")
+	}
+	if strings.TrimSpace(p.BaseURL) == "" {
+		return ProviderModelsResult{}, invalidArg("该厂商未配置 Base URL")
+	}
+	key, kErr := s.decryptKey(p)
+	if kErr != nil {
+		return ProviderModelsResult{}, kErr
+	}
+	prov, nErr := llm.NewOpenAICompat(llm.OpenAICompatConfig{
+		Name:       p.Name,
+		BaseURL:    p.BaseURL,
+		APIKey:     key,
+		MaxRetries: 0,
+	})
+	if nErr != nil {
+		return ProviderModelsResult{}, apperr.Wrap(nErr, apperr.CodeInvalidArgument, "厂商配置无效")
+	}
+	cctx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
+	list, lErr := prov.ListModels(cctx)
+	if lErr != nil {
+		le := llm.AsError(lErr)
+		return ProviderModelsResult{}, apperr.New(apperr.CodeUnavailable, "获取模型列表失败：%s", le.Message)
+	}
+	return ProviderModelsResult{Items: list, Count: len(list)}, nil
+}
+
+// RevealAPIKey 读取厂商密钥明文（供「设置 → 模型」的眼睛图标显示与复制）。
+//
+// 安全边界（用户确认放开部署形态限制，不再区分 local/server/cloud）：
+//   - 仍要求已登录（Bearer/Cookie 由全局鉴权中间件把关），且只返回**该厂商自己**的密钥；
+//   - 响应头由 handler 加 `Cache-Control: no-store`，明文不落 access log；
+//   - 未配置密钥返回空串 + has_key=false，不视为错误（前端据 has_key 置灰复制按钮）。
+func (s *ProviderService) RevealAPIKey(ctx context.Context, id string) (ProviderSecretResult, error) {
+	p, err := s.main.Providers().Get(ctx, id)
+	if err != nil {
+		return ProviderSecretResult{}, wrapStoreErr(err, apperr.CodeNotFound, "厂商不存在")
+	}
+	key, kErr := s.decryptKey(p)
+	if kErr != nil {
+		return ProviderSecretResult{}, kErr
+	}
+	return ProviderSecretResult{APIKey: key, HasKey: key != ""}, nil
+}
+
+// decryptKey 解密厂商密钥；未配置返回空串，cipher 缺失时给出明确原因。
+func (s *ProviderService) decryptKey(p *model.Provider) (string, error) {
+	if len(p.APIKeyEnc) == 0 {
+		return "", nil
+	}
+	if s.cipher == nil {
+		return "", apperr.New(apperr.CodeUnavailable, "服务未启用密钥，无法读取 api_key")
+	}
+	raw, err := s.cipher.Decrypt(p.APIKeyEnc)
+	if err != nil {
+		return "", apperr.Wrap(err, apperr.CodeInvalidArgument, "api_key 解密失败")
+	}
+	return string(raw), nil
 }
 
 func (s *ProviderService) encrypt(apiKey string) ([]byte, error) {

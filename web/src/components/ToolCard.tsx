@@ -39,7 +39,7 @@ function getToolIcon(name: string) {
 export function ToolCard({ call, onRevertHunk }: { call: ToolCall; onRevertHunk?: (hunkId: string) => void }) {
   const [open, setOpen] = useState(call.status === 'running' || call.status === 'pending')
   const risk = RISK[call.risk] || RISK.readonly
-  const hasBody = Boolean(call.result || call.diff || Object.keys(call.args || {}).length)
+  const hasBody = Boolean(call.result || call.liveOutput || call.diff || Object.keys(call.args || {}).length)
   const { toast } = useUI()
 
   const isSpawn = call.name === 'spawn_subagent' || call.name === 'spawn_subprocess'
@@ -162,6 +162,14 @@ export function ToolCard({ call, onRevertHunk }: { call: ToolCall; onRevertHunk?
               <span className="w-1.5 h-1.5 rounded-full bg-accent inline-block typing-dot" />
               <span className="ml-1 font-medium">执行中…</span>
             </div>
+          )}
+
+          {/* 实时增量输出（tool.progress，200ms 节流推送）：命令执行中的流式回显；
+              终态后以 result 展示（completed 时 liveOutput 不再渲染） */}
+          {call.status === 'running' && call.liveOutput && (
+            <pre className="text-[11.5px] leading-5 font-mono text-inkdim bg-panel p-2.5 rounded-lg max-h-48 overflow-auto whitespace-pre-wrap break-words">
+              {call.liveOutput}
+            </pre>
           )}
         </div>
       )}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -26,9 +27,17 @@ type fakeSessionDB struct {
 	toolEvents []*model.ToolEvent
 	rules      []approval.Rule
 	seq        int64
+	usageP     int64
+	usageC     int64
 }
 
-func (f *fakeSessionDB) AddRunUsage(_ context.Context, _ string, _, _ int64) error { return nil }
+func (f *fakeSessionDB) AddRunUsage(_ context.Context, _ string, promptTokens, completionTokens int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.usageP = promptTokens
+	f.usageC = completionTokens
+	return nil
+}
 
 func (f *fakeSessionDB) AppendMessage(_ context.Context, m *model.Message) error {
 	f.mu.Lock()
@@ -292,6 +301,49 @@ func TestEngineCancelledByContext(t *testing.T) {
 	}
 }
 
+// 终态 run.status 事件携带 usage（P1）：与 AddRunUsage 落库同源同值，前端用量以此出栈。
+func TestEngineTerminalStatusCarriesUsage(t *testing.T) {
+	provider := &fakeProvider{rounds: [][]llm.Chunk{{
+		{Delta: "你"},
+		{Delta: "好"},
+		{FinishReason: "stop", Usage: &llm.Usage{PromptTokens: 33, CompletionTokens: 2, TotalTokens: 35}},
+	}}}
+	eng, sdb, bus, _ := newTestEngine(t, provider)
+
+	sub, err := bus.Subscribe("run-1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bus.Unsubscribe(sub)
+
+	if err := eng.Execute(context.Background(), baseRunRequest()); err != nil {
+		t.Fatalf("Run 应完成: %v", err)
+	}
+
+	// 落库口径：AddRunUsage 收到 33/2
+	if sdb.usageP != 33 || sdb.usageC != 2 {
+		t.Fatalf("AddRunUsage 应收到 33/2，得到 %d/%d", sdb.usageP, sdb.usageC)
+	}
+	// 事件口径：最终 run.status completed 事件带 input_tokens/output_tokens
+	var got map[string]any
+	for {
+		ev, ok := <-sub.C()
+		if !ok {
+			t.Fatal("事件流提前关闭，未收到终态 run.status")
+		}
+		if ev.Type == events.TypeRunStatus {
+			var payload map[string]any
+			if json.Unmarshal(ev.Payload, &payload) == nil && payload["status"] == string(model.RunCompleted) {
+				got = payload
+				break
+			}
+		}
+	}
+	if got["input_tokens"] != float64(33) || got["output_tokens"] != float64(2) {
+		t.Fatalf("终态事件应携带 usage 33/2，得到 %v/%v", got["input_tokens"], got["output_tokens"])
+	}
+}
+
 type slowProvider struct{}
 
 func (slowProvider) Name() string { return "slow" }
@@ -455,7 +507,159 @@ func TestEngineApprovalTimeoutDeniesAndContinues(t *testing.T) {
 	}
 }
 
-// 非 pending 的 Run 不允许执行（状态机收口）。
+// 访问模式切换即时生效：Run 以 confirm 启动，审批时实时读到 full → write 工具自动放行。
+func TestEngineAccessModeLiveUpdate(t *testing.T) {
+	provider := &fakeProvider{rounds: [][]llm.Chunk{
+		{{ToolCall: &llm.ToolCallDelta{Index: 0, ID: "call_1", Name: "write_file"}}},
+		{{Delta: "完成"}},
+	}}
+	tools := &fakeTools{result: ToolRunResult{Status: model.ToolOK}}
+	eng, sdb, _, _ := newTestEngine(t, provider, func(d *Deps) {
+		d.Tools = tools
+		d.Gate = approval.NewGate(50 * time.Millisecond)
+		// 模拟「运行中把会话切到 full」：审批时读到的不再是启动快照
+		d.AccessModeProvider = func(ctx context.Context, sessionID string) (approval.AccessMode, error) {
+			return approval.ModeFull, nil
+		}
+	})
+
+	req := baseRunRequest()
+	req.AccessMode = approval.ModeConfirm // 启动快照仍是 confirm
+	if err := eng.Execute(context.Background(), req); err != nil {
+		t.Fatalf("Run 应完成: %v", err)
+	}
+	if tools.calls != 1 {
+		t.Fatalf("full 模式下 write 工具应自动放行，实际执行 %d 次", tools.calls)
+	}
+	if len(sdb.toolEvents) != 1 || sdb.toolEvents[0].Status != model.ToolOK {
+		t.Fatalf("工具事件应为 ok，得到 %+v", sdb.toolEvents)
+	}
+}
+
+// AccessModeProvider 读取失败时回落 Run 启动快照（confirm → 审批仍拦截）。
+func TestEngineAccessModeFallbackOnError(t *testing.T) {
+	provider := &fakeProvider{rounds: [][]llm.Chunk{
+		{{ToolCall: &llm.ToolCallDelta{Index: 0, ID: "call_1", Name: "write_file"}}},
+		{{Delta: "好的，我换个方式"}},
+	}}
+	tools := &fakeTools{result: ToolRunResult{Status: model.ToolOK}}
+	eng, sdb, _, _ := newTestEngine(t, provider, func(d *Deps) {
+		d.Tools = tools
+		d.Gate = approval.NewGate(50 * time.Millisecond)
+		d.AccessModeProvider = func(ctx context.Context, sessionID string) (approval.AccessMode, error) {
+			return "", errors.New("db down")
+		}
+	})
+
+	req := baseRunRequest()
+	req.AccessMode = approval.ModeConfirm
+	if err := eng.Execute(context.Background(), req); err != nil {
+		t.Fatalf("Run 应完成: %v", err)
+	}
+	if tools.calls != 0 {
+		t.Fatalf("读库失败应回落快照（confirm 拦截），实际执行 %d 次", tools.calls)
+	}
+	if len(sdb.toolEvents) != 1 || sdb.toolEvents[0].Status != model.ToolDenied {
+		t.Fatalf("工具事件应为 denied，得到 %+v", sdb.toolEvents)
+	}
+}
+
+// recordingProvider 记录最近一次 ChatStream 请求（断言引导回灌进上下文）。
+type recordingProvider struct {
+	inner   llm.Provider
+	mu      sync.Mutex
+	lastReq llm.ChatRequest
+}
+
+func (p *recordingProvider) Name() string { return p.inner.Name() }
+func (p *recordingProvider) ChatStream(ctx context.Context, req llm.ChatRequest) (llm.Stream, error) {
+	p.mu.Lock()
+	p.lastReq = req
+	p.mu.Unlock()
+	return p.inner.ChatStream(ctx, req)
+}
+
+// 运行中引导（§4.2）：引擎在轮次边界消费 GuidanceCh，把引导消息回灌进下一轮上下文
+// （消息由 service 层落库，引擎不重复落库）。
+func TestEngineGuidanceInjectedAtTurnBoundary(t *testing.T) {
+	provider := &fakeProvider{rounds: [][]llm.Chunk{
+		{{ToolCall: &llm.ToolCallDelta{Index: 0, ID: "call_1", Name: "run_command", ArgumentsDelta: `{"cmd":"go","args":["test","./..."]}`}}},
+		{{Delta: "收到引导"}},
+	}}
+	rec := &recordingProvider{inner: provider}
+	tools := &fakeTools{result: ToolRunResult{Status: model.ToolOK}}
+	eng, _, _, _ := newTestEngine(t, rec, func(d *Deps) {
+		d.Tools = tools
+		d.Catalog = fakeCatalog{}
+	})
+
+	guidanceCh := make(chan *model.Message, 4)
+	guidanceCh <- &model.Message{ID: "g1", RunID: "run-1", Role: model.RoleUser, Content: "顺便跑一下 go vet", Seq: 3}
+	req := baseRunRequest()
+	req.GuidanceCh = guidanceCh
+	if err := eng.Execute(context.Background(), req); err != nil {
+		t.Fatalf("Run 应完成: %v", err)
+	}
+
+	rec.mu.Lock()
+	last := rec.lastReq
+	rec.mu.Unlock()
+	found := false
+	for _, m := range last.Messages {
+		if m.Role == llm.RoleUser && m.Content == "顺便跑一下 go vet" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("引导消息应回灌进下一轮上下文，请求消息数=%d", len(last.Messages))
+	}
+}
+
+// fakeCatalog 契约风险级桩（run_command = command）。
+type fakeCatalog struct{}
+
+func (fakeCatalog) Risk(name string) (model.Risk, bool) {
+	if name == "run_command" {
+		return model.RiskCommand, true
+	}
+	return model.RiskWrite, true
+}
+
+// 高危命令特征检测（RiskOverride）：full 模式下 rm -rf 仍因升级为 danger 被逐次审批拦截。
+func TestEngineDangerCommandEscalation(t *testing.T) {
+	dangerArgs := `{"cmd":"rm","args":["-rf","/tmp/target"]}`
+	provider := &fakeProvider{rounds: [][]llm.Chunk{
+		{{ToolCall: &llm.ToolCallDelta{Index: 0, ID: "call_1", Name: "run_command", ArgumentsDelta: dangerArgs}}},
+		{{Delta: "换个方式"}},
+	}}
+	tools := &fakeTools{result: ToolRunResult{Status: model.ToolOK}}
+	eng, sdb, _, _ := newTestEngine(t, provider, func(d *Deps) {
+		d.Tools = tools
+		d.Catalog = fakeCatalog{}
+		d.Gate = approval.NewGate(50 * time.Millisecond)
+		// 与 tools.Runner.RiskFor 同口径：命中高危特征 → danger
+		d.RiskOverride = func(name string, args []byte, base model.Risk) model.Risk {
+			if name == "run_command" && strings.Contains(string(args), "-rf") {
+				return model.RiskDanger
+			}
+			return base
+		}
+	})
+
+	req := baseRunRequest()
+	req.AccessMode = approval.ModeFull // full 自动放行 write/command，但 danger 必须逐次审批
+	if err := eng.Execute(context.Background(), req); err != nil {
+		t.Fatalf("Run 应完成: %v", err)
+	}
+	if tools.calls != 0 {
+		t.Fatalf("full 模式下高危命令不应自动放行，实际执行 %d 次", tools.calls)
+	}
+	if len(sdb.toolEvents) != 1 || sdb.toolEvents[0].Status != model.ToolDenied {
+		t.Fatalf("高危命令应被审批拦截，得到 %+v", sdb.toolEvents)
+	}
+}
+
 func TestEngineRejectsNonPendingRun(t *testing.T) {
 	provider := &fakeProvider{rounds: [][]llm.Chunk{{{Delta: "x"}}}}
 	eng, sdb, _, _ := newTestEngine(t, provider)

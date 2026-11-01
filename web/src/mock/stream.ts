@@ -6,6 +6,7 @@ export type StreamEvent =
   | { type: 'reasoning'; text: string }
   | { type: 'tool_start'; call: ToolCall }
   | { type: 'tool_result'; callId: string; result: string; durationMs: number; diff?: FileDiff; skipped?: boolean }
+  | { type: 'tool_progress'; callId: string; chunk: string }
   | { type: 'step'; tokens?: number; promptTokens?: number; cachedTokens?: number }
   | { type: 'approval'; approval: Approval }
   | { type: 'done'; tokensIn: number; tokensOut: number; cachedTokens?: number }

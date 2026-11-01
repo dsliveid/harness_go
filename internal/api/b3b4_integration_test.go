@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -123,6 +124,125 @@ func TestProviderAndSettingsEndpoints(t *testing.T) {
 	}
 	// 二次删除 → 404（不静默成功）
 	doJSON(t, http.MethodDelete, base+"/providers/"+created.ID, token, nil, http.StatusNotFound, nil)
+}
+
+// TestProviderSecretAndModels 覆盖「显示/复制密钥」与「获取模型列表」两个新端点：
+//   - secret：已配置密钥回明文、未配置回空串；响应必须 no-store
+//   - models：上游成功回真实清单；上游失败必须报错（不得回退本地兜底）
+func TestProviderSecretAndModels(t *testing.T) {
+	// 假上游：/v1/models 返回 OpenAI 形状，/v1/chat/completions 走测试用最小流
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/models":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(w, `{"data":[{"id":"upstream-a"},{"id":"upstream-b"}]}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer upstream.Close()
+
+	srv, token := newTestServer(t)
+	base := srv.URL + "/api/v1"
+
+	var created struct {
+		ID string `json:"id"`
+	}
+	doJSON(t, http.MethodPost, base+"/providers", token, map[string]any{
+		"name":     "上游可用的厂商",
+		"base_url": upstream.URL + "/v1",
+		"api_key":  "sk-reveal-me",
+		"models":   []string{"upstream-a"},
+		"enabled":  true,
+	}, http.StatusCreated, &created)
+
+	// ① 列表仍脱敏（回归保护：不能因为新增 secret 端点就顺手放开 List）
+	var list struct {
+		Items []struct {
+			APIKey    string `json:"api_key"`
+			HasAPIKey bool   `json:"has_api_key"`
+		} `json:"items"`
+	}
+	doJSON(t, http.MethodGet, base+"/providers", token, nil, http.StatusOK, &list)
+	if len(list.Items) != 1 || list.Items[0].APIKey != "" || !list.Items[0].HasAPIKey {
+		t.Fatalf("列表不应回密钥明文: %+v", list.Items)
+	}
+
+	// ② secret 端点回明文 + has_key=true，且响应头 no-store
+	var secret struct {
+		APIKey string `json:"api_key"`
+		HasKey bool   `json:"has_key"`
+	}
+	doJSON(t, http.MethodGet, base+"/providers/"+created.ID+"/secret", token, nil, http.StatusOK, &secret)
+	if secret.APIKey != "sk-reveal-me" || !secret.HasKey {
+		t.Fatalf("secret 端点应回明文密钥: %+v", secret)
+	}
+	if h := providerGetHeader(t, base+"/providers/"+created.ID+"/secret", token); h != "no-store" {
+		t.Fatalf("secret 响应 Cache-Control 应为 no-store，实际 %q", h)
+	}
+
+	// ③ models 端点：真实转发上游清单（按名称排序后落库口径无关，只断言集合）
+	var models struct {
+		Items []string `json:"items"`
+		Count int      `json:"count"`
+	}
+	doJSON(t, http.MethodGet, base+"/providers/"+created.ID+"/models", token, nil, http.StatusOK, &models)
+	if models.Count != 2 || len(models.Items) != 2 {
+		t.Fatalf("期望 2 个上游模型，得到 %+v", models)
+	}
+	got := map[string]bool{models.Items[0]: true, models.Items[1]: true}
+	if !got["upstream-a"] || !got["upstream-b"] {
+		t.Fatalf("模型清单应来自上游，得到 %v", models.Items)
+	}
+
+	// ④ 上游不可达的厂商：models 必须报错（不得回退本地兜底样例）
+	var bad struct {
+		ID string `json:"id"`
+	}
+	doJSON(t, http.MethodPost, base+"/providers", token, map[string]any{
+		"name":     "上游不可达",
+		"base_url": "http://127.0.0.1:1/v1",
+		"api_key":  "sk-x",
+		"models":   []string{"m"},
+		"enabled":  true,
+	}, http.StatusCreated, &bad)
+	doJSON(t, http.MethodGet, base+"/providers/"+bad.ID+"/models", token, nil, http.StatusServiceUnavailable, nil)
+
+	// ⑤ 未配置密钥的厂商：secret 回空串而非报错（前端据 has_key 置灰复制）
+	var noKey struct {
+		ID string `json:"id"`
+	}
+	doJSON(t, http.MethodPost, base+"/providers", token, map[string]any{
+		"name":     "无密钥厂商",
+		"base_url": "http://127.0.0.1:1/v1",
+		"models":   []string{"m"},
+		"enabled":  true,
+	}, http.StatusCreated, &noKey)
+	doJSON(t, http.MethodGet, base+"/providers/"+noKey.ID+"/secret", token, nil, http.StatusOK, &secret)
+	if secret.APIKey != "" || secret.HasKey {
+		t.Fatalf("未配置密钥时应回空串: %+v", secret)
+	}
+
+	// ⑥ 厂商不存在 → 404
+	doJSON(t, http.MethodGet, base+"/providers/nonexistent/secret", token, nil, http.StatusNotFound, nil)
+	doJSON(t, http.MethodGet, base+"/providers/nonexistent/models", token, nil, http.StatusNotFound, nil)
+}
+
+// providerGetHeader 取指定端点的 Cache-Control 头（用于断言密钥响应禁止缓存）。
+func providerGetHeader(t *testing.T, url, token string) string {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s 失败: %v", url, err)
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.Header.Get("Cache-Control")
 }
 
 // B-3：审批决策端点的参数与状态校验（真实「等待审批」链路需工具调用，这里覆盖拒绝路径）。

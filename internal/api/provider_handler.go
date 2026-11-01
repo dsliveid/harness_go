@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"harness-go/internal/model"
+	"harness-go/internal/service"
 )
 
 // ============ 审批（B-3） ============
@@ -118,8 +119,15 @@ func (h *handlers) deleteProvider(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// providerTestReq 连通测试入参（均可选）：
+//   - model 留空用厂商首个模型；
+//   - base_url / api_key / models 携带前端草稿里「尚未保存」的当前值，实现所见即所测
+//     （厂商未落库时 base_url 必填，否则 404；api_key 仅本次测试使用，不落库）。
 type providerTestReq struct {
-	Model string `json:"model"`
+	Model   string   `json:"model"`
+	BaseURL string   `json:"base_url"`
+	APIKey  string   `json:"api_key"`
+	Models  []string `json:"models"`
 }
 
 func (h *handlers) testProvider(w http.ResponseWriter, r *http.Request) {
@@ -131,13 +139,45 @@ func (h *handlers) testProvider(w http.ResponseWriter, r *http.Request) {
 			writeError(w, r, err)
 			return
 		}
-		req.Model = ""
+		req = providerTestReq{}
 	}
-	res, err := h.d.Providers.Test(r.Context(), r.PathValue("pid"), req.Model)
+	res, err := h.d.Providers.Test(r.Context(), r.PathValue("pid"), service.ProviderTestInput{
+		Model:   req.Model,
+		BaseURL: req.BaseURL,
+		APIKey:  req.APIKey,
+		Models:  req.Models,
+	})
 	if err != nil {
 		writeError(w, r, err)
 		return
 	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// listProviderModels 拉取上游真实模型清单：GET /api/v1/providers/{pid}/models
+//
+// 失败时按上游原因返回可读错误（4xx/5xx），**不做本地目录兜底**。
+func (h *handlers) listProviderModels(w http.ResponseWriter, r *http.Request) {
+	res, err := h.d.Providers.ListModels(r.Context(), r.PathValue("pid"))
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, res)
+}
+
+// revealProviderKey 读取厂商密钥明文（眼睛图标显示 / 复制）：GET /api/v1/providers/{pid}/secret
+//
+// 明文敏感：响应禁止任何缓存，并明确 no-referrer，避免被中间层/截图链路留存。
+func (h *handlers) revealProviderKey(w http.ResponseWriter, r *http.Request) {
+	res, err := h.d.Providers.RevealAPIKey(r.Context(), r.PathValue("pid"))
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
 	writeJSON(w, http.StatusOK, res)
 }
 

@@ -50,6 +50,9 @@ func NewRouter(d Deps) http.Handler {
 	mux.HandleFunc("PATCH /api/v1/sessions/{sid}", h.renameSession)
 	mux.HandleFunc("DELETE /api/v1/sessions/{sid}", h.deleteSession)
 	mux.HandleFunc("GET /api/v1/sessions/{sid}/messages", h.listMessages)
+	// 归档（对齐桌面端「归档中心」；状态落主库，刷新/重启不丢）
+	mux.HandleFunc("POST /api/v1/sessions/{sid}/archive", h.archiveSession)
+	mux.HandleFunc("POST /api/v1/sessions/{sid}/unarchive", h.unarchiveSession)
 	// P1：Webhook 事件订阅管理（需求 §4.4）
 	mux.HandleFunc("GET /api/v1/webhooks", h.listWebhooks)
 	mux.HandleFunc("POST /api/v1/webhooks", h.createWebhook)
@@ -74,6 +77,8 @@ func NewRouter(d Deps) http.Handler {
 	mux.HandleFunc("POST /api/v1/sessions/{sid}/runs", h.createRun)
 	mux.HandleFunc("GET /api/v1/sessions/{sid}/runs/{rid}", h.getRun)
 	mux.HandleFunc("POST /api/v1/sessions/{sid}/runs/{rid}/stop", h.stopRun)
+	// 运行中引导（需求 §4.2）：消息立即落库，引擎轮次边界回灌上下文
+	mux.HandleFunc("POST /api/v1/sessions/{sid}/runs/{rid}/guidance", h.guideRun)
 	mux.HandleFunc("GET /api/v1/sessions/{sid}/runs/{rid}/events", h.runEvents)
 	mux.HandleFunc("GET /api/v1/sessions/{sid}/runs/{rid}/tool-events", h.listToolEvents)
 	// 审批决策（B-3）：aid = 等待中的审批 ID（= 工具事件 ID）
@@ -88,6 +93,9 @@ func NewRouter(d Deps) http.Handler {
 	mux.HandleFunc("PATCH /api/v1/providers/{pid}", h.updateProvider)
 	mux.HandleFunc("DELETE /api/v1/providers/{pid}", h.deleteProvider)
 	mux.HandleFunc("POST /api/v1/providers/{pid}/test", h.testProvider)
+	// 上游真实模型清单 + 密钥明文（眼睛图标显示/复制；handler 内加 no-store）
+	mux.HandleFunc("GET /api/v1/providers/{pid}/models", h.listProviderModels)
+	mux.HandleFunc("GET /api/v1/providers/{pid}/secret", h.revealProviderKey)
 	mux.HandleFunc("GET /api/v1/settings", h.getSettings)
 	mux.HandleFunc("PATCH /api/v1/settings", h.patchSettings)
 	mux.HandleFunc("GET /api/v1/stats", h.stats)

@@ -29,6 +29,9 @@ import {
   type PairCodeDTO,
   type ProviderDTO,
   type ProviderInput,
+  type ProviderModelsResult,
+  type ProviderSecretResult,
+  type ProviderTestInput,
   type ProviderTestResult,
   type Run as ApiRun,
   type RunStatus as ApiRunStatus,
@@ -132,13 +135,27 @@ export interface ApiClient {
   getSession(id: string): Promise<Session>
   createSession(input: CreateSessionInput): Promise<Session>
   renameSession(id: string, title: string): Promise<void>
+  /** 更新会话级模型选择（空串 = 未选择；服务端持久化，重载后仍生效） */
+  setSessionModel(id: string, modelRef: string): Promise<void>
+  /** 更新会话访问模式（confirm/full；引擎每次审批实时重读，运行中切换立即生效） */
+  setSessionAccessMode(id: string, mode: 'confirm' | 'full'): Promise<void>
+  /** 归档会话（落库；侧栏默认列表不再显示，归档中心可见） */
+  archiveSession(id: string): Promise<void>
+  /** 取消归档（回到原分组） */
+  unarchiveSession(id: string): Promise<void>
   deleteSession(id: string): Promise<void>
+  /** 消息级回滚（S10）：seq 之后的消息置灰、受影响文件回滚到 before 快照；返回回滚事件 id（供 reapply） */
+  rollbackToMessage(sessionId: string, messageSeq: number): Promise<string>
+  /** 重新应用一次回滚：恢复 after 快照 + 恢复置灰消息 */
+  reapplyRollback(sessionId: string, rollbackId: string): Promise<void>
   // 消息
   listMessages(sessionId: string, afterSeq?: number): Promise<Message[]>
   // Run
   startRun(opts: StartRunOptions): Promise<RunHandle>
   getRun(sessionId: string, runId: string): Promise<Run>
   stopRun(sessionId: string, runId: string): Promise<void>
+  /** 运行中引导（§4.2）：消息立即落库并就地返回，引擎在轮次边界回灌上下文；Run 已结束抛 409 */
+  sendGuidance(sessionId: string, runId: string, input: string): Promise<{ id: string; seq: number; content: string }>
   listToolEvents(sessionId: string, runId: string): Promise<ApiToolEvent[]>
   // 工具（A-10 三端点）
   getTools(): Promise<ToolSnapshot>
@@ -151,8 +168,12 @@ export interface ApiClient {
   createProvider(input: ProviderInput): Promise<ProviderDTO>
   updateProviderById(id: string, input: ProviderInput): Promise<ProviderDTO>
   deleteProvider(id: string): Promise<void>
-  /** 连通测试：用该厂商发一次极小请求，返回延迟与错误码 */
-  testProvider(id: string): Promise<ProviderTestResult>
+  /** 连通测试：用该厂商发一次极小请求，返回延迟与错误码；入参可携带草稿未保存值（所见即所测） */
+  testProvider(id: string, input?: ProviderTestInput): Promise<ProviderTestResult>
+  /** 获取上游真实模型清单（失败直接抛错，不回退本地兜底） */
+  listProviderModels(id: string): Promise<ProviderModelsResult>
+  /** 读取厂商密钥明文（眼睛图标显示 / 复制） */
+  revealProviderKey(id: string): Promise<ProviderSecretResult>
   // 配置 / 统计 / 日志（B-4）
   getSettings(): Promise<Record<string, unknown>>
   patchSettings(patch: Record<string, unknown>): Promise<Record<string, unknown>>
@@ -232,6 +253,7 @@ export function toUiSession(s: ApiSession): Session {
     modelRef: s.model_ref,
     updatedAt: s.updated_at,
     running: s.last_run_status === 'running' || s.last_run_status === 'pending',
+    archivedAt: s.archived_at,
   }
 }
 
@@ -280,6 +302,8 @@ export function toUiMessages(list: ApiMessage[], sessionId: string): Message[] {
         : undefined,
       createdAt: m.created_at,
       tokens: m.token_count || undefined,
+      // 服务端消息级回滚（S10）置灰的消息：保留可见、上下文组装已排除（hidden）
+      ...(m.hidden ? { reverted: true, revertedAt: m.created_at } : {}),
     }
   })
 }
@@ -408,6 +432,35 @@ export const mockApi: ApiClient = {
       found.updatedAt = Date.now()
     }
   },
+  async setSessionModel(id, modelRef) {
+    const found = mockData.sessions.find((s) => s.id === id)
+    if (found) {
+      found.modelRef = modelRef
+      found.updatedAt = Date.now()
+    }
+  },
+  async setSessionAccessMode(id, mode) {
+    const found = mockData.sessions.find((s) => s.id === id)
+    if (found) {
+      found.accessMode = mode
+      found.updatedAt = Date.now()
+    }
+  },
+  async archiveSession(id) {
+    const found = mockData.sessions.find((s) => s.id === id)
+    if (found) found.archivedAt = Date.now()
+  },
+  async unarchiveSession(id) {
+    const found = mockData.sessions.find((s) => s.id === id)
+    if (found) found.archivedAt = undefined
+  },
+  async rollbackToMessage(_sessionId, _messageSeq) {
+    // mock 无服务端历史：返回合成回滚 id（reapply 语义由 chatStore 本地状态承担）
+    return `rb-mock-${Date.now()}`
+  },
+  async reapplyRollback() {
+    /* mock：本地状态已在 chatStore 内回退 */
+  },
   async deleteSession(id) {
     const i = mockData.sessions.findIndex((s) => s.id === id)
     if (i >= 0) mockData.sessions.splice(i, 1)
@@ -438,6 +491,10 @@ export const mockApi: ApiClient = {
   },
   async stopRun() {
     /* mock 由 RunHandle.stop 处理 */
+  },
+  async sendGuidance(_sessionId, _runId, input) {
+    // mock：无服务端轮次边界，引导以普通用户消息呈现
+    return { id: `m-guide-${Date.now()}`, seq: 0, content: String(input ?? '') }
   },
   async listToolEvents() {
     return []
@@ -510,6 +567,12 @@ export const mockApi: ApiClient = {
   async testProvider() {
     return { ok: true, latency_ms: 120, model: 'mock' }
   },
+  async listProviderModels() {
+    return { items: ['mock-model-a', 'mock-model-b'], count: 2 }
+  },
+  async revealProviderKey() {
+    return { api_key: 'sk-mock-demo-key', has_key: true }
+  },
   async getSettings() {
     return {}
   },
@@ -575,8 +638,12 @@ function mapSseToStreamEvent(type: string, data: string): StreamEvent | null {
         },
       }
     case 'tool.progress':
-      // 增量输出仅用于本地预览，最终结果以 tool.result 为准
-      return null
+      // 实时增量输出（需求 §10-4）：接到运行中的工具卡片输出区，最终结果仍以 tool.result 为准
+      return {
+        type: 'tool_progress',
+        callId: String(payload.tool_event_id ?? ''),
+        chunk: String(payload.chunk ?? ''),
+      }
     case 'tool.result':
       return {
         type: 'tool_result',
@@ -609,7 +676,13 @@ function mapSseToStreamEvent(type: string, data: string): StreamEvent | null {
     case 'run.status': {
       const status = String(payload.status ?? '')
       if (status === 'completed') {
-        return { type: 'done', tokensIn: 0, tokensOut: 0 }
+        // usage 与 runs 表 AddRunUsage 同源同值（P1）：真实输入/输出 token，
+        // 供用量条与上下文水位（上游未回 usage 时为 0，UI 按估算口径展示）
+        return {
+          type: 'done',
+          tokensIn: Number(payload.input_tokens ?? 0),
+          tokensOut: Number(payload.output_tokens ?? 0),
+        }
       }
       if (status === 'failed' || status === 'cancelled') {
         return {
@@ -710,8 +783,42 @@ export const realApi: ApiClient = {
       body: JSON.stringify({ title }),
     })
   },
+  async setSessionModel(id, modelRef) {
+    await request<void>(API_PATHS.session(id), {
+      method: 'PATCH',
+      headers: authHeaders(),
+      body: JSON.stringify({ model_ref: modelRef }),
+    })
+  },
+  async setSessionAccessMode(id, mode) {
+    await request<void>(API_PATHS.session(id), {
+      method: 'PATCH',
+      headers: authHeaders(),
+      body: JSON.stringify({ access_mode: mode }),
+    })
+  },
+  async archiveSession(id) {
+    await request<void>(API_PATHS.sessionArchive(id), { method: 'POST', headers: authHeaders() })
+  },
+  async unarchiveSession(id) {
+    await request<void>(API_PATHS.sessionUnarchive(id), { method: 'POST', headers: authHeaders() })
+  },
   async deleteSession(id) {
     await request<void>(API_PATHS.session(id), { method: 'DELETE', headers: authHeaders() })
+  },
+  async rollbackToMessage(sessionId, messageSeq) {
+    const rb = await request<{ id: string }>(API_PATHS.rollback(sessionId), {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({ mode: 'message', message_seq: messageSeq }),
+    })
+    return rb.id
+  },
+  async reapplyRollback(sessionId, rollbackId) {
+    await request<void>(API_PATHS.rollbackReapply(sessionId, rollbackId), {
+      method: 'POST',
+      headers: authHeaders(),
+    })
   },
 
   async listMessages(sessionId, afterSeq) {
@@ -769,6 +876,13 @@ export const realApi: ApiClient = {
   async stopRun(sessionId, runId) {
     await request<void>(API_PATHS.runStop(sessionId, runId), { method: 'POST', headers: authHeaders() })
   },
+  async sendGuidance(sessionId, runId, input) {
+    const msg = await request<{ id: string; seq: number; content: string }>(
+      API_PATHS.runGuidance(sessionId, runId),
+      { method: 'POST', headers: authHeaders(), body: JSON.stringify({ input }) },
+    )
+    return msg
+  },
   async listToolEvents(sessionId, runId) {
     const res = await request<{ items: ApiToolEvent[] }>(API_PATHS.runToolEvents(sessionId, runId), {
       headers: authHeaders(),
@@ -816,11 +930,23 @@ export const realApi: ApiClient = {
   async deleteProvider(id) {
     await request<void>(API_PATHS.provider(id), { method: 'DELETE', headers: authHeaders() })
   },
-  async testProvider(id) {
+  async testProvider(id: string, input: ProviderTestInput = {}) {
     return request<ProviderTestResult>(API_PATHS.providerTest(id), {
       method: 'POST',
       headers: authHeaders(),
-      body: JSON.stringify({}),
+      body: JSON.stringify(input),
+    })
+  },
+  async listProviderModels(id) {
+    return request<ProviderModelsResult>(API_PATHS.providerModels(id), {
+      method: 'GET',
+      headers: authHeaders(),
+    })
+  },
+  async revealProviderKey(id) {
+    return request<ProviderSecretResult>(API_PATHS.providerSecret(id), {
+      method: 'GET',
+      headers: authHeaders(),
     })
   },
   async getSettings() {

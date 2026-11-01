@@ -19,7 +19,7 @@ const fmtSize = (n: number) =>
   n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)}MB` : n >= 1024 ? `${(n / 1024).toFixed(0)}KB` : `${n}B`
 
 export function Composer() {
-  const { send, stop, streaming, queued, removeQueued, draft, setDraft, tokensIn, tokensOut, cachedTokens } = useChat()
+  const { send, stop, streaming, queued, removeQueued, guide, draft, setDraft, tokensIn, tokensOut, cachedTokens } = useChat()
   const { workspaces, activeWorkspaceId } = useSessions()
   const ref = useRef<HTMLTextAreaElement>(null)
   const fileRef = useRef<HTMLInputElement>(null)
@@ -84,6 +84,17 @@ export function Composer() {
               <Clock size={11} className="opacity-70" />
               <span className="text-[10px] opacity-75">待执行</span>
               <span className="max-w-[180px] truncate">{q}</span>
+              {/* 引导（需求 §4.2）：运行中立即介入当前对话（引擎轮次边界注入） */}
+              <button
+                className="w-4 h-4 rounded hover:bg-accent/20 flex items-center justify-center transition-colors text-accent hover:text-ink"
+                onClick={() => {
+                  guide(q)
+                  removeQueued(i)
+                }}
+                title="引导：立即介入当前对话"
+              >
+                <Zap size={11} />
+              </button>
               <button
                 className="w-4 h-4 rounded hover:bg-accent/20 flex items-center justify-center transition-colors text-accent hover:text-ink"
                 onClick={() => removeQueued(i)}

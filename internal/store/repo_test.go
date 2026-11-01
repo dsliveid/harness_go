@@ -101,6 +101,65 @@ func TestSessionRepoCRUD(t *testing.T) {
 	}
 }
 
+// TestSessionRepoArchive 归档语义（对齐桌面端「归档中心」）：
+// archived_at 落库可查；列表仍返回归档会话（前端分组）；unarchive 置 NULL；软删语义不受影响。
+func TestSessionRepoArchive(t *testing.T) {
+	ctx, m, _ := newTestStores(t)
+	repo := m.Sessions()
+
+	if err := repo.Create(ctx, &model.Session{ID: "sa", Title: "待归档"}); err != nil {
+		t.Fatalf("创建会话失败: %v", err)
+	}
+	got, _ := repo.Get(ctx, "sa")
+	if got.ArchivedAt != nil {
+		t.Fatalf("新会话不应已归档: %+v", got.ArchivedAt)
+	}
+
+	if err := repo.Archive(ctx, "sa"); err != nil {
+		t.Fatalf("归档失败: %v", err)
+	}
+	got, _ = repo.Get(ctx, "sa")
+	if got.ArchivedAt == nil || *got.ArchivedAt == 0 {
+		t.Fatalf("归档后 archived_at 应有值: %+v", got.ArchivedAt)
+	}
+	// 归档会话仍在列表中（由前端分组展示），Get 不受影响
+	list, err := repo.List(ctx, 10, 0)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("归档会话应仍在列表: n=%d err=%v", len(list), err)
+	}
+	if list[0].ArchivedAt == nil {
+		t.Fatalf("列表行应携带 archived_at")
+	}
+
+	// 幂等：重复归档不报错
+	if err := repo.Archive(ctx, "sa"); err != nil {
+		t.Fatalf("重复归档应幂等成功: %v", err)
+	}
+
+	// 取消归档 → NULL；未归档会话重复取消也幂等
+	if err := repo.Unarchive(ctx, "sa"); err != nil {
+		t.Fatalf("取消归档失败: %v", err)
+	}
+	if err := repo.Unarchive(ctx, "sa"); err != nil {
+		t.Fatalf("重复取消归档应幂等成功: %v", err)
+	}
+	got, _ = repo.Get(ctx, "sa")
+	if got.ArchivedAt != nil {
+		t.Fatalf("取消归档后 archived_at 应为 NULL: %+v", got.ArchivedAt)
+	}
+
+	// 不存在的会话报 NotFound；软删后的会话不可归档
+	if err := repo.Archive(ctx, "nope"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("归档不存在会话应 ErrNotFound，得到 %v", err)
+	}
+	if err := repo.SoftDelete(ctx, "sa"); err != nil {
+		t.Fatalf("软删失败: %v", err)
+	}
+	if err := repo.Archive(ctx, "sa"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("软删后归档应 ErrNotFound，得到 %v", err)
+	}
+}
+
 func TestUserAndTokenRepo(t *testing.T) {
 	ctx, m, _ := newTestStores(t)
 	users := m.Users()

@@ -231,16 +231,26 @@ paths:
           $ref: "#/components/responses/NotFound"
     patch:
       tags: [sessions]
-      summary: 重命名会话
+      summary: 更新会话（重命名 / 会话级模型 / 访问模式）
+      description: |
+        title、model_ref、access_mode 均可选：title 非空时重命名；model_ref 传 null 之外任意值
+        （含空串）即更新会话级模型，空串表示「未选择」（省略字段则不改动模型）；
+        access_mode 非空时更新访问模式（confirm/full），引擎每次审批实时重读，运行中切换立即生效。
       requestBody:
         required: true
         content:
           application/json:
             schema:
               type: object
-              required: [title]
               properties:
                 title: { type: string }
+                model_ref:
+                  type: string
+                  description: 会话级模型引用（providerID/modelID）；空串 = 未选择
+                access_mode:
+                  type: string
+                  enum: [confirm, full]
+                  description: 访问模式（变更前确认/完全访问）；非法值 400
       responses:
         "204": { description: 已更新 }
         "400":
@@ -250,6 +260,26 @@ paths:
       summary: 删除会话（主库软删 + 会话目录回收）
       responses:
         "204": { description: 已删除 }
+  /api/v1/sessions/{sid}/archive:
+    parameters:
+      - $ref: "#/components/parameters/SessionID"
+    post:
+      tags: [sessions]
+      summary: 归档会话（落库 sessions.archived_at；侧栏默认列表不再显示，归档中心可见；幂等）
+      responses:
+        "204": { description: 已归档 }
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/v1/sessions/{sid}/unarchive:
+    parameters:
+      - $ref: "#/components/parameters/SessionID"
+    post:
+      tags: [sessions]
+      summary: 取消归档（回到原分组；幂等）
+      responses:
+        "204": { description: 已取消归档 }
+        "404":
+          $ref: "#/components/responses/NotFound"
   /api/v1/sessions/{sid}/messages:
     parameters:
       - $ref: "#/components/parameters/SessionID"
@@ -562,6 +592,35 @@ paths:
       summary: 停止 Run（幂等）
       responses:
         "204": { description: 已请求停止 }
+  /api/v1/sessions/{sid}/runs/{rid}/guidance:
+    parameters:
+      - $ref: "#/components/parameters/SessionID"
+      - $ref: "#/components/parameters/RunID"
+    post:
+      tags: [runs]
+      summary: 运行中引导（需求 §4.2）
+      description: |
+        用户消息立即落库（响应返回该消息），引擎在**轮次边界**回灌上下文——
+        当前流结束后模型即看到该引导。Run 已结束 → 409；输入为空 → 400。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [input]
+              properties:
+                input: { type: string, description: 引导内容（trim 后非空） }
+      responses:
+        "201":
+          description: 已落库的引导消息
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Message" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          description: Run 不在运行中，无法引导
   /api/v1/sessions/{sid}/runs/{rid}/events:
     parameters:
       - $ref: "#/components/parameters/SessionID"
@@ -899,6 +958,9 @@ paths:
     post:
       tags: [providers]
       summary: 连通测试（用该厂商发一次极小 chat 请求，返回延迟与错误码）
+      description: |
+        base_url / api_key / models 为可选草稿覆盖：携带前端「尚未保存」的当前值实现所见即所测。
+        厂商未落库（pid 不存在）时只要有 base_url 就按请求配置直接测；api_key 仅本次测试使用，不落库。
       parameters:
         - { name: pid, in: path, required: true, schema: { type: string } }
       requestBody:
@@ -909,12 +971,61 @@ paths:
               type: object
               properties:
                 model: { type: string, description: 留空则用厂商首个模型 }
+                base_url: { type: string, description: "可选：草稿里的 Base URL（未保存时以此为准；厂商不存在时必填）" }
+                api_key: { type: string, description: "可选：草稿里刚输入未保存的密钥（仅本次测试使用，不落库）" }
+                models:
+                  type: array
+                  items: { type: string }
+                  description: "可选：草稿里的模型清单（未保存时以此为准）"
       responses:
         "200":
           description: 测试结果（业务失败也返回 200，ok=false）
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ProviderTestResult" }
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/v1/providers/{pid}/models:
+    get:
+      tags: [providers]
+      summary: 获取上游真实模型清单（依次尝试 {base}/models、{base}/v1/models、{base}/api/tags）
+      description: |
+        兼容 OpenAI `{"data":[{"id":...}]}` 与 Ollama `{"models":[{"name":...}]}` 两种响应形状。
+        Base URL 会自动剥离误填的 `/chat/completions`、`/messages`、`/responses` 后缀。
+        **失败时直接返回错误（不回退任何本地兜底清单）**，让前端展示真实原因。
+      parameters:
+        - { name: pid, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: 上游模型清单
+          headers:
+            Cache-Control: { schema: { type: string }, description: 恒为 no-store }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProviderModelsResult" }
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          description: 上游全部候选均失败（错误信息含各候选的 HTTP 状态）
+  /api/v1/providers/{pid}/secret:
+    get:
+      tags: [providers]
+      summary: 读取厂商 API Key 明文（设置页「显示 / 复制」用）
+      description: |
+        供眼睛图标明文展示与一键复制。需已登录（Bearer/Cookie），只返回该厂商自身密钥。
+        响应强制 `Cache-Control: no-store` + `Referrer-Policy: no-referrer`，明文不落 access log。
+        未配置密钥时返回空串且 `has_key=false`（不是错误）。
+      parameters:
+        - { name: pid, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: 密钥明文
+          headers:
+            Cache-Control: { schema: { type: string }, description: 恒为 no-store }
+            Referrer-Policy: { schema: { type: string }, description: 恒为 no-referrer }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProviderSecretResult" }
         "404":
           $ref: "#/components/responses/NotFound"
   # ===== B-4 通用配置 / 统计 / 日志 =====
@@ -1440,6 +1551,10 @@ components:
         last_run_status: { $ref: "#/components/schemas/RunStatus" }
         created_at: { type: integer, format: int64 }
         updated_at: { type: integer, format: int64 }
+        archived_at:
+          type: integer
+          format: int64
+          description: 归档时间（毫秒；缺省 = 未归档。归档中心可见，侧栏默认列表不显示）
     Message:
       type: object
       properties:
@@ -1648,6 +1763,19 @@ components:
         model: { type: string }
         code: { type: string, description: 失败时的 llm 错误分类 }
         error: { type: string }
+    ProviderModelsResult:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { type: string }
+          description: 上游返回的模型 ID（已去重保序）
+        count: { type: integer }
+    ProviderSecretResult:
+      type: object
+      properties:
+        api_key: { type: string, description: 密钥明文；未配置时为空串 }
+        has_key: { type: boolean, description: 是否已配置密钥（false 时前端置灰复制按钮） }
     # ===== B-4 配置 =====
     SettingsMap:
       type: object

@@ -155,8 +155,8 @@ export function LoginPage() {
               <span>{loading ? '正在验证…' : '进入工作台'}</span>
             </Button>
 
-            {/* 演示直通 + 一键填入：仅 mock 演示模式（real 模式账号由服务端引导创建） */}
-            {isDemo ? (
+            {/* 演示直通 + 一键填入：仅 mock 演示模式（real 模式安静呈现，不显示任何说明文案） */}
+            {isDemo && (
               <>
                 <Button
                   type="button"
@@ -183,13 +183,6 @@ export function LoginPage() {
                   </button>
                 </div>
               </>
-            ) : (
-              <div className="rounded-xl border border-edge bg-panel2/40 px-3 py-2 text-[11px] text-inkfaint leading-relaxed">
-                账号由服务端创建：首次启动见日志或{' '}
-                <code className="font-mono text-accent">data/initial_password</code>
-                <br />
-                支持免登链接 <code className="font-mono text-inkdim">/?user_name=xxx&pwd=xxx</code>
-              </div>
             )}
           </div>
         </form>

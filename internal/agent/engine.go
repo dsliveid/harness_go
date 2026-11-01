@@ -44,6 +44,15 @@ type Deps struct {
 	MaxSteps      int
 	ToolTimeout   time.Duration
 	Now           func() int64
+	// AccessModeProvider 实时读取会话访问模式（可选）。
+	// 对齐桌面端语义：顶栏「变更前确认/完全访问」切换即时生效——对话进行中同样立即生效，
+	// 因此每次审批决策前重读一次；读取失败回落 RunRequest.AccessMode（Run 启动快照）。
+	// nil 时维持旧行为（始终用启动快照）。
+	AccessModeProvider func(ctx context.Context, sessionID string) (approval.AccessMode, error)
+	// RiskOverride 按参数升级工具风险级（可选）：入参 (工具名, 参数 JSON, 契约静态风险级)，
+	// 返回实际用于审批的风险级。用于高危命令特征检测（run_command 命中 → danger）；
+	// nil 时始终用契约静态风险级。
+	RiskOverride func(toolName string, argsJSON []byte, base model.Risk) model.Risk
 }
 
 // Engine Run 执行引擎。
@@ -116,6 +125,10 @@ type RunRequest struct {
 	// RequesterDevice 发起本次 Run 的执行端设备（阶段 C-7 审批跨端仲裁的审计来源）。
 	// 未填时回退 LeaseHolder；两者都空表示服务端本地执行面（审批不绑定设备）。
 	RequesterDevice string
+	// GuidanceCh 运行中引导通道（需求 §4.2，对齐桌面端「引导」）：service 层把已落库的
+	// 引导用户消息推入该通道，引擎在**轮次边界**消费——当前流结束后模型即看到该引导。
+	// 消息已由 service 层落库，引擎只回灌上下文不重复落库；nil 表示本 Run 不支持引导。
+	GuidanceCh <-chan *model.Message
 }
 
 // Execute 执行 Run，阻塞直到终态。
@@ -176,15 +189,16 @@ func (e *Engine) Execute(ctx context.Context, req RunRequest) error {
 	if err := e.transition(ctx, sdb, req.RunID, model.RunRunning, "", "", ""); err != nil {
 		return err
 	}
-	e.publishStatus(req.RunID, req.SessionID, model.RunRunning, "", "", "")
+	e.publishStatus(req.RunID, req.SessionID, model.RunRunning, "", "", "", nil)
 
-	final, stopReason, errCode, errMsg, tokens := e.loop(ctx, sdb, req)
+	usage := &runUsage{}
+	final, stopReason, errCode, errMsg, tokens := e.loop(ctx, sdb, req, usage)
 
 	if err := e.transition(ctx, sdb, req.RunID, final, stopReason, errCode, errMsg); err != nil {
 		// 终态迁移失败不掩盖原始错误
 		return fmt.Errorf("agent: 终态迁移失败: %w (原始状态=%s)", err, final)
 	}
-	e.publishStatus(req.RunID, req.SessionID, final, stopReason, errCode, errMsg)
+	e.publishStatus(req.RunID, req.SessionID, final, stopReason, errCode, errMsg, usage)
 	e.deps.Events.CloseRun(req.RunID)
 
 	// ③ 摘要回写主库（**不同事务、最终一致**；失败只影响列表新鲜度）
@@ -198,15 +212,23 @@ func (e *Engine) Execute(ctx context.Context, req RunRequest) error {
 	return nil
 }
 
+// runUsage per-Run 用量累计（P1：落 runs 表 + 终态 run.status 事件出栈）。
+type runUsage struct {
+	prompt     int64
+	completion int64
+}
+
 // loop 主循环：组装 → 流式 → 落消息 → 工具 → 回灌，直到终态或步数上限。
-func (e *Engine) loop(ctx context.Context, sdb SessionDB, req RunRequest) (
+// usage 非空时累计本 Run 的输入/输出 token（供落库与终态事件），nil 时只丢弃。
+func (e *Engine) loop(ctx context.Context, sdb SessionDB, req RunRequest, usage *runUsage) (
 	final model.RunStatus, stopReason, errCode, errMsg string, tokens int64,
 ) {
 	// P1：per-Run 用量累计，返回前统一回写 runs 表（取消路径也记账——
 	// WithoutCancel 保证写入不被请求取消吞掉）。
-	var runPrompt, runCompletion int64
 	defer func() {
-		_ = sdb.AddRunUsage(context.WithoutCancel(ctx), req.RunID, runPrompt, runCompletion)
+		if usage != nil {
+			_ = sdb.AddRunUsage(context.WithoutCancel(ctx), req.RunID, usage.prompt, usage.completion)
+		}
 	}()
 
 	history, err := e.loadHistory(ctx, sdb)
@@ -221,6 +243,9 @@ func (e *Engine) loop(ctx context.Context, sdb SessionDB, req RunRequest) (
 		}
 		// 每步续期会话租约（C-6）：长 Run 不因租约 TTL 到期而被误接管。
 		e.renewLease(ctx, req)
+
+		// 轮次边界消费运行中引导（§4.2）：当前流结束后模型即看到引导内容
+		e.drainGuidance(ctx, sdb, req, &history)
 
 		res := e.deps.Builder.Build(prompt.Input{
 			Model:          req.ModelRef,
@@ -258,8 +283,10 @@ func (e *Engine) loop(ctx context.Context, sdb SessionDB, req RunRequest) (
 
 		out, status, code, failMsg, used := e.streamOnce(ctx, req, provider, res)
 		tokens += used
-		runPrompt += out.promptTokens
-		runCompletion += out.completionTokens
+		if usage != nil {
+			usage.prompt += out.promptTokens
+			usage.completion += out.completionTokens
+		}
 		if status != "" { // 非空表示本轮异常终止
 			return status, "", code, failMsg, tokens
 		}
@@ -313,6 +340,34 @@ func (e *Engine) loop(ctx context.Context, sdb SessionDB, req RunRequest) (
 
 	return model.RunFailed, "", "max_steps_exceeded",
 		fmt.Sprintf("超过最大步数 %d", e.deps.MaxSteps), tokens
+}
+
+// drainGuidance 消费运行中引导（轮次边界）：消息已由 service 层落库，这里只
+// 回灌上下文（history）并广播 message.appended 事件供多端对齐。非阻塞：无引导立即返回。
+func (e *Engine) drainGuidance(ctx context.Context, sdb SessionDB, req RunRequest, history *[]llm.Message) {
+	if req.GuidanceCh == nil {
+		return
+	}
+	for {
+		select {
+		case msg := <-req.GuidanceCh:
+			if msg == nil || strings.TrimSpace(msg.Content) == "" {
+				continue
+			}
+			*history = append(*history, toLLMMessage(msg))
+			if e.deps.Summary != nil {
+				_ = e.deps.Summary.TouchMessage(ctx, req.SessionID, e.deps.Now())
+			}
+			e.publish(req.RunID, events.TypeMessageAppended, map[string]any{
+				"message_id": msg.ID,
+				"role":       string(model.RoleUser),
+				"content":    msg.Content,
+				"seq":        msg.Seq,
+			})
+		default:
+			return
+		}
+	}
 }
 
 // streamOutcome 单轮流式结果。
@@ -413,17 +468,34 @@ func (e *Engine) streamOnce(ctx context.Context, req RunRequest, provider llm.Pr
 	return out, "", "", "", tokens
 }
 
+// effectiveAccessMode 返回当前审批应采用的访问模式：
+// Deps.AccessModeProvider 可用时实时读库（切换即时生效），失败回落 Run 启动快照。
+func (e *Engine) effectiveAccessMode(ctx context.Context, req RunRequest) approval.AccessMode {
+	if e.deps.AccessModeProvider == nil {
+		return req.AccessMode
+	}
+	mode, err := e.deps.AccessModeProvider(ctx, req.SessionID)
+	if err != nil || mode == "" {
+		return req.AccessMode
+	}
+	return mode
+}
+
 // execTool 执行单次工具调用（含审批）。返回的 cancelled 表示被中断。
 func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc llm.ToolCall) (
 	msg *model.Message, cancelled bool,
 ) {
 	eventID := newID()
-	// 风险级由工具契约提供（Catalog 未注入时按 write 保守处理）
+	// 风险级由工具契约提供（Catalog 未注入时按 write 保守处理）；
+	// RiskOverride 可按参数升级（高危命令特征检测 → danger，full 模式仍逐次审批）
 	risk := model.RiskWrite
 	if e.deps.Catalog != nil {
 		if r, ok := e.deps.Catalog.Risk(tc.Name); ok {
 			risk = r
 		}
+	}
+	if e.deps.RiskOverride != nil {
+		risk = e.deps.RiskOverride(tc.Name, tc.Arguments, risk)
 	}
 	ev := &model.ToolEvent{
 		ID:          eventID,
@@ -466,7 +538,7 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 		ToolName:          tc.Name,
 		Risk:              risk,
 		ArgsJSON:          string(tc.Arguments),
-		AccessMode:        req.AccessMode,
+		AccessMode:        e.effectiveAccessMode(ctx, req),
 		Rules:             rules,
 		RequestedByDevice: requester,
 		RequiredDeviceID:  required,
@@ -536,13 +608,14 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 
 	toolCtx, cancel := context.WithTimeout(ctx, e.deps.ToolTimeout)
 	defer cancel()
+	effMode := e.effectiveAccessMode(ctx, req)
 	result, runErr := e.deps.Tools.Run(toolCtx, ToolRunRequest{
 		RunID:       req.RunID,
 		SessionID:   req.SessionID,
 		ToolEventID: eventID,
 		ToolName:    tc.Name,
 		ArgsJSON:    string(tc.Arguments),
-		AccessMode:  string(req.AccessMode),
+		AccessMode:  string(effMode),
 	})
 	if runErr != nil {
 		errText := runErr.Error()
@@ -617,7 +690,7 @@ func (e *Engine) publish(runID string, typ events.Type, payload any) {
 	_, _ = e.deps.Events.Publish(runID, typ, payload)
 }
 
-func (e *Engine) publishStatus(runID, sessionID string, status model.RunStatus, stopReason, errCode, errMsg string) {
+func (e *Engine) publishStatus(runID, sessionID string, status model.RunStatus, stopReason, errCode, errMsg string, usage *runUsage) {
 	payload := map[string]any{"status": string(status), "session_id": sessionID}
 	if stopReason != "" {
 		payload["stop_reason"] = stopReason
@@ -627,6 +700,12 @@ func (e *Engine) publishStatus(runID, sessionID string, status model.RunStatus, 
 	}
 	if errMsg != "" {
 		payload["error_message"] = errMsg
+	}
+	// 终态随行 usage（P1：与 runs 表 AddRunUsage 同源同值；前端用量条/上下文水位以此为准）。
+	// running 状态 usage 为 nil（尚未产生），不出栈这两个字段，保持 payload 形状向后兼容。
+	if usage != nil {
+		payload["input_tokens"] = usage.prompt
+		payload["output_tokens"] = usage.completion
 	}
 	e.publish(runID, events.TypeRunStatus, payload)
 }

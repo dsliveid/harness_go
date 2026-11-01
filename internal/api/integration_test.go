@@ -367,6 +367,140 @@ func TestSessionNotFound(t *testing.T) {
 	doJSON(t, http.MethodGet, srv.URL+"/api/v1/sessions/nope", token, nil, http.StatusNotFound, nil)
 }
 
+// 归档 / 取消归档（对齐桌面端「归档中心」）：状态落库，列表携带 archived_at，刷新语义不丢。
+func TestSessionArchiveRoundTrip(t *testing.T) {
+	srv, token := newTestServer(t)
+
+	var sess struct {
+		ID string `json:"id"`
+	}
+	doJSON(t, http.MethodPost, srv.URL+"/api/v1/sessions", token,
+		map[string]any{"title": "归档测试"}, http.StatusCreated, &sess)
+
+	// 新会话未归档
+	var before struct {
+		ArchivedAt *int64 `json:"archived_at"`
+	}
+	doJSON(t, http.MethodGet, srv.URL+"/api/v1/sessions/"+sess.ID, token, nil, http.StatusOK, &before)
+	if before.ArchivedAt != nil {
+		t.Fatalf("新会话不应已归档: %v", *before.ArchivedAt)
+	}
+
+	// 归档 → 204，archived_at 有值
+	doJSON(t, http.MethodPost, srv.URL+"/api/v1/sessions/"+sess.ID+"/archive", token, nil, http.StatusNoContent, nil)
+	var archived struct {
+		ArchivedAt *int64 `json:"archived_at"`
+	}
+	doJSON(t, http.MethodGet, srv.URL+"/api/v1/sessions/"+sess.ID, token, nil, http.StatusOK, &archived)
+	if archived.ArchivedAt == nil || *archived.ArchivedAt == 0 {
+		t.Fatal("归档后 archived_at 应有值")
+	}
+	// 列表仍返回该会话（归档由前端分组），且带 archived_at
+	var list struct {
+		Items []struct {
+			ID         string `json:"id"`
+			ArchivedAt *int64 `json:"archived_at"`
+		} `json:"items"`
+	}
+	doJSON(t, http.MethodGet, srv.URL+"/api/v1/sessions?limit=100", token, nil, http.StatusOK, &list)
+	found := false
+	for _, it := range list.Items {
+		if it.ID == sess.ID {
+			found = true
+			if it.ArchivedAt == nil {
+				t.Fatal("列表行应携带 archived_at")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("归档会话应仍在列表中（前端负责分组）")
+	}
+
+	// 幂等：重复归档仍 204
+	doJSON(t, http.MethodPost, srv.URL+"/api/v1/sessions/"+sess.ID+"/archive", token, nil, http.StatusNoContent, nil)
+
+	// 取消归档 → archived_at 清空
+	doJSON(t, http.MethodPost, srv.URL+"/api/v1/sessions/"+sess.ID+"/unarchive", token, nil, http.StatusNoContent, nil)
+	doJSON(t, http.MethodPost, srv.URL+"/api/v1/sessions/"+sess.ID+"/unarchive", token, nil, http.StatusNoContent, nil)
+	var after struct {
+		ArchivedAt *int64 `json:"archived_at"`
+	}
+	doJSON(t, http.MethodGet, srv.URL+"/api/v1/sessions/"+sess.ID, token, nil, http.StatusOK, &after)
+	if after.ArchivedAt != nil {
+		t.Fatalf("取消归档后 archived_at 应为空: %v", *after.ArchivedAt)
+	}
+
+	// 不存在的会话 → 404
+	doJSON(t, http.MethodPost, srv.URL+"/api/v1/sessions/nope/archive", token, nil, http.StatusNotFound, nil)
+	doJSON(t, http.MethodPost, srv.URL+"/api/v1/sessions/nope/unarchive", token, nil, http.StatusNotFound, nil)
+}
+
+// 访问模式 PATCH 落库（confirm/full）：引擎每次审批实时重读，运行中切换立即生效。
+func TestSessionAccessModePatch(t *testing.T) {
+	srv, token := newTestServer(t)
+
+	var sess struct {
+		ID         string `json:"id"`
+		AccessMode string `json:"access_mode"`
+	}
+	doJSON(t, http.MethodPost, srv.URL+"/api/v1/sessions", token,
+		map[string]any{"title": "访问模式测试"}, http.StatusCreated, &sess)
+	if sess.AccessMode != "confirm" {
+		t.Fatalf("新会话默认应为 confirm，得到 %q", sess.AccessMode)
+	}
+
+	// 切 full → 落库可读
+	doJSON(t, http.MethodPatch, srv.URL+"/api/v1/sessions/"+sess.ID, token,
+		map[string]any{"access_mode": "full"}, http.StatusNoContent, nil)
+	var got struct {
+		AccessMode string `json:"access_mode"`
+	}
+	doJSON(t, http.MethodGet, srv.URL+"/api/v1/sessions/"+sess.ID, token, nil, http.StatusOK, &got)
+	if got.AccessMode != "full" {
+		t.Fatalf("切 full 后应读到 full，得到 %q", got.AccessMode)
+	}
+
+	// 切回 confirm
+	doJSON(t, http.MethodPatch, srv.URL+"/api/v1/sessions/"+sess.ID, token,
+		map[string]any{"access_mode": "confirm"}, http.StatusNoContent, nil)
+	doJSON(t, http.MethodGet, srv.URL+"/api/v1/sessions/"+sess.ID, token, nil, http.StatusOK, &got)
+	if got.AccessMode != "confirm" {
+		t.Fatalf("切回 confirm 后应读到 confirm，得到 %q", got.AccessMode)
+	}
+
+	// 非法值 → 400，且不改动现值
+	doJSON(t, http.MethodPatch, srv.URL+"/api/v1/sessions/"+sess.ID, token,
+		map[string]any{"access_mode": "yolo"}, http.StatusBadRequest, nil)
+	doJSON(t, http.MethodGet, srv.URL+"/api/v1/sessions/"+sess.ID, token, nil, http.StatusOK, &got)
+	if got.AccessMode != "confirm" {
+		t.Fatalf("非法值不应改动现值，得到 %q", got.AccessMode)
+	}
+
+	// 不存在的会话 → 404
+	doJSON(t, http.MethodPatch, srv.URL+"/api/v1/sessions/nope", token,
+		map[string]any{"access_mode": "full"}, http.StatusNotFound, nil)
+}
+
+// 运行中引导端点：Run 不在运行中 → 409；空输入 → 400（fake provider 瞬时完成，
+// 注册后立即结束，因此这里只覆盖失败分支；回灌机制由 agent 包 TestEngineGuidanceInjectedAtTurnBoundary 覆盖）。
+func TestRunGuidanceValidation(t *testing.T) {
+	srv, token := newTestServer(t)
+
+	var sess struct {
+		ID string `json:"id"`
+	}
+	doJSON(t, http.MethodPost, srv.URL+"/api/v1/sessions", token,
+		map[string]any{"title": "引导测试"}, http.StatusCreated, &sess)
+
+	// Run 不存在 → 409（引导通道已注销/从未注册）
+	doJSON(t, http.MethodPost, srv.URL+"/api/v1/sessions/"+sess.ID+"/runs/nope/guidance", token,
+		map[string]any{"input": "引导"}, http.StatusConflict, nil)
+
+	// 空 Run id → 路由层 405（ServeMux 拒绝空路径段）
+	doJSON(t, http.MethodPost, srv.URL+"/api/v1/sessions/"+sess.ID+"/runs//guidance", token,
+		map[string]any{"input": "引导"}, http.StatusMethodNotAllowed, nil)
+}
+
 // 空输入 → 400。
 func TestCreateRunRequiresInput(t *testing.T) {
 	srv, token := newTestServer(t)

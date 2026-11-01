@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 
 	"harness-go/internal/agent"
 	"harness-go/internal/model"
@@ -153,6 +154,27 @@ func (r *Runner) Risk(toolName string) (model.Risk, bool) {
 		return "", false
 	}
 	return model.Risk(rk), true
+}
+
+// RiskFor 按参数升级风险级（引擎 Deps.RiskOverride 的实现）：
+// run_command 命中高危命令特征表 → danger（full 模式仍逐次审批，见 danger.go）。
+// 其余工具维持契约静态风险级；argsJSON 解析失败按原级返回（宽进严出，不因参数畸形放行更高风险）。
+func (r *Runner) RiskFor(toolName string, argsJSON []byte, base model.Risk) model.Risk {
+	if toolName != "run_command" {
+		return base
+	}
+	var args struct {
+		Cmd  string   `json:"cmd"`
+		Args []string `json:"args"`
+	}
+	if json.Unmarshal(argsJSON, &args) != nil {
+		return base
+	}
+	cmdline := strings.TrimSpace(args.Cmd + " " + strings.Join(args.Args, " "))
+	if IsDangerCommand(cmdline) {
+		return model.RiskDanger
+	}
+	return base
 }
 
 // Snapshot 返回注册表快照。

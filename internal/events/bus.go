@@ -28,6 +28,9 @@ const (
 	TypeMessageStart Type = "message.start" // payload: {message_id, role, seq}
 	TypeMessageDelta Type = "message.delta" // payload: {message_id, delta}（不落库，仅预览）
 	TypeMessageEnd   Type = "message.end"   // payload: {message_id, content, token_count}
+	// TypeMessageAppended 运行中引导消息已落库（需求 §4.2 引导：引擎轮次边界回灌上下文）。
+	// payload: {message_id, role, content, seq}；前端以 reloadMessages/POST 响应对齐，不驱动流式 UI。
+	TypeMessageAppended Type = "message.appended"
 
 	// 工具
 	TypeToolStarted  Type = "tool.started"  // payload: {tool_event_id, tool_name, args, risk}

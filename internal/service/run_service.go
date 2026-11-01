@@ -66,6 +66,9 @@ type RunService struct {
 
 	mu      sync.Mutex
 	cancels map[string]context.CancelFunc
+	// guidanceChans 运行中引导通道（§4.2）：runID → chan *model.Message（容量 16）。
+	// 与 cancels 同生命周期：Run 创建时注册、终态注销；Run 已结束的引导返回 409。
+	guidanceChans sync.Map
 }
 
 // NewRunService 创建 Run 用例。
@@ -157,12 +160,20 @@ func (s *RunService) CreateRunWithSystem(ctx context.Context, sessionID, userInp
 	if err != nil {
 		return nil, wrapStoreErr(err, apperr.CodeSessionNotFound, "会话不存在")
 	}
+	// 自动标题（对齐桌面端）：会话仍是默认标题时，用首条用户消息前 24 字生成；
+	// 用户已手动重命名则不覆盖。失败不阻断对话（标题是体验项不是正确性项）。
+	if title := deriveSessionTitle(sess.Title, userInput); title != "" {
+		if rErr := s.main.Sessions().Rename(ctx, sessionID, title); rErr == nil {
+			sess.Title = title
+		}
+	}
 	if modelRef == "" {
 		modelRef = sess.ModelRef
 	}
 	if modelRef == "" {
-		// 未配置模型时不阻断对话：回退 "default"（provider 层未配置真实端点时会解析到
-		// fake provider，保证单二进制开箱可用）。真实使用请在「设置 → 模型」配置厂商。
+		// 未指定模型时不阻断对话：折算为 "default"，由 ProviderResolver 按
+		// agent.default_model（设置 → 能力模型槽位 chat）→ 首个启用厂商的首个模型解析；
+		// 全都不可用才回退 fake provider（单二进制开箱可用），回退时会打 Warn 日志。
 		modelRef = "default"
 	}
 
@@ -229,9 +240,14 @@ func (s *RunService) CreateRunWithSystem(ctx context.Context, sessionID, userInp
 		LeaseHolder:     deviceID, // C-6：空串 = 服务端本地执行面
 		RequesterDevice: deviceID, // C-7：审批跨端仲裁的发起端来源
 	}
+	// 运行中引导通道（§4.2）：随 Run 注册/注销，Guidance 端点推送、引擎轮次边界消费
+	guidanceCh := make(chan *model.Message, 16)
+	s.guidanceChans.Store(run.ID, guidanceCh)
+	req.GuidanceCh = guidanceCh
 	go func() {
 		defer func() {
 			s.unregisterCancel(run.ID)
+			s.guidanceChans.Delete(run.ID)
 			cancel()
 		}()
 		// 执行结果以数据库为准，这里只记录日志（由上层 logger 接管前先忽略）
@@ -239,6 +255,48 @@ func (s *RunService) CreateRunWithSystem(ctx context.Context, sessionID, userInp
 	}()
 
 	return run, nil
+}
+
+// Guidance 运行中引导（需求 §4.2，对齐桌面端「待执行列表 → 引导」）。
+//
+// 用户消息**立即落库**（多端立即可见），并推送给引擎在**轮次边界**回灌上下文——
+// 当前流结束后模型即看到该引导。Run 已结束（通道已注销）返回 409；
+// 引擎通道缓冲满（16）时消息不丢（已落库），只是本轮不再回灌。
+func (s *RunService) Guidance(ctx context.Context, sessionID, runID, input string) (*model.Message, error) {
+	text := strings.TrimSpace(input)
+	if text == "" {
+		return nil, invalidArg("引导内容不能为空")
+	}
+	v, ok := s.guidanceChans.Load(runID)
+	if !ok {
+		return nil, apperr.New(apperr.CodeConflict, "Run 不在运行中，无法引导")
+	}
+	ch, _ := v.(chan *model.Message)
+	if ch == nil {
+		return nil, apperr.New(apperr.CodeConflict, "Run 不在运行中，无法引导")
+	}
+	sdb, err := s.sessions.Acquire(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	msg := &model.Message{
+		ID:        newID(),
+		RunID:     runID,
+		Role:      model.RoleUser,
+		Content:   text,
+		CreatedAt: store.NowMillis(),
+	}
+	if err := sdb.Messages().Append(ctx, msg); err != nil {
+		return nil, err
+	}
+	// 摘要回写（最终一致，失败不影响引导本身）
+	_ = s.main.Sessions().TouchMessage(ctx, sessionID, msg.CreatedAt)
+	select {
+	case ch <- msg:
+	default:
+		// 引导密度超上限：消息已落库不丢失，仅本轮上下文不回灌（可观测，不打断对话）
+	}
+	return msg, nil
 }
 
 // StopRun 停止正在运行的 Run（ctx 取消 → 引擎迁移到 cancelled）。
@@ -401,11 +459,49 @@ func (s *RunService) unregisterCancel(runID string) {
 	delete(s.cancels, runID)
 }
 
+// defaultSessionTitle 会话默认标题（session_service.Create 兜底值，与前端一致）。
+const defaultSessionTitle = "新对话"
+
+// deriveSessionTitle 首条消息自动生成会话标题：仅当会话还是默认标题（空/新对话）时，
+// 取输入前 24 字（与桌面端 commands.rs 口径一致）；已有自定义标题返回空串（不覆盖）。
+func deriveSessionTitle(current, userInput string) string {
+	cur := strings.TrimSpace(current)
+	if cur != "" && cur != defaultSessionTitle {
+		return ""
+	}
+	input := strings.TrimSpace(userInput)
+	if input == "" {
+		return ""
+	}
+	runes := []rune(input)
+	if len(runes) > 24 {
+		runes = runes[:24]
+	}
+	title := strings.TrimSpace(string(runes))
+	if title == "" {
+		return ""
+	}
+	return title
+}
+
 func normalizeAccessMode(mode string) string {
 	switch mode {
 	case string(approval.ModeFull):
 		return string(approval.ModeFull)
 	default:
 		return string(approval.ModeConfirm)
+	}
+}
+
+// normalizeAccessModeStrict 严格归一化访问模式：仅接受 confirm/full，
+// 其余值返回空串（调用方以 400 拒绝，避免非法值静默降级为 confirm）。
+func normalizeAccessModeStrict(mode string) string {
+	switch strings.TrimSpace(mode) {
+	case string(approval.ModeConfirm):
+		return string(approval.ModeConfirm)
+	case string(approval.ModeFull):
+		return string(approval.ModeFull)
+	default:
+		return ""
 	}
 }

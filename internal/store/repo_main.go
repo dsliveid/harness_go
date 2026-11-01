@@ -48,19 +48,20 @@ func (r *SessionRepo) Create(ctx context.Context, sess *model.Session) error {
 
 const sessionColumns = `id, title, workspace_path, access_mode, model_ref, user_id,
 	message_count, last_message_at, total_tokens, last_run_status,
-	created_at, updated_at, deleted_at, source`
+	created_at, updated_at, deleted_at, source, archived_at`
 
 func scanSession(sc interface{ Scan(...any) error }) (model.Session, error) {
 	var (
-		s       model.Session
-		lastMsg sql.NullInt64
-		status  sql.NullString
-		deleted sql.NullInt64
-		source  sql.NullString
+		s        model.Session
+		lastMsg  sql.NullInt64
+		status   sql.NullString
+		deleted  sql.NullInt64
+		source   sql.NullString
+		archived sql.NullInt64
 	)
 	err := sc.Scan(&s.ID, &s.Title, &s.WorkspacePath, &s.AccessMode, &s.ModelRef, &s.UserID,
 		&s.MessageCount, &lastMsg, &s.TotalTokens, &status,
-		&s.CreatedAt, &s.UpdatedAt, &deleted, &source)
+		&s.CreatedAt, &s.UpdatedAt, &deleted, &source, &archived)
 	if err != nil {
 		return model.Session{}, err
 	}
@@ -74,6 +75,10 @@ func scanSession(sc interface{ Scan(...any) error }) (model.Session, error) {
 	if deleted.Valid {
 		v := deleted.Int64
 		s.DeletedAt = &v
+	}
+	if archived.Valid {
+		v := archived.Int64
+		s.ArchivedAt = &v
 	}
 	s.Source = source.String
 	if s.Source == "" {
@@ -140,6 +145,50 @@ func (r *SessionRepo) Rename(ctx context.Context, id, title string) error {
 		title, NowMillis(), id)
 	if err != nil {
 		return fmt.Errorf("store: 重命名会话失败: %w", err)
+	}
+	return ensureAffected(res, "会话 "+id)
+}
+
+// UpdateModel 更新会话级模型引用（顶栏模型选择器；空串表示未选择）。
+func (r *SessionRepo) UpdateModel(ctx context.Context, id, modelRef string) error {
+	res, err := r.s.conn().ExecContext(ctx,
+		`UPDATE sessions SET model_ref=?, updated_at=? WHERE id=? AND deleted_at IS NULL`,
+		modelRef, NowMillis(), id)
+	if err != nil {
+		return fmt.Errorf("store: 更新会话模型失败: %w", err)
+	}
+	return ensureAffected(res, "会话 "+id)
+}
+
+// UpdateAccessMode 更新会话访问模式（confirm | full；对齐桌面端顶栏切换）。
+func (r *SessionRepo) UpdateAccessMode(ctx context.Context, id, mode string) error {
+	res, err := r.s.conn().ExecContext(ctx,
+		`UPDATE sessions SET access_mode=?, updated_at=? WHERE id=? AND deleted_at IS NULL`,
+		mode, NowMillis(), id)
+	if err != nil {
+		return fmt.Errorf("store: 更新访问模式失败: %w", err)
+	}
+	return ensureAffected(res, "会话 "+id)
+}
+
+// Archive 归档会话（archived_at 置当前时间；幂等，重复归档刷新时间戳）。
+func (r *SessionRepo) Archive(ctx context.Context, id string) error {
+	res, err := r.s.conn().ExecContext(ctx,
+		`UPDATE sessions SET archived_at=?, updated_at=? WHERE id=? AND deleted_at IS NULL`,
+		NowMillis(), NowMillis(), id)
+	if err != nil {
+		return fmt.Errorf("store: 归档会话失败: %w", err)
+	}
+	return ensureAffected(res, "会话 "+id)
+}
+
+// Unarchive 取消归档（archived_at 置 NULL；对未归档会话幂等成功）。
+func (r *SessionRepo) Unarchive(ctx context.Context, id string) error {
+	res, err := r.s.conn().ExecContext(ctx,
+		`UPDATE sessions SET archived_at=NULL, updated_at=? WHERE id=? AND deleted_at IS NULL`,
+		NowMillis(), id)
+	if err != nil {
+		return fmt.Errorf("store: 取消归档失败: %w", err)
 	}
 	return ensureAffected(res, "会话 "+id)
 }

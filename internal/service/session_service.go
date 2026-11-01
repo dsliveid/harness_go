@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"strings"
 
 	"harness-go/internal/apperr"
 	"harness-go/internal/model"
@@ -66,6 +67,31 @@ func (s *SessionService) Rename(ctx context.Context, id, title string) error {
 		return invalidArg("标题不能为空")
 	}
 	return wrapStoreErr(s.main.Sessions().Rename(ctx, id, title), apperr.CodeSessionNotFound, "会话不存在")
+}
+
+// UpdateModel 更新会话级模型引用（顶栏模型选择器持久化；空串 = 未选择）。
+func (s *SessionService) UpdateModel(ctx context.Context, id, modelRef string) error {
+	return wrapStoreErr(s.main.Sessions().UpdateModel(ctx, id, strings.TrimSpace(modelRef)), apperr.CodeSessionNotFound, "会话不存在")
+}
+
+// Archive 归档会话（归档中心可见，侧栏默认列表不再显示；状态落库，刷新/重启不丢）。
+func (s *SessionService) Archive(ctx context.Context, id string) error {
+	return wrapStoreErr(s.main.Sessions().Archive(ctx, id), apperr.CodeSessionNotFound, "会话不存在")
+}
+
+// Unarchive 取消归档（回到原分组；对未归档会话幂等）。
+func (s *SessionService) Unarchive(ctx context.Context, id string) error {
+	return wrapStoreErr(s.main.Sessions().Unarchive(ctx, id), apperr.CodeSessionNotFound, "会话不存在")
+}
+
+// SetAccessMode 更新会话访问模式（顶栏「变更前确认/完全访问」切换落库；
+// 非法值 400，引擎每次审批实时重读该值，运行中切换立即生效）。
+func (s *SessionService) SetAccessMode(ctx context.Context, id, mode string) error {
+	m := normalizeAccessModeStrict(mode)
+	if m == "" {
+		return invalidArg("access_mode 必须是 confirm 或 full")
+	}
+	return wrapStoreErr(s.main.Sessions().UpdateAccessMode(ctx, id, m), apperr.CodeSessionNotFound, "会话不存在")
 }
 
 // Delete 删除会话：主库软删 → 删会话目录（失败留孤儿，由启动清理）。

@@ -118,6 +118,8 @@ type Session struct {
 	CreatedAt     int64     `json:"created_at"`
 	UpdatedAt     int64     `json:"updated_at"`
 	DeletedAt     *int64    `json:"deleted_at,omitempty"`
+	// ArchivedAt 归档时间（NULL/缺省 = 未归档；对齐桌面端「归档中心」语义）。
+	ArchivedAt *int64 `json:"archived_at,omitempty"`
 }
 
 // Message 消息（会话库）。

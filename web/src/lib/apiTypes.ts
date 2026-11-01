@@ -100,6 +100,7 @@ export interface Session {
   last_run_status?: RunStatus;
   created_at: number;
   updated_at: number;
+  archived_at?: number;
 }
 
 export interface CreateSessionRequest {
@@ -121,6 +122,7 @@ export interface Message {
   token_count: number;
   usage?: Record<string, unknown>;
   created_at: number;
+  hidden?: boolean;
 }
 
 export interface Run {
@@ -278,10 +280,13 @@ export const API_PATHS = {
   authPassword: '/api/v1/auth/password',
   sessions: '/api/v1/sessions',
   session: (sid: string) => `/api/v1/sessions/${sid}`,
+  sessionArchive: (sid: string) => `/api/v1/sessions/${sid}/archive`,
+  sessionUnarchive: (sid: string) => `/api/v1/sessions/${sid}/unarchive`,
   messages: (sid: string) => `/api/v1/sessions/${sid}/messages`,
   runs: (sid: string) => `/api/v1/sessions/${sid}/runs`,
   run: (sid: string, rid: string) => `/api/v1/sessions/${sid}/runs/${rid}`,
   runStop: (sid: string, rid: string) => `/api/v1/sessions/${sid}/runs/${rid}/stop`,
+  runGuidance: (sid: string, rid: string) => `/api/v1/sessions/${sid}/runs/${rid}/guidance`,
   runEvents: (sid: string, rid: string) => `/api/v1/sessions/${sid}/runs/${rid}/events`,
   runToolEvents: (sid: string, rid: string) =>
     `/api/v1/sessions/${sid}/runs/${rid}/tool-events`,
@@ -296,6 +301,8 @@ export const API_PATHS = {
   providers: '/api/v1/providers',
   provider: (pid: string) => `/api/v1/providers/${pid}`,
   providerTest: (pid: string) => `/api/v1/providers/${pid}/test`,
+  providerModels: (pid: string) => `/api/v1/providers/${pid}/models`,
+  providerSecret: (pid: string) => `/api/v1/providers/${pid}/secret`,
   settings: '/api/v1/settings',
   stats: '/api/v1/stats',
   logs: '/api/v1/logs',
@@ -394,6 +401,30 @@ export interface ProviderTestResult {
   model: string;
   code?: string;
   error?: string;
+}
+
+/**
+ * 连通测试入参（均可选）：
+ * model 留空用厂商首个模型；base_url / api_key / models 携带草稿里「尚未保存」的
+ * 当前值，实现所见即所测（厂商未落库时 base_url 必填；api_key 仅本次测试使用不落库）。
+ */
+export interface ProviderTestInput {
+  model?: string;
+  base_url?: string;
+  api_key?: string;
+  models?: string[];
+}
+
+/** 上游真实模型清单（获取模型列表）；失败时后端返回错误，不回退本地兜底。 */
+export interface ProviderModelsResult {
+  items: string[];
+  count: number;
+}
+
+/** 厂商密钥明文（眼睛图标显示 / 复制）；未配置时 api_key 为空串、has_key=false。 */
+export interface ProviderSecretResult {
+  api_key: string;
+  has_key: boolean;
 }
 
 /** 通用配置：键到任意 JSON 片段（白名单键见后端 service.settingsWhitelist）。 */

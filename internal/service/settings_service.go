@@ -12,18 +12,24 @@ import (
 	"harness-go/internal/store"
 )
 
+// settingsKeyDefaultModel 全局默认对话模型（agent.default_model）。
+//
+// 前端「设置 → 能力模型槽位 chat」落库为 `<providerID>/<modelID>`，
+// 运行时由 ProviderResolver 在 model_ref 为空/"default" 时消费（见 provider_resolver.go）。
+const settingsKeyDefaultModel = "agent.default_model"
+
 // settingsWhitelist 允许经 API 读写的配置键（白名单，防止任意键污染）。
 //
 // 说明：`tools.tiers` 为工具分组三层覆盖的全局层（见 D11 修订）。
 var settingsWhitelist = map[string]bool{
-	"ui.theme":            true,
-	"ui.locale":           true,
-	"ui.compact":          true,
-	"agent.default_model": true,
-	"agent.access_mode":   true,
-	"agent.max_steps":     true,
-	"tools.tiers":         true,
-	"storage.quota_warn":  true,
+	"ui.theme":              true,
+	"ui.locale":             true,
+	"ui.compact":            true,
+	settingsKeyDefaultModel: true,
+	"agent.access_mode":     true,
+	"agent.max_steps":       true,
+	"tools.tiers":           true,
+	"storage.quota_warn":    true,
 }
 
 // SettingsService 通用键值配置用例（B-4）。

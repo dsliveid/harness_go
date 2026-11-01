@@ -19,6 +19,8 @@ let flushTimer: ReturnType<typeof setTimeout> | null = null
 let streamingMsgId: string | null = null
 let currentRunId: string | null = null
 let stepStartAt = 0
+/** 每会话最近一次消息级回滚的事件 id（real 模式 reapply 依据；S10 语义，刷新后从服务端 rollbacks 列表不可得时降级为不可重放） */
+const lastRollbackBySession: Record<string, string> = {}
 
 interface ChatState {
   messages: Message[]
@@ -86,7 +88,7 @@ export const useChat = create<ChatState>((set, get) => {
     flushTimer = setTimeout(flush, 50)
   }
 
-  const patchTool = (callId: string, patch: Partial<ToolCall>, appendResult?: string) => {
+  const patchTool = (callId: string, patch: Partial<ToolCall>, appendResult?: string, appendLive?: string) => {
     flush()
     set((s) => ({
       messages: s.messages.map((m) => {
@@ -99,6 +101,7 @@ export const useChat = create<ChatState>((set, get) => {
                   ...c,
                   ...patch,
                   result: appendResult !== undefined ? `${c.result ? `${c.result}\n` : ''}${appendResult}` : c.result,
+                  liveOutput: appendLive !== undefined ? `${c.liveOutput ?? ''}${appendLive}` : c.liveOutput,
                 }
               : c,
           ),
@@ -109,6 +112,12 @@ export const useChat = create<ChatState>((set, get) => {
 
   const startRun = (input: string) => {
     const sessionId = useSessions.getState().currentId
+    // 没有「默认模型」的隐式回退：会话未选择模型时直接拦截提示（避免静默落到 fake 回显模型）
+    const session = useSessions.getState().sessions.find((s) => s.id === sessionId)
+    if (!session?.modelRef) {
+      useUI.getState().toast('warn', '请先选择模型')
+      return
+    }
     // 发送新消息将覆盖撤回边界之后的历史（对齐桌面端）
     if (get().messages.some((m) => m.sessionId === sessionId && m.revertedAt)) {
       set((s) => ({ messages: s.messages.filter((m) => !(m.sessionId === sessionId && m.revertedAt)) }))
@@ -170,6 +179,11 @@ export const useChat = create<ChatState>((set, get) => {
                 result: e.result,
               })
             }
+            break
+          case 'tool_progress':
+            // 实时增量输出（需求 §10-4）：追加到运行中的工具卡片输出区；
+            // 终态结果仍以 tool.result 为准（完成后 ToolCard 展示 result，不再展示 liveOutput）
+            patchTool(e.callId, {}, undefined, e.chunk)
             break
           case 'approval':
             flush()
@@ -245,8 +259,8 @@ export const useChat = create<ChatState>((set, get) => {
 
     // real 模式：Run 在服务端执行（本地 runId 仅用于消息壳，真实 id 以服务端返回为准）
     cancelPending = false
-    // 模型引用：会话级配置优先（服务端在为空时还会回退 default）
-    const modelRef = useSessions.getState().sessions.find((s) => s.id === sessionId)?.modelRef || undefined
+    // 模型引用：startRun 入口已保证会话已选模型
+    const modelRef = session.modelRef || undefined
     void api
       .startRun({
         sessionId,
@@ -372,6 +386,22 @@ export const useChat = create<ChatState>((set, get) => {
           return m
         }),
       }))
+      if (apiMode === 'real') {
+        // 服务端上下文同步截断（S10 消息级回滚）：目标消息起置灰 + 受影响文件回滚到 before 快照。
+        // 必须先回滚再起 Run（引擎在 Run 启动时装载历史，晚到会把待置灰消息喂进本轮上下文）；
+        // 回滚失败仍继续本地重发（服务端历史以 DB 为准，可稍后手工回滚），但会给出警示。
+        void (async () => {
+          try {
+            const rid = await api.rollbackToMessage(target.sessionId, target.seq)
+            lastRollbackBySession[target.sessionId] = rid
+          } catch {
+            useUI.getState().toast('warn', '服务端回滚失败，本轮上下文可能仍含旧消息')
+          } finally {
+            startRun(content)
+          }
+        })()
+        return
+      }
       startRun(content)
     },
 
@@ -380,6 +410,32 @@ export const useChat = create<ChatState>((set, get) => {
       if (!text) return
       if (!get().streaming) {
         startRun(text)
+        return
+      }
+      if (apiMode === 'real' && currentRunId) {
+        // 引导（需求 §4.2）：运行中立即介入——消息经服务端落库（响应就地追加），
+        // 引擎在轮次边界回灌上下文；Run 已结束（409）降级为待执行队列
+        const sessionId = useSessions.getState().currentId
+        void api
+          .sendGuidance(sessionId, currentRunId, text)
+          .then((msg) => {
+            set((s) => ({
+              messages: [
+                ...s.messages,
+                {
+                  id: msg.id, sessionId, runId: currentRunId ?? undefined,
+                  seq: msg.seq || s.messages.reduce((a, m) => Math.max(a, m.seq), 0) + 1,
+                  turnSeq: s.messages.filter((m) => m.sessionId === sessionId && m.role === 'user').length + 1,
+                  role: 'user' as const, content: msg.content, createdAt: Date.now(),
+                },
+              ],
+            }))
+            useUI.getState().toast('success', '已引导：模型将在当前轮结束后看到这条消息')
+          })
+          .catch(() => {
+            set((s) => ({ queued: [...s.queued, text] }))
+            useUI.getState().toast('info', 'Run 已结束，已加入待执行队列')
+          })
         return
       }
       set((s) => ({ queued: [...s.queued, text] }))
@@ -416,6 +472,16 @@ export const useChat = create<ChatState>((set, get) => {
         ),
         draft: target.content,
       }))
+      if (apiMode === 'real') {
+        // 服务端同步置灰（S10 消息级回滚，含受影响文件回滚），重拉快照以 DB 为准
+        void api
+          .rollbackToMessage(target.sessionId, target.seq)
+          .then((rid) => {
+            lastRollbackBySession[target.sessionId] = rid
+            return get().reloadMessages(target.sessionId)
+          })
+          .catch(() => useUI.getState().toast('warn', '服务端回滚失败，历史以本地界面为准'))
+      }
       useUI.getState().toast('info', '已撤回至此处，内容已回填输入框（发送新消息将覆盖此后历史）')
     },
 
@@ -431,7 +497,20 @@ export const useChat = create<ChatState>((set, get) => {
         ),
         draft: get().draft === target.content ? '' : get().draft,
       }))
-      useUI.getState().toast('success', '已重新应用，消息与文件还原为最新')
+      if (apiMode === 'real') {
+        const rid = lastRollbackBySession[target.sessionId]
+        if (!rid) {
+          useUI.getState().toast('warn', '本端没有可重放的回滚记录（重新应用仅在回滚后可用）')
+          return
+        }
+        void api
+          .reapplyRollback(target.sessionId, rid)
+          .then(() => get().reloadMessages(target.sessionId))
+          .then(() => useUI.getState().toast('success', '已重新应用，消息与文件还原为最新'))
+          .catch(() => useUI.getState().toast('error', '重新应用失败（回滚可能已被重放过）'))
+      } else {
+        useUI.getState().toast('success', '已重新应用，消息与文件还原为最新')
+      }
     },
 
     // 删除对话：删除该提问及其后全部消息
@@ -443,6 +522,16 @@ export const useChat = create<ChatState>((set, get) => {
           (m) => !(m.sessionId === target.sessionId && m.seq >= target.seq),
         ),
       }))
+      if (apiMode === 'real') {
+        // 删除 = 同一消息级回滚（服务端语义为置灰保留，可 reapply 恢复；界面按已删除呈现）
+        void api
+          .rollbackToMessage(target.sessionId, target.seq)
+          .then((rid) => {
+            lastRollbackBySession[target.sessionId] = rid
+            return get().reloadMessages(target.sessionId)
+          })
+          .catch(() => useUI.getState().toast('warn', '服务端回滚失败，历史以本地界面为准'))
+      }
       useUI.getState().toast('success', '已删除该对话及后续内容')
     },
 

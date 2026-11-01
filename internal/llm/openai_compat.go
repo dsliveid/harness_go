@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	crand "crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -24,14 +26,20 @@ type OpenAICompatConfig struct {
 	MaxRetries        int               // 默认 2（仅对可重试错误）
 	BaseDelay         time.Duration     // 默认 500ms
 	FirstTokenTimeout time.Duration     // 默认 60s；0 表示不限制
-	ExtraHeaders      map[string]string // 额外请求头（如厂商要求的版本头）
+	ExtraHeaders      map[string]string // 额外请求头（如厂商要求的版本头），可覆盖内置会话头
+	// SessionID 会话路由 ID（随 chat 请求以 x-opencode-session / x-session-id 头发送）。
+	// opencode zen 等网关强制要求该头做路由（缺失直接 400 MissingSessionID）；
+	// 对不认识的厂商无副作用。为空自动生成 sess-<32hex>（对齐桌面端 llm.rs）。
+	SessionID string
 }
 
 // OpenAICompat OpenAI Chat Completions 协议适配器（流式）。
 type OpenAICompat struct {
 	name              string
+	baseURL           string
 	endpoint          string
 	apiKey            string
+	sessionID         string
 	client            *http.Client
 	maxRetries        int
 	baseDelay         time.Duration
@@ -60,14 +68,20 @@ func NewOpenAICompat(cfg OpenAICompatConfig) (*OpenAICompat, error) {
 	if name == "" {
 		name = "openai-compat"
 	}
+	sessionID := strings.TrimSpace(cfg.SessionID)
+	if sessionID == "" {
+		sessionID = NewSessionID()
+	}
 	client := cfg.HTTPClient
 	if client == nil {
 		client = &http.Client{Transport: http.DefaultTransport}
 	}
 	return &OpenAICompat{
 		name:              name,
+		baseURL:           strings.TrimRight(cfg.BaseURL, "/"),
 		endpoint:          strings.TrimRight(cfg.BaseURL, "/") + "/chat/completions",
 		apiKey:            cfg.APIKey,
+		sessionID:         sessionID,
 		client:            client,
 		maxRetries:        cfg.MaxRetries,
 		baseDelay:         cfg.BaseDelay,
@@ -76,8 +90,195 @@ func NewOpenAICompat(cfg OpenAICompatConfig) (*OpenAICompat, error) {
 	}, nil
 }
 
+// NewSessionID 生成会话路由 ID：sess-<32hex>（对齐桌面端 llm.rs 的 sess-{uuid simple}，
+// 不引入 uuid 依赖）。
+func NewSessionID() string {
+	b := make([]byte, 16)
+	if _, err := crand.Read(b); err != nil {
+		// crypto/rand 失败极罕见（系统熵源不可用）：退化为时间戳 + 固定后缀，保住「非空且可区分」
+		return fmt.Sprintf("sess-%x-fallback", time.Now().UnixNano())
+	}
+	return "sess-" + hex.EncodeToString(b)
+}
+
 // Name 返回适配器名。
 func (p *OpenAICompat) Name() string { return p.name }
+
+// ListModels 拉取上游模型清单（用于「设置 → 模型 → 获取模型列表」）。
+//
+// Base URL 规整与候选顺序对齐桌面端 src-tauri/src/llm.rs::list_models：
+// 先剥离误填的 `/chat/completions`、`/messages`、`/responses` 后缀，
+// 再依次尝试 `{base}/models`、`{base}/v1/models`（base 未含 /v1 时）、`{base}/api/tags`（Ollama）。
+//
+// 兼容两种响应形状：OpenAI `{"data":[{"id":"..."}]}`、Ollama `{"models":[{"name":"..."}]}`。
+// 全部候选失败时返回聚合错误（含每个候选的最后状态），**绝不回退本地目录/样例数据**。
+func (p *OpenAICompat) ListModels(ctx context.Context) ([]string, error) {
+	base := normalizeModelsBase(p.baseURL)
+	if base == "" {
+		return nil, NewError(ErrKindBadRequest, 0, "Base URL 不能为空")
+	}
+	var candidates []string
+	if strings.HasSuffix(base, "/models") {
+		candidates = []string{base}
+	} else {
+		candidates = []string{base + "/models"}
+		if !strings.Contains(base, "/v1") && !strings.Contains(base, "/v4") {
+			candidates = append(candidates, base+"/v1/models")
+		}
+		candidates = append(candidates, base+"/api/tags")
+	}
+
+	var failures []string
+	var lastErr error
+	for _, url := range candidates {
+		list, err := p.fetchModelList(ctx, url)
+		if err != nil {
+			failures = append(failures, summarizeModelFetch(err))
+			lastErr = err
+			continue
+		}
+		return list, nil
+	}
+	msg := "获取模型列表失败"
+	if len(failures) > 0 {
+		msg += "：" + strings.Join(failures, "；")
+	}
+	if lastErr != nil {
+		return nil, WrapError(lastErr, AsError(lastErr).Kind, AsError(lastErr).StatusCode, "%s", msg)
+	}
+	return nil, NewError(ErrKindNetwork, 0, "%s", msg)
+}
+
+// normalizeModelsBase 归一化「获取模型列表」用的 Base URL（去尾斜杠 + 剥离具体端点后缀）。
+func normalizeModelsBase(raw string) string {
+	base := strings.TrimSpace(raw)
+	if base == "" {
+		return ""
+	}
+	base = strings.TrimRight(base, "/")
+	for _, suffix := range []string{"/chat/completions", "/messages", "/responses"} {
+		if strings.HasSuffix(base, suffix) {
+			base = strings.TrimSuffix(base, suffix)
+			break
+		}
+	}
+	return strings.TrimRight(base, "/")
+}
+
+// fetchModelList 请求单个候选 URL 并解析模型名。
+func (p *OpenAICompat) fetchModelList(ctx context.Context, url string) ([]string, error) {
+	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(cctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, WrapError(err, ErrKindBadRequest, 0, "构造请求失败")
+	}
+	req.Header.Set("Accept", "application/json")
+	if p.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+p.apiKey)
+		// Anthropic 兼容端点要求 x-api-key + 版本头
+		if strings.Contains(strings.ToLower(p.baseURL), "anthropic") {
+			req.Header.Set("x-api-key", p.apiKey)
+			req.Header.Set("anthropic-version", "2023-06-01")
+		}
+	}
+	for k, v := range p.extraHeaders {
+		req.Header.Set(k, v)
+	}
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, WrapError(err, ErrKindNetwork, 0, "发起请求失败")
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		return nil, classifyStatus(resp)
+	}
+	// 模型清单通常几十~几百 KB，限 8MB 防御异常响应
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return nil, WrapError(err, ErrKindNetwork, 0, "读取响应失败")
+	}
+	list, err := parseModelList(raw)
+	if err != nil {
+		return nil, WrapError(err, ErrKindBadRequest, resp.StatusCode, "解析模型列表失败")
+	}
+	if len(list) == 0 {
+		return nil, NewError(ErrKindBadRequest, resp.StatusCode, "上游返回的模型列表为空")
+	}
+	return list, nil
+}
+
+// parseModelList 解析 OpenAI / Ollama 两种模型清单形状（去重保序）。
+func parseModelList(raw []byte) ([]string, error) {
+	var openai struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	var ollama struct {
+		Models []struct {
+			Name string `json:"name"`
+			// Ollama 新版也返回 model 字段
+			Model string `json:"model"`
+		} `json:"models"`
+	}
+	// 先按 OpenAI 形状解析，无结果再按 Ollama 形状
+	if err := json.Unmarshal(raw, &openai); err == nil && len(openai.Data) > 0 {
+		out := make([]string, 0, len(openai.Data))
+		for _, m := range openai.Data {
+			if id := strings.TrimSpace(m.ID); id != "" {
+				out = append(out, id)
+			}
+		}
+		return dedupeStrings(out), nil
+	}
+	if err := json.Unmarshal(raw, &ollama); err == nil && len(ollama.Models) > 0 {
+		out := make([]string, 0, len(ollama.Models))
+		for _, m := range ollama.Models {
+			name := strings.TrimSpace(m.Name)
+			if name == "" {
+				name = strings.TrimSpace(m.Model)
+			}
+			if name != "" {
+				out = append(out, name)
+			}
+		}
+		return dedupeStrings(out), nil
+	}
+	// 两种形状都不匹配：返回解析错误而非空列表，避免「静默成功但无模型」
+	var probe any
+	if err := json.Unmarshal(raw, &probe); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
+// dedupeStrings 去重并保持首次出现顺序。
+func dedupeStrings(in []string) []string {
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
+}
+
+// summarizeModelFetch 把单个候选的失败原因压缩成一句话（用于聚合错误）。
+func summarizeModelFetch(err error) string {
+	le := AsError(err)
+	if le == nil {
+		return "未知错误"
+	}
+	if le.StatusCode > 0 {
+		return fmt.Sprintf("HTTP %d %s", le.StatusCode, le.Message)
+	}
+	return le.Message
+}
 
 // ChatStream 发起流式调用（含可重试错误的指数退避）。
 func (p *OpenAICompat) ChatStream(ctx context.Context, req ChatRequest) (Stream, error) {
@@ -231,6 +432,10 @@ func (p *OpenAICompat) send(ctx context.Context, body []byte) (*http.Response, e
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Accept", "text/event-stream")
+	// 会话路由头（对齐桌面端 llm.rs）：opencode zen 等网关强制要求，其余厂商忽略不碍事；
+	// 放在 ExtraHeaders 之前，允许 ExtraHeaders 按厂商覆盖
+	httpReq.Header.Set("x-opencode-session", p.sessionID)
+	httpReq.Header.Set("x-session-id", p.sessionID)
 	if p.apiKey != "" {
 		httpReq.Header.Set("Authorization", "Bearer "+p.apiKey)
 	}
