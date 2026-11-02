@@ -39,18 +39,22 @@ if not defined BASH_EXE (
 )
 
 rem remember current code page, switch to UTF-8 for package.sh output.
-rem System32 is prepended to PATH first: when this script is started detached
-rem (WMI / Task Scheduler / service wrapper) PATH may lack System32, and a bare
-rem "chcp" then fails with a garbled "'chcp' is not recognized" line.
-set "PATH=%SystemRoot%\System32;%PATH%"
+rem NOTE: do NOT prepend %SystemRoot%\System32 to PATH here. That was the old
+rem workaround for "chcp not found" when started detached, but it hijacks the
+rem GNU tools used by the bash scripts: System32\find.exe is a *string search*
+rem tool (no -newer) and System32\sort.exe does not support -u. With them on
+rem PATH, build.sh/package.sh silently build an empty "keep" list and delete
+rem every asset under web/dist/assets. Calling chcp by absolute path fixes the
+rem original problem without polluting PATH.
 set "OLDCP="
-for /f "tokens=2 delims=:" %%A in ('chcp') do set "OLDCP=%%A"
-if defined OLDCP chcp 65001 >nul 2>nul
+for /f "tokens=2 delims=:" %%A in ('"%SystemRoot%\System32\chcp.com"') do set "OLDCP=%%A"
+if defined OLDCP "%SystemRoot%\System32\chcp.com" 65001 >nul 2>nul
 
 "%BASH_EXE%" "%HERE%package.sh" %*
+
 set "RC=%ERRORLEVEL%"
 
-if defined OLDCP chcp %OLDCP% >nul 2>nul
+if defined OLDCP "%SystemRoot%\System32\chcp.com" %OLDCP% >nul 2>nul
 if not "%RC%"=="0" call :pause_on_failure
 exit /b %RC%
 

@@ -341,7 +341,15 @@ func (s *Store) listLayer(ctx context.Context, layer Layer) ([]retrieval.Doc, er
 			out = append(out, *d)
 		}
 	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].UpdatedAt < out[j].UpdatedAt })
+	// 按 updated_at 升序（写入顺序）；同毫秒并列时用 ID 兜底 ——
+	// ID 为自增主键，等价于真实落库先后，保证「最早 N 条」选择是确定性的。
+	// 若不兜底，L0 预算截断在同毫秒批量写入时会随机丢弃条目（曾导致 TestRecallL0BudgetCap flaky）。
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].UpdatedAt != out[j].UpdatedAt {
+			return out[i].UpdatedAt < out[j].UpdatedAt
+		}
+		return out[i].ID < out[j].ID
+	})
 	return out, nil
 }
 

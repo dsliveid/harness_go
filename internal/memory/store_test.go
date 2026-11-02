@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"testing"
 
@@ -78,6 +79,9 @@ func (f *fakeRepo) ListKeys(_ context.Context, kind retrieval.Kind) ([]string, e
 			out = append(out, d.Key)
 		}
 	}
+	// 必须复刻真实 Repo 的 `ORDER BY key ASC` 契约：map 遍历顺序随机，
+	// 否则 listLayer 的同毫秒并列条目顺序不确定，导致 L0 预算截断选谁随机（flaky 根因）。
+	sort.Strings(out)
 	return out, nil
 }
 
