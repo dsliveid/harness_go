@@ -9,7 +9,7 @@ import react from '@vitejs/plugin-react'
  * 注意：这里读的是 Node 的 process.env（vite.config 运行在 Node 侧，不进浏览器包），
  * 加上 declare 是为了在无 @types/node 的纯前端工程里也能通过 tsc -b 的类型检查。
  */
-declare const process: { env: Record<string, string | undefined }
+declare const process: { env: Record<string, string | undefined> }
 const BACKEND = process.env.HARNESS_BACKEND || 'http://127.0.0.1:8080'
 
 export default defineConfig({

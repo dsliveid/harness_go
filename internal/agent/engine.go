@@ -198,13 +198,18 @@ func (e *Engine) Execute(ctx context.Context, req RunRequest) error {
 		// 终态迁移失败不掩盖原始错误
 		return fmt.Errorf("agent: 终态迁移失败: %w (原始状态=%s)", err, final)
 	}
-	e.publishStatus(req.RunID, req.SessionID, final, stopReason, errCode, errMsg, usage)
-	e.deps.Events.CloseRun(req.RunID)
-
 	// ③ 摘要回写主库（**不同事务、最终一致**；失败只影响列表新鲜度）
+	//
+	// ⚠️ 顺序约束（可见性竞态，勿随意调整）：必须在「终态事件发布 + CloseRun」之前完成。
+	// 客户端一旦从终态事件/连接关闭得知 Run 已结束，就会立刻回查会话列表；
+	// 若回写滞后于终态可观测，则会出现「Run 已 completed，但 last_run_status 仍为空」
+	// 的瞬时不一致（TestEndToEndChatFlow 曾因此以约 60% 概率偶发失败）。
 	if e.deps.Summary != nil {
 		_ = e.deps.Summary.AddTokensAndStatus(ctx, req.SessionID, tokens, final)
 	}
+
+	e.publishStatus(req.RunID, req.SessionID, final, stopReason, errCode, errMsg, usage)
+	e.deps.Events.CloseRun(req.RunID)
 
 	if final == model.RunFailed {
 		return fmt.Errorf("agent: Run 失败: %s %s", errCode, errMsg)
