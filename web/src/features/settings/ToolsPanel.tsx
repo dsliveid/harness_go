@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react'
 import { toolList, toolInstallInfo } from '../../mock/settingsData'
 import { toggleDisabled, useSettings } from '../../stores/settingsStore'
 import { usePlugins } from '../../stores/pluginStore'
@@ -7,6 +8,8 @@ import { RealModeNotice } from '../../components/RealModeNotice'
 import type { DeviceNode, Risk, ToolGroup, ToolInstallMeta } from '../../types'
 import { cn } from '../../components/ui'
 import { supportsClient, unsupportedReason } from '../../lib/platform'
+import { api, apiMode } from '../../lib/api'
+import type { ToolSnapshot, ToolTier } from '../../lib/apiTypes'
 
 // ---------------- 分区元信息（顺序即渲染顺序，数量统计按「已启用 n / 总数 m」） ----------------
 const TOOL_GROUPS: Array<{ key: ToolGroup; label: string; hint: string; dot: string; text: string }> = [
@@ -137,6 +140,153 @@ function ToolItem({ name, enabled, onToggle, client }: {
   )
 }
 
+// ---------------- 服务端工具快照（A1 接真） ----------------
+// 为什么能接真：lib/api.ts 的 getTools() / patchToolTiers() 已走 request() 直连 A-10 三端点，
+// 返回 ToolSnapshot（total / 三档 tier / cost_* / limits / warnings / overrides），此处不做任何本地估算。
+// 为什么只能部分对齐：后端只有 core / deferred / on_demand 三档 tier，**没有**「启用/禁用」布尔，
+// 因此下方工具卡片的启停开关仍是 settingsStore 的本地态（不写服务端）；只有 tier 变更才回写服务端。
+const TIER_META: Array<{ key: ToolTier; label: string; hint: string }> = [
+  { key: 'core', label: 'core 常驻', hint: '每次请求都注入完整 schema' },
+  { key: 'deferred', label: 'deferred 延迟', hint: '只注入索引，按需回捞定义' },
+  { key: 'on_demand', label: 'on_demand 按需', hint: '仅列举，不进入注入预算' },
+]
+
+const fmtNum = (n: number) => n.toLocaleString('en-US')
+
+function ServerToolSnapshot() {
+  const toast = useUI((s) => s.toast)
+  const [snap, setSnap] = useState<ToolSnapshot | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState<string | null>(null)
+
+  useEffect(() => {
+    let alive = true
+    api
+      .getTools()
+      .then((s) => {
+        if (!alive) return
+        setSnap(s)
+        setError(null)
+      })
+      .catch((e: unknown) => {
+        // 不求兜底成假值：失败就如实展示错误
+        if (alive) setError(e instanceof Error ? e.message : String(e))
+      })
+      .finally(() => {
+        if (alive) setLoading(false)
+      })
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  const changeTier = (name: string, tier: ToolTier) => {
+    setSaving(name)
+    api
+      .patchToolTiers({ [name]: tier })
+      .then((s) => {
+        setSnap(s)
+        toast('success', `已将 ${name} 调整为 ${tier}`)
+      })
+      .catch((e: unknown) => toast('error', `调整失败：${e instanceof Error ? e.message : String(e)}`))
+      .finally(() => setSaving(null))
+  }
+
+  return (
+    <div className="rounded-xl border border-edge bg-panel2/30 p-3 space-y-2.5">
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="text-[12px] font-semibold">服务端工具快照</span>
+        <Badge tone="blue">GET /tools · 真实</Badge>
+        {loading && <span className="text-[11px] text-inkfaint">读取中…</span>}
+        {error && <span className="text-[11px] text-err">读取失败：{error}</span>}
+      </div>
+
+      {!snap && !loading && !error && <div className="text-[11px] text-inkfaint">服务端未返回工具快照</div>}
+
+      {snap && (
+        <>
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+            <div className="rounded-lg border border-edge px-2 py-1.5">
+              <div className="text-[10px] text-inkfaint">注册工具总数</div>
+              <div className="text-[14px] font-medium">{fmtNum(snap.total)}</div>
+            </div>
+            <div className="rounded-lg border border-edge px-2 py-1.5">
+              <div className="text-[10px] text-inkfaint">注入成本 / 预算</div>
+              <div className="text-[14px] font-medium">
+                {fmtNum(snap.cost_total)}
+                <span className="text-[11px] text-inkfaint"> / {fmtNum(snap.limits.core_soft + snap.limits.deferred_soft)}</span>
+              </div>
+            </div>
+            <div className="rounded-lg border border-edge px-2 py-1.5">
+              <div className="text-[10px] text-inkfaint">core / deferred 成本</div>
+              <div className="text-[14px] font-medium">
+                {fmtNum(snap.cost_core)} <span className="text-inkfaint">/</span> {fmtNum(snap.cost_deferred)}
+              </div>
+            </div>
+            <div className="rounded-lg border border-edge px-2 py-1.5">
+              <div className="text-[10px] text-inkfaint">插件来源 / tier 覆盖</div>
+              <div className="text-[14px] font-medium">
+                {fmtNum(snap.plugins.length)} <span className="text-inkfaint">/</span> {fmtNum(Object.keys(snap.overrides).length)}
+              </div>
+            </div>
+          </div>
+
+          {snap.warnings.length > 0 && (
+            <div className="rounded-lg border border-warn/40 bg-warn/[0.06] px-2 py-1.5 text-[11px] text-warn space-y-0.5">
+              {snap.warnings.map((w, i) => <div key={i}>· {w}</div>)}
+            </div>
+          )}
+
+          <div className="space-y-2">
+            {TIER_META.map((t) => {
+              const list = snap[t.key]
+              return (
+                <div key={t.key}>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[11px] font-medium">{t.label}</span>
+                    <Badge tone={list.length ? 'green' : 'gray'}>{list.length} 个</Badge>
+                    <span className="text-[10px] text-inkfaint">{t.hint}</span>
+                  </div>
+                  {list.length === 0 ? (
+                    <div className="text-[11px] text-inkfaint pl-1">（服务端该档为空）</div>
+                  ) : (
+                    <div className="mt-1 flex flex-wrap gap-1.5">
+                      {list.map((tool) => (
+                        <span
+                          key={tool.name}
+                          className="inline-flex items-center gap-1 rounded border border-edge bg-panel2 px-1.5 py-0.5 text-[10px] font-mono"
+                          title={`namespace=${tool.namespace} · risk=${tool.risk} · executor=${tool.executor} · cost=${tool.cost_tokens} · health=${tool.health}`}
+                        >
+                          {tool.name}
+                          <span className="text-inkfaint">·{tool.cost_tokens}</span>
+                          <select
+                            className="bg-transparent text-[10px] outline-none cursor-pointer disabled:opacity-50"
+                            value={tool.tier}
+                            disabled={saving !== null}
+                            onChange={(e) => changeTier(tool.name, e.target.value as ToolTier)}
+                            title="调整服务端 tier（PATCH /tools/tiers）"
+                          >
+                            {TIER_META.map((o) => <option key={o.key} value={o.key}>{o.key}</option>)}
+                          </select>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+
+          <div className="text-[10px] text-inkfaint font-mono">
+            generated_at: {snap.generated_at}
+          </div>
+        </>
+      )}
+    </div>
+  )
+}
+
 export function ToolsPanel({ client, query = '' }: { client: DeviceNode; query?: string }) {
   const { settings, setDisabledTools } = useSettings()
   const d = settings
@@ -155,7 +305,9 @@ export function ToolsPanel({ client, query = '' }: { client: DeviceNode; query?:
 
   return (
     <div className="flex flex-col gap-4">
-      <RealModeNotice text="工具清单与「可安装性/已安装」状态来自前端内置表（mock/settingsData）：禁用开关只写本地设置，尚未通过 /tools 与 /tools/tiers 接口下发；真实工具注册状态以服务端为准。" />
+      <RealModeNotice text="下方「服务端工具快照」区块来自 GET /tools 真实返回（总数 / 三档 tier / 注入成本 / warnings），tier 变更会 PATCH /tools/tiers 回写服务端。而内置工具卡片的「启用/禁用」开关仍是本地设置：后端只有 core / deferred / on_demand 三档 tier，不存在启停布尔，故该开关仅本地生效、不下发服务端；「可安装性 / 本端已安装」来自前端内置表。" />
+      {/* real 模式才渲染真实快照区块；mock 模式保持纯演示数据，不臆造接口 */}
+      {apiMode === 'real' && <ServerToolSnapshot />}
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">
           <div className="text-[13px] font-medium">系统内置工具</div>

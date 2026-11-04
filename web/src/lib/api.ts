@@ -26,6 +26,15 @@ import {
   type LoginRequest,
   type LoginResponse,
   type Message as ApiMessage,
+  type MCPHealthDTO,
+  type MCPListResponseDTO,
+  type MCPServerInputDTO,
+  type MCPServerViewDTO,
+  type MCPTestResultDTO,
+  type PackageInstallRequestDTO,
+  type PackageInstallResultDTO,
+  type PackageListResponseDTO,
+  type PackageViewDTO,
   type PairCodeDTO,
   type ProviderDTO,
   type ProviderInput,
@@ -202,6 +211,42 @@ export interface ApiClient {
   revokeDevice(id: string): Promise<void>
   /** 会话租约（无租约 = active=true / epoch=0 / holder=''，不是错误） */
   getSessionLease(sessionId: string): Promise<SessionLeaseDTO>
+
+  // ---- 阶段 E：MCP Server 管理（10 个端点，protocol 依据 internal/api/router.go:110-119） ----
+  /** 全部 Server（配置 + 运行态合并；env/headers 只回键名不回值） */
+  listMcpServers(): Promise<MCPListResponseDTO>
+  /** 单个 Server 视图 */
+  getMcpServer(id: string): Promise<MCPServerViewDTO>
+  /** 新增（start=true 时立即建连；连接失败则配置已落库但状态 failed） */
+  createMcpServer(input: MCPServerInputDTO, start?: boolean): Promise<MCPServerViewDTO>
+  /** 全量更新（变更后需显式 reloadMcpServer 才生效，服务端不自动重连） */
+  updateMcpServer(id: string, input: MCPServerInputDTO): Promise<MCPServerViewDTO>
+  /** 删除（先注销工具再关连接） */
+  deleteMcpServer(id: string): Promise<void>
+  /** 联通测试（配置可未落库）：返回工具清单 + 耗时，用完即清理临时连接 */
+  testMcpServer(input: MCPServerInputDTO): Promise<MCPTestResultDTO>
+  /** 热重载（原子替换，失败保留旧连接） */
+  reloadMcpServer(id: string): Promise<void>
+  /** 启用（配置 enabled=true 并建连） */
+  enableMcpServer(id: string): Promise<void>
+  /** 停用（断开连接但保留配置） */
+  disableMcpServer(id: string): Promise<void>
+  /** 健康详情（calls/failures/tool_count/state） */
+  getMcpServerHealth(id: string): Promise<MCPHealthDTO>
+
+  // ---- 阶段 E：本地工具包（6 个端点，protocol 依据 internal/api/router.go:121-126） ----
+  /** 全部已安装工具包 */
+  listPackages(): Promise<PackageListResponseDTO>
+  /** 安装（入参为**服务端本地 zip 路径**，无 HTTP 上传通道） */
+  installPackage(req: PackageInstallRequestDTO): Promise<PackageInstallResultDTO>
+  /** 卸载（注销工具 + 清目录 + 删行） */
+  uninstallPackage(id: string): Promise<void>
+  /** 回滚到上一版本 */
+  rollbackPackage(id: string): Promise<PackageViewDTO>
+  /** 启用（保留安装，重新注册工具） */
+  enablePackage(id: string): Promise<void>
+  /** 停用（保留安装，注销工具） */
+  disablePackage(id: string): Promise<void>
 }
 
 /* ============ HTTP 基础设施 ============ */
@@ -394,6 +439,88 @@ function mockDeviceList(): DeviceDTO[] {
       capabilities: [{ device_id: 'dev-mock-mobile', name: 'fetch_web_page', version: '1', updated_at: now - 5_400_000 }],
     },
   ]
+}
+
+/* ============ 阶段 E：MCP / 工具包（mock 样例数据） ============ */
+
+/**
+ * mock MCP 视图：从 `mock/data.ts` 的 mcpServers 派生，字段与后端
+ * `GET /api/v1/mcp/servers`（internal/service/mcp_service.go:51-74 ServerView）逐一对齐。
+ * 注意 UI 的 McpServer.tools 是 McpToolInfo[]，后端只回 tool_count/allow_tools，
+ * 因此 mock 侧把工具名映射成 McpToolInfo（risk 取自后端 default_risk 口径）。
+ */
+function mockMcpViews(): MCPServerViewDTO[] {
+  return mockData.mcpServers.map((m) => ({
+    id: m.id,
+    name: m.name,
+    transport: m.transport,
+    command: m.command,
+    args: m.command ? m.command.split(' ').slice(1) : undefined,
+    cwd: undefined,
+    url: m.url,
+    env_keys: [],
+    header_keys: [],
+    enabled: m.enabled,
+    timeout_ms: 30_000,
+    max_output: 100_000,
+    default_risk: m.tools[0]?.risk ?? 'readonly',
+    allow_tools: m.tools.map((t) => t.name),
+    deny_tools: [],
+    health_interval_s: m.healthIntervalS ?? 60,
+    state: m.state === 'starting' ? 'degraded' : m.state,
+    calls: m.calls,
+    failures: m.failures,
+    tool_count: m.tools.length,
+    last_error: m.lastError,
+  }))
+}
+
+/** 入参 → 视图（create/update 的 mock 回包，字段口径同 ServerView）。 */
+function mockMcpViewOf(input: MCPServerInputDTO): MCPServerViewDTO {
+  return {
+    id: '',
+    name: input.name,
+    transport: input.transport,
+    command: input.command,
+    args: input.args,
+    cwd: input.cwd,
+    url: input.url,
+    env_keys: Object.keys(input.env ?? {}),
+    header_keys: Object.keys(input.headers ?? {}),
+    enabled: input.enabled ?? true,
+    timeout_ms: input.timeout_ms ?? 30_000,
+    max_output: input.max_output ?? 100_000,
+    default_risk: input.default_risk ?? 'readonly',
+    allow_tools: input.allow_tools ?? [],
+    deny_tools: input.deny_tools ?? [],
+    health_interval_s: input.health_interval_s ?? 60,
+    state: 'disabled',
+    calls: 0,
+    failures: 0,
+    tool_count: 0,
+  }
+}
+
+/**
+ * mock 工具包视图：从 `mock/data.ts` 的 registryItems 中 kind='plugin' 派生，
+ * 字段对齐 internal/service/package_service.go:71-83 PackageView。
+ */
+function mockPackageViews(): PackageViewDTO[] {
+  return mockData.registryItems
+    .filter((r) => r.kind === 'plugin')
+    .map((r) => ({
+      id: r.id,
+      version: r.version,
+      previous_version: undefined,
+      name: r.name,
+      trust: r.signature,
+      namespace: 'demo',
+      enabled: !r.installed,
+      description: r.description,
+      tool_names: [],
+      state: r.installed ? 'ready' : 'installed',
+      last_error: undefined,
+    }))
 }
 
 export const mockApi: ApiClient = {
@@ -624,6 +751,80 @@ export const mockApi: ApiClient = {
   },
   async getSessionLease(sessionId) {
     return { session_id: sessionId, holder: '', holder_kind: 'server', epoch: 0, active: true }
+  },
+
+  // ---- 阶段 E：MCP（mock 由内置表派生，与 real 同签名，绝不抛错） ----
+  async listMcpServers() {
+    return { items: mockMcpViews() }
+  },
+  async getMcpServer(id) {
+    const found = mockMcpViews().find((m) => m.id === id)
+    // 与 real 一致的 404 语义（避免组件因 undefined 崩溃）
+    if (!found) throw new ApiError('MCP Server 不存在', 'mcp.not_found', 404)
+    return found
+  },
+  async createMcpServer(input) {
+    return { ...mockMcpViewOf(input), id: `mcp-${Date.now()}`, state: 'disabled' }
+  },
+  async updateMcpServer(id, input) {
+    return { ...mockMcpViewOf(input), id }
+  },
+  async deleteMcpServer(id) {
+    if (!mockMcpViews().some((m) => m.id === id)) throw new ApiError('MCP Server 不存在', 'mcp.not_found', 404)
+  },
+  async testMcpServer(input) {
+    // 演示口径：随便给出一个「握手成功」样例，让 UI 的测试按钮可用但不造假连接
+    return { tool_names: ['demo_tool'], elapsed_ms: 218, server_info: `${input.name} (mock)` }
+  },
+  async reloadMcpServer(id) {
+    if (!mockMcpViews().some((m) => m.id === id)) throw new ApiError('MCP Server 不存在', 'mcp.not_found', 404)
+  },
+  async enableMcpServer(id) {
+    if (!mockMcpViews().some((m) => m.id === id)) throw new ApiError('MCP Server 不存在', 'mcp.not_found', 404)
+  },
+  async disableMcpServer(id) {
+    if (!mockMcpViews().some((m) => m.id === id)) throw new ApiError('MCP Server 不存在', 'mcp.not_found', 404)
+  },
+  async getMcpServerHealth(id) {
+    const m = mockMcpViews().find((x) => x.id === id)
+    if (!m) throw new ApiError('MCP Server 不存在', 'mcp.not_found', 404)
+    return {
+      id: m.id, name: m.name, transport: m.transport, state: m.state ?? 'disabled',
+      last_error: m.last_error, calls: m.calls ?? 0, failures: m.failures ?? 0,
+      tool_count: m.tool_count ?? 0,
+    }
+  },
+
+  // ---- 阶段 E：本地工具包（mock 由 registryItems 派生） ----
+  async listPackages() {
+    return { items: mockPackageViews() }
+  },
+  async installPackage(req) {
+    // 演示：按路径 basename 造一个已安装包视图（不落盘、不注册工具）
+    const base = req.path.replace(/\\/g, '/').split('/').pop() || 'demo.pkg.zip'
+    const name = base.replace(/\.[^.]+$/, '')
+    return {
+      view: {
+        id: `pkg-${Date.now()}`, version: '0.0.1', name, trust: 'signed', namespace: 'demo',
+        enabled: true, description: `演示安装：${base}`, tool_names: [], state: 'ready',
+      },
+      signed: true,
+      tools: 0,
+    }
+  },
+  async uninstallPackage(id) {
+    if (!mockPackageViews().some((p) => p.id === id)) throw new ApiError('工具包不存在', 'package.not_found', 404)
+  },
+  async rollbackPackage(id) {
+    const p = mockPackageViews().find((x) => x.id === id)
+    if (!p) throw new ApiError('工具包不存在', 'package.not_found', 404)
+    return { ...p, version: p.previous_version ?? p.version, previous_version: p.version }
+  },
+  async enablePackage(id) {
+    if (!mockPackageViews().some((p) => p.id === id)) throw new ApiError('工具包不存在', 'package.not_found', 404)
+  },
+  async disablePackage(id) {
+    if (!mockPackageViews().some((p) => p.id === id)) throw new ApiError('工具包不存在', 'package.not_found', 404)
   },
 }
 
@@ -1017,6 +1218,79 @@ export const realApi: ApiClient = {
   },
   async getSessionLease(sessionId) {
     return request<SessionLeaseDTO>(API_PATHS.sessionLease(sessionId), { headers: authHeaders() })
+  },
+
+  // ---- 阶段 E：MCP Server 管理（路径与 internal/api/router.go:110-119 一一对应） ----
+  async listMcpServers() {
+    return request<MCPListResponseDTO>(API_PATHS.mcpServers, { headers: authHeaders() })
+  },
+  async getMcpServer(id) {
+    return request<MCPServerViewDTO>(API_PATHS.mcpServer(id), { headers: authHeaders() })
+  },
+  async createMcpServer(input, start) {
+    // start=true 为后端 query 参数语义：落库后立刻建连（market_handler.go:54 注释）
+    const path = start ? `${API_PATHS.mcpServers}?start=true` : API_PATHS.mcpServers
+    return request<MCPServerViewDTO>(path, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify(input),
+    })
+  },
+  async updateMcpServer(id, input) {
+    return request<MCPServerViewDTO>(API_PATHS.mcpServer(id), {
+      method: 'PUT',
+      headers: authHeaders(),
+      body: JSON.stringify(input),
+    })
+  },
+  async deleteMcpServer(id) {
+    await request<void>(API_PATHS.mcpServer(id), { method: 'DELETE', headers: authHeaders() })
+  },
+  async testMcpServer(input) {
+    return request<MCPTestResultDTO>(API_PATHS.mcpTest, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify(input),
+    })
+  },
+  async reloadMcpServer(id) {
+    await request<void>(API_PATHS.mcpReload(id), { method: 'POST', headers: authHeaders() })
+  },
+  async enableMcpServer(id) {
+    await request<void>(API_PATHS.mcpEnable(id), { method: 'POST', headers: authHeaders() })
+  },
+  async disableMcpServer(id) {
+    await request<void>(API_PATHS.mcpDisable(id), { method: 'POST', headers: authHeaders() })
+  },
+  async getMcpServerHealth(id) {
+    return request<MCPHealthDTO>(API_PATHS.mcpHealth(id), { headers: authHeaders() })
+  },
+
+  // ---- 阶段 E：本地工具包（路径与 internal/api/router.go:121-126 一一对应） ----
+  async listPackages() {
+    return request<PackageListResponseDTO>(API_PATHS.packages, { headers: authHeaders() })
+  },
+  async installPackage(req) {
+    return request<PackageInstallResultDTO>(API_PATHS.packagesInstall, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify(req),
+    })
+  },
+  async uninstallPackage(id) {
+    await request<void>(API_PATHS.package(id), { method: 'DELETE', headers: authHeaders() })
+  },
+  async rollbackPackage(id) {
+    return request<PackageViewDTO>(API_PATHS.packageRollback(id), {
+      method: 'POST',
+      headers: authHeaders(),
+    })
+  },
+  async enablePackage(id) {
+    await request<void>(API_PATHS.packageEnable(id), { method: 'POST', headers: authHeaders() })
+  },
+  async disablePackage(id) {
+    await request<void>(API_PATHS.packageDisable(id), { method: 'POST', headers: authHeaders() })
   },
 }
 

@@ -622,6 +622,31 @@ export interface PackageInstallResultDTO {
   tools: number;
 }
 
+/**
+ * MCP Server 列表包装：`GET /api/v1/mcp/servers` → `{"items":[...]}`。
+ * 来源：internal/api/market_handler.go:30（writeJSON map[string]any{"items": items}）。
+ */
+export interface MCPListResponseDTO {
+  items: MCPServerViewDTO[];
+}
+
+/**
+ * 工具包列表包装：`GET /api/v1/packages` → `{"items":[...]}`。
+ * 来源：internal/api/market_handler.go:206。
+ */
+export interface PackageListResponseDTO {
+  items: PackageViewDTO[];
+}
+
+/**
+ * 工具包安装入参：`POST /api/v1/packages/install {"path":"<zip 路径>"}`。
+ * 来源：internal/api/market_handler.go:215-217（installPackageReq）。
+ * 说明：一期只接受「服务端本地路径」，无 HTTP 上传通道（见 :213-214 设计说明）。
+ */
+export interface PackageInstallRequestDTO {
+  path: string;
+}
+
 /* ============ 阶段 G：快照回滚（与 openapi.yaml schemas 对应） ============ */
 
 /** 单路径快照绑定（hash 为空且 absent=true 表示快照时文件不存在）。 */

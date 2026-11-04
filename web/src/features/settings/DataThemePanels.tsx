@@ -1,8 +1,63 @@
+import { useEffect, useState } from 'react'
 import { useUI } from '../../stores/uiStore'
 import { useChat } from '../../stores/chatStore'
 import { Button, Switch } from '../../components/ui'
 import { RealModeNotice } from '../../components/RealModeNotice'
 import { promptInstall, usePwa } from '../../lib/pwa'
+import { api, apiMode } from '../../lib/api'
+
+/**
+ * GET /maintenance 真实返回（已核实 internal/service/maintenance_service.go）：
+ *   { protocol_version, sessions, open_session_dbs, running_runs, pending_approvals,
+ *     main_db: { path, page_size, page_count, freelist_count, file_size_bytes, ... } }
+ *
+ * 接真能力边界（勿越界造假）：
+ * - 数据库体积：✅ main_db.file_size_bytes
+ * - 会话数：✅ sessions（消息总数后端不提供 → 一律展示「—」）
+ * - 快照 blob 占用：❌ 后端无任何快照占用统计 → 只能「—」并注明未采集
+ * - 库页数等：可选展示 page_count（真实值）
+ */
+type MaintenanceView = {
+  protocolVersion?: string
+  sessions?: number
+  openSessionDbs?: number
+  runningRuns?: number
+  pendingApprovals?: number
+  dbFilePath?: string
+  dbSizeBytes?: number
+  dbPageCount?: number
+  dbFreelist?: number
+}
+
+const asNum = (v: unknown): number | undefined =>
+  typeof v === 'number' && Number.isFinite(v) ? v : undefined
+const asStr = (v: unknown): string | undefined =>
+  typeof v === 'string' && v.length > 0 ? v : undefined
+
+function pickMaintenance(raw: Record<string, unknown>): MaintenanceView {
+  const db = (raw.main_db ?? {}) as Record<string, unknown>
+  return {
+    protocolVersion: asStr(raw.protocol_version),
+    sessions: asNum(raw.sessions),
+    openSessionDbs: asNum(raw.open_session_dbs),
+    runningRuns: asNum(raw.running_runs),
+    pendingApprovals: asNum(raw.pending_approvals),
+    dbFilePath: asStr(db.path),
+    dbSizeBytes: asNum(db.file_size_bytes),
+    dbPageCount: asNum(db.page_count),
+    dbFreelist: asNum(db.freelist_count),
+  }
+}
+
+/** 字节 → 人类可读；未取到就返回「—」，绝不凭空给一个数 */
+const fmtBytes = (n?: number): string => {
+  if (n === undefined) return '—'
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`
+  return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`
+}
+const fmtCount = (n?: number): string => (n === undefined ? '—' : String(n))
 
 // 数据与存储面板：原设置弹窗「数据与存储」标签页迁入「高级」弹窗
 export function DataPanel() {
@@ -10,14 +65,84 @@ export function DataPanel() {
   const { pushDataApproval } = useChat()
   const pwa = usePwa()
 
+  // real 模式：容量/计数全部来自 GET /maintenance 真实返回；mock 模式不做请求（下方明示为演示）
+  const [maint, setMaint] = useState<MaintenanceView | null>(null)
+  const [maintErr, setMaintErr] = useState<string | null>(null)
+  const [maintLoading, setMaintLoading] = useState(apiMode === 'real')
+
+  useEffect(() => {
+    if (apiMode !== 'real') return
+    let alive = true
+    api
+      .getMaintenance()
+      .then((raw) => {
+        if (!alive) return
+        setMaint(pickMaintenance(raw))
+        setMaintErr(null)
+      })
+      .catch((e: unknown) => {
+        // 如实展示失败，不兜底成看似正常的假容量
+        if (alive) setMaintErr(e instanceof Error ? e.message : String(e))
+      })
+      .finally(() => {
+        if (alive) setMaintLoading(false)
+      })
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  const real = apiMode === 'real'
+  // mock 模式也不放演示数字：容量类数据后端确实不提供（除 /maintenance 少数指标），
+  // 与其展示「看起来真实」的写死值，不如统一显示「—」并注明未接入。
+  const notWired = '—'
+  const dbValue = real
+    ? maintLoading
+      ? '读取中…'
+      : maintErr
+        ? '读取失败'
+        : fmtBytes(maint?.dbSizeBytes)
+    : notWired
+  const dbHint = real
+    ? maintErr
+      ? 'GET /maintenance 失败'
+      : maint?.dbPageCount !== undefined
+        ? `${fmtCount(maint.dbPageCount)} 页 · freelist ${fmtCount(maint.dbFreelist)} · SQLite WAL`
+        : 'SQLite WAL'
+    : 'DEMO 模式未请求 /maintenance'
+  // 快照占用：后端完全无统计能力 → 任何模式恒为「—」，不保留任何假数字
+  const snapValue = notWired
+  const snapHint = '后端未提供快照占用统计'
+  // 消息总数后端不提供 → 恒为「—」；仅 sessions 是真实值
+  const sessionValue = real
+    ? maintLoading
+      ? '读取中…'
+      : maintErr
+        ? '读取失败'
+        : `${fmtCount(maint?.sessions)} / —`
+    : notWired
+  const sessionHint = real
+    ? maint?.openSessionDbs !== undefined
+      ? `已打开 ${maint.openSessionDbs} 个会话库 · 消息总数后端未提供`
+      : '会话数真实 · 消息总数后端未提供'
+    : 'DEMO 模式未请求 /maintenance'
+
   return (
     <div className="p-3 space-y-4">
-      <RealModeNotice text="容量数字（18.4 MB / 126 MB / 6 / 42）是写死的示意值：服务端 /maintenance 只返回维护模式与未完成计数，不提供库体积与快照占用统计。" />
+      <RealModeNotice
+        text={
+          real
+            ? maintErr
+              ? `GET /maintenance 读取失败（${maintErr}）：数据库体积与计数无法展示，下方以「读取失败」如实标注，不做假值兜底。`
+              : '数据库体积与会话数来自 GET /maintenance 真实返回（main_db.file_size_bytes / sessions）；消息总数与快照 blob 占用后端未提供，一律显示「—」，不做估算或填充。'
+            : '当前为 DEMO 模式：下方容量与计数均为占位「—」，本端未请求服务端（演示数据已按「不造假」口径移除）。切到 REAL 模式后，数据库体积与会话数会替换为 GET /maintenance 真实返回。'
+        }
+      />
       <div className="grid grid-cols-2 gap-3">
-        <Stat label="数据目录" value="data/" hint="可整体拷贝迁移" />
-        <Stat label="数据库" value="18.4 MB" hint="SQLite WAL" />
-        <Stat label="快照 blob" value="126 MB" hint="CAS 去重后" />
-        <Stat label="会话 / 消息" value="6 / 42" hint="—" />
+        <Stat label="数据目录" value={real && maint?.dbFilePath ? maint.dbFilePath : 'data/'} hint="可整体拷贝迁移" />
+        <Stat label="数据库" value={dbValue} hint={dbHint} />
+        <Stat label="快照 blob" value={snapValue} hint={snapHint} />
+        <Stat label="会话 / 消息" value={sessionValue} hint={sessionHint} />
         <button
           type="button"
           onClick={() =>
@@ -38,21 +163,30 @@ export function DataPanel() {
         </button>
       </div>
       <div className="flex flex-wrap gap-2">
-        <Button variant="outline" onClick={() => toast('success', 'VACUUM 完成，回收 3.2 MB')}>压缩数据库（VACUUM）</Button>
+        <Button
+          variant="outline"
+          onClick={() =>
+            // 后端未提供 VACUUM 触发接口，因此不做「已回收 x MB」这种编造结果
+            real
+              ? toast('info', '服务端未提供 VACUUM 触发接口，本按钮暂不执行任何压缩操作')
+              : toast('info', 'DEMO 模式：不会真正执行 VACUUM（无对应后端接口）')
+          }
+        >压缩数据库（VACUUM）</Button>
         <Button
           variant="outline"
           title="导出会话数据受「项目设置 → 数据权限」控制，越界会触发审批"
           onClick={() => {
             setAdvanced(false)
+            const sessions = real ? maint?.sessions : undefined
             pushDataApproval({
               scope: 'session_export',
               toolName: 'export_session',
-              summary: '导出 6 个会话的全部消息、工具结果与 12 个制品，打包为 data/export/session-bundle.zip',
+              // 会话数用真实值（未取到就不编数）；制品数后端无统计，标注为未知
+              summary: `导出${sessions !== undefined ? ` ${sessions} 个` : ''}会话的全部消息与工具结果，打包为 data/export/session-bundle.zip（制品数未采集）`,
               args: {
                 scope: 'session_export',
                 target: 'data/export/session-bundle.zip',
-                sessions: 6,
-                artifacts: 12,
+                ...(sessions !== undefined ? { sessions } : {}),
               },
             })
             toast('info', '已发起数据权限审批，请在对话区处置')

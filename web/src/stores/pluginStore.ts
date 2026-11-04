@@ -1,10 +1,58 @@
 import { create } from 'zustand'
-import type { DeviceNode, ExtensionItem, McpServer, MemoryItem, Plugin, RegistryItem, Skill } from '../types'
+import type { DeviceNode, ExtensionItem, McpServer, McpState, McpTransport, MemoryItem, Plugin, RegistryItem, Risk, Skill } from '../types'
 import {
   devices as mockDevices, extensions as mockExtensions,
   mcpServers as mockMcp, memories as mockMemories,
   plugins as mockPlugins, registryItems as mockRegistry, skills as mockSkills,
 } from '../mock/data'
+import { api, apiMode } from '../lib/api'
+import type { MCPServerViewDTO, PackageViewDTO } from '../lib/apiTypes'
+
+/* ============ real 模式映射（DTO → UI 领域模型） ============ */
+
+/**
+ * 服务端状态 → UI 状态。
+ * 依据：internal/mcp/manager.go:426 `State string \`json:"state"\``，取值为
+ * ready / degraded / failed / disabled（另有 UI 侧独有的 starting，仅本地过渡态）。
+ */
+const MCP_STATE_MAP: Record<string, McpState> = {
+  ready: 'ready',
+  degraded: 'degraded',
+  failed: 'failed',
+  disabled: 'disabled',
+}
+
+/**
+ * `GET /api/v1/mcp/servers` 的 ServerView → UI McpServer。
+ * 来源：internal/service/mcp_service.go:51-74。
+ *
+ * 降级说明（不造假）：
+ *   - 后端只回 `allow_tools`（启用白名单）与 `tool_count`，**不回工具描述与逐个 risk**；
+ *     故工具条目按白名单名字生成，description 明确标注「服务端未回传描述」，
+ *     risk 统一取 `default_risk`（后端字段口径）。
+ *   - origin 归入 'builtin'（= 随服务端发布、由服务端托管），
+ *     因为「已安装」页签读的是端节点 client.installed（mock 端状态），
+ *     把服务端 Server 放进去会导致真实数据在 UI 上不可见。
+ */
+function toUiMcpServer(v: MCPServerViewDTO): McpServer {
+  const risk = (v.default_risk as Risk) ?? 'readonly'
+  const names = v.allow_tools ?? []
+  return {
+    id: v.id,
+    name: v.name,
+    origin: 'builtin',
+    transport: v.transport as McpTransport,
+    command: [v.command, ...(v.args ?? [])].filter(Boolean).join(' ') || undefined,
+    url: v.url,
+    enabled: v.enabled,
+    state: MCP_STATE_MAP[v.state ?? ''] ?? (v.enabled ? 'starting' : 'disabled'),
+    tools: names.map((n) => ({ name: n, description: '（服务端未回传工具描述）', risk })),
+    lastError: v.last_error,
+    calls: v.calls,
+    failures: v.failures,
+    healthIntervalS: v.health_interval_s,
+  }
+}
 
 /**
  * 能力安装模型：客户端自行安装。
@@ -14,6 +62,8 @@ import {
 interface PluginState {
   plugins: Plugin[]
   mcpServers: McpServer[]
+  /** 本地工具包（real 模式来自 GET /api/v1/packages；mock 模式由 registry 派生） */
+  packages: PackageViewDTO[]
   registryItems: RegistryItem[]
   skills: Skill[]
   memories: MemoryItem[]
@@ -23,6 +73,11 @@ interface PluginState {
   devices: DeviceNode[]
   /** 当前操作所在客户端（安装/卸载只作用于本端） */
   currentClientId: string
+  /** real 模式接线状态：idle 未拉取 / loading / ready 已生效 / error 拉取失败（附原因） */
+  remoteStatus: 'idle' | 'loading' | 'ready' | 'error'
+  remoteError?: string
+  /** 拉取服务端真实 MCP Server 与工具包（仅 real 模式生效；mock 模式直接返回） */
+  loadRemoteCapabilities: () => Promise<void>
   setCurrentClient: (id: string) => void
   togglePlugin: (id: string) => void
   reloadMcp: (id: string) => void
@@ -43,12 +98,55 @@ interface PluginState {
 export const usePlugins = create<PluginState>((set, get) => ({
   plugins: mockPlugins,
   mcpServers: mockMcp,
+  packages: [],
   registryItems: mockRegistry,
   skills: mockSkills,
   memories: mockMemories,
   extensions: mockExtensions,
   devices: mockDevices,
   currentClientId: mockDevices.find((d) => d.self)?.id ?? 'client-win',
+  remoteStatus: 'idle',
+
+  /**
+   * 拉取服务端真实 MCP Server 与工具包（A 类接线：仅这两类有后端端点）。
+   *
+   * 铁律：
+   *   - mock 模式直接返回，保持内置演示数据不变（组件无感）；
+   *   - registry / skills / extensions 仍是演示数据，**此处不覆盖**（属 B/C 类，无后端端点）；
+   *   - 拉取失败不抛错、不静默：写入 remoteError，由 UI 明示降级。
+   */
+  loadRemoteCapabilities: async () => {
+    if (apiMode !== 'real') return
+    set({ remoteStatus: 'loading', remoteError: undefined })
+    // 两个端点独立成败：MCP 通了但 packages 挂了也应展示已拿到的部分（部分成功优于全空白）
+    const [mcpRes, pkgRes] = await Promise.allSettled([
+      api.listMcpServers(),
+      api.listPackages(),
+    ])
+    const errors: string[] = []
+    const patch: Partial<PluginState> = {}
+    if (mcpRes.status === 'fulfilled') {
+      patch.mcpServers = (mcpRes.value.items ?? []).map(toUiMcpServer)
+    } else {
+      errors.push(`MCP Server：${mcpRes.reason instanceof Error ? mcpRes.reason.message : String(mcpRes.reason)}`)
+    }
+    if (pkgRes.status === 'fulfilled') {
+      patch.packages = pkgRes.value.items ?? []
+    } else {
+      errors.push(`工具包：${pkgRes.reason instanceof Error ? pkgRes.reason.message : String(pkgRes.reason)}`)
+    }
+    if (errors.length === 0) {
+      set({ ...patch, remoteStatus: 'ready' })
+      return
+    }
+    // 全部失败才算 error；部分失败保留已成功数据并提示原因
+    const allFailed = mcpRes.status === 'rejected' && pkgRes.status === 'rejected'
+    set({
+      ...patch,
+      remoteStatus: allFailed ? 'error' : 'ready',
+      remoteError: errors.join('；'),
+    })
+  },
 
   setCurrentClient: (currentClientId) => set({ currentClientId }),
 
@@ -62,6 +160,18 @@ export const usePlugins = create<PluginState>((set, get) => ({
     })),
 
   reloadMcp: (id) => {
+    // real 模式：热重载走后端 POST /mcp/servers/{id}/reload（原子替换，失败保留旧连接），
+    // 完成后重新拉取列表以回显服务端真实 state（不靠前端猜）
+    if (apiMode === 'real') {
+      set((s) => ({
+        mcpServers: s.mcpServers.map((m) => (m.id === id ? { ...m, state: 'starting', lastError: undefined } : m)),
+      }))
+      void api
+        .reloadMcpServer(id)
+        .catch(() => undefined)
+        .then(() => get().loadRemoteCapabilities())
+      return
+    }
     set((s) => ({
       mcpServers: s.mcpServers.map((m) => (m.id === id ? { ...m, state: 'starting', lastError: undefined } : m)),
     }))
@@ -80,16 +190,52 @@ export const usePlugins = create<PluginState>((set, get) => ({
     }, 900)
   },
 
-  toggleMcp: (id) =>
+  toggleMcp: (id) => {
+    // real 模式：启停走后端 /mcp/servers/{id}/enable|disable（停用断连但保留配置）
+    if (apiMode === 'real') {
+      const target = get().mcpServers.find((m) => m.id === id)
+      const willEnable = !target?.enabled
+      void (willEnable ? api.enableMcpServer(id) : api.disableMcpServer(id))
+        .catch(() => undefined)
+        .then(() => get().loadRemoteCapabilities())
+      return
+    }
     set((s) => ({
       mcpServers: s.mcpServers.map((m) =>
         m.id === id ? { ...m, enabled: !m.enabled, state: !m.enabled ? 'starting' : 'disabled' } : m,
       ),
-    })),
+    }))
+  },
 
   testMcp: (id) => {
     const m = get().mcpServers.find((x) => x.id === id)
     if (!m) return { ok: false, message: '未找到该 Server' }
+    // real 模式：走 POST /api/v1/mcp/test 真建连（用完即清理临时连接）。
+    // 注意该方法是同步返回签名（Select 组件用），真实结果异步回填到 lastError/state，
+    // 因此这里只发起请求并返回「已发起」——最终结论以 loadRemoteCapabilities 回读为准。
+    if (apiMode === 'real') {
+      void api
+        .testMcpServer({
+          name: m.name,
+          transport: m.transport,
+          command: m.command,
+          url: m.url,
+        })
+        .then((res) => {
+          set((s) => ({
+            mcpServers: s.mcpServers.map((x) =>
+              x.id === id
+                ? { ...x, lastError: undefined, tools: res.tool_names.map((n) => ({ name: n, description: `（联通测试发现，耗时 ${res.elapsed_ms}ms）`, risk: 'readonly' as Risk })) }
+                : x,
+            ),
+          }))
+        })
+        .catch((e: unknown) => {
+          const msg = e instanceof Error ? e.message : String(e)
+          set((s) => ({ mcpServers: s.mcpServers.map((x) => (x.id === id ? { ...x, lastError: msg } : x)) }))
+        })
+      return { ok: true, message: '已发起真实联通测试，结果稍后回填（见该 Server 的错误行/工具清单）' }
+    }
     if (m.name === 'postgres') return { ok: false, message: '握手超时（10s）：connection refused' }
     return { ok: true, message: `握手成功，发现 ${m.tools.length} 个工具（耗时 218ms）` }
   },

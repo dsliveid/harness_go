@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { ChevronDown, ChevronRight } from 'lucide-react'
-import { logEntries as mockLogEntries, tokenStats, tokenSummary } from '../../mock/settingsData'
+import { logEntries as mockLogEntries, tokenStats } from '../../mock/settingsData'
 import { Badge, cn } from '../../components/ui'
 import { RealModeNotice } from '../../components/RealModeNotice'
 import type { LogEntry, TokenStatRow } from '../../types'
@@ -38,8 +38,10 @@ function Chip({ active, onClick, children }: { active: boolean; onClick: () => v
 const searchCls = 'h-8 w-full sm:w-56 px-2.5 rounded-lg bg-panel2 border border-edge text-[12px] outline-none focus:border-accent'
 
 // ---------------- Token 统计 ----------------
-// 时间范围决定聚合系数与明细过滤（原型模拟后端聚合）
-const RANGE_SCALE: Record<TimeRange, number> = { today: 0.12, '7d': 1, '30d': 2.9, all: 3.4 }
+// ⚠️ 降级真相（勿再"美化"）：后端 GET /stats 返回的就是 MaintenanceStats（库/会话/未完成计数），
+// **不包含任何按模型聚合的 token 行**。因此本面板整体为前端演示数据，不能接线。
+// 这里刻意删除了旧的区间乘法系数表（today 0.12 / 7d 1 / 30d 2.9 / all 3.4）——
+// 用固定系数乘样例行伪造区间差异属于造假；现在时间范围切换只过滤「最近调用明细」，不改变任何聚合数值。
 const RANGE_MS: Record<TimeRange, number | null> = { today: 24 * 3_600_000, '7d': 7 * 24 * 3_600_000, '30d': 30 * 24 * 3_600_000, all: null }
 
 export function TokenStatsPanel() {
@@ -49,20 +51,13 @@ export function TokenStatsPanel() {
 
   const rows = useMemo(() => {
     const ms = RANGE_MS[range]
-    const scale = RANGE_SCALE[range]
     return tokenStats
       .filter((r) => modelFilter === 'all' || r.model === modelFilter)
       .map((r: TokenStatRow) => {
         const all = r.recent ?? []
+        // 仅对演示明细行做时间窗过滤（过滤 ≠ 缩放），聚合数字原样透出不做任何系数变换
         const recent = ms ? all.filter((c) => Date.now() - c.time <= ms) : all
-        return {
-          ...r,
-          sessions: Math.max(1, Math.round(r.sessions * scale)),
-          prompt: Math.round(r.prompt * scale),
-          completion: Math.round(r.completion * scale),
-          cached: Math.round(r.cached * scale),
-          recent,
-        }
+        return { ...r, recent }
       })
   }, [range, modelFilter])
 
@@ -71,17 +66,17 @@ export function TokenStatsPanel() {
 
   return (
     <div className="flex flex-col gap-4">
-      <RealModeNotice text="Token 统计仍是前端演示数据：区间聚合用固定系数（today 0.12 / 7d 1 / 30d 2.9 / all 3.4）乘样例行伪造，并非服务端真实聚合。" />
+      <RealModeNotice text="本面板整体为前端演示数据：后端 /stats 不提供按模型 token 聚合（它返回的是维护计数）。演示数值固定不变，切换时间范围不会改变汇总/明细数字，仅过滤「最近调用明细」行；缓存命中率已移除（无真实分子分母可算）。" />
       <div>
         <div className="text-[13px] font-medium">Token 用量统计</div>
         <div className="text-[12px] text-inkdim mt-0.5 leading-relaxed">
-          已发生用量为后端响应 <code className="font-mono text-[11px] bg-panel2 px-1 rounded">usage</code> 的精确值；预估列展示本地 tokenizer + 请求结构开销的校准结果。点击行展开最近调用明细。
+          演示面板：真实后端尚未提供按模型聚合的用量接口，下列数字为样例数据，不代表服务端实际用量。点击行展开最近调用明细。
         </div>
       </div>
 
       {/* 查询条件：时间范围 + 模型筛选 */}
       <div className="flex items-center gap-2 flex-wrap">
-        <span className="text-[12px] text-inkfaint shrink-0">时间范围</span>
+        <span className="text-[12px] text-inkfaint shrink-0">时间范围（仅过滤演示明细）</span>
         <div className="flex items-center gap-1">
           {TIME_RANGES.map((r) => (
             <Chip key={r.key} active={range === r.key} onClick={() => setRange(r.key)}>{r.label}</Chip>
@@ -94,12 +89,12 @@ export function TokenStatsPanel() {
         </select>
       </div>
 
-      {/* 汇总卡 */}
-      <div className="grid grid-cols-3 gap-2">
+      {/* 汇总卡：缓存命中率卡片已删除——旧实现用 totalCached/(total+totalCached*3) 凭空凑比率，
+          没有任何真实分子分母可用，保留即造假。改为直接展示 cached 原始数值，不做比率运算。 */}
+      <div className="grid grid-cols-2 gap-2">
         {[
-          { label: '区间用量', value: fmt(total) },
-          { label: '缓存命中', value: fmt(totalCached) },
-          { label: '缓存命中率', value: total > 0 ? `${Math.round((totalCached / (total + totalCached * 3)) * 100)}%` : '0%' },
+          { label: '区间用量（演示）', value: fmt(total) },
+          { label: '缓存命中（演示）', value: fmt(totalCached) },
         ].map((c) => (
           <div key={c.label} className="rounded-xl border border-edge bg-panel2/30 p-3">
             <div className="text-[11px] text-inkfaint">{c.label}</div>
@@ -133,7 +128,7 @@ export function TokenStatsPanel() {
       </div>
 
       <div className="rounded-lg border border-edge bg-panel2/40 px-2.5 py-2 text-[11px] text-inkfaint">
-        UI 铁律：已发生用量显示精确值，未发生预算显示 ≈；偏差系数超过 ±3% 的模型会在下轮校准中修正。
+        降级说明：本面板未接线。后端 <code className="font-mono text-[11px] bg-panel2 px-1 rounded">/stats</code> 只返回维护计数（会话数、未完成 Run、待审批等），无按模型 token 聚合，故上表全部为前端样例，切换时间范围不改变数值。
       </div>
     </div>
   )
