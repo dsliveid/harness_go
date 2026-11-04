@@ -9,6 +9,7 @@ import { CodeBlock } from '../../components/CodeBlock'
 import { RealModeNotice } from '../../components/RealModeNotice'
 import { sampleDiff } from '../../mock/data'
 import { MessageThread } from '../chat/MessageList'
+import { RollbackHistoryPanel } from '../chat/RollbackHistoryPanel'
 import { Check, Square, RotateCcw, X, ArrowLeft, Bot, FileText, CheckSquare, ListTodo, TerminalSquare, Layers, ShieldAlert, ChevronRight, ChevronDown, Download } from 'lucide-react'
 import type { CommandRun, FileDiff, Message, PlanDoc, Subagent } from '../../types'
 
@@ -392,13 +393,28 @@ function SubagentDetailHeader({ agent }: { agent: Subagent }) {
 }
 
 // ---------------- 快照 ----------------
+/** 快照与回滚：上半部为服务端真实回滚历史/快照锚点；下半部是本地工作区快照演示列表。 */
 function SnapshotPanel() {
+  return (
+    <div className="space-y-3">
+      <RollbackHistoryPanel />
+      <LocalSnapshotSection />
+    </div>
+  )
+}
+
+function LocalSnapshotSection() {
   const { snapshots, revertSnapshot, reapplySnapshot } = useWorkspace()
   const toast = useUI((s) => s.toast)
   const [openId, setOpenId] = useState<string | null>(null)
 
   return (
     <div className="space-y-3">
+      <div className="flex items-center gap-2 px-1">
+        <span className="text-[12px] font-semibold text-inkdim tracking-tight">本地工作区快照</span>
+        <Badge tone="gray">{snapshots.length}</Badge>
+      </div>
+      <RealModeNotice text="本区块文件快照与 diff 为前端本地演示数据：服务端快照只存前后哈希与该轮元数据，不返回逐行 diff 文本；上方「回滚历史 / 快照锚点」才是服务端真实数据。" />
       <div className="rounded-lg border border-edge bg-panel2/50 p-2.5 text-[11px] text-inkfaint space-y-0.5">
         <div>· 保留最近 50 轮；单文件 &gt; 5MB 跳过并标记</div>
         <div>· 仅覆盖经内核写入的路径；run_command 变更不可回滚</div>

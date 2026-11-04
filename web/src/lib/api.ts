@@ -42,16 +42,22 @@ import {
   type ProviderSecretResult,
   type ProviderTestInput,
   type ProviderTestResult,
+  type Rollback,
   type Run as ApiRun,
   type RunStatus as ApiRunStatus,
   type Session as ApiSession,
   type SessionLeaseDTO,
+  type Snapshot,
   type SSORequest,
   type ToolEvent as ApiToolEvent,
   type ToolInjection,
   type ToolSnapshot,
   type ToolTier,
   type User,
+  type Webhook,
+  type WebhookCreateInput,
+  type WebhookListResponseDTO,
+  type WebhookTestResult,
 } from './apiTypes'
 
 /* ============ 模式选择 ============ */
@@ -171,6 +177,10 @@ export interface ApiClient {
   rollbackToMessage(sessionId: string, messageSeq: number): Promise<string>
   /** 重新应用一次回滚：恢复 after 快照 + 恢复置灰消息 */
   reapplyRollback(sessionId: string, rollbackId: string): Promise<void>
+  /** 会话回滚历史（后端时间倒序；GET /sessions/{sid}/rollbacks → {items}） */
+  listRollbacks(sessionId: string): Promise<Rollback[]>
+  /** 会话快照锚点（后端时间倒序；GET /sessions/{sid}/snapshots → {items}） */
+  listSessionSnapshots(sessionId: string): Promise<Snapshot[]>
   // 消息
   listMessages(sessionId: string, afterSeq?: number): Promise<Message[]>
   // Run
@@ -247,6 +257,20 @@ export interface ApiClient {
   enablePackage(id: string): Promise<void>
   /** 停用（保留安装，注销工具） */
   disablePackage(id: string): Promise<void>
+
+  // ---- P1：Webhook 事件订阅（6 个端点，protocol 依据 internal/api/router.go:57-62） ----
+  /** 全部订阅（secret 只写不读：仅回 has_secret，永不回明文/密文） */
+  listWebhooks(): Promise<WebhookListResponseDTO>
+  /** 新增订阅（events 为空数组 = 订阅全部一期事件，由后端白名单校验） */
+  createWebhook(input: WebhookCreateInput): Promise<Webhook>
+  /** 删除订阅 */
+  deleteWebhook(id: string): Promise<void>
+  /** 启用（恢复投递） */
+  enableWebhook(id: string): Promise<void>
+  /** 停用（保留配置但不投递） */
+  disableWebhook(id: string): Promise<void>
+  /** 联通测试：同步投递一条 webhook.test 事件（不重试），失败也返回 200 + ok=false */
+  testWebhook(id: string): Promise<WebhookTestResult>
 }
 
 /* ============ HTTP 基础设施 ============ */
@@ -523,6 +547,29 @@ function mockPackageViews(): PackageViewDTO[] {
     }))
 }
 
+/**
+ * mock Webhook 订阅（演示态）：模块级可变数组，让新增/删除/启停在本次会话内自洽。
+ * 字段对齐 internal/api/webhook_handler.go:14-21 webhookView（secret 只写不读 → 只有 has_secret）。
+ */
+const mockWebhookStore: Webhook[] = [
+  {
+    id: 'wh-demo-1',
+    url: 'https://example.com/hooks/harness-go',
+    has_secret: true,
+    events: ['run.completed', 'run.failed'],
+    enabled: true,
+    created_at: Date.now() - 3 * 24 * 3_600_000,
+  },
+  {
+    id: 'wh-demo-2',
+    url: 'https://internal.example.com/approval-bot',
+    has_secret: false,
+    events: ['approval.requested'],
+    enabled: false,
+    created_at: Date.now() - 26 * 3_600_000,
+  },
+]
+
 export const mockApi: ApiClient = {
   mode: 'mock',
 
@@ -601,6 +648,44 @@ export const mockApi: ApiClient = {
   },
   async reapplyRollback() {
     /* mock：本地状态已在 chatStore 内回退 */
+  },
+  async listRollbacks(_sessionId) {
+    // mock 无服务端回滚历史：返回一条样例事件（字段与后端 Rollback 一致）
+    return [
+      {
+        id: 'rb-mock-1',
+        mode: 'message',
+        target: '12',
+        affected: [
+          {
+            tool_event_id: 'te-mock-1',
+            run_id: 'run-mock-1',
+            snapshot_before: 'snap-mock-before',
+            snapshot_after: 'snap-mock-after',
+            paths: ['src/demo.ts'],
+          },
+        ],
+        hidden_from_seq: 13,
+        restored: [{ path: 'src/demo.ts', action: 'restored', bytes: 1024 }],
+        created_at: Date.now() - 60_000,
+        reapplied_at: null,
+      },
+    ] as Rollback[]
+  },
+  async listSessionSnapshots(_sessionId) {
+    // mock 无服务端快照：返回一条样例锚点（字段与后端 Snapshot 一致）
+    return [
+      {
+        id: 'snap-mock-1',
+        session_id: 's-mock-1',
+        run_id: 'run-mock-1',
+        tool_event_id: 'te-mock-1',
+        kind: 'before',
+        paths: [{ path: 'src/demo.ts', hash: 'deadbeef', size: 1024 }],
+        size: 1024,
+        created_at: Date.now() - 120_000,
+      },
+    ] as Snapshot[]
   },
   async deleteSession(id) {
     const i = mockData.sessions.findIndex((s) => s.id === id)
@@ -826,6 +911,46 @@ export const mockApi: ApiClient = {
   async disablePackage(id) {
     if (!mockPackageViews().some((p) => p.id === id)) throw new ApiError('工具包不存在', 'package.not_found', 404)
   },
+
+  // ---- P1：Webhook（mock 走模块级 demo 表，与 real 同签名，绝不抛「unavailable」） ----
+  async listWebhooks() {
+    return { items: mockWebhookStore.map((w) => ({ ...w })) }
+  },
+  async createWebhook(input) {
+    const created: Webhook = {
+      id: `wh-demo-${Date.now().toString(36)}`,
+      url: input.url,
+      // secret 只写不读：演示态同样只落布尔，不保存明文
+      has_secret: Boolean(input.secret),
+      events: input.events ?? [],
+      enabled: true,
+      created_at: Date.now(),
+    }
+    mockWebhookStore.unshift(created)
+    return { ...created }
+  },
+  async deleteWebhook(id) {
+    const i = mockWebhookStore.findIndex((w) => w.id === id)
+    if (i < 0) throw new ApiError('Webhook 订阅不存在', 'webhook.not_found', 404)
+    mockWebhookStore.splice(i, 1)
+  },
+  async enableWebhook(id) {
+    const w = mockWebhookStore.find((x) => x.id === id)
+    if (!w) throw new ApiError('Webhook 订阅不存在', 'webhook.not_found', 404)
+    w.enabled = true
+  },
+  async disableWebhook(id) {
+    const w = mockWebhookStore.find((x) => x.id === id)
+    if (!w) throw new ApiError('Webhook 订阅不存在', 'webhook.not_found', 404)
+    w.enabled = false
+  },
+  async testWebhook(id) {
+    const w = mockWebhookStore.find((x) => x.id === id)
+    if (!w) throw new ApiError('Webhook 订阅不存在', 'webhook.not_found', 404)
+    // 演示：不真正发网络请求；地址以 .invalid 结尾时模拟对端拒绝，便于查看失败样式
+    if (w.url.includes('.invalid')) return { status: 502, ok: false, error: 'dial tcp: connect: connection refused' }
+    return { status: 200, ok: true, error: '' }
+  },
 }
 
 /* ============ real 实现（B-2 起逐端点启用） ============ */
@@ -1039,6 +1164,18 @@ export const realApi: ApiClient = {
       method: 'POST',
       headers: authHeaders(),
     })
+  },
+  async listRollbacks(sessionId) {
+    const res = await request<{ items: Rollback[] }>(API_PATHS.rollbacks(sessionId), {
+      headers: authHeaders(),
+    })
+    return res.items ?? []
+  },
+  async listSessionSnapshots(sessionId) {
+    const res = await request<{ items: Snapshot[] }>(API_PATHS.sessionSnapshots(sessionId), {
+      headers: authHeaders(),
+    })
+    return res.items ?? []
   },
 
   async listMessages(sessionId, afterSeq) {
@@ -1291,6 +1428,32 @@ export const realApi: ApiClient = {
   },
   async disablePackage(id) {
     await request<void>(API_PATHS.packageDisable(id), { method: 'POST', headers: authHeaders() })
+  },
+
+  // ---- P1：Webhook 事件订阅（路径与 internal/api/router.go:57-62 一一对应） ----
+  // ⚠️ 后端 h.d.Webhooks == nil 时返回 code=unavailable，此处**不做任何静默兜底**，
+  // 原样抛出 ApiError 让面板展示真实错误文案（严禁回退 mock 数据）。
+  async listWebhooks() {
+    return request<WebhookListResponseDTO>(API_PATHS.webhooks, { headers: authHeaders() })
+  },
+  async createWebhook(input) {
+    return request<Webhook>(API_PATHS.webhooks, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify(input),
+    })
+  },
+  async deleteWebhook(id) {
+    await request<void>(API_PATHS.webhook(id), { method: 'DELETE', headers: authHeaders() })
+  },
+  async enableWebhook(id) {
+    await request<void>(API_PATHS.webhookEnable(id), { method: 'POST', headers: authHeaders() })
+  },
+  async disableWebhook(id) {
+    await request<void>(API_PATHS.webhookDisable(id), { method: 'POST', headers: authHeaders() })
+  },
+  async testWebhook(id) {
+    return request<WebhookTestResult>(API_PATHS.webhookTest(id), { method: 'POST', headers: authHeaders() })
   },
 }
 

@@ -724,3 +724,22 @@ export interface WebhookCreateInput {
   secret?: string;
   events?: string[];
 }
+
+/**
+ * Webhook 列表包装：`GET /api/v1/webhooks` → `{"items":[...]}`。
+ * 来源：internal/api/webhook_handler.go:36（writeJSON map[string]any{"items": items}）。
+ */
+export interface WebhookListResponseDTO {
+  items: Webhook[];
+}
+
+/**
+ * Webhook 联通测试结果：`POST /api/v1/webhooks/{id}/test`。
+ * 来源：internal/api/webhook_handler.go:106（{"status": int, "ok": bool, "error": string}）。
+ * 说明：投递失败不抛错——`ok=false` 且 `error` 携带对端失败原因（非 2xx / 超时 / 连接拒绝）。
+ */
+export interface WebhookTestResult {
+  status: number;
+  ok: boolean;
+  error: string;
+}
