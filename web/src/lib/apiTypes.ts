@@ -366,6 +366,14 @@ export const API_PATHS = {
   packageRollback: (id: string) => `/api/v1/packages/${id}/rollback`,
   packageEnable: (id: string) => `/api/v1/packages/${id}/enable`,
   packageDisable: (id: string) => `/api/v1/packages/${id}/disable`,
+  /* B-2：制品下载 / 会话导出 / 全量备份恢复（均为二进制流，不做 JSON 解析） */
+  artifact: (id: string) => `/api/v1/artifacts/${id}`,
+  /** 会话导出（format=zip → application/zip 流） */
+  sessionExport: (sid: string) => `/api/v1/sessions/${sid}/export`,
+  /** 全量数据备份（owner 专用，application/zip 流） */
+  dataBackup: '/api/v1/data/backup',
+  /** 从备份 zip 恢复（POST 上传） */
+  dataRestore: '/api/v1/data/restore',
 } as const;
 
 /** 免鉴权路径（与 internal/api/router.go 的 publicPaths 保持一致）。 */

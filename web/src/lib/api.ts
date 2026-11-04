@@ -272,6 +272,19 @@ export interface ApiClient {
   disableWebhook(id: string): Promise<void>
   /** 联通测试：同步投递一条 webhook.test 事件（不重试），失败也返回 200 + ok=false */
   testWebhook(id: string): Promise<WebhookTestResult>
+
+  // ---- B-2：制品下载 / 会话导出 / 全量备份恢复（均为二进制流） ----
+  /**
+   * 下载制品（GET /artifacts/{id} → 二进制流）。成功后**立即触发浏览器下载**并返回 Blob + 文件名。
+   * 失败原样抛 ApiError（含后端 message / trace_id），不静默兜底。
+   */
+  downloadArtifact(id: string): Promise<DownloadResult>
+  /** 导出会话为 zip（GET /sessions/{sid}/export?format=zip），成功后触发下载 */
+  exportSession(sessionId: string): Promise<DownloadResult>
+  /** 全量数据备份 zip（GET /data/backup，owner 专用），成功后触发下载 */
+  backupData(): Promise<DownloadResult>
+  /** 从备份 zip 恢复（POST /data/restore，multipart 上传） */
+  restoreData(file: File): Promise<RestoreResult>
 }
 
 /* ============ HTTP 基础设施 ============ */
@@ -279,10 +292,13 @@ export interface ApiClient {
 const toAbsolute = (path: string) => (path.startsWith('http') ? path : `${location.origin}${path}`)
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  // FormData（如 /data/restore 上传备份 zip）必须由浏览器自动补 multipart boundary，
+  // 手写 application/json 会让后端解析失败。
+  const isForm = typeof FormData !== 'undefined' && init.body instanceof FormData
   const res = await fetch(toAbsolute(path), {
     credentials: 'include', // Cookie hg_sess（HttpOnly）与 Bearer 双通道
     headers: {
-      'Content-Type': 'application/json',
+      ...(isForm ? {} : { 'Content-Type': 'application/json' }),
       ...(init.headers ?? {}),
     },
     ...init,
@@ -307,6 +323,94 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     )
   }
   return body as T
+}
+
+/* ---------- 二进制流（B-2：制品下载 / 会话导出 / 备份恢复） ----------
+ * 铁律：下载类端点返回的是 application/zip 或任意二进制，**绝不能走 request<T>()**，
+ * 否则 JSON.parse 失败会把内容当成字符串 body 返回并污染 Blob。
+ * 失败时后端仍回 JSON 错误体（{error:{code,message,trace_id}}），必须原样解析成 ApiError 抛出。
+ */
+
+/** 一次二进制下载的结果（Blob + 后端在 Content-Disposition 声明的文件名）。 */
+export interface DownloadResult {
+  blob: Blob
+  filename: string
+}
+
+/**
+ * 从备份 zip 恢复的结果（POST /data/restore）。
+ * 字段严格对齐后端契约；缺字段一律按「未提供」处理，不臆造。
+ */
+export interface RestoreResult {
+  ok: boolean
+  /** 恢复的消息/记录条数（后端未提供则为 undefined，UI 走「—」） */
+  restored?: number
+  /** 后端附带的提示文案（可能为空串） */
+  message?: string
+}
+
+/** 从 Content-Disposition 取文件名：优先 RFC 5987 的 filename*=UTF-8''xxx，其次 filename="xxx"。 */
+function filenameFrom(res: Response, fallback: string): string {
+  const cd = res.headers.get('Content-Disposition') ?? ''
+  const star = /filename\*\s*=\s*(?:UTF-8|utf-8)''([^;]+)/i.exec(cd)
+  if (star?.[1]) {
+    try {
+      return decodeURIComponent(star[1].trim().replace(/^"|"$/g, ''))
+    } catch {
+      /* 解码失败则回退下一个分支 */
+    }
+  }
+  const plain = /filename\s*=\s*"?([^";]+)"?/i.exec(cd)
+  if (plain?.[1]) return plain[1].trim()
+  return fallback
+}
+
+/** 触发浏览器下载。返回创建的 objectURL，调用方用 revokeObjectURL 释放。 */
+function triggerDownload(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.rel = 'noopener'
+  a.style.display = 'none'
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  // 立即 revoke 在部分浏览器会中断下载，延后释放
+  setTimeout(() => URL.revokeObjectURL(url), 10_000)
+}
+
+/** 二进制 GET/POST：成功返回 Blob + 文件名；失败按 JSON 错误体抛 ApiError（不吞错误）。 */
+async function requestBlob(
+  path: string,
+  init: RequestInit = {},
+  fallbackName = 'download.bin',
+): Promise<DownloadResult> {
+  const res = await fetch(toAbsolute(path), {
+    credentials: 'include',
+    ...init,
+    headers: { ...authHeaders(), ...(init.headers ?? {}) },
+  })
+  if (!res.ok) {
+    const text = await res.text()
+    let body: unknown = null
+    if (text) {
+      try {
+        body = JSON.parse(text)
+      } catch {
+        body = text
+      }
+    }
+    const err = (body as { error?: { code?: string; message?: string; trace_id?: string } })?.error
+    const plain = typeof body === 'string' && body.trim() ? body.trim() : ''
+    throw new ApiError(
+      err?.message || plain || `请求失败（HTTP ${res.status}）`,
+      err?.code || 'http_error',
+      res.status,
+      err?.trace_id || '',
+    )
+  }
+  return { blob: await res.blob(), filename: filenameFrom(res, fallbackName) }
 }
 
 const bearer = (token: string): Record<string, string> => ({ Authorization: `Bearer ${token}` })
@@ -1019,6 +1123,37 @@ export const mockApi: ApiClient = {
     if (w.url.includes('.invalid')) return { status: 502, ok: false, error: 'dial tcp: connect: connection refused' }
     return { status: 200, ok: true, error: '' }
   },
+
+  /* ---- B-2：二进制能力在演示态**一律诚实拒绝** ---- */
+  // 铁律：绝不伪造 zip 内容 / 绝不返回空 Blob 冒充成功（用户会得到一个 0 字节文件而误以为导出成功）。
+  async downloadArtifact() {
+    throw new ApiError(
+      'mock 演示模式不支持制品下载：请切换到 real 模式（apiMode=real）后重试',
+      'mock.unsupported',
+      501,
+    )
+  },
+  async exportSession() {
+    throw new ApiError(
+      'mock 演示模式不支持会话导出：请切换到 real 模式（apiMode=real）后重试',
+      'mock.unsupported',
+      501,
+    )
+  },
+  async backupData() {
+    throw new ApiError(
+      'mock 演示模式不支持全量备份：请切换到 real 模式（apiMode=real）后重试',
+      'mock.unsupported',
+      501,
+    )
+  },
+  async restoreData() {
+    throw new ApiError(
+      'mock 演示模式不支持从备份恢复：请切换到 real 模式（apiMode=real）后重试',
+      'mock.unsupported',
+      501,
+    )
+  },
 }
 
 /* ============ real 实现（B-2 起逐端点启用） ============ */
@@ -1533,6 +1668,35 @@ export const realApi: ApiClient = {
   },
   async testWebhook(id) {
     return request<WebhookTestResult>(API_PATHS.webhookTest(id), { method: 'POST', headers: authHeaders() })
+  },
+
+  // ---- B-2：制品下载 / 会话导出 / 全量备份恢复 ----
+  // 路径严格对齐后端契约（internal/api 新增路由），**不自创端点、不猜字段**。
+  // 下载成功即触发浏览器下载；失败原样抛 ApiError 让调用方展示后端错误文案。
+  async downloadArtifact(id) {
+    const res = await requestBlob(API_PATHS.artifact(id), { method: 'GET' }, `artifact-${id}`)
+    triggerDownload(res.blob, res.filename)
+    return res
+  },
+  async exportSession(sessionId) {
+    const res = await requestBlob(
+      `${API_PATHS.sessionExport(sessionId)}?format=zip`,
+      { method: 'GET' },
+      `session-${sessionId}.zip`,
+    )
+    triggerDownload(res.blob, res.filename)
+    return res
+  },
+  async backupData() {
+    const res = await requestBlob(API_PATHS.dataBackup, { method: 'GET' }, 'harness-backup.zip')
+    triggerDownload(res.blob, res.filename)
+    return res
+  },
+  async restoreData(file) {
+    const form = new FormData()
+    form.append('file', file, file.name)
+    // ⚠️ 不能手写 Content-Type：必须让浏览器自动补 multipart boundary
+    return request<RestoreResult>(API_PATHS.dataRestore, { method: 'POST', body: form })
   },
 }
 
