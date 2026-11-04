@@ -1,4 +1,12 @@
-/** @type {import('tailwindcss').Config} */
+// P4 门禁加固：本文件已被 web/tsconfig.node.json 纳入 `tsc -b`（allowJs + checkJs）。
+// 下面仅补充 JSDoc 类型标注，不改变任何运行时行为 / 配置语义。
+/** @typedef {(path: string) => Record<string, unknown>} ThemeHelper */
+
+/**
+ * 生成「CSS 变量 + 可选 alpha」的颜色函数。
+ * @param {string} variableName 形如 '--bg-rgb' 的 CSS 变量名
+ * @returns {(arg: { opacityValue?: number | string }) => string}
+ */
 function withOpacity(variableName) {
   return ({ opacityValue }) => {
     if (opacityValue !== undefined) {
@@ -29,6 +37,7 @@ export default {
         warn: withOpacity('--warn-rgb'),
         err: withOpacity('--err-rgb'),
       },
+      /** @param {{ theme: ThemeHelper }} ctx */
       borderColor: ({ theme }) => ({
         ...theme('colors'),
         DEFAULT: withOpacity('--edge-rgb')({ opacityValue: 1 }),

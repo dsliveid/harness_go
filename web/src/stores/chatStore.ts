@@ -476,7 +476,7 @@ export const useChat = create<ChatState>((set, get) => {
 
     removeQueued: (index) => set((s) => ({ queued: s.queued.filter((_, i) => i !== index) })),
 
-    // 分支：以此消息为截止点分叉新会话（复制前序历史）
+    // 分支：以此消息为截止点分叉新会话（历史仅本地复制，服务端不复制历史消息）
     fork: (msgId) => {
       const target = get().messages.find((m) => m.id === msgId)
       if (!target) return
@@ -488,6 +488,17 @@ export const useChat = create<ChatState>((set, get) => {
         .messages.filter((m) => m.sessionId === target.sessionId && m.seq <= target.seq && !m.reverted)
         .map((m) => ({ ...m, id: `${newId}-${m.id}`, sessionId: newId }))
       set((s) => ({ messages: [...s.messages, ...copied] }))
+      if (apiMode === 'real') {
+        // 后端无「分叉时复制历史消息」端点：新会话在服务端是真建库的空会话，
+        // 前序消息只是本端缓存副本。文案必须如实说明，不得暗示服务端已有历史。
+        useUI
+          .getState()
+          .toast(
+            'info',
+            `已新建分支会话：服务端为空会话，此处 ${copied.length} 条前序消息仅本端可见；下一条消息起按新会话独立落库`,
+          )
+        return
+      }
       useUI.getState().toast('success', `已分叉新会话（含此前 ${copied.length} 条消息）`)
     },
 
@@ -496,6 +507,9 @@ export const useChat = create<ChatState>((set, get) => {
       const target = get().messages.find((m) => m.id === msgId)
       if (!target) return
       const now = Date.now()
+      // 先留一份本地快照：real 模式服务端回滚失败时必须原样还原，严禁静默留下列置灰
+      const prevMessages = get().messages
+      const prevDraft = get().draft
       set((s) => ({
         messages: s.messages.map((m) =>
           m.sessionId === target.sessionId && m.seq >= target.seq && !m.reverted
@@ -505,14 +519,24 @@ export const useChat = create<ChatState>((set, get) => {
         draft: target.content,
       }))
       if (apiMode === 'real') {
-        // 服务端同步置灰（S10 消息级回滚，含受影响文件回滚），重拉快照以 DB 为准
+        // 等价性：api.rollbackToMessage(sid, seq) = POST /sessions/{sid}/rollback，
+        // 服务端「seq 起消息置灰（hidden，组装上下文时排除）+ 受影响文件回滚到 before 快照」，
+        // 与「撤回对话到此处」语义一致，故直接复用该已有方法。
         void api
           .rollbackToMessage(target.sessionId, target.seq)
           .then((rid) => {
             lastRollbackBySession[target.sessionId] = rid
+            useUI
+              .getState()
+              .toast('info', '已撤回至此处（服务端历史同步置灰），内容已回填输入框；发送新消息将覆盖此后历史')
             return get().reloadMessages(target.sessionId)
           })
-          .catch(() => useUI.getState().toast('warn', '服务端回滚失败，历史以本地界面为准'))
+          .catch(() => {
+            // 失败：还原本地置灰与草稿，保证界面与服务端一致（否则会出现「看着撤回了、实际没撤」）
+            set({ messages: prevMessages, draft: prevDraft })
+            useUI.getState().toast('error', '服务端回滚失败，已还原本地状态（历史以服务端为准）')
+          })
+        return
       }
       useUI.getState().toast('info', '已撤回至此处，内容已回填输入框（发送新消息将覆盖此后历史）')
     },
@@ -549,20 +573,34 @@ export const useChat = create<ChatState>((set, get) => {
     deleteFrom: (msgId) => {
       const target = get().messages.find((m) => m.id === msgId)
       if (!target) return
+      const prevMessages = get().messages
       set((s) => ({
         messages: s.messages.filter(
           (m) => !(m.sessionId === target.sessionId && m.seq >= target.seq),
         ),
       }))
       if (apiMode === 'real') {
-        // 删除 = 同一消息级回滚（服务端语义为置灰保留，可 reapply 恢复；界面按已删除呈现）
+        // 后端无「删除一段消息」端点。能做到的最接近语义是 S10 消息级回滚：
+        // 服务端把 seq 起消息置灰（hidden，组装上下文时排除）并回滚受影响文件，可 reapply 恢复；
+        // 界面按「已删除」呈现。⚠️ 必须显式告知用户：服务端是置灰而非物理删除，
+        // 否则用户会以为聊天记录已在服务端被抹掉。
         void api
           .rollbackToMessage(target.sessionId, target.seq)
           .then((rid) => {
             lastRollbackBySession[target.sessionId] = rid
-            return get().reloadMessages(target.sessionId)
+            // 不 reloadMessages：服务端置灰消息重拉回来会「删了又出现」，与本端「已删除」呈现冲突
+            useUI
+              .getState()
+              .toast(
+                'success',
+                '已删除该对话及后续内容：服务端仅置灰不再参与上下文（可重新应用恢复），未物理删除',
+              )
           })
-          .catch(() => useUI.getState().toast('warn', '服务端回滚失败，历史以本地界面为准'))
+          .catch(() => {
+            set({ messages: prevMessages })
+            useUI.getState().toast('error', '服务端回滚失败，已还原本地视图（未删除任何内容）')
+          })
+        return
       }
       useUI.getState().toast('success', '已删除该对话及后续内容')
     },
@@ -670,15 +708,22 @@ export const useChat = create<ChatState>((set, get) => {
       const ap = get().approval
       if (!ap) return
 
-      // 数据权限审批：只改策略与台账，不触碰工具调用句柄
+      // 数据权限审批：只改本地策略与台账，不触碰工具调用句柄
       if (ap.kind === 'data') {
         const sessions = useSessions.getState()
         const session = sessions.sessions.find((x) => x.id === sessions.currentId)
         if (decision === 'allow_session' && session?.projectId && ap.dataScope) {
           sessions.setDataScope(session.projectId, ap.dataScope, 'allow')
-          useUI.getState().toast('success', `已允许本项目「${DATA_SCOPE_LABEL[ap.dataScope]}」（已写入项目数据权限）`)
+          // 后端无「数据授权 / 项目策略」端点（router.go 仅有 Run 工具审批 decide），
+          // 本地 sessionStore.dataGrants 为内存态且刷新即丢：文案必须如实说明未持久化。
+          useUI
+            .getState()
+            .toast(
+              'info',
+              `本项目「${DATA_SCOPE_LABEL[ap.dataScope]}」已在本地设为允许：服务端未持久化，刷新页面后失效`,
+            )
         } else if (decision === 'allow_once') {
-          useUI.getState().toast('success', `已允许本次「${ap.dataScope ? DATA_SCOPE_LABEL[ap.dataScope] : '数据'}」访问（一次性）`)
+          useUI.getState().toast('info', `已允许本次「${ap.dataScope ? DATA_SCOPE_LABEL[ap.dataScope] : '数据'}」访问（一次性，仅本次调用）`)
         } else if (decision === 'deny') {
           useUI.getState().toast('info', '已拒绝该数据访问请求，原因将回传给调用方')
         }

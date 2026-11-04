@@ -19,7 +19,16 @@
     "skipLibCheck": true,
     "allowSyntheticDefaultImports": true,
     "isolatedModules": true,
-    "strict": true
+    "strict": true,
+    // P4 加固：web 根目录下的 postcss.config.js / tailwind.config.js 均为 ESM JS 配置，
+    // 需 allowJs 才能被本 project 纳入语法/类型检查（否则它们仍然完全游离在 tsc 之外）。
+    // 注意：allowJs 与 composite/emitDeclarationOnly 可共存，仅生成 .d.ts 到 node_modules/.tmp。
+    "allowJs": true,
+    // checkJs=true：让 JS 配置也走语义检查（不是只解析语法）。
+    // 代价仅为 tailwind.config.js 内少量 JSDoc 标注，不改变任何运行时行为。
+    "checkJs": true
   },
-  "include": ["vite.config.ts"]
+  // ⚠️ 显式列举文件名，严禁 `**/*` 宽泛通配（会把 src 与 public 一并卷入本 project，
+  // 与主 project 的 include: ["src"] 重复归属，触发 TS6307/TS6059 类问题）。
+  "include": ["vite.config.ts", "postcss.config.js", "tailwind.config.js"]
 }

@@ -2,7 +2,7 @@ import { create } from 'zustand'
 import type { ModelInfo, Provider } from '../types'
 import { defaultModels, providers as mockProviders } from '../mock/data'
 import { api, apiMode } from '../lib/api'
-import { DEFAULT_CONTEXT_LIMIT } from '../lib/context'
+import { DEFAULT_CONTEXT_LIMIT, registerProviderSource } from '../lib/context'
 import type { ProviderDTO, ProviderInput } from '../lib/apiTypes'
 import { useUI } from './uiStore'
 
@@ -288,3 +288,12 @@ export function removeModel(d: AppSettings, providerId: string, index: number): 
 export function toggleDisabled(list: string[], id: string): string[] {
   return list.includes(id) ? list.filter((x) => x !== id) : [...list, id]
 }
+
+/**
+ * 向 lib/context 注册真实厂商表读取器（消除 contextLimit 对 mock/data 的直引）。
+ *
+ * 放在模块末尾：此刻 `useSettings` 已求值完成，回调只读 `settings.providers` 快照，
+ * 既不形成 import 循环，也不会在 loop 初始化期被访问到 TDZ。
+ * real 模式下该表来自 `GET /providers`（ProviderDTO），demo 模式为本地样例。
+ */
+registerProviderSource(() => useSettings.getState().settings.providers)

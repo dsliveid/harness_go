@@ -4,6 +4,7 @@ import { Composer } from './Composer'
 import { ApprovalBar } from './ApprovalBar'
 import { CompactionBar, CompactionNotice } from './CompactionBar'
 import { SideRail } from './SideRail'
+import { SessionLeaseBar } from './SessionLeaseBar'
 import { useChat } from '../../stores/chatStore'
 import { useSessions } from '../../stores/sessionStore'
 import { COMPACTION_RATIO, resolveModelContext } from '../../lib/context'
@@ -38,6 +39,9 @@ export function ChatView() {
           {lastError}
         </div>
       )}
+
+      {/* 会话租约（C-6）：展示当前会话写者归属 / epoch / 心跳，无租约时为「服务端本地可写」 */}
+      <SessionLeaseBar />
 
       {/* 压缩摘要：仅在发生过压缩后出现，可展开查看摘要全文 */}
       <CompactionNotice />

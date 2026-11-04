@@ -10,6 +10,7 @@ import { cn } from '../../components/ui'
 import { supportsClient, unsupportedReason } from '../../lib/platform'
 import { api, apiMode } from '../../lib/api'
 import type { ToolSnapshot, ToolTier } from '../../lib/apiTypes'
+import { ToolInjectionPanel } from './ToolInjectionPanel'
 
 // ---------------- 分区元信息（顺序即渲染顺序，数量统计按「已启用 n / 总数 m」） ----------------
 const TOOL_GROUPS: Array<{ key: ToolGroup; label: string; hint: string; dot: string; text: string }> = [
@@ -305,9 +306,10 @@ export function ToolsPanel({ client, query = '' }: { client: DeviceNode; query?:
 
   return (
     <div className="flex flex-col gap-4">
-      <RealModeNotice text="下方「服务端工具快照」区块来自 GET /tools 真实返回（总数 / 三档 tier / 注入成本 / warnings），tier 变更会 PATCH /tools/tiers 回写服务端。而内置工具卡片的「启用/禁用」开关仍是本地设置：后端只有 core / deferred / on_demand 三档 tier，不存在启停布尔，故该开关仅本地生效、不下发服务端；「可安装性 / 本端已安装」来自前端内置表。" />
+      <RealModeNotice text="下方「服务端工具快照」区块来自 GET /tools 真实返回（总数 / 三档 tier / 注入成本 / warnings），tier 变更会 PATCH /tools/tiers 回写服务端。「本轮工具注入明细」来自 GET /tools/injection，展示本轮真正塞进 prompt 的内容与 token 预算（core 全量 / deferred 索引 / on_demand 零注入）。而内置工具卡片的「启用/禁用」开关仍是本地设置：后端只有 core / deferred / on_demand 三档 tier，不存在启停布尔，故该开关仅本地生效、不下发服务端；「可安装性 / 本端已安装」来自前端内置表。" />
       {/* real 模式才渲染真实快照区块；mock 模式保持纯演示数据，不臆造接口 */}
       {apiMode === 'real' && <ServerToolSnapshot />}
+      {apiMode === 'real' && <ToolInjectionPanel />}
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">
           <div className="text-[13px] font-medium">系统内置工具</div>

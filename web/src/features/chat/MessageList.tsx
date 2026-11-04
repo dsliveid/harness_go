@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useChat } from '../../stores/chatStore'
 import { useSessions } from '../../stores/sessionStore'
 import { MarkdownLite } from '../../components/MarkdownLite'
+import { RealModeNotice } from '../../components/RealModeNotice'
 import { VirtualList } from '../../components/VirtualList'
 import { cn } from '../../components/ui'
 import { useUI } from '../../stores/uiStore'
@@ -46,12 +47,16 @@ export function MessageList() {
   const messages = useChat((s) => s.messagesOf(currentId))
 
   return (
-    <MessageThread
-      messages={messages}
-      streaming={streaming}
-      reasoning={reasoning}
-      actions={{ fork, revertTo, reapply, deleteFrom }}
-    />
+    <div className="flex-1 min-h-0 flex flex-col">
+      {/* real 模式下明示消息操作的真实服务端语义（见 chatStore 中各动作注释） */}
+      <RealModeNotice text="消息操作真实口径：撤回 / 重新应用 = 服务端消息级回滚（原消息置灰、可重放）；「删除对话」服务端无物理删除端点，仅置灰不再参与上下文；「分支」服务端只建空会话，前序历史仅本端可见；数据权限策略仅本地生效、刷新即失效。" />
+      <MessageThread
+        messages={messages}
+        streaming={streaming}
+        reasoning={reasoning}
+        actions={{ fork, revertTo, reapply, deleteFrom }}
+      />
+    </div>
   )
 }
 
@@ -369,7 +374,7 @@ function MessageItem({ msg, actions }: { msg: Message; actions: ThreadActions })
               {actions.deleteFrom && (
                 <button
                   className={`${actBtn} text-inkdim hover:text-err hover:bg-err/10`}
-                  title="删除对话：删除该提问及其后全部内容"
+                  title="删除对话：删除该提问及其后全部内容（服务端仅置灰不再参与上下文，未物理删除，可重新应用恢复）"
                   onClick={() => actions.deleteFrom?.(msg.id)}
                 >
                   <Trash2 size={13} />
@@ -381,7 +386,7 @@ function MessageItem({ msg, actions }: { msg: Message; actions: ThreadActions })
               {actions.fork && (
                 <button
                   className={`${actBtn} text-inkdim hover:text-accent hover:bg-panel2`}
-                  title="从此提问节点分叉新对话（复制前序历史）"
+                  title="从此提问节点分叉新对话（新建会话；前序历史仅本端副本，服务端不复制消息）"
                   onClick={() => actions.fork?.(msg.id)}
                 >
                   <GitBranch size={13} />
@@ -390,7 +395,7 @@ function MessageItem({ msg, actions }: { msg: Message; actions: ThreadActions })
               {actions.revertTo && (
                 <button
                   className={`${actBtn} text-inkdim hover:text-warn hover:bg-panel2`}
-                  title="撤回对话到此处（后续所有对话与执行过程置灰；发送新消息将覆盖此后历史）"
+                  title="撤回对话到此处（此后消息置灰并同步服务端回滚；发送新消息将覆盖此后历史）"
                   onClick={() => actions.revertTo?.(msg.id)}
                 >
                   <RotateCcw size={13} />

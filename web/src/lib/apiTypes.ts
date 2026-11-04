@@ -228,10 +228,32 @@ export interface ToolIndexEntry {
   cost_tokens: number;
 }
 
+/**
+ * 注入载荷中的工具规格（逐字段对齐 `pkg/toolapi/spec.go` 的 `Spec` 结构体 JSON 标签）。
+ *
+ * 为什么不再用 `Record<string, unknown>`：`GET /tools/injection` 的 core / on_demand
+ * 直接序列化 `toolapi.Spec`，字段是确定的；窄化后才能在前端如实渲染而无需 `as` 断言。
+ */
+export interface ToolSpecBrief {
+  name: string;
+  /** 例：builtin / pkg:<id> / mcp:<server>（Go 侧 omitempty，缺省由 Normalized() 补为 builtin） */
+  namespace?: string;
+  description: string;
+  schema_json?: unknown;
+  tier: ToolTier;
+  executor: Executor;
+  capabilities?: string[];
+  cost_tokens: number;
+  risk: Risk;
+  /** 运行期依赖（如 chromium、git） */
+  requires?: string[];
+  version?: string;
+}
+
 export interface ToolInjection {
-  core: Array<Record<string, unknown>>;
+  core: ToolSpecBrief[];
   deferred_index: ToolIndexEntry[];
-  on_demand: Array<Record<string, unknown>>;
+  on_demand: ToolSpecBrief[];
   deferred_hidden?: string[];
   cost_core: number;
   cost_index: number;
