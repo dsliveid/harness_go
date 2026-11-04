@@ -14,12 +14,13 @@ import type { RestoreResult } from '../../lib/api'
  *   - GET  /api/v1/artifacts/{id}            → 二进制流（Content-Disposition: attachment）
  *   - GET  /api/v1/sessions/{sid}/export?format=zip → application/zip 流
  *   - GET  /api/v1/data/backup               → application/zip 流（owner 专用）
- *   - POST /api/v1/data/restore              → 接收 zip（multipart，字段名 file）
+ *   - POST /api/v1/data/restore              → 请求体为备份包**原始 zip 字节流**（Content-Type: application/zip）
  *
  * 铁律：
  *   1. 错误**原样透传**（含后端 message / code / trace_id），绝不静默吞掉；
  *   2. mock 演示态如实拒绝（见 api.ts mockApi），本面板在 mock 下禁用并明示，不展示「假成功」；
- *   3. 恢复会覆盖服务端数据，必须二次确认 + 必须显式选择 .zip 文件，不提供任何隐式默认值。
+ *   3. 后端恢复只做「校验 + 解压到 staging 目录」，**不覆盖运行中的 data/**，须停机替换才生效；
+ *      因此必须二次确认 + 必须显式选择 .zip 文件，且结果文案必须给出 staging_path，不得谎称「已完成恢复」。
  */
 
 const errText = (e: unknown) => (e instanceof Error ? e.message : String(e))
@@ -97,11 +98,12 @@ export function DataBackupPanel() {
   const onRestore = () =>
     run('restore', async () => {
       if (!restoreFile) throw new Error('请先选择备份 zip 文件')
-      if (!confirmRestore) throw new Error('恢复会覆盖服务端数据，请先勾选确认')
+      if (!confirmRestore) throw new Error('恢复需停机替换数据目录，请先勾选确认')
       const res: RestoreResult = await api.restoreData(restoreFile)
-      if (!res.ok) throw new Error(res.message || '后端返回恢复失败（ok=false）')
-      const count = res.restored !== undefined ? ` · 恢复 ${res.restored} 条` : ''
-      return `恢复完成${count}${res.message ? ` · ${res.message}` : ''}`
+      const count = res.skipped?.length ? ` · 跳过 ${res.skipped.length} 项` : ''
+      // 后端只做校验+暂存，绝不自动生效：必须把 staging_path 明确交给用户，
+      // 否则用户会误以为「点一下就恢复好了」。
+      return `已校验并解压 ${res.entries} 项（${fmtBytes(res.bytes)}）${count} → 暂存于 ${res.staging_path}，需停机替换后生效`
     })
 
   return (
@@ -111,7 +113,7 @@ export function DataBackupPanel() {
         <div className="min-w-0">
           <div className="text-[14px] font-medium text-ink">导出与备份</div>
           <div className="text-[12px] text-inkfaint mt-0.5">
-            会话导出 / 全量备份为服务端打包的 zip 流；恢复会覆盖服务端数据，务必先备份。
+            会话导出 / 全量备份为服务端打包的 zip 流；恢复仅校验并解压到暂存目录，需停机替换后才生效。
           </div>
         </div>
       </div>
@@ -201,7 +203,7 @@ export function DataBackupPanel() {
             onChange={(e) => setConfirmRestore(e.target.checked)}
             className="mt-0.5"
           />
-          <span>我已知晓：恢复会覆盖服务端现有数据，请确认已先下载全量备份。</span>
+          <span>我已知晓：恢复只解压到服务端暂存目录、不会自动生效，仍需停机替换数据目录。</span>
         </label>
         <Button variant="outline" disabled={!real || busy !== null || !restoreFile || !confirmRestore} onClick={onRestore}>
           {busy === 'restore' ? '恢复中…' : '上传并恢复'}

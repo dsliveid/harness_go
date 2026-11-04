@@ -1,8 +1,12 @@
 // Package image 是图片插件（阶段 F / on_demand 档）。
 //
-// 一期能力：base64 图片落工作区（魔数校验）与元信息读取（宽高/格式/大小）。
-// generate_image / recognize_image 需要「图像模型槽位」（能力路由，基础服务设计
-// §199 S3）——当前 provider 面无图像能力，调用即返回诚实错误，不假装可用。
+// 一期能力（**仅此两项**）：base64 图片落工作区（魔数校验）与元信息读取（宽高/格式/大小）。
+//
+// 诚实边界：本插件**不注册** generate_image / recognize_image —— 二者需要「图像模型槽位」
+// （能力路由，基础服务设计 §199 S3），当前 provider 面只有 []string 模型清单、无 capability
+// 概念，因此不提供任何生成/识别工具（不是"注册了但调用报错"）。像素级识别亦不在范围内：
+// read_image_meta 只解头信息，不解码像素、不做内容理解。前端工具卡中的
+// generate_image / recognize_image 属前端内置演示条目，不对应本插件任何工具。
 package image
 
 import (

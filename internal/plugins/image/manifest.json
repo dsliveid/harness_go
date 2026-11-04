@@ -1,7 +1,7 @@
 {
   "id": "image",
   "name": "图片",
-  "description": "图片文件的落盘校验与读取（PNG/JPEG/GIF/WebP 魔数校验）；图像生成/识别需图像模型槽位（能力路由属后续增强）",
+  "description": "仅图片落盘校验与元信息读取（PNG/JPEG/GIF/WebP 魔数 + 宽高/格式/大小）；不提供图像生成与像素识别工具（需图像模型槽位，provider 面暂无 capability 路由）",
   "version": "1.0.0",
   "kind": "builtin",
   "default_tier": "on_demand",

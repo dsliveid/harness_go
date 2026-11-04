@@ -32,6 +32,12 @@ type Deps struct {
 	Packages *service.PackageService
 	// Rollback 快照回滚（阶段 G / S10；nil 时相关端点返回 unavailable）
 	Rollback *service.RollbackService
+	// Artifacts 制品下载（R4：按快照 CAS 引用寻址；nil 时相关端点返回 unavailable）
+	Artifacts *service.ArtifactService
+	// Bundles 会话导出包（R2 会话导出；nil 时相关端点返回 unavailable）
+	Bundles *service.BundleService
+	// Backups 全量备份 / 恢复（R2；nil 时相关端点返回 unavailable）
+	Backups *service.BackupService
 	// Webhooks / OpenAI 接入增强（P1；nil 时相关端点返回 unavailable）
 	Webhooks *service.WebhookService
 	OpenAI   *service.OpenAICompatService

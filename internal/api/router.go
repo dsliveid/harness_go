@@ -133,6 +133,15 @@ func NewRouter(d Deps) http.Handler {
 	// 设备长连接（C-3 WS 网关）：设备令牌在升级前独立鉴权，不走用户令牌中间件
 	mux.HandleFunc("GET /api/v1/devices/ws", h.deviceWS)
 
+	// 制品下载 / 数据导出备份（R2 / R4，docs/基础功能边界与插件化可行性评估.md）
+	// —— 均落在 /api/** 前缀下，由全局 Auth 中间件强制令牌。
+	mux.HandleFunc("GET /api/v1/artifacts/{id}", h.downloadArtifact)
+	// R2 会话导出（含消息、tool_events、快照引用；application/zip 流）
+	mux.HandleFunc("GET /api/v1/sessions/{sid}/export", h.exportSession)
+	// R2 全量备份 / 恢复（owner 专用：handler 内校验 users.role）
+	mux.HandleFunc("GET /api/v1/data/backup", h.backupData)
+	mux.HandleFunc("POST /api/v1/data/restore", h.restoreData)
+
 	return Chain(mux,
 		Recover(d.Log),
 		TraceID(),

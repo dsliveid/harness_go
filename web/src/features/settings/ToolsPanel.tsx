@@ -15,7 +15,7 @@ import { ToolInjectionPanel } from './ToolInjectionPanel'
 // ---------------- 分区元信息（顺序即渲染顺序，数量统计按「已启用 n / 总数 m」） ----------------
 const TOOL_GROUPS: Array<{ key: ToolGroup; label: string; hint: string; dot: string; text: string }> = [
   { key: 'file', label: '文件与命令', hint: '文件读写 · 代码检索 · 终端命令执行', dot: 'bg-accent', text: 'text-accent' },
-  { key: 'net', label: '网络与多模态', hint: '网页抓取 · 图片生成与视觉识别', dot: 'bg-ok', text: 'text-ok' },
+  { key: 'net', label: '网络与多模态', hint: '网页抓取 · 图片落盘校验与元信息读取（生成/识别未接线）', dot: 'bg-ok', text: 'text-ok' },
   { key: 'plan', label: '任务与计划', hint: '任务清单与计划文档中台', dot: 'bg-warn', text: 'text-warn' },
   { key: 'memory', label: '长期记忆', hint: '项目长期认知记忆读写', dot: 'bg-accent2', text: 'text-accent2' },
   { key: 'agent', label: '子 Agent 编排', hint: '子 Agent 与子进程的派生、等待、停止与恢复', dot: 'bg-accent', text: 'text-accent' },
@@ -306,7 +306,7 @@ export function ToolsPanel({ client, query = '' }: { client: DeviceNode; query?:
 
   return (
     <div className="flex flex-col gap-4">
-      <RealModeNotice text="下方「服务端工具快照」区块来自 GET /tools 真实返回（总数 / 三档 tier / 注入成本 / warnings），tier 变更会 PATCH /tools/tiers 回写服务端。「本轮工具注入明细」来自 GET /tools/injection，展示本轮真正塞进 prompt 的内容与 token 预算（core 全量 / deferred 索引 / on_demand 零注入）。而内置工具卡片的「启用/禁用」开关仍是本地设置：后端只有 core / deferred / on_demand 三档 tier，不存在启停布尔，故该开关仅本地生效、不下发服务端；「可安装性 / 本端已安装」来自前端内置表。" />
+      <RealModeNotice text="下方「服务端工具快照」区块来自 GET /tools 真实返回（总数 / 三档 tier / 注入成本 / warnings），tier 变更会 PATCH /tools/tiers 回写服务端。「本轮工具注入明细」来自 GET /tools/injection，展示本轮真正塞进 prompt 的内容与 token 预算（core 全量 / deferred 索引 / on_demand 零注入）。而内置工具卡片的「启用/禁用」开关仍是本地设置：后端只有 core / deferred / on_demand 三档 tier，不存在启停布尔，故该开关仅本地生效、不下发服务端；「可安装性 / 本端已安装」来自前端内置表。另：「网络与多模态」分组内的 generate_image / recognize_image 卡片为前端内置表占位条目，服务端 image 插件实际只提供 save_image（base64 落盘 + 魔数校验）与 read_image_meta（格式/尺寸/大小），无图像生成与像素识别能力，这两张卡不会出现在 GET /tools 快照中。" />
       {/* real 模式才渲染真实快照区块；mock 模式保持纯演示数据，不臆造接口 */}
       {apiMode === 'real' && <ServerToolSnapshot />}
       {apiMode === 'real' && <ToolInjectionPanel />}

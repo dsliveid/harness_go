@@ -14,7 +14,7 @@ import { cn } from '../../components/ui'
 const CAP_SLOTS: Array<{ key: CapSlot; label: string; hint: string }> = [
   { key: 'chat', label: 'chat', hint: '对话主模型（禁止 NULL）' },
   { key: 'vision', label: 'vision', hint: '视觉理解' },
-  { key: 'image', label: 'image', hint: '图像生成' },
+  { key: 'image', label: 'image', hint: '图像生成（槽位仅登记，无调用方）' },
   { key: 'decision', label: 'decision', hint: '决策判断' },
 ]
 
@@ -521,7 +521,7 @@ export function ModelSettingsSection() {
       {/* 能力模型槽位 */}
       <section>
         <div className="text-[14px] font-semibold text-ink mb-1">能力模型槽位</div>
-        <div className="text-[12px] text-inkfaint mb-3">能力模型允许「跟随全局」；对话槽位为会话主模型来源，禁止 NULL。</div>
+        <div className="text-[12px] text-inkfaint mb-3">能力模型允许「跟随全局」；对话槽位为会话主模型来源，禁止 NULL。当前仅有 chat 槽位真正参与模型路由；vision / image / decision 三个槽位只做登记，服务端无对应调用方（image 插件无生成/识别工具），设置后不会改变任何运行时行为。</div>
         <div className="flex flex-col gap-2">
           {CAP_SLOTS.map(({ key, label, hint }) => {
             const candidates = d.providers

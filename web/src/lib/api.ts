@@ -292,13 +292,15 @@ export interface ApiClient {
 const toAbsolute = (path: string) => (path.startsWith('http') ? path : `${location.origin}${path}`)
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
-  // FormData（如 /data/restore 上传备份 zip）必须由浏览器自动补 multipart boundary，
-  // 手写 application/json 会让后端解析失败。
+  // ① FormData（如 multipart 上传）必须由浏览器自动补 multipart boundary，手写会解析失败；
+  // ② Blob/File（如 /data/restore 的备份 zip 原始字节流）必须让浏览器按 body 类型自动推断，
+  //    绝不能强行标 application/json —— 后端 backup_handler.go:104-110 会因 Content-Type 不符直接 400。
   const isForm = typeof FormData !== 'undefined' && init.body instanceof FormData
+  const isBlob = typeof Blob !== 'undefined' && init.body instanceof Blob
   const res = await fetch(toAbsolute(path), {
     credentials: 'include', // Cookie hg_sess（HttpOnly）与 Bearer 双通道
     headers: {
-      ...(isForm ? {} : { 'Content-Type': 'application/json' }),
+      ...(isForm || isBlob ? {} : { 'Content-Type': 'application/json' }),
       ...(init.headers ?? {}),
     },
     ...init,
@@ -339,14 +341,23 @@ export interface DownloadResult {
 
 /**
  * 从备份 zip 恢复的结果（POST /data/restore）。
- * 字段严格对齐后端契约；缺字段一律按「未提供」处理，不臆造。
+ * 字段**逐字对齐**后端 `internal/service/backup_service.go:112-118` 的 RestoreResult：
+ * 服务端只做「校验 + 暂存」，**不覆盖运行中的 data/**，实际替换需停机运维，
+ * 故没有 ok/restored 之类字段，`requires_restart` 恒为 true。
  */
 export interface RestoreResult {
-  ok: boolean
-  /** 恢复的消息/记录条数（后端未提供则为 undefined，UI 走「—」） */
-  restored?: number
-  /** 后端附带的提示文案（可能为空串） */
-  message?: string
+  /** 解压后的暂存目录绝对路径（供运维停机替换） */
+  staging_path: string
+  /** 成功解压的条目数 */
+  entries: number
+  /** 解压总字节数 */
+  bytes: number
+  /** 被跳过的条目名（体积/类型过滤） */
+  skipped?: string[]
+  /** 恒为 true：必须停机替换暂存目录，服务不会自动生效 */
+  requires_restart: boolean
+  /** 后端附带的启用步骤说明 */
+  note?: string
 }
 
 /** 从 Content-Disposition 取文件名：优先 RFC 5987 的 filename*=UTF-8''xxx，其次 filename="xxx"。 */
@@ -1693,10 +1704,15 @@ export const realApi: ApiClient = {
     return res
   },
   async restoreData(file) {
-    const form = new FormData()
-    form.append('file', file, file.name)
-    // ⚠️ 不能手写 Content-Type：必须让浏览器自动补 multipart boundary
-    return request<RestoreResult>(API_PATHS.dataRestore, { method: 'POST', body: form })
+    // ⚠️ 后端 backup_handler.go:104-110 只接受**备份包原始 zip 字节流**
+    // （Content-Type: application/zip / application/octet-stream），
+    // 明确拒绝 multipart/form-data。故此处必须直接传 File（Blob）本体，
+    // 由 request() 的 isBlob 分支让浏览器自动推断 Content-Type。
+    return request<RestoreResult>(API_PATHS.dataRestore, {
+      method: 'POST',
+      body: file,
+      headers: { 'Content-Type': 'application/zip' },
+    })
   },
 }
 

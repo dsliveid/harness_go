@@ -1,8 +1,9 @@
-import { useState, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { useUI, type SidePanel } from '../../stores/uiStore'
 import { useWorkspace } from '../../stores/workspaceStore'
 import { useSessions } from '../../stores/sessionStore'
 import { useChat } from '../../stores/chatStore'
+import { apiMode } from '../../lib/api'
 import { Badge, Button, cn, Drawer, StateBadge } from '../../components/ui'
 import { DiffView } from '../../components/DiffView'
 import { CodeBlock } from '../../components/CodeBlock'
@@ -428,21 +429,47 @@ function findSnapshotDiff(s: Snapshot): FileDiff | undefined {
 }
 
 function LocalSnapshotSection() {
-  const { snapshots, revertSnapshot, reapplySnapshot } = useWorkspace()
+  const { snapshots, revertSnapshot, reapplySnapshot, snapshotsLoading, snapshotsError, loadSnapshots } =
+    useWorkspace()
   const toast = useUI((s) => s.toast)
+  const currentId = useSessions((s) => s.currentId)
+  const real = apiMode === 'real'
   const [openId, setOpenId] = useState<string | null>(null)
+
+  // real 模式下随当前会话切换拉取真实快照锚点；mock 模式保持演示数据不发请求
+  useEffect(() => {
+    void loadSnapshots(currentId ?? '')
+  }, [currentId, loadSnapshots])
 
   return (
     <div className="space-y-3">
       <div className="flex items-center gap-2 px-1">
-        <span className="text-[12px] font-semibold text-inkdim tracking-tight">本地工作区快照</span>
+        <span className="text-[12px] font-semibold text-inkdim tracking-tight">工作区快照</span>
         <Badge tone="gray">{snapshots.length}</Badge>
       </div>
-      <RealModeNotice text="本区块的快照列表本身是本地演示数据：服务端 GET /snapshots 只存前后哈希与该轮元数据，不含逐行 diff 文本。展开时的逐行 diff 一律取自真实工具结果 meta.data.diff（write_file / edit_file），取不到则明确显示空态，不再用样例内容填充。上方「回滚历史 / 快照锚点」为服务端真实数据。" />
+      {real ? (
+        <RealModeNotice text="本区块在 real 模式下已接服务端真实数据：列表来自 GET /sessions/{sid}/snapshots（锚点级，含 paths[] 多路径，前端按单文件展开）。服务端快照只存前后哈希与该轮元数据，不含逐行 diff 文本，展开时的逐行 diff 一律取自真实工具结果 meta.data.diff（write_file / edit_file），取不到则明确显示空态，不用样例内容填充。⚠️ 诚实边界：后端锚点无 turnSeq / beforeHash / revertedAt 字段，故「轮次」显示为 0、「已回滚」标记不生效；「回滚 / 重新应用」按钮仍是本地演示（真实回滚请用上方「回滚历史 / 快照锚点」面板）。" />
+      ) : (
+        <RealModeNotice text="演示模式：下方快照为前端演示数据，非服务端返回。切换到 real 模式后将自动改读 GET /sessions/{sid}/snapshots。" />
+      )}
       <div className="rounded-lg border border-edge bg-panel2/50 p-2.5 text-[11px] text-inkfaint space-y-0.5">
-        <div>· 保留最近 50 轮；单文件 &gt; 5MB 跳过并标记</div>
-        <div>· 仅覆盖经内核写入的路径；run_command 变更不可回滚</div>
+        <div>· 快照不按轮次剪枝（随会话删除统一清理）；单文件 &gt; 64MB 时快照失败 → write_file / edit_file <span className="text-warn">直接拒绝写入</span>（不静默跳过）</div>
+        <div>· 仅覆盖经内核写入的路径（write_file / edit_file）；run_command 等非 fs 插件造成的文件变更不在快照范围，不可回滚</div>
       </div>
+
+      {real && snapshotsLoading && (
+        <div className="px-1 text-[12px] text-inkfaint">正在拉取快照锚点…</div>
+      )}
+      {real && snapshotsError && (
+        <div className="rounded-lg border border-danger/40 bg-danger/5 p-2.5 text-[12px] text-danger">
+          快照加载失败：{snapshotsError}
+        </div>
+      )}
+      {real && !snapshotsLoading && !snapshotsError && snapshots.length === 0 && (
+        <div className="rounded-lg border border-edge bg-panel2/60 p-2.5 text-[11.5px] text-inkfaint leading-relaxed">
+          该会话暂无快照锚点：只有经内核 write_file / edit_file 写入过的文件才会产生快照。
+        </div>
+      )}
 
       {snapshots.map((s) => {
         const realDiff = openId === s.id && !s.skipped ? findSnapshotDiff(s) : undefined
@@ -468,7 +495,7 @@ function LocalSnapshotSection() {
           {openId === s.id && (
             <div className="p-2 border-t border-edge space-y-2">
               {s.skipped ? (
-                <div className="text-[12px] text-warn">文件超过 5MB，已跳过快照，本次修改不可回滚。</div>
+                <div className="text-[12px] text-warn">该条标记为「跳过」（前端演示数据）：真实服务端不做跳过，单文件 &gt; 64MB 会直接拒绝写入。</div>
               ) : realDiff ? (
                 <DiffView diff={realDiff} onRevertHunk={(h) => { toast('success', `已回滚 hunk ${h}（重新定位当前文件）`) }} />
               ) : (
@@ -478,8 +505,20 @@ function LocalSnapshotSection() {
                   本会话内未找到该文件对应的工具结果，因此不展示行内容。
                 </div>
               )}
-              <div className="flex gap-2">
-                {s.revertedAt ? (
+              <div className="flex flex-col gap-1.5">
+                {real ? (
+                  <>
+                    <Button size="sm" variant="outline" disabled>
+                      回滚到此快照
+                    </Button>
+                    <div className="text-[11px] text-inkfaint leading-relaxed">
+                      诚实边界：real 模式下该按钮已禁用。服务端回滚端点为
+                      <span className="font-mono"> POST /sessions/&#123;sid&#125;/rollback </span>
+                      （mode = tool / turn / message），不接受「快照锚点 id」作为目标，
+                      无法由此处发起真实回滚。请使用上方「回滚历史 / 快照锚点」面板按工具事件 / 轮次 / 消息回滚。
+                    </div>
+                  </>
+                ) : s.revertedAt ? (
                   <Button size="sm" variant="outline" onClick={() => { reapplySnapshot(s.id); toast('success', '已重新应用（正序写回）') }}>重新应用</Button>
                 ) : (
                   <Button size="sm" variant="primary" disabled={s.skipped} onClick={() => { revertSnapshot(s.id); toast('success', `已回滚到该快照（校验当前 hash 后写回）`) }}>回滚到此快照</Button>

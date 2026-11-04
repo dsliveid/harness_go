@@ -1303,6 +1303,97 @@ paths:
         - { name: id, in: path, required: true, schema: { type: string } }
       responses:
         "200": { description: 已禁用 }
+  /api/v1/artifacts/{id}:
+    get:
+      tags: [artifacts]
+      summary: 制品下载（按快照 CAS 引用寻址，返回二进制流）
+      description: |
+        id 即 sha256 十六进制串（`^[a-f0-9]{64}$`），服务端按 `hash[:2]` 分桶从全局 CAS 读取。
+        响应带 `Content-Disposition: attachment` 与 `X-Content-Type-Options: nosniff`。
+        诚实边界：仅做全局鉴权 + 资源存在性校验，**未实现**细粒度数据权限（session_export/fs_outside）与下载审计写库。
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, pattern: "^[a-f0-9]{64}$" } }
+      responses:
+        "200":
+          description: 制品二进制流
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        "400": { description: id 非法（非 64 位小写十六进制，含路径穿越尝试） }
+        "401": { description: 未鉴权 }
+        "404": { description: CAS 中不存在该内容 }
+        "503": { description: 制品子系统未接入 }
+  /api/v1/sessions/{sid}/export:
+    get:
+      tags: [artifacts]
+      summary: 会话导出为 zip 包（含消息 / tool_events / Run / 快照 blob 引用）
+      description: |
+        复用内核 `service.BundleService.Export`（与 session-bundle 插件 `export_session` 同一执行体），
+        包内已含 `manifest.json` / `messages.jsonl` / `runs.json` / `tool_events.jsonl` / `blobs/**`。
+        诚实边界：契约提及的 `session_export` 数据权限当前不存在，仅做全局鉴权 + 会话存在性校验。
+      parameters:
+        - { name: sid, in: path, required: true, schema: { type: string } }
+        - { name: format, in: query, required: false, schema: { type: string, enum: [zip], default: zip } }
+      responses:
+        "200":
+          description: 会话导出 zip 流
+          content:
+            application/zip:
+              schema: { type: string, format: binary }
+        "400": { description: format 非 zip }
+        "401": { description: 未鉴权 }
+        "404": { description: 会话不存在 }
+        "503": { description: 会话导出子系统未接入 }
+  /api/v1/data/backup:
+    get:
+      tags: [artifacts]
+      summary: 全量数据备份为 zip 归档（owner 专用）
+      description: |
+        归档相对 dataDir 的全部数据：`backup-manifest.json` + `main.db` + `sessions/<sid>/session.db` + blob CAS + 其余数据文件。
+        跳过 `-wal` / `-shm` / `data/tmp/**` / `*.part` / `restore-staging-*` / 备份产物自身。
+        诚实边界：**文件级**归档而非 SQLite 事务快照，语义为「最后一次 checkpoint 的落盘状态」，建议低写入窗口触发。
+      responses:
+        "200":
+          description: 备份 zip 流
+          content:
+            application/zip:
+              schema: { type: string, format: binary }
+        "401": { description: 未鉴权 }
+        "403": { description: 非 owner 角色 }
+        "500": { description: 归档失败 }
+        "503": { description: 备份子系统未接入 }
+  /api/v1/data/restore:
+    post:
+      tags: [artifacts]
+      summary: 从备份 zip 恢复（校验 + 暂存，owner 专用）
+      description: |
+        安全边界：**不直接覆盖生产 data/**。流程为 ① 落 `data/tmp/*.part` → ② 整体校验（路径归一拒绝 `..`/绝对路径/反斜杠/盘符、拒绝符号链接、
+        单条目 ≤512MiB、总量 ≤2GiB、条目数 ≤50000、路径去重、必须含 `backup-manifest.json` 且含 `main.db`、schema 1..1）
+        → ③ 解压到独立暂存目录 `data/restore-staging-<ts>` → ④ 校验清单与 `main.db` 可读。
+        任一步失败即 `RemoveAll(staging)` 清理。返回 `staging_path` + `requires_restart=true`，替换由停机运维执行。
+      requestBody:
+        required: true
+        content:
+          application/zip:
+            schema: { type: string, format: binary }
+      responses:
+        "200":
+          description: 恢复校验通过，返回暂存路径
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  staging_path: { type: string, description: 暂存目录绝对路径 }
+                  entries: { type: integer, description: 解压条目数 }
+                  bytes: { type: integer, format: int64 }
+                  skipped: { type: integer }
+                  requires_restart: { type: boolean, description: 恒为 true（需停机替换） }
+                  note: { type: string, description: 启用步骤说明 }
+        "400": { description: 非 zip / 空体 / 非法 zip / 缺清单 / schema 越界 / 路径穿越条目 / 符号链接 / 超体积 }
+        "401": { description: 未鉴权 }
+        "403": { description: 非 owner 角色 }
+        "503": { description: 备份子系统未接入 }
 
 components:
   Rollback:
