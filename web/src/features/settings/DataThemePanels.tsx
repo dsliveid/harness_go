@@ -1,6 +1,7 @@
 import { useUI } from '../../stores/uiStore'
 import { useChat } from '../../stores/chatStore'
 import { Button, Switch } from '../../components/ui'
+import { RealModeNotice } from '../../components/RealModeNotice'
 import { promptInstall, usePwa } from '../../lib/pwa'
 
 // 数据与存储面板：原设置弹窗「数据与存储」标签页迁入「高级」弹窗
@@ -11,6 +12,7 @@ export function DataPanel() {
 
   return (
     <div className="p-3 space-y-4">
+      <RealModeNotice text="容量数字（18.4 MB / 126 MB / 6 / 42）是写死的示意值：服务端 /maintenance 只返回维护模式与未完成计数，不提供库体积与快照占用统计。" />
       <div className="grid grid-cols-2 gap-3">
         <Stat label="数据目录" value="data/" hint="可整体拷贝迁移" />
         <Stat label="数据库" value="18.4 MB" hint="SQLite WAL" />

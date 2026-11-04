@@ -6,6 +6,7 @@ import { useChat } from '../../stores/chatStore'
 import { Badge, Button, cn, Drawer, StateBadge } from '../../components/ui'
 import { DiffView } from '../../components/DiffView'
 import { CodeBlock } from '../../components/CodeBlock'
+import { RealModeNotice } from '../../components/RealModeNotice'
 import { sampleDiff } from '../../mock/data'
 import { MessageThread } from '../chat/MessageList'
 import { Check, Square, RotateCcw, X, ArrowLeft, Bot, FileText, CheckSquare, ListTodo, TerminalSquare, Layers, ShieldAlert, ChevronRight, ChevronDown, Download } from 'lucide-react'
@@ -424,6 +425,7 @@ function SnapshotPanel() {
           </div>
           {openId === s.id && (
             <div className="p-2 border-t border-edge space-y-2">
+              <RealModeNotice text="下方 diff 是前端样例内容（sampleDiff）：服务端快照只存前后哈希与该轮元数据，不返回逐行 diff 文本，因此行内容仅供示意。" />
               {s.skipped ? (
                 <div className="text-[12px] text-warn">文件超过 5MB，已跳过快照，本次修改不可回滚。</div>
               ) : (

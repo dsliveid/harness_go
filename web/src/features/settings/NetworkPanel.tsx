@@ -3,6 +3,7 @@ import { useUI } from '../../stores/uiStore'
 import { useSettings } from '../../stores/settingsStore'
 import { Switch, inputCls } from '../../components/ui'
 import { cn } from '../../components/ui'
+import { RealModeNotice } from '../../components/RealModeNotice'
 
 // 网络代理：统一正向代理开关 + 地址 + 连接测试（对齐桌面端「网络代理」）
 export function NetworkPanel() {
@@ -36,6 +37,7 @@ export function NetworkPanel() {
 
   return (
     <div className="flex flex-col gap-4">
+      <RealModeNotice text="代理「连接测试」是本地原型模拟（随机延迟 + 随机成功/失败），并未真正发起探测请求；代理配置本身会写入服务端设置。" />
       <div>
         <div className="text-[13px] font-medium">网络代理设置</div>
         <div className="text-[12px] text-inkdim mt-1 leading-relaxed max-w-[560px]">

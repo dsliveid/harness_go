@@ -5,9 +5,11 @@ import type {
 import { longSessionMessages, messages as mockMessages } from '../mock/data'
 import { startMockRun, type Decision, type MockRunHandle, type StreamEvent } from '../mock/stream'
 import { api, apiMode, type RunHandle } from '../lib/api'
+import type { SseState as SseStateName, SseStateInfo } from '../lib/sse'
 import { COMPACTION_RATIO, resolveModelContext } from '../lib/context'
 import { DATA_SCOPE_LABEL } from '../lib/dataScopes'
 import { useSessions } from './sessionStore'
+import { useSse } from './sseStore'
 import { useUI } from './uiStore'
 
 // 模块级流式缓冲：delta 累积后按 50ms 批量提交，避免逐 token setState
@@ -21,6 +23,14 @@ let currentRunId: string | null = null
 let stepStartAt = 0
 /** 每会话最近一次消息级回滚的事件 id（real 模式 reapply 依据；S10 语义，刷新后从服务端 rollbacks 列表不可得时降级为不可重放） */
 const lastRollbackBySession: Record<string, string> = {}
+
+/**
+ * SSE 真实状态上报转发（lib/api.ts → 顶栏 SseStatus）。
+ * 单独抽成函数而非内联，是为了 mock/real 两个分支共用同一套转发与终态清理逻辑。
+ */
+function applySseState(state: SseStateName, info: SseStateInfo) {
+  useSse.getState().applyReal(state, info)
+}
 
 interface ChatState {
   messages: Message[]
@@ -241,6 +251,8 @@ export const useChat = create<ChatState>((set, get) => {
             handle = null
             streamingMsgId = null
             currentRunId = null
+            // 订阅结束：如实回到空闲态（顶栏不再残留「已连接」假象）
+            useSse.getState().detachRun()
             const queued = get().queued
             if (queued.length > 0) {
               const next = queued[0]
@@ -254,11 +266,16 @@ export const useChat = create<ChatState>((set, get) => {
 
     if (apiMode === 'mock') {
       handle = startMockRun({ sessionId, runId, input, onEvent: onStreamEvent })
+      // mock 无真实 EventSource：如实上报「演示态」（顶栏同时有 🟡 DEMO 角标提示为演示数据）
+      useSse.getState().attachRun(runId)
+      useSse.getState().applyReal('open', { reason: 'mock-stream' })
       return
     }
 
     // real 模式：Run 在服务端执行（本地 runId 仅用于消息壳，真实 id 以服务端返回为准）
     cancelPending = false
+    // 订阅开始：顶栏如实进入「连接中」，此后由 SseClient 状态机接管
+    useSse.getState().attachRun(runId)
     // 模型引用：startRun 入口已保证会话已选模型
     const modelRef = session.modelRef || undefined
     void api
@@ -271,9 +288,20 @@ export const useChat = create<ChatState>((set, get) => {
           // 断线重连 / 服务端 resync：以 DB 快照覆盖本地流式态（delta 只是预览）
           void get().reloadMessages(sessionId)
         },
+        onSseState: (state, info) => {
+          applySseState(state, info)
+          // 服务端返回真实 runId 后回填订阅目标（本地壳 id 与真实 id 不同）
+          if (state === 'open' && currentRunId && useSse.getState().runId !== currentRunId) {
+            useSse.getState().retargetRun(currentRunId)
+          }
+        },
+        onSseEventSeq: (seq) => useSse.getState().noteEvent(seq),
       })
       .then((h) => {
         handle = h
+        currentRunId = h.runId
+        // 只回填 id，不重置已建立的连接阶段
+        if (useSse.getState().runId && useSse.getState().runId !== h.runId) useSse.getState().retargetRun(h.runId)
         if (cancelPending) {
           cancelPending = false
           h.stop()
@@ -287,6 +315,8 @@ export const useChat = create<ChatState>((set, get) => {
         streamingMsgId = null
         currentRunId = null
         handle = null
+        // 启动失败没有任何订阅：如实回到空闲态
+        useSse.getState().detachRun()
       })
   }
 
@@ -347,6 +377,8 @@ export const useChat = create<ChatState>((set, get) => {
       const id = streamingMsgId
       streamingMsgId = null
       currentRunId = null
+      // 主动停止：SSE 订阅随之关闭，顶栏如实显示「已断开」而非残留连接态
+      useSse.getState().detachRun()
       set((s) => ({
         streaming: false,
         runStatus: 'cancelled',

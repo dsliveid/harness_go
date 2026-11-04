@@ -3,6 +3,7 @@ import { toggleDisabled, useSettings } from '../../stores/settingsStore'
 import { usePlugins } from '../../stores/pluginStore'
 import { useUI } from '../../stores/uiStore'
 import { Badge, Button, Switch } from '../../components/ui'
+import { RealModeNotice } from '../../components/RealModeNotice'
 import type { DeviceNode, Risk, ToolGroup, ToolInstallMeta } from '../../types'
 import { cn } from '../../components/ui'
 import { supportsClient, unsupportedReason } from '../../lib/platform'
@@ -154,6 +155,7 @@ export function ToolsPanel({ client, query = '' }: { client: DeviceNode; query?:
 
   return (
     <div className="flex flex-col gap-4">
+      <RealModeNotice text="工具清单与「可安装性/已安装」状态来自前端内置表（mock/settingsData）：禁用开关只写本地设置，尚未通过 /tools 与 /tools/tiers 接口下发；真实工具注册状态以服务端为准。" />
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">
           <div className="text-[13px] font-medium">系统内置工具</div>

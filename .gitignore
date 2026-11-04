@@ -58,6 +58,9 @@ desktop.ini
 .env
 .env.*
 !.env.example
+# web/.env.real 仅含 VITE_API_MODE=real（无任何密钥），必须随仓分发，
+# 否则 `npm run dev:real` 会因缺少 mode 文件静默回落到 mock，开发态误判"接线没通"。
+!web/.env.real
 *.pem
 secret.key
 

@@ -14,7 +14,7 @@ import type { AccessMode, Message, Run, RunStatus, Session, ToolCall, Risk, Tool
 import * as mockData from '../mock/data'
 import { toolList } from '../mock/settingsData'
 import { startMockRun, type Decision, type StreamEvent } from '../mock/stream'
-import { SseClient } from './sse'
+import { SseClient, type SseState as SseStateName, type SseStateInfo } from './sse'
 import {
   API_PATHS,
   type ChangePasswordRequest,
@@ -112,6 +112,20 @@ export interface StartRunOptions {
    * 上层应重拉消息快照覆盖本地流式态（铁律：消息最终内容以 DB 为准）。
    */
   onResync?: () => void
+  /**
+   * SSE 连接状态上报（阶段 B-5 补）：把 lib/sse.ts 的 SseClient 真实状态机
+   * （connecting/open/backoff/resync/closed）外泄给上层，供顶栏 SseStatus 展示**真实**状态。
+   *
+   * ⚠️ 独白：此前 sseStore 是纯硬编码假值（lastSeq:214 / reconnects:2 / 永为「43 分钟前断开」），
+   * 又被 TopBar 常驻渲染 → 每个页面顶部都在展示假连接状态。本回调是消除该假象的唯一真实数据源，
+   * 请勿在 UI 侧再补任何编造指标。
+   */
+  onSseState?: (state: SseStateName, info: SseStateInfo) => void
+  /**
+   * SSE 事件游标上报：每收到一帧携带 `id`（即 per-Run seq）的事件时回调，
+   * 供顶栏展示真实 lastEventId。**不做任何插值或估算**，无 id 的帧不上报。
+   */
+  onSseEventSeq?: (seq: number) => void
 }
 
 export interface CreateSessionInput {
@@ -474,6 +488,8 @@ export const mockApi: ApiClient = {
 
   async startRun(opts) {
     const runId = `r-mock-${Date.now()}`
+    // mock 无真实 EventSource：如实上报「演示态」，顶栏同时有 🟡 DEMO 角标提示这是演示数据
+    opts.onSseState?.('open', { reason: 'mock-stream' })
     const handle = startMockRun({
       sessionId: opts.sessionId,
       runId,
@@ -482,7 +498,10 @@ export const mockApi: ApiClient = {
     })
     return {
       runId,
-      stop: () => handle.stop(),
+      stop: () => {
+        handle.stop()
+        opts.onSseState?.('closed', { reason: 'client_closed' })
+      },
       resume: (decision, reason) => handle.resume(decision, reason),
     }
   },
@@ -840,6 +859,11 @@ export const realApi: ApiClient = {
     const sse = new SseClient({
       url: toAbsolute(API_PATHS.runEvents(opts.sessionId, created.run_id)),
       onEvent: (ev) => {
+        // 真实 lastEventId 游标上报（无 id 帧不报，不做估算）
+        if (ev.id) {
+          const seq = Number(ev.id)
+          if (Number.isFinite(seq)) opts.onSseEventSeq?.(seq)
+        }
         if (ev.type === 'resync') {
           // 服务端补发完成：以 DB 为准重拉消息快照（delta 只是预览）
           opts.onResync?.()
@@ -854,6 +878,8 @@ export const realApi: ApiClient = {
         // 断线重连：SSE 已按 Last-Event-ID 续传，额外拉一次快照兜底
         opts.onResync?.()
       },
+      // 真实状态机外泄（顶栏 SseStatus 唯一真实数据源）
+      onState: (state, info) => opts.onSseState?.(state, info),
     })
     sse.connect()
     return {

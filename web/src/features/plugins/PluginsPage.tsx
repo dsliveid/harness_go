@@ -9,6 +9,11 @@ import type {
 import { toolInstallInfo, toolList } from '../../mock/settingsData'
 import { supportsClient, unsupportedReason, clientPlatformLabel } from '../../lib/platform'
 import { ToolsPanel } from '../settings/ToolsPanel'
+import { RealModeNotice } from '../../components/RealModeNotice'
+
+/** 能力面板统一降级提示：清单与安装状态均来自前端内置表 */
+const PLUGIN_MOCK_NOTICE =
+  '本面板的能力清单、市场制品与「已安装」状态均来自前端内置演示数据：服务端虽已有 /tools、/mcp/servers、/packages 等接口，但此视图尚未接线（store 也未补对应方法）。'
 
 // ============ 能力面板（客户端自行安装）============
 // 口径：
@@ -324,6 +329,7 @@ export function ToolsPane({ client }: { client: DeviceNode }) {
 
   return (
     <div className="space-y-3">
+      <RealModeNotice text={PLUGIN_MOCK_NOTICE} />
       <div className="flex items-center gap-2 flex-wrap">
         <div className="flex-1 min-w-[200px]"><SearchBar value={q} onChange={setQ} placeholder="搜索工具：名称 / 描述 / 版本" /></div>
         <SourceTabs view={view} onView={setView} counts={{ builtin: toolList.length, installed: installedCount, extended: extAll.length }} />
@@ -386,6 +392,7 @@ export function McpPane({ client }: { client: DeviceNode }) {
 
   return (
     <div className="space-y-3">
+      <RealModeNotice text={PLUGIN_MOCK_NOTICE} />
       <div className="flex items-center gap-2 flex-wrap">
         <div className="flex-1 min-w-[200px]"><SearchBar value={q} onChange={setQ} placeholder="搜索 MCP：名称 / 命令 / 工具" /></div>
         <SourceTabs view={view} onView={setView} counts={{ builtin: builtinList.length, installed: installedCount, extended: extAll.length }} />
@@ -495,6 +502,7 @@ export function SkillsPane({ client }: { client: DeviceNode }) {
 
   return (
     <div className="space-y-3">
+      <RealModeNotice text={PLUGIN_MOCK_NOTICE} />
       <div className="flex items-center gap-2 flex-wrap">
         <div className="flex-1 min-w-[200px]"><SearchBar value={q} onChange={setQ} placeholder="搜索技能：名称 / 描述" /></div>
         <SourceTabs view={view} onView={setView} counts={{ builtin: builtinList.length, installed: installedCount, extended: extAll.length }} />
@@ -565,6 +573,7 @@ export function ExtensionsPane({ client }: { client: DeviceNode }) {
 
   return (
     <div className="space-y-3">
+      <RealModeNotice text={PLUGIN_MOCK_NOTICE} />
       <div className="flex items-center gap-2 flex-wrap">
         <div className="flex-1 min-w-[200px]"><SearchBar value={q} onChange={setQ} placeholder="搜索拓展：名称 / 描述" /></div>
         <Badge tone="cyan">草稿 {drafts.length}</Badge>

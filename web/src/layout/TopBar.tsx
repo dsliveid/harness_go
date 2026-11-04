@@ -5,6 +5,7 @@ import { useUI } from '../stores/uiStore'
 import { useSettings } from '../stores/settingsStore'
 import { roleLabel, useAuth } from '../stores/authStore'
 import { Button, IconButton } from '../components/ui'
+import { ModeBadge } from '../components/ModeBadge'
 import { ChangePasswordModal } from '../features/auth/ChangePasswordModal'
 import { SseStatus } from '../features/chat/SseStatus'
 import type { AccessMode } from '../types'
@@ -164,6 +165,9 @@ export function TopBar() {
       <IconButton onClick={() => setSettings(true)} title="程序设置" ariaLabel="打开设置">
         <Settings size={15} />
       </IconButton>
+
+      {/* 全局数据模式角标：🟢REAL / 🟡DEMO，任意页面一眼可辨真假 */}
+      <ModeBadge />
 
       {/* 账户菜单：账号密码登录态与退出 */}
       <div className="relative flex items-center" ref={accountRef}>

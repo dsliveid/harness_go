@@ -1,6 +1,7 @@
 import { agentSops } from '../../mock/settingsData'
 import { toggleDisabled, useSettings } from '../../stores/settingsStore'
 import { Badge, Button, Switch } from '../../components/ui'
+import { RealModeNotice } from '../../components/RealModeNotice'
 import { cn } from '../../components/ui'
 import { ShieldCheck } from 'lucide-react'
 
@@ -24,6 +25,7 @@ export function SopPanel() {
 
   return (
     <div className="flex flex-col gap-4">
+      <RealModeNotice text="SOP 清单仍是前端内置样例：服务端未提供 SOP 规范的增删启停端点，此处开关仅写本地设置，不会下发到执行引擎。" />
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">
           <div className="text-[13px] font-medium">Agent SOP 规范管理</div>

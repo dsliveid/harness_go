@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { ChevronDown, ChevronRight } from 'lucide-react'
 import { logEntries as mockLogEntries, tokenStats, tokenSummary } from '../../mock/settingsData'
 import { Badge, cn } from '../../components/ui'
+import { RealModeNotice } from '../../components/RealModeNotice'
 import type { LogEntry, TokenStatRow } from '../../types'
 import { api, apiMode } from '../../lib/api'
 
@@ -70,6 +71,7 @@ export function TokenStatsPanel() {
 
   return (
     <div className="flex flex-col gap-4">
+      <RealModeNotice text="Token 统计仍是前端演示数据：区间聚合用固定系数（today 0.12 / 7d 1 / 30d 2.9 / all 3.4）乘样例行伪造，并非服务端真实聚合。" />
       <div>
         <div className="text-[13px] font-medium">Token 用量统计</div>
         <div className="text-[12px] text-inkdim mt-0.5 leading-relaxed">

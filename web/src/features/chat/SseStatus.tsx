@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Activity, Zap } from 'lucide-react'
 import { useSse, SSE_PHASE_META } from '../../stores/sseStore'
+import { apiMode } from '../../lib/api'
 import { Button, cn } from '../../components/ui'
 
 const dotCls: Record<string, string> = {
@@ -8,12 +9,19 @@ const dotCls: Record<string, string> = {
   warn: 'bg-warn',
   accent2: 'bg-accent2',
   err: 'bg-err',
+  dim: 'bg-inkfaint',
 }
 
 /**
- * SSE 断线续传可见态（对齐客户端状态机 open → backoff → resync → open）：
- * 顶栏会话标题行内嵌状态胶囊，点击弹出订阅详情（游标 / 缓冲 / 重连 / 断开原因），
- * 并提供「模拟断线重连」演示（正式实现为 EventSource + lastEventId 游标 + 指数退避）。
+ * SSE 订阅真实状态（顶栏常驻）。
+ *
+ * ⚠️ 该组件在 layout/TopBar.tsx 常驻渲染，历史上展示的是 sseStore 里的**硬编码假值**
+ *    （游标 214/218、重连 2 次、断开原因永为「43 分钟前缓冲已满」），等于每个页面顶部
+ *    都在展示假的连接状态，且 RealModeNotice 对它无效（它是状态点不是面板）。
+ *    现已改为只消费真实状态机：唯一写入方是 lib/sse.ts SseClient → api.startRun → chatStore。
+ *    无活跃订阅时如实显示「未订阅」，**不展示任何编造指标**。
+ *
+ * 「模拟断线重连」按钮仅在 mock 模式出现，用于演示状态机流转；real 模式下隐藏（不伪造状态）。
  */
 export function SseStatus() {
   const sse = useSse()
@@ -23,6 +31,9 @@ export function SseStatus() {
   const panelRef = useRef<HTMLDivElement>(null)
 
   const meta = SSE_PHASE_META[sse.phase]
+  const isMock = apiMode === 'mock'
+  /** 有真实订阅（正在跑 Run 且事件流打开） */
+  const active = sse.runId !== null && (sse.phase === 'open' || sse.phase === 'connecting' || sse.phase === 'backoff' || sse.phase === 'resync')
 
   useEffect(() => {
     if (!open) return
@@ -53,8 +64,6 @@ export function SseStatus() {
     }
     setOpen(true)
   }
-
-  const pending = Math.max(0, sse.totalSeq - sse.lastSeq)
 
   return (
     <div className="relative shrink-0" ref={rootRef}>
@@ -91,6 +100,7 @@ export function SseStatus() {
                 meta.tone === 'warn' && 'bg-warn/15 text-warn border-warn/30',
                 meta.tone === 'accent2' && 'bg-accent2/15 text-accent2 border-accent2/30',
                 meta.tone === 'err' && 'bg-err/15 text-err border-err/30',
+                meta.tone === 'dim' && 'bg-panel2 text-inkfaint border-edge',
               )}
             >
               {meta.label}
@@ -100,10 +110,12 @@ export function SseStatus() {
           <div className="mt-2.5 text-[10.5px] text-inkfaint leading-relaxed">{meta.hint}</div>
 
           <div className="mt-2.5 space-y-1.5 text-[11px] text-inkdim border-t border-edge/40 pt-2.5 font-mono">
-            <Row label="事件游标:" value={`${sse.lastSeq} / ${sse.totalSeq}`} />
-            <Row label="待补事件:" value={pending > 0 ? `${pending} 条（resync 补拉）` : '0（已对齐）'} tone={pending > 0 ? 'accent2' : undefined} />
-            <Row label="订阅缓冲:" value={`${sse.bufferUsed} / ${sse.bufferCap}`} />
+            <Row label="订阅 Run:" value={sse.runId ?? '—'} />
+            <Row label="事件游标:" value={active ? `lastEventId ${sse.lastSeq}` : '—'} />
             <Row label="累计重连:" value={`${sse.reconnects} 次`} />
+            {sse.phase === 'backoff' && sse.retryIn !== null && (
+              <Row label="下次重连:" value={`${Math.round(sse.retryIn)}ms 后`} tone="accent2" />
+            )}
             <Row
               label="上次断开:"
               value={sse.lastDrop ? new Date(sse.lastDrop.at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }) : '—'}
@@ -113,28 +125,35 @@ export function SseStatus() {
           {sse.lastDrop && (
             <div className="mt-2 rounded-lg border border-edge bg-panel2/40 p-2.5 text-[10.5px] text-inkfaint leading-relaxed">
               <div className="text-inkdim font-medium">断开原因：{sse.lastDrop.reason}</div>
-              <div className="mt-1 font-mono">
-                退避 {sse.lastDrop.backoffMs}ms → 重连 → 补拉 {sse.lastDrop.resynced} 条里程碑事件 → 恢复订阅
-              </div>
+              {typeof sse.lastDrop.retryIn === 'number' && (
+                <div className="mt-1 font-mono">退避 {Math.round(sse.lastDrop.retryIn)}ms 后按 lastEventId 续传重连</div>
+              )}
             </div>
           )}
 
-          <div className="mt-3 pt-2.5 border-t border-edge/40 flex items-center gap-2">
-            <Button
-              size="sm"
-              variant="outline"
-              className="gap-1.5"
-              disabled={sse.demoRunning || sse.phase !== 'open'}
-              onClick={() => sse.simulateDrop()}
-              title="演示断线 → 指数退避 → 重连 → 按游标补同步的全过程"
-            >
-              <Zap size={12} className="text-warn" />
-              <span>{sse.demoRunning ? '断线重连演示中…' : '模拟断线重连'}</span>
-            </Button>
-            <span className="text-[10px] text-inkfaint leading-relaxed">
-              回到前台会立即重连（visibilitychange）
-            </span>
-          </div>
+          {isMock ? (
+            <div className="mt-3 pt-2.5 border-t border-edge/40 flex items-center gap-2">
+              <Button
+                size="sm"
+                variant="outline"
+                className="gap-1.5"
+                disabled={sse.demoRunning || (sse.phase !== 'open' && sse.phase !== 'idle')}
+                onClick={() => sse.simulateDrop()}
+                title="演示断线 → 指数退避 → 重连 → 按游标补同步的全过程（仅 mock 模式）"
+              >
+                <Zap size={12} className="text-warn" />
+                <span>{sse.demoRunning ? '断线重连演示中…' : '模拟断线重连（演示）'}</span>
+              </Button>
+              <span className="text-[10px] text-inkfaint leading-relaxed">
+                回到前台会立即重连（visibilitychange）
+              </span>
+            </div>
+          ) : (
+            <div className="mt-3 pt-2.5 border-t border-edge/40 text-[10px] text-inkfaint leading-relaxed">
+              real 模式：显示的是 EventSource 真实状态机（连接 / 退避 / 补同步），断线由
+              `lib/sse.ts` 自动按 lastEventId 续传，无演示按钮。
+            </div>
+          )}
 
           <div className="mt-2.5 pt-2 border-t border-edge/40 text-[10px] text-inkfaint leading-relaxed">
             铁律：消息最终内容以数据库为准；流式 delta 只是预览，resync 后以消息快照对齐。
@@ -149,7 +168,7 @@ function Row({ label, value, tone }: { label: string; value: string; tone?: 'acc
   return (
     <div className="flex items-center justify-between gap-2">
       <span className="text-inkfaint shrink-0">{label}</span>
-      <span className={cn('font-medium text-right', tone === 'accent2' ? 'text-accent2' : 'text-ink')}>{value}</span>
+      <span className={cn('font-medium text-right truncate', tone === 'accent2' ? 'text-accent2' : 'text-ink')}>{value}</span>
     </div>
   )
 }
