@@ -5,7 +5,7 @@ export type StreamEvent =
   | { type: 'delta'; text: string }
   | { type: 'reasoning'; text: string }
   | { type: 'tool_start'; call: ToolCall }
-  | { type: 'tool_result'; callId: string; result: string; durationMs: number; diff?: FileDiff; skipped?: boolean }
+  | { type: 'tool_result'; callId: string; result: string; durationMs: number; diff?: FileDiff; skipped?: boolean; failed?: boolean }
   | { type: 'tool_progress'; callId: string; chunk: string }
   | { type: 'step'; tokens?: number; promptTokens?: number; cachedTokens?: number }
   | { type: 'approval'; approval: Approval }

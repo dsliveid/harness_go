@@ -15,6 +15,7 @@ import * as mockData from '../mock/data'
 import { toolList } from '../mock/settingsData'
 import { startMockRun, type Decision, type StreamEvent } from '../mock/stream'
 import { SseClient, type SseState as SseStateName, type SseStateInfo } from './sse'
+import { extractFileDiff, extractResultContent } from './toolDiff'
 import {
   API_PATHS,
   type ChangePasswordRequest,
@@ -357,11 +358,62 @@ export function toUiRun(r: ApiRun, sessionId: string): Run {
 /** 会话内按 role 累计轮次（B-1 近似实现：user 消息开启新一轮；B-2 改为读服务端轮次字段） */
 let turnCounter = 0
 
+/**
+ * 历史回放（B3）：DB 里 assistant 的 `tool_calls` 与 tool 消息（`role='tool'` +
+ * `tool_call_id` + `content=ResultJSON`）是分离的两条记录，必须归并后工具卡片才有
+ * 结果与逐行 diff，否则刷新页面后 diff 全部丢失。
+ *
+ * 提取复用 lib/toolDiff.ts 的 extractFileDiff（与 SSE 实时路径同一个函数）。
+ */
+function collectToolResults(list: ApiMessage[]) {
+  const map = new Map<string, { content: string; diff?: ReturnType<typeof extractFileDiff>; failed: boolean }>()
+  for (const m of list) {
+    if (m.role !== 'tool' || !m.tool_call_id) continue
+    // content 同样是 ResultJSON 整包：展示文本取 content 字段，diff 取 meta.data.diff
+    const shown = extractResultContent(m.content)
+    map.set(m.tool_call_id, {
+      content: shown,
+      diff: extractFileDiff(m.content),
+      failed: shown.startsWith('工具执行失败'),
+    })
+  }
+  return map
+}
+
+/**
+ * tool_calls 条目归一化。
+ *
+ * 后端 `internal/llm/provider.go` 的 `ToolCall{ID, Name, Arguments}` **没有 json tag**，
+ * 经 `json.Marshal` 落库后是 `{"ID":..,"Name":..,"Arguments":{..}}`（大写）；
+ * 而 OpenAI 兼容上游给的是 `{id, function:{name, arguments:"<json str>"}}`。
+ * 两种形状都必须能吃下，否则历史工具卡片会全部空壳。
+ */
+function normalizeToolCall(raw: unknown): { id: string; name: string; args: Record<string, unknown> } {
+  const tc = (raw ?? {}) as {
+    ID?: string; Name?: string; Arguments?: unknown
+    id?: string; name?: string; arguments?: unknown
+    function?: { name?: string; arguments?: unknown }
+  }
+  const id = tc.ID ?? tc.id ?? ''
+  const name = tc.Name ?? tc.name ?? tc.function?.name ?? ''
+  const rawArgs = tc.Arguments ?? tc.arguments ?? tc.function?.arguments
+  const args = typeof rawArgs === 'string'
+    ? parseArgsOrEmpty(rawArgs)
+    : typeof rawArgs === 'object' && rawArgs !== null
+      ? (rawArgs as Record<string, unknown>)
+      : {}
+  return { id, name, args }
+}
+
 export function toUiMessages(list: ApiMessage[], sessionId: string): Message[] {
   turnCounter = 0
-  return list.map((m) => {
+  const toolResults = collectToolResults(list)
+  const out: Message[] = []
+  for (const m of list) {
     if (m.role === 'user') turnCounter += 1
-    return {
+    // 已归并进 assistant.toolCalls 的 tool 消息不再单独成条，避免时间线出现空壳卡片
+    if (m.role === 'tool' && m.tool_call_id && toolResults.has(m.tool_call_id)) continue
+    out.push({
       id: m.id,
       sessionId,
       runId: m.run_id,
@@ -373,13 +425,18 @@ export function toUiMessages(list: ApiMessage[], sessionId: string): Message[] {
       toolCallId: m.tool_call_id,
       toolCalls: Array.isArray(m.tool_calls)
         ? (m.tool_calls as unknown[]).map((raw) => {
-            const tc = raw as { id?: string; name?: string; arguments?: unknown; function?: { name?: string; arguments?: string } }
+            const { id, name, args } = normalizeToolCall(raw)
+            const done = toolResults.get(id)
             return {
-              id: tc.id ?? '',
-              name: tc.name ?? tc.function?.name ?? '',
-              args: (tc.arguments as Record<string, unknown>) ?? {},
-              status: 'done' as ToolStatus,
+              id,
+              name,
+              args,
+              // 有对应 tool 消息即已终态；无则保持 pending（不假装成功）
+              status: (done ? (done.failed ? 'error' : 'ok') : 'pending') as ToolStatus,
               risk: 'write' as Risk,
+              ...(done ? { result: done.content } : {}),
+              // 只认 meta.data.diff；无该字段（端侧执行 / 只读工具）保持 undefined
+              ...(done?.diff ? { diff: done.diff } : {}),
             } satisfies ToolCall
           })
         : undefined,
@@ -387,8 +444,19 @@ export function toUiMessages(list: ApiMessage[], sessionId: string): Message[] {
       tokens: m.token_count || undefined,
       // 服务端消息级回滚（S10）置灰的消息：保留可见、上下文组装已排除（hidden）
       ...(m.hidden ? { reverted: true, revertedAt: m.created_at } : {}),
-    }
-  })
+    })
+  }
+  return out
+}
+
+/** tool_calls 里 arguments 可能是 JSON 原文串（OpenAI 兼容格式），解析失败按空对象处理。 */
+function parseArgsOrEmpty(raw: string): Record<string, unknown> {
+  try {
+    const v = JSON.parse(raw) as unknown
+    return typeof v === 'object' && v !== null ? (v as Record<string, unknown>) : {}
+  } catch {
+    return {}
+  }
 }
 
 /* ============ mock 实现（行为与 demo 一致） ============ */
@@ -989,14 +1057,25 @@ function mapSseToStreamEvent(type: string, data: string): StreamEvent | null {
         callId: String(payload.tool_event_id ?? ''),
         chunk: String(payload.chunk ?? ''),
       }
-    case 'tool.result':
+    case 'tool.result': {
+      // 逐行 diff 不在事件顶层，而是藏在 result 字符串的 meta.data.diff（见 lib/toolDiff.ts）；
+      // 提取失败/形状不符一律 undefined，绝不伪造。
+      // 展示文本走 extractResultContent：real 模式 result 是整包 ResultJSON（含 meta），
+      // 直接铺到卡片上会带出 meta 噪声。
+      const raw = typeof payload.result === 'string' ? payload.result : JSON.stringify(payload.result ?? '')
+      const status = String(payload.status ?? '')
+      const shown = extractResultContent(raw)
       return {
         type: 'tool_result',
         callId: String(payload.tool_event_id ?? ''),
-        result: typeof payload.result === 'string' ? payload.result : JSON.stringify(payload.result ?? ''),
+        // 失败/超时事件不带 result，只带 error：如实把错误文案作为结果呈现
+        result: shown || String(payload.error ?? ''),
+        diff: extractFileDiff(raw),
         durationMs: 0,
-        skipped: payload.status === 'denied' ? true : undefined,
+        skipped: status === 'denied' ? true : undefined,
+        failed: status === 'error' || status === 'timeout' ? true : undefined,
       }
+    }
     case 'approval.request':
       // 审批闸门已阻塞在服务端（Run=waiting_approval），前端弹出 ApprovalBar
       return {

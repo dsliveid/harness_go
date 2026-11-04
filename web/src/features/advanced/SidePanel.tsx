@@ -7,11 +7,10 @@ import { Badge, Button, cn, Drawer, StateBadge } from '../../components/ui'
 import { DiffView } from '../../components/DiffView'
 import { CodeBlock } from '../../components/CodeBlock'
 import { RealModeNotice } from '../../components/RealModeNotice'
-import { sampleDiff } from '../../mock/data'
 import { MessageThread } from '../chat/MessageList'
 import { RollbackHistoryPanel } from '../chat/RollbackHistoryPanel'
 import { Check, Square, RotateCcw, X, ArrowLeft, Bot, FileText, CheckSquare, ListTodo, TerminalSquare, Layers, ShieldAlert, ChevronRight, ChevronDown, Download } from 'lucide-react'
-import type { CommandRun, FileDiff, Message, PlanDoc, Subagent } from '../../types'
+import type { CommandRun, FileDiff, Message, PlanDoc, Snapshot, Subagent } from '../../types'
 
 const TITLES: Record<Exclude<SidePanel, 'none'>, string> = {
   todo: '任务清单',
@@ -403,6 +402,31 @@ function SnapshotPanel() {
   )
 }
 
+/** 快照关联的真实 diff：优先按 toolEventId 精确命中工具卡，其次按文件路径回退匹配。 */
+function findSnapshotDiff(s: Snapshot): FileDiff | undefined {
+  const { messagesOf } = useChat.getState()
+  const currentId = useSessions.getState().currentId
+  const msgs = messagesOf(currentId)
+
+  if (s.toolEventId) {
+    for (const m of msgs) {
+      for (const c of m.toolCalls ?? []) {
+        if (c.id === s.toolEventId && c.diff) return c.diff
+      }
+    }
+  }
+  // 回退：同一路径的写入/编辑工具卡（服务端 write_file/edit_file 的 meta.data.diff）
+  const norm = (p: string) => p.replace(/\\/g, '/')
+  for (const m of msgs) {
+    for (const c of m.toolCalls ?? []) {
+      if (!c.diff) continue
+      if (c.name !== 'write_file' && c.name !== 'edit_file') continue
+      if (norm(c.diff.path) === norm(s.filePath) || norm(c.args?.path as string ?? '') === norm(s.filePath)) return c.diff
+    }
+  }
+  return undefined
+}
+
 function LocalSnapshotSection() {
   const { snapshots, revertSnapshot, reapplySnapshot } = useWorkspace()
   const toast = useUI((s) => s.toast)
@@ -414,13 +438,15 @@ function LocalSnapshotSection() {
         <span className="text-[12px] font-semibold text-inkdim tracking-tight">本地工作区快照</span>
         <Badge tone="gray">{snapshots.length}</Badge>
       </div>
-      <RealModeNotice text="本区块文件快照与 diff 为前端本地演示数据：服务端快照只存前后哈希与该轮元数据，不返回逐行 diff 文本；上方「回滚历史 / 快照锚点」才是服务端真实数据。" />
+      <RealModeNotice text="本区块的快照列表本身是本地演示数据：服务端 GET /snapshots 只存前后哈希与该轮元数据，不含逐行 diff 文本。展开时的逐行 diff 一律取自真实工具结果 meta.data.diff（write_file / edit_file），取不到则明确显示空态，不再用样例内容填充。上方「回滚历史 / 快照锚点」为服务端真实数据。" />
       <div className="rounded-lg border border-edge bg-panel2/50 p-2.5 text-[11px] text-inkfaint space-y-0.5">
         <div>· 保留最近 50 轮；单文件 &gt; 5MB 跳过并标记</div>
         <div>· 仅覆盖经内核写入的路径；run_command 变更不可回滚</div>
       </div>
 
-      {snapshots.map((s) => (
+      {snapshots.map((s) => {
+        const realDiff = openId === s.id && !s.skipped ? findSnapshotDiff(s) : undefined
+        return (
         <div key={s.id} className="rounded-lg border border-edge overflow-hidden">
           <button className="w-full flex items-center gap-2 px-2.5 py-2 text-left hover:bg-panel2" onClick={() => setOpenId(openId === s.id ? null : s.id)}>
             <span className="w-3.5 h-3.5 flex items-center justify-center shrink-0">
@@ -441,23 +467,29 @@ function LocalSnapshotSection() {
           </div>
           {openId === s.id && (
             <div className="p-2 border-t border-edge space-y-2">
-              <RealModeNotice text="下方 diff 是前端样例内容（sampleDiff）：服务端快照只存前后哈希与该轮元数据，不返回逐行 diff 文本，因此行内容仅供示意。" />
               {s.skipped ? (
                 <div className="text-[12px] text-warn">文件超过 5MB，已跳过快照，本次修改不可回滚。</div>
+              ) : realDiff ? (
+                <DiffView diff={realDiff} onRevertHunk={(h) => { toast('success', `已回滚 hunk ${h}（重新定位当前文件）`) }} />
               ) : (
-                <DiffView diff={{ ...sampleDiff, path: s.filePath }} onRevertHunk={(h) => { toast('success', `已回滚 hunk ${h}（重新定位当前文件）`) }} />
+                <div className="rounded-lg border border-edge bg-panel2/60 p-2.5 text-[11.5px] text-inkfaint leading-relaxed">
+                  该快照未关联逐行 diff：服务端快照记录只保存前后哈希与该轮元数据，
+                  逐行 diff 仅存在于 write_file / edit_file 工具结果的 meta.data.diff 中；
+                  本会话内未找到该文件对应的工具结果，因此不展示行内容。
+                </div>
               )}
               <div className="flex gap-2">
                 {s.revertedAt ? (
                   <Button size="sm" variant="outline" onClick={() => { reapplySnapshot(s.id); toast('success', '已重新应用（正序写回）') }}>重新应用</Button>
                 ) : (
-                  <Button size="sm" variant="primary" disabled={s.skipped} onClick={() => { revertSnapshot(s.id); toast('success', '已回滚到该快照（校验当前 hash 后写回）') }}>回滚到此快照</Button>
+                  <Button size="sm" variant="primary" disabled={s.skipped} onClick={() => { revertSnapshot(s.id); toast('success', `已回滚到该快照（校验当前 hash 后写回）`) }}>回滚到此快照</Button>
                 )}
               </div>
             </div>
           )}
         </div>
-      ))}
+        )
+      })}
     </div>
   )
 }

@@ -178,18 +178,22 @@ export const useChat = create<ChatState>((set, get) => {
               ),
             }))
             break
-          case 'tool_result':
+          case 'tool_result': {
+            // 终态 status 以事件为准：denied 走「已拒绝」样式，error/timeout 走错误态
+            const status: ToolCall['status'] = e.skipped ? 'denied' : e.failed ? 'error' : 'ok'
             if (e.durationMs === 0) {
-              patchTool(e.callId, {}, e.result)
+              // real 模式 tool.result 不带耗时（服务端未下发），不能因此丢弃 result / diff
+              patchTool(e.callId, { status, ...(e.diff ? { diff: e.diff } : {}) }, e.result)
             } else {
               patchTool(e.callId, {
-                status: 'ok',
+                status,
                 durationMs: e.durationMs,
-                diff: e.diff,
+                ...(e.diff ? { diff: e.diff } : {}),
                 result: e.result,
               })
             }
             break
+          }
           case 'tool_progress':
             // 实时增量输出（需求 §10-4）：追加到运行中的工具卡片输出区；
             // 终态结果仍以 tool.result 为准（完成后 ToolCard 展示 result，不再展示 liveOutput）
