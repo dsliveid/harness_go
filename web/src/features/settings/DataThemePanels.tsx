@@ -5,6 +5,7 @@ import { Button, Switch } from '../../components/ui'
 import { RealModeNotice } from '../../components/RealModeNotice'
 import { promptInstall, usePwa } from '../../lib/pwa'
 import { api, apiMode } from '../../lib/api'
+import { DataBackupPanel } from './DataBackupPanel'
 
 /**
  * GET /maintenance 真实返回（已核实 internal/service/maintenance_service.go）：
@@ -162,6 +163,8 @@ export function DataPanel() {
           </div>
         </button>
       </div>
+      {/* B-2：制品下载 / 会话导出 / 全量备份恢复（真实端点接线，mock 下如实禁用） */}
+      <DataBackupPanel />
       <div className="flex flex-wrap gap-2">
         <Button
           variant="outline"
