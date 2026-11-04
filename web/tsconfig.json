@@ -16,5 +16,8 @@
     "noUnusedParameters": false,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src"]
+  "include": ["src"],
+  // P2 加固：vite.config.ts 等 Node 侧配置脚本不在 src 覆盖范围内，
+  // 通过独立 project 引用纳入 `tsc -b` 门禁，避免语法/类型错误只在 esbuild 阶段暴露。
+  "references": [{ "path": "./tsconfig.node.json" }]
 }

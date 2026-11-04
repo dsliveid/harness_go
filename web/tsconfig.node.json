@@ -1,0 +1,25 @@
+{
+  // P2 加固：把 vite.config.ts 纳入 tsc 覆盖。
+  // 历史事故：vite.config.ts 内 `Record<string, string | undefined>` 泛型漏写闭合 `>`
+  // 时，tsc 因 tsconfig.json 的 include 仅含 `src` 而全程静默，
+  // 错误直到 vite build 的 esbuild 加载阶段才暴露，直接导致 dist 不产出。
+  // 本文件作为被 references 引用的独立 project，只负责编译期校验 Node 侧配置脚本。
+  "compilerOptions": {
+    "composite": true,
+    // composite 项目不允许 noEmit（TS6310），故改为仅产声明文件并输出到 node_modules/.tmp，
+    // 既不污染源码目录，又能让 `tsc -b` 一条命令把 vite.config.ts 一并纳入门禁。
+    "emitDeclarationOnly": true,
+    "declaration": true,
+    "outDir": "./node_modules/.tmp/node-types",
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.node.tsbuildinfo",
+    "target": "ES2022",
+    "lib": ["ES2023"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "skipLibCheck": true,
+    "allowSyntheticDefaultImports": true,
+    "isolatedModules": true,
+    "strict": true
+  },
+  "include": ["vite.config.ts"]
+}

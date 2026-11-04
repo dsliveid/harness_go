@@ -27,5 +27,31 @@ export default defineConfig({
   },
   // emptyOutDir: false —— dist 内含 .gitkeep 占位文件（git 只跟踪该文件，产物本身不入库），
   // 默认的清空行为会把它删掉，导致干净检出后 //go:embed all:dist 找不到目录而编译失败
-  build: { outDir: 'dist', emptyOutDir: false, sourcemap: false },
+  build: {
+    outDir: 'dist',
+    emptyOutDir: false,
+    sourcemap: false,
+    // P3：主 chunk 曾达 542.69 kB（> vite 默认 500 kB 告警线）。
+    // 按依赖职责手工分包：React 运行时变更频率最低、可长期命中浏览器缓存；
+    // zustand / 图标 / 虚拟列表各自独立，避免任一升级导致整包失效。
+    rollupOptions: {
+      output: {
+        manualChunks(id: string) {
+          if (!id.includes('node_modules')) return
+          // React 运行时（含 scheduler 与 jsx-runtime，三者必须同组，否则出现跨 chunk 循环引用告警）
+          if (
+            id.includes('/react-dom/') ||
+            id.includes('/react/') ||
+            id.includes('/scheduler/')
+          ) {
+            return 'vendor-react'
+          }
+          if (id.includes('/zustand/')) return 'vendor-state'
+          if (id.includes('/lucide-react/')) return 'vendor-icons'
+          if (id.includes('/@tanstack/')) return 'vendor-virtual'
+          return 'vendor-misc'
+        },
+      },
+    },
+  },
 })
