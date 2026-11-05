@@ -15,8 +15,6 @@
  * 本模块不依赖任何 store，未被注册时安全退回兜底窗口。
  */
 
-/** 智能压缩触发比例（与桌面端一致：达到 75% 需人工确认） */
-export const COMPACTION_RATIO = 0.75
 /** 未匹配到模型时的兜底上下文窗口（默认 1M）；也是后端未提供 per-model 窗口时的口径值 */
 export const DEFAULT_CONTEXT_LIMIT = 1000000
 
