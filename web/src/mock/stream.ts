@@ -193,14 +193,14 @@ export function startMockRun(opts: {
       // 步骤 1：建计划 + 更新任务清单
       await streamText(TEXTS.plan[0])
       const planCall: ToolCall = {
-        id: `tc-${Date.now()}`, name: 'create_plan', risk: 'write', status: 'running',
+        id: `tc-${Date.now()}`, name: 'plan_set', risk: 'write', status: 'running',
         args: { title: '插件注册表热加载改造', steps: 4 },
       }
       emit({ type: 'tool_start', call: planCall })
       await sleep(360)
-      emit({ type: 'tool_result', callId: planCall.id, result: '已创建计划（4 步）', durationMs: 355 })
+      emit({ type: 'tool_result', callId: planCall.id, result: '已登记执行计划（4 步）', durationMs: 355 })
       const todoCall: ToolCall = {
-        id: `tc-${Date.now() + 1}`, name: 'todo', risk: 'readonly', status: 'running',
+        id: `tc-${Date.now() + 1}`, name: 'todo_write', risk: 'write', status: 'running',
         args: { items: 4 },
       }
       emit({ type: 'tool_start', call: todoCall })

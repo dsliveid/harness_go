@@ -440,37 +440,12 @@ export interface MemoryItem {
   updatedAt: number
 }
 
-// ============ 上下文压缩 ============
-export type CompactionStrategy = 'semantic' | 'summary_only' | 'truncate'
-
-/** 待确认的压缩请求（达到阈值或用户手动触发） */
-export interface CompactionPending {
-  sessionId: string
-  beforeTokens: number
-  limit: number
-  threshold: number
-  /** 预计丢弃的轮次数 */
-  droppedTurns: number
-  /** 预计保留的最近轮次数 */
-  keptTurns: number
-  /** 触发来源：自动（达阈值） | 手动 */
-  trigger: 'auto' | 'manual'
-}
-
-/** 一次已完成压缩的记录（压缩历史 + 摘要展示） */
-export interface CompactionRecord {
-  id: string
-  sessionId: string
-  createdAt: number
-  beforeTokens: number
-  afterTokens: number
-  freedTokens: number
-  droppedTurns: number
-  keptTurns: number
-  strategy: CompactionStrategy
-  summary: string
-  trigger: 'auto' | 'manual'
-}
+// ============ 上下文压缩（已下线） ============
+// 说明：配套的 CompactionStrategy / CompactionPending / CompactionRecord 三个类型已随
+// 「智能压缩」功能一并移除。原因：后端全仓（internal/）无任何压缩器、无 compaction_records 表、
+// 无压缩接口，前端原有实现是纯前端计数 + 摘要模板拼接，服务端不产生任何效果（静默失败）。
+// 按「能力不存在就下线，绝不保留假开关」的诚实边界原则整体摘除，勿在未实装后端能力前复活。
+// ContextGauge 的 tokensIn / tokensOut / cachedTokens 等真实 usage 指标不受影响，继续展示。
 
 // ============ 数据权限（项目级策略 + 审批） ============
 /** 数据范围：工作区外路径 / 会话导出 / 数据库查询 / 外部外发 */

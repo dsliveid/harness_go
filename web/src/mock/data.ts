@@ -1,4 +1,4 @@
-import type {
+﻿import type {
   ApprovalRule, CommandRun, DataScopeGrant, DeviceNode, ExtensionItem, FileDiff, McpServer, MemoryItem,
   Message, PlanDoc, Plugin, Project, ProjectLink, Provider, RegistryItem, ScheduledTask, Session,
   Skill, Snapshot, Subagent, TodoItem, Workspace,
@@ -183,12 +183,12 @@ export const messages: Message[] = [
     content: '已创建计划并登记待办：',
     toolCalls: [
       {
-        id: 'tc4', name: 'create_plan', risk: 'write', status: 'ok', durationMs: 25,
+        id: 'tc4', name: 'plan_set', risk: 'write', status: 'ok', durationMs: 25,
         args: { title: '插件注册表热加载改造', steps: 4 },
-        result: '已创建 .harness/plans/plugin-registry-hot-reload.md（4 步）',
+        result: '已登记执行计划「插件注册表热加载改造」（4 步）',
       },
       {
-        id: 'tc5', name: 'todo', risk: 'readonly', status: 'ok', durationMs: 6,
+        id: 'tc5', name: 'todo_write', risk: 'write', status: 'ok', durationMs: 6,
         args: { items: 4 },
         result: '任务清单已更新（4 项）',
       },
@@ -261,18 +261,18 @@ export const todos: TodoItem[] = [
 export const plugins: Plugin[] = [
   { id: 'fs', name: '文件操作', kind: 'builtin', description: '工作区文件读写、检索与结构大纲', version: '1.0.0', state: 'enabled', requires: ['fs_read', 'fs_write'], tools: ['read_file', 'list_dir', 'file_outline', 'write_file', 'edit_file', 'glob', 'grep'], riskCeiling: 'write', defaultEnabled: true, calls: 128, failures: 0, phase: 'M2' },
   { id: 'command', name: '命令执行', kind: 'builtin', description: 'Shell 命令执行，流式输出与进程树终止', version: '1.0.0', state: 'enabled', requires: ['fs_write'], tools: ['run_command'], riskCeiling: 'danger', defaultEnabled: true, calls: 34, failures: 1, phase: 'M2' },
-  { id: 'web-fetch', name: '网页抓取', kind: 'builtin', description: '抓取网页并转纯文本', version: '1.0.0', state: 'enabled', requires: ['net'], tools: ['fetch_web_page'], riskCeiling: 'readonly', defaultEnabled: true, calls: 7, failures: 0, phase: 'M2' },
-  { id: 'todo', name: '任务清单', kind: 'builtin', description: '维护任务清单并在 UI 呈现', version: '1.0.0', state: 'enabled', requires: [], tools: ['todo'], riskCeiling: 'readonly', defaultEnabled: true, calls: 22, failures: 0, phase: 'M2' },
-  { id: 'plan', name: '计划管理', kind: 'builtin', description: '物理计划文档 + 看板投影', version: '1.0.0', state: 'enabled', requires: ['fs_write'], tools: ['create_plan', 'update_plan', 'switch_plan', 'read_plan', 'list_plans'], riskCeiling: 'write', defaultEnabled: true, calls: 41, failures: 0, phase: 'M2' },
-  { id: 'decision', name: '决策工具', kind: 'builtin', description: 'judge / choice / score 决策模型调用', version: '1.0.0', state: 'enabled', requires: ['model:decision'], tools: ['judge_decision', 'choice_decision', 'score_decision'], riskCeiling: 'readonly', defaultEnabled: false, calls: 12, failures: 0, phase: 'M2' },
-  { id: 'memory', name: '长期记忆', kind: 'builtin', description: '项目记忆读写（profile/conventions/digest）', version: '1.0.0', state: 'enabled', requires: ['fs_write'], tools: ['record_memory', 'read_memory'], riskCeiling: 'write', defaultEnabled: true, calls: 9, failures: 0, phase: 'M3' },
-  { id: 'skill', name: '技能库', kind: 'builtin', description: '技能保存、列举与执行', version: '1.0.0', state: 'enabled', requires: ['fs_read', 'fs_write'], tools: ['list_skills', 'save_skill', 'run_skill'], riskCeiling: 'write', defaultEnabled: true, calls: 5, failures: 0, phase: 'M3' },
-  { id: 'image', name: '多模态', kind: 'builtin', description: '图片生成与视觉识别', version: '1.0.0', state: 'degraded', requires: ['model:vision', 'model:image', 'fs_write'], missing: ['model:image 未配置'], tools: ['generate_image', 'recognize_image'], riskCeiling: 'write', defaultEnabled: false, calls: 3, failures: 3, phase: 'M3' },
-  { id: 'browser', name: '浏览器自动化', kind: 'builtin', description: '无头 Chromium 导航、交互、截图', version: '1.0.0', state: 'unavailable', requires: ['chromium', 'net'], missing: ['未检测到 Chromium（可改用 Playwright MCP）'], tools: ['browser_navigate', 'browser_interact', 'browser_scroll', 'browser_screenshot', 'browser_get_debug_state', 'browser_close'], riskCeiling: 'write', defaultEnabled: false, phase: 'M3' },
-  { id: 'subagent', name: '子 Agent', kind: 'builtin', description: '派生、等待、停止子 Agent 与子进程', version: '1.0.0', state: 'enabled', requires: [], tools: ['spawn_subagent', 'wait_subagents', 'get_subagent_status', 'stop_subagent', 'spawn_subprocess', 'wait_subprocesses', 'stop_subprocess', 'resume_subprocess'], riskCeiling: 'write', defaultEnabled: true, calls: 18, failures: 0, phase: 'M3' },
-  { id: 'collaborator', name: '协作器', kind: 'builtin', description: '常驻角色会话与增量汇报', version: '1.0.0', state: 'disabled', requires: [], tools: ['dispatch_collaborator', 'wait_collaborators', 'get_collaborators'], riskCeiling: 'write', defaultEnabled: false, calls: 2, failures: 0, phase: 'M3' },
+  { id: 'web-fetch', name: '网页抓取', kind: 'builtin', description: '抓取网页并转纯文本', version: '1.0.0', state: 'enabled', requires: ['net'], tools: ['web_fetch'], riskCeiling: 'readonly', defaultEnabled: true, calls: 7, failures: 0, phase: 'M2' },
+  { id: 'todo', name: '任务清单', kind: 'builtin', description: '维护任务清单并在 UI 呈现', version: '1.0.0', state: 'enabled', requires: [], tools: ['todo_write', 'todo_read'], riskCeiling: 'write', defaultEnabled: true, calls: 22, failures: 0, phase: 'M2' },
+  { id: 'plan', name: '计划管理', kind: 'builtin', description: '维护结构化执行计划（标题 + 步骤完成状态）', version: '1.0.0', state: 'enabled', requires: [], tools: ['plan_set', 'plan_get'], riskCeiling: 'write', defaultEnabled: true, calls: 41, failures: 0, phase: 'M2' },
+  { id: 'decision', name: '决策工具', kind: 'builtin', description: '关键决策记录与历史列举（不含模型打分/判优）', version: '1.0.0', state: 'enabled', requires: [], tools: ['decision_record', 'decision_list'], riskCeiling: 'write', defaultEnabled: false, calls: 12, failures: 0, phase: 'M2' },
+  { id: 'memory', name: '长期记忆', kind: 'builtin', description: '记忆写侧：结论沉淀到 .harness/memory/（core/notes/archive 三层）', version: '1.0.0', state: 'enabled', requires: ['fs_write'], tools: ['memory_write', 'memory_list'], riskCeiling: 'write', defaultEnabled: true, calls: 9, failures: 0, phase: 'M3' },
+  { id: 'skill', name: '技能库', kind: 'builtin', description: '技能列举、读取与沉淀（不含技能脚本执行）', version: '1.0.0', state: 'enabled', requires: ['fs_read', 'fs_write'], tools: ['skill_list', 'skill_read', 'skill_save'], riskCeiling: 'write', defaultEnabled: true, calls: 5, failures: 0, phase: 'M3' },
+  { id: 'image', name: '图片', kind: 'builtin', description: '图片落盘校验与元信息读取；不提供图像生成与像素识别', version: '1.0.0', state: 'enabled', requires: ['fs_write'], tools: ['save_image', 'read_image_meta'], riskCeiling: 'write', defaultEnabled: false, calls: 3, failures: 0, phase: 'M3' },
+  { id: 'browser', name: '浏览器', kind: 'builtin', description: '无头 Chromium 打开 URL 并提取渲染后文本快照', version: '1.0.0', state: 'unavailable', requires: ['chromium'], missing: ['未检测到 Chromium（可改用 Playwright MCP）'], tools: ['browser_probe', 'browser_text'], riskCeiling: 'readonly', defaultEnabled: false, phase: 'M3' },
+  { id: 'subagent', name: '子 Agent', kind: 'builtin', description: '派生子代理执行独立子任务并阻塞等待终态（深度上限 2，禁递归）', version: '1.0.0', state: 'enabled', requires: ['llm'], tools: ['spawn_subagent'], riskCeiling: 'write', defaultEnabled: true, calls: 18, failures: 0, phase: 'M3' },
+  { id: 'collaborator', name: '协作者', kind: 'builtin', description: '向常驻角色发起单次征询（无批量派发 / 等待 / 列举）', version: '1.0.0', state: 'disabled', requires: ['llm'], tools: ['ask_collaborator'], riskCeiling: 'write', defaultEnabled: false, calls: 2, failures: 0, phase: 'M3' },
   { id: 'session-bundle', name: '会话打包', kind: 'builtin', description: '会话与产物导出/导入（数据面板「导出会话包」即其入口）', version: '1.0.0', state: 'enabled', requires: ['fs_read', 'fs_write'], tools: ['export_session', 'import_session'], riskCeiling: 'write', defaultEnabled: true, phase: 'M4' },
-  { id: 'sop', name: 'SOP', kind: 'builtin', description: '项目级标准作业流程（设置 → Agent SOP 为其开关面）', version: '1.0.0', state: 'disabled', requires: ['fs_read', 'fs_write'], tools: ['run_workspace_sop'], riskCeiling: 'write', defaultEnabled: false, phase: 'M4' },
+  { id: 'sop', name: 'SOP', kind: 'builtin', description: '项目级 SOP（Markdown 流程规范，落盘 .harness/sop/ 并全量注入系统提示）', version: '1.0.0', state: 'disabled', requires: ['fs_read', 'fs_write'], tools: ['list_sops', 'save_sop'], riskCeiling: 'write', defaultEnabled: false, phase: 'M4' },
 ]
 
 // ---------------- MCP ----------------
@@ -307,11 +307,9 @@ export const mcpServers: McpServer[] = [
     id: 'mcp-playwright', name: 'playwright', origin: 'installed', transport: 'stdio', command: 'npx -y @playwright/mcp@latest',
     enabled: false, state: 'disabled', calls: 0, failures: 0,
     platforms: { windows: true, linux: true, mobile: false },
-    tools: [
-      { name: 'browser_navigate', description: '打开网页', risk: 'write' },
-      { name: 'browser_click', description: '点击元素', risk: 'write' },
-      { name: 'browser_snapshot', description: '页面快照', risk: 'readonly' },
-    ],
+    // 未连接（enabled=false）：外部 MCP Server 的工具清单须由握手（tools/list）返回，
+    // 不得在此预写外部工具名——否则 real 模式会把它们误认成服务端已具备的能力。
+    tools: [],
   },
   {
     id: 'mcp-repo-graph', name: 'repo-graph', origin: 'extended', transport: 'stdio', command: 'node .harness/extensions/repo-graph/server.js',
@@ -342,7 +340,7 @@ export const registryItems: RegistryItem[] = [
 // platforms：技能支持的客户端平台（脚本执行类仅 PC 端）
 export const skills: Skill[] = [
   { id: 'sk-builtin-web-test', name: 'web-autonomous-test', description: '无头浏览器语义测试与异常自愈（内置 SOP）', source: 'local', origin: 'builtin', updatedAt: now - 30 * min, platforms: { windows: true, linux: true, mobile: false } },
-  { id: 'sk-builtin-plan', name: 'plan-first-workflow', description: '大改动计划先行：create_plan → 自动推进 → 验收门禁', source: 'local', origin: 'builtin', updatedAt: now - 45 * min, platforms: { windows: true, linux: true, mobile: true } },
+  { id: 'sk-builtin-plan', name: 'plan-first-workflow', description: '大改动计划先行：写好计划文档 → plan_set 登记步骤 → 自动推进 → 验收门禁', source: 'local', origin: 'builtin', updatedAt: now - 45 * min, platforms: { windows: true, linux: true, mobile: true } },
   { id: 'sk1', name: 'build-check', description: '构建与静态检查流水线', source: 'local', origin: 'installed', updatedAt: now - 2 * hour, script: 'npm run build && go vet ./...', platforms: { windows: true, linux: true, mobile: false } },
   { id: 'sk2', name: 'code-review-skill', description: '代码审查流程与检查清单', source: 'registry', origin: 'installed', updatedAt: now - 26 * hour, platforms: { windows: true, linux: true, mobile: true } },
   { id: 'sk3', name: 'release-notes', description: '根据提交记录生成发布说明', source: 'local', origin: 'installed', updatedAt: now - 3 * 24 * hour, platforms: { windows: true, linux: true, mobile: true } },
@@ -439,27 +437,27 @@ export const extensions: ExtensionItem[] = [
 export const devices: DeviceNode[] = [
   {
     id: 'client-win', name: '桌面端 · Windows', platform: 'desktop', os: 'windows', online: true, self: true,
-    installed: ['read_file', 'write_file', 'edit_file', 'run_command', 'fetch_web_page', 'mcp:filesystem', 'skill:build-check', 'reg:reg-pdf'],
+    installed: ['read_file', 'write_file', 'edit_file', 'run_command', 'web_fetch', 'mcp:filesystem', 'skill:build-check', 'reg:reg-pdf'],
     installing: [], lastSyncAt: now - 2 * min,
   },
   {
     id: 'client-linux', name: '桌面端 · Linux', platform: 'desktop', os: 'linux', online: true,
-    installed: ['read_file', 'list_dir', 'grep', 'run_command', 'record_memory', 'mcp:repo-graph'],
+    installed: ['read_file', 'list_dir', 'grep', 'run_command', 'memory_write', 'mcp:repo-graph'],
     installing: [], lastSyncAt: now - 18 * min,
   },
   {
     id: 'client-ios', name: '移动端 · iOS', platform: 'mobile', os: 'ios', online: true,
-    installed: ['read_file', 'fetch_web_page', 'skill:web-autonomous-test'],
+    installed: ['read_file', 'web_fetch', 'skill:web-autonomous-test'],
     installing: [], lastSyncAt: now - 3 * hour,
   },
   {
     id: 'client-android', name: '移动端 · Android', platform: 'mobile', os: 'android', online: false,
-    installed: ['read_file', 'todo'],
+    installed: ['read_file', 'todo_write'],
     installing: [], lastSyncAt: now - 3 * 24 * hour,
   },
   {
     id: 'dev-server', name: 'Web 服务端', platform: 'server', os: 'web', online: true,
-    installed: ['read_file', 'write_file', 'run_command', 'fetch_web_page', 'spawn_subagent'],
+    installed: ['read_file', 'write_file', 'run_command', 'web_fetch', 'spawn_subagent'],
     installing: [], lastSyncAt: now - 2 * min,
   },
 ]

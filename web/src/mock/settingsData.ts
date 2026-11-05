@@ -15,36 +15,27 @@ export const toolList: ToolInfo[] = [
   { group: 'file', name: 'write_file', title: '写入文件', risk: 'write', category: 'builtin', description: '新建文件或整体覆盖写入完整内容；仅用于新文件。' },
   { group: 'file', name: 'edit_file', title: '编辑文件', risk: 'write', category: 'builtin', description: '基于精确原文的最小化替换修改文件。' },
   { group: 'file', name: 'run_command', title: '执行命令', risk: 'danger', category: 'builtin', description: '在工作区目录执行 shell 命令（构建、测试、git 等），禁止破坏性命令。' },
-  // ---------- 网络与多模态 ----------
-  { group: 'net', name: 'fetch_web_page', title: '网页抓取', risk: 'readonly', category: 'builtin', description: '通过 HTTP/HTTPS 抓取网页并清洗为纯文本 / Markdown。' },
-  { group: 'net', name: 'generate_image', title: '图片生成', risk: 'write', category: 'builtin', description: '按提示词生成图片或图标并保存至本地，结果直接在界面渲染。' },
-  { group: 'net', name: 'recognize_image', title: '视觉识别', risk: 'readonly', category: 'builtin', description: '调用视觉模型识别、分析本地图片文件内容。' },
+  // ---------- 网络与图片 ----------
+  { group: 'net', name: 'web_fetch', title: '网页抓取', risk: 'readonly', category: 'builtin', description: '通过 HTTP/HTTPS 抓取网页并清洗为纯文本（私有网段默认拦截，正文上限 32KB）。' },
+  { group: 'net', name: 'save_image', title: '图片落盘', risk: 'write', category: 'builtin', description: '把 base64 图片数据写入工作区（PNG/JPEG/GIF/WebP 魔数校验，非法即拒）。' },
+  { group: 'net', name: 'read_image_meta', title: '图片元信息', risk: 'readonly', category: 'builtin', description: '读取工作区图片的格式 / 宽高 / 大小，不经像素识别。' },
   // ---------- 任务与计划 ----------
-  { group: 'plan', name: 'todo', title: '任务清单', risk: 'readonly', category: 'builtin', description: '维护多步任务清单，随进展更新各项状态。' },
-  { group: 'plan', name: 'create_plan', title: '计划管理', risk: 'write', category: 'builtin', description: '在 .harness/plans/ 建立结构化计划文档，作为权威执行锚点。' },
-  { group: 'plan', name: 'update_plan', title: '计划更新', risk: 'write', category: 'builtin', description: '需求变更或阶段推进时更新计划正文与分步状态。' },
-  { group: 'plan', name: 'switch_plan', title: '切换计划', risk: 'readonly', category: 'builtin', description: '在多个历史计划之间切换，将目标计划重新唤醒为当前活动计划。' },
-  { group: 'plan', name: 'read_plan', title: '读取计划', risk: 'readonly', category: 'builtin', description: '查阅指定计划或当前活动计划的完整方案文档正文。' },
-  { group: 'plan', name: 'list_plans', title: '计划清单', risk: 'readonly', category: 'builtin', description: '列出工作区已建立的全部任务计划及其推进状态与版本。' },
+  { group: 'plan', name: 'todo_write', title: '更新任务清单', risk: 'write', category: 'builtin', description: '整体覆写任务清单（每项含内容与状态 pending|in_progress|done）。' },
+  { group: 'plan', name: 'todo_read', title: '读取任务清单', risk: 'readonly', category: 'builtin', description: '读取当前任务清单。' },
+  { group: 'plan', name: 'plan_set', title: '设置执行计划', risk: 'write', category: 'builtin', description: '设置 / 更新执行计划（标题 + 步骤列表，步骤可标记完成）。' },
+  { group: 'plan', name: 'plan_get', title: '读取执行计划', risk: 'readonly', category: 'builtin', description: '读取当前执行计划。' },
   // ---------- 长期记忆 ----------
-  { group: 'memory', name: 'record_memory', title: '记录记忆', risk: 'write', category: 'builtin', description: '将技术栈、架构约定与阶段结论沉淀至项目知识库。' },
-  { group: 'memory', name: 'read_memory', title: '读取记忆', risk: 'readonly', category: 'builtin', description: '查阅项目已积累的技术大盘与主题碎记。' },
-  // ---------- 子 Agent 与子进程编排 ----------
-  { group: 'agent', name: 'spawn_subagent', title: '派生子 Agent', risk: 'readonly', category: 'builtin', description: '创建独立上下文的子 Agent 并行协作开发，避免污染主会话。' },
-  { group: 'agent', name: 'get_subagent_status', title: '子 Agent 状态', risk: 'readonly', category: 'builtin', description: '查询子 Agent 进程的执行状态与最新进展输出摘要。' },
-  { group: 'agent', name: 'wait_subagents', title: '等待子 Agent', risk: 'readonly', category: 'builtin', description: '等待子 Agent 执行完毕并汇总其结论与改动文件清单。' },
-  { group: 'agent', name: 'stop_subagent', title: '停止子 Agent', risk: 'write', category: 'builtin', description: '停止正在运行的子 Agent 协作进程。' },
-  { group: 'agent', name: 'spawn_subprocess', title: '派生子进程', risk: 'readonly', category: 'builtin', description: '创建临时子进程执行聚焦的探索、排查或独立测试任务。' },
-  { group: 'agent', name: 'wait_subprocesses', title: '等待子进程', risk: 'readonly', category: 'builtin', description: '等待临时子进程执行完毕并汇总其结论与改动文件清单。' },
-  { group: 'agent', name: 'stop_subprocess', title: '停止子进程', risk: 'write', category: 'builtin', description: '强制停止正在运行的临时子进程。' },
-  { group: 'agent', name: 'resume_subprocess', title: '恢复子进程', risk: 'write', category: 'builtin', description: '在已有断点处恢复推进被中断或失败的临时子进程。' },
-  // ---------- 决策模型 ----------
-  { group: 'decision', name: 'judge_decision', title: '决策判断', risk: 'readonly', category: 'builtin', description: '调用决策模型进行高精度二元判断。' },
-  { group: 'decision', name: 'choice_decision', title: '决策选择', risk: 'readonly', category: 'builtin', description: '在多个备选项中做出最优选择与分类。' },
-  { group: 'decision', name: 'score_decision', title: '决策评分', risk: 'readonly', category: 'builtin', description: '对意图理解与方案合理性做量化百分制评分与多维度质检。' },
-  { group: 'skill', name: 'list_skills', title: '查询技能库', risk: 'readonly', category: 'skill', description: '列出工作区 .harness/skills/ 下已定义的所有项目技能。' },
-  { group: 'skill', name: 'save_skill', title: '固化项目技能', risk: 'write', category: 'skill', description: '将高频或复杂的组合脚本固化为可重复调用的项目技能。' },
-  { group: 'skill', name: 'run_skill', title: '执行项目技能', risk: 'write', category: 'skill', description: '执行已固化的项目技能脚本并返回输出。' },
+  { group: 'memory', name: 'memory_write', title: '记录记忆', risk: 'write', category: 'builtin', description: '写入一条记忆（core / notes / archive 三层，启动时同步进检索索引）。' },
+  { group: 'memory', name: 'memory_list', title: '列出记忆', risk: 'readonly', category: 'builtin', description: '列出工作区 .harness/memory/ 下已沉淀的记忆文件。' },
+  // ---------- 子 Agent 与协作者 ----------
+  { group: 'agent', name: 'spawn_subagent', title: '派生子 Agent', risk: 'write', category: 'builtin', description: '派生子代理执行独立子任务并阻塞等待结果（深度上限 2，禁递归；同会话在途上限 4）。' },
+  { group: 'agent', name: 'ask_collaborator', title: '征询协作者', risk: 'write', category: 'builtin', description: '向指定常驻角色发起单次征询（无批量派发 / 等待 / 列举能力）。' },
+  // ---------- 决策记录 ----------
+  { group: 'decision', name: 'decision_record', title: '记录决策', risk: 'write', category: 'builtin', description: '记录一条关键决策。' },
+  { group: 'decision', name: 'decision_list', title: '决策历史', risk: 'readonly', category: 'builtin', description: '列出历史决策（最近在前，默认 20 条）。' },
+  { group: 'skill', name: 'skill_list', title: '查询技能库', risk: 'readonly', category: 'skill', description: '列出全部技能（名称 + 描述首行）。' },
+  { group: 'skill', name: 'skill_read', title: '读取技能', risk: 'readonly', category: 'skill', description: '读取技能全文（.harness/skills/<name>/SKILL.md 正文）。' },
+  { group: 'skill', name: 'skill_save', title: '沉淀技能', risk: 'write', category: 'skill', description: '沉淀 / 更新技能（写 .harness/skills/<name>/SKILL.md：标题行 + 正文步骤）。' },
 ]
 
 // ---------------- 系统内置工具的可安装性（供「插件市场 → 工具」展示与客户端自装） ----------------
@@ -53,12 +44,12 @@ export const toolList: ToolInfo[] = [
 // 纯服务端能力（如子 Agent / 子进程编排）标注不可安装，客户端仅通过 API 代理调用。
 export const toolInstallMeta: Record<ToolGroup, ToolInstallMeta> = {
   file: { installable: true, mode: '随包内置', deps: ['仅标准库'], note: '纯本地文件系统操作，随客户端包体发布，无需额外下载。', platforms: { windows: true, linux: true, mobile: true } },
-  net: { installable: true, mode: '按需下发', deps: ['network', 'model:vision'], note: '网页抓取随包内置；图片生成 / 视觉识别需客户端已配置对应模型能力。', platforms: { windows: true, linux: true, mobile: true } },
-  plan: { installable: true, mode: '随包内置', deps: ['fs_write'], note: '计划文档落本地 .harness/plans/，各端共用同一目录约定。', platforms: { windows: true, linux: true, mobile: true } },
+  net: { installable: true, mode: '按需下发', deps: ['network'], note: '网页抓取随包内置；图片工具只做落盘校验与元信息读取，不提供生成 / 像素识别（需图像模型槽位，provider 面暂无 capability 路由）。', platforms: { windows: true, linux: true, mobile: true } },
+  plan: { installable: true, mode: '随包内置', deps: ['fs_write'], note: '任务清单与执行计划状态落服务端 .harness/，各端共用同一状态源。', platforms: { windows: true, linux: true, mobile: true } },
   memory: { installable: true, mode: '随包内置', deps: ['fs_write'], note: '记忆落本地 .harness/memory/，多端通过同步协议合并，避免双写冲突。', platforms: { windows: true, linux: true, mobile: true } },
-  agent: { installable: false, mode: '不可安装', deps: [], note: '子 Agent / 子进程编排依赖服务端调度与并发信号量，任何客户端都不安装，仅通过 API 代理调用。', platforms: { windows: false, linux: false, mobile: false } },
-  decision: { installable: true, mode: '按需下发', deps: ['model:decision'], note: '决策工具是薄壳，客户端需配置决策模型后才可安装启用。', platforms: { windows: true, linux: true, mobile: true } },
-  skill: { installable: true, mode: '按需下发', deps: ['fs_read', 'fs_write'], note: '技能库三件套随包内置；具体技能按需安装到客户端 .harness/skills/。', platforms: { windows: true, linux: true, mobile: true } },
+  agent: { installable: false, mode: '不可安装', deps: [], note: '子 Agent / 协作者依赖服务端调度与并发信号量，任何客户端都不安装，仅通过 API 代理调用。', platforms: { windows: false, linux: false, mobile: false } },
+  decision: { installable: true, mode: '随包内置', deps: ['fs_write'], note: '决策记录与历史列举是本地落盘能力，不依赖决策模型槽位。', platforms: { windows: true, linux: true, mobile: true } },
+  skill: { installable: true, mode: '按需下发', deps: ['fs_read', 'fs_write'], note: '技能三件套随包内置；具体技能按需安装到客户端 .harness/skills/。', platforms: { windows: true, linux: true, mobile: true } },
 }
 
 /** 单工具覆盖（缺省沿用分组元信息）：平台差异集中在此声明，便于逐工具校准 */
@@ -78,11 +69,11 @@ export const toolInstallOverrides: Record<string, {
   // 写入类工具：PC 端全支持，移动端仅提供受限沙箱写入
   write_file: { platforms: { windows: true, linux: true, mobile: true }, note: '移动端写入受沙箱目录限制（仅工作区根内）。' },
   edit_file: { platforms: { windows: true, linux: true, mobile: true }, note: '移动端写入受沙箱目录限制（仅工作区根内）。' },
-  browser_navigate: { mode: '按需下发', deps: ['chromium'], platforms: { windows: true, linux: true, mobile: false }, note: '无头 Chromium 仅 PC 端可安装；移动端走服务端代理。' },
-  generate_image: { mode: '按需下发', deps: ['model:image'], platforms: { windows: true, linux: true, mobile: true }, note: '需客户端已配置生图模型。' },
-  recognize_image: { mode: '按需下发', deps: ['model:vision'], platforms: { windows: true, linux: true, mobile: true }, note: '需客户端已配置视觉模型。' },
-  run_skill: { platforms: { windows: true, linux: true, mobile: false }, note: '技能脚本执行（py/sh/ps1）在移动端不可用，仅可读取技能说明。' },
-  save_skill: { platforms: { windows: true, linux: true, mobile: false }, note: '技能固化需本地脚本运行时，移动端仅支持安装现成技能。' },
+  browser_probe: { mode: '按需下发', deps: ['chromium'], platforms: { windows: true, linux: true, mobile: false }, note: '探测本机无头浏览器能力；仅 PC 端可安装，移动端走服务端代理。' },
+  browser_text: { mode: '按需下发', deps: ['chromium'], platforms: { windows: true, linux: true, mobile: false }, note: '无头打开 URL 取渲染后文本快照（一期仅文本，不含点击/截图）；仅 PC 端可安装。' },
+  save_image: { mode: '按需下发', deps: ['fs_write'], platforms: { windows: true, linux: true, mobile: true }, note: '仅落盘校验（魔数 + 尺寸），不生成图片。' },
+  read_image_meta: { mode: '按需下发', deps: ['fs_read'], platforms: { windows: true, linux: true, mobile: true }, note: '只读元信息，不经像素识别。' },
+  skill_save: { platforms: { windows: true, linux: true, mobile: false }, note: '技能沉淀需本地文件写入与脚本运行时，移动端仅支持安装现成技能。' },
 }
 
 export function toolInstallInfo(name: string, group: ToolGroup): ToolInstallMeta {
@@ -106,7 +97,7 @@ export const agentSops: AgentSopInfo[] = [
     name: '方案先行与计划中枢规范',
     category: 'thinking',
     categoryLabel: '思考范式',
-    description: '面对大改动任务（3 个以上文件）或多轮需求，在 .harness/plans/ 自动建立结构化计划 MD 文档；需求变更时优先更新计划，后续严格根据计划分步执行，防止多轮需求失真与遗忘。',
+    description: '面对大改动任务（3 个以上文件）或多轮需求，先用 write_file 在 .harness/plans/ 落一份结构化计划 MD 文档，并用 plan_set 登记步骤状态；需求变更时优先更新计划，后续严格根据计划分步执行，防止多轮需求失真与遗忘。',
     disableEffect: '禁用后：Agent 接到任务后可直接编写代码，不强制在 .harness/plans/ 建立结构化方案文档。',
   },
   {
@@ -114,16 +105,16 @@ export const agentSops: AgentSopInfo[] = [
     name: '任务清单全生命周期规范',
     category: 'workflow',
     categoryLabel: '任务规划',
-    description: '接到多步任务时先用 todo 工具列出计划，并随进展更新各项状态；在执行完最后一步、给出最终回复前，务必调用 todo 工具将已完成任务的状态更新为 done，切勿遗留 in_progress 状态。',
-    disableEffect: '禁用后：允许 Agent 自由多步推进，不强制调用 todo 工具维护状态清单。',
+    description: '接到多步任务时先用 todo_write 列出计划，用 todo_read 查看当前清单，并随进展更新各项状态；在执行完最后一步、给出最终回复前，务必把已完成任务的状态更新为 done，切勿遗留 in_progress 状态。',
+    disableEffect: '禁用后：允许 Agent 自由多步推进，不强制调用 todo_write 维护状态清单。',
   },
   {
     id: 'subagent_orchestration',
-    name: '子进程协作与架构编排规范',
+    name: '子 Agent 协作与架构编排规范',
     category: 'orchestration',
     categoryLabel: '协同体系',
-    description: '面对复杂需求、多模块并发开发（如前后端分离、多业务模块并行）时，总架构师按标准流程（规划拆解 → 派生子 Agent → 等待汇聚 → 全局验收）采用子进程协同提升效率与模块隔离度。',
-    disableEffect: '禁用后：停用多子进程协作编排指引，Agent 倾向于在单主进程内串行处理全部任务。',
+    description: '面对复杂需求、多模块并发开发（如前后端分离、多业务模块并行）时，总架构师按标准流程（规划拆解 → 用 spawn_subagent 派生子 Agent → 阻塞等待汇聚 → 全局验收）采用子 Agent 协同提升效率与模块隔离度。',
+    disableEffect: '禁用后：停用多子 Agent 协作编排指引，Agent 倾向于在单主进程内串行处理全部任务。',
   },
   {
     id: 'surgical_code_reading',
@@ -146,8 +137,8 @@ export const agentSops: AgentSopInfo[] = [
     name: '边读边记与认知沉淀规范',
     category: 'memory',
     categoryLabel: '知识资产',
-    description: '内置工作区长期认知记忆（.harness/memory/）；常见技术栈提问优先秒级召回；深入探索或阅读多个文件后强制调用 record_memory 沉淀技术大盘与主题碎记。',
-    disableEffect: '禁用后：移除强制调用 record_memory 沉淀约束，且会话结束后不触发后台自动提炼。',
+    description: '内置工作区长期认知记忆（.harness/memory/）；常见技术栈提问优先秒级召回；深入探索或阅读多个文件后强制调用 memory_write 沉淀技术大盘与主题碎记（用 memory_list 查看已有条目）。',
+    disableEffect: '禁用后：移除强制调用 memory_write 沉淀约束，且会话结束后不触发后台自动提炼。',
   },
 ]
 

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   Bot, Terminal, FileText, FileCode2, Search, Wrench,
   ChevronDown, ChevronRight, Clock, ArrowRight, Download
@@ -38,9 +38,19 @@ function getToolIcon(name: string) {
 
 export function ToolCard({ call, onRevertHunk }: { call: ToolCall; onRevertHunk?: (hunkId: string) => void }) {
   const [open, setOpen] = useState(call.status === 'running' || call.status === 'pending')
+  // 实时输出折叠面板：默认展开，用户可收起
+  const [liveOpen, setLiveOpen] = useState(true)
   const risk = RISK[call.risk] || RISK.readonly
   const hasBody = Boolean(call.result || call.liveOutput || call.diff || Object.keys(call.args || {}).length)
   const { toast } = useUI()
+  // 实时输出容器：新 chunk 到达时自动滚底（用户手动上翻查看历史时不被强制拉回）
+  const liveRef = useRef<HTMLPreElement>(null)
+  useEffect(() => {
+    const el = liveRef.current
+    if (!el) return
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 48
+    if (nearBottom) el.scrollTop = el.scrollHeight
+  }, [call.liveOutput])
 
   const isSpawn = call.name === 'spawn_subagent' || call.name === 'spawn_subprocess'
   const { subagents } = useWorkspace()
@@ -165,11 +175,33 @@ export function ToolCard({ call, onRevertHunk }: { call: ToolCall; onRevertHunk?
           )}
 
           {/* 实时增量输出（tool.progress，200ms 节流推送）：命令执行中的流式回显；
-              终态后以 result 展示（completed 时 liveOutput 不再渲染） */}
+              终态后以 result 展示（completed 时 liveOutput 不再渲染）。
+              payload 只有 tool_event_id + chunk，无任何百分比/ETA 概念，此处如实只显示累计文本。 */}
           {call.status === 'running' && call.liveOutput && (
-            <pre className="text-[11.5px] leading-5 font-mono text-inkdim bg-panel p-2.5 rounded-lg max-h-48 overflow-auto whitespace-pre-wrap break-words">
-              {call.liveOutput}
-            </pre>
+            <div className="rounded-lg border border-edge/60 bg-panel overflow-hidden">
+              <div className="flex items-center justify-between px-2.5 py-1 bg-panel2/60 border-b border-edge/40">
+                <span className="inline-flex items-center gap-1 text-[10.5px] text-inkfaint font-mono">
+                  <Terminal size={10} className="text-accent2" />
+                  实时输出 · {call.liveOutput.length.toLocaleString('zh-CN')} 字符
+                </span>
+                <button
+                  type="button"
+                  className="text-[10.5px] text-inkfaint hover:text-ink transition-colors"
+                  onClick={() => setLiveOpen((v) => !v)}
+                  title={liveOpen ? '收起实时输出' : '展开实时输出'}
+                >
+                  {liveOpen ? '收起' : '展开'}
+                </button>
+              </div>
+              {liveOpen && (
+                <pre
+                  ref={liveRef}
+                  className="text-[11.5px] leading-5 font-mono text-inkdim bg-panel p-2.5 max-h-48 overflow-auto whitespace-pre-wrap break-words"
+                >
+                  {call.liveOutput}
+                </pre>
+              )}
+            </div>
           )}
         </div>
       )}

@@ -1,12 +1,11 @@
 import { create } from 'zustand'
 import type {
-  Approval, CompactionPending, CompactionRecord, CompactionStrategy, DataScope, Message, Run, ToolCall,
+  Approval, DataScope, Message, Run, ToolCall,
 } from '../types'
 import { longSessionMessages, messages as mockMessages } from '../mock/data'
 import { startMockRun, type Decision, type MockRunHandle, type StreamEvent } from '../mock/stream'
 import { api, apiMode, type RunHandle } from '../lib/api'
 import type { SseState as SseStateName, SseStateInfo } from '../lib/sse'
-import { COMPACTION_RATIO, resolveModelContext } from '../lib/context'
 import { DATA_SCOPE_LABEL } from '../lib/dataScopes'
 import { useSessions } from './sessionStore'
 import { useSse } from './sseStore'
@@ -44,16 +43,8 @@ interface ChatState {
   /** 会话累计缓存命中 tokens（加权命中率分母为 tokensIn） */
   cachedTokens: number
   lastError: string | null
-  // ---- 上下文压缩 ----
-  compactions: CompactionRecord[]
-  compactionPending: CompactionPending | null
-  /** 本会话内压缩累计释放的 tokens（从活跃上下文抵扣；累计消耗不变） */
-  compactionFreed: number
-  /** 「稍后再说」时的活跃水位，避免同一水位反复提示 */
-  compactionSnoozeAt: number
-  requestCompaction: (trigger?: 'auto' | 'manual') => void
-  confirmCompaction: (strategy: CompactionStrategy) => void
-  dismissCompaction: () => void
+  // 说明：上下文「智能压缩」交互链路已整体下线（后端无压缩器 / 无压缩记录表 / 无压缩接口，
+  // 保留入口即静默失败）。此处不再持有任何压缩状态与方法，真实 token 水位仅由 tokensIn/tokensOut/cachedTokens 承载。
   /** 推送一条数据权限审批（不阻塞 Run） */
   pushDataApproval: (input: { scope: DataScope; toolName: string; summary: string; args: Record<string, unknown> }) => void
   // 输入框草稿（供撤回 / 重新引用回填）
@@ -336,10 +327,6 @@ export const useChat = create<ChatState>((set, get) => {
     tokensOut: apiMode === 'mock' ? 1280 : 0,
     cachedTokens: apiMode === 'mock' ? 15980 : 0,
     lastError: null,
-    compactions: [],
-    compactionPending: null,
-    compactionFreed: 0,
-    compactionSnoozeAt: 0,
     draft: '',
 
     setDraft: (text) => set({ draft: text }),
@@ -607,88 +594,6 @@ export const useChat = create<ChatState>((set, get) => {
         return
       }
       useUI.getState().toast('success', '已删除该对话及后续内容')
-    },
-
-    // ---------------- 上下文压缩（确认 → 摘要 → 历史） ----------------
-    requestCompaction: (trigger = 'manual') => {
-      const st = get()
-      if (st.compactionPending) return
-      const sessions = useSessions.getState()
-      const session = sessions.sessions.find((x) => x.id === sessions.currentId)
-      const { limit } = resolveModelContext(session?.modelRef)
-      const active = Math.max(0, st.tokensIn + st.tokensOut - st.compactionFreed)
-      if (active <= 0) {
-        useUI.getState().toast('warn', '当前会话暂无可压缩的上下文')
-        return
-      }
-      // 自动触发时，同一水位已被「稍后再说」过就不再打扰（再涨 5% 才提醒）
-      if (trigger === 'auto' && st.compactionSnoozeAt > 0 && active < st.compactionSnoozeAt + limit * 0.05) return
-
-      const msgs = st.messages.filter((m) => m.sessionId === sessions.currentId && !m.reverted)
-      const turns = new Set(msgs.map((m) => m.turnSeq)).size
-      const keptTurns = 3
-      set({
-        compactionPending: {
-          sessionId: sessions.currentId,
-          beforeTokens: active,
-          limit,
-          threshold: Math.round(limit * COMPACTION_RATIO),
-          droppedTurns: Math.max(0, turns - keptTurns),
-          keptTurns,
-          trigger,
-        },
-      })
-    },
-
-    confirmCompaction: (strategy) => {
-      const p = get().compactionPending
-      if (!p) return
-      const keptTurns = strategy === 'semantic' ? p.keptTurns : strategy === 'summary_only' ? 1 : 0
-      const ratio = strategy === 'semantic' ? 0.42 : strategy === 'summary_only' ? 0.55 : 0.3
-      const after = Math.max(1200, Math.round(p.beforeTokens * ratio))
-      const freed = Math.max(0, p.beforeTokens - after)
-      const sessions = useSessions.getState()
-      const session = sessions.sessions.find((x) => x.id === p.sessionId)
-      const project = sessions.projects.find((x) => x.id === session?.projectId)
-      const droppedTurns = Math.max(p.droppedTurns, 1)
-      const strategyLabel =
-        strategy === 'semantic' ? '智能语义压缩' : strategy === 'summary_only' ? '仅保留摘要' : '截断最早轮次'
-      const summary = [
-        `【上下文摘要】${session?.title ?? '当前会话'}`,
-        `压缩策略：${strategyLabel}${strategy === 'truncate' ? '（未生成语义摘要，仅按轮次截断）' : ''}`,
-        `已折叠：${droppedTurns} 轮历史对话（含工具调用与 diff 明细）`,
-        `保留：最近 ${keptTurns} 轮完整消息 + 系统提示 + 项目约束 + 活跃计划`,
-        project?.constraints ? `项目约束：${project.constraints.split('\n')[0]}` : '项目约束：未设置',
-        '关键结论：M2 插件注册表已落地；审批闸门与快照链校验通过；待办 3 项待推进',
-      ].join('\n')
-
-      const record: CompactionRecord = {
-        id: `cp-${Date.now()}`,
-        sessionId: p.sessionId,
-        createdAt: Date.now(),
-        beforeTokens: p.beforeTokens,
-        afterTokens: after,
-        freedTokens: freed,
-        droppedTurns,
-        keptTurns,
-        strategy,
-        summary,
-        trigger: p.trigger,
-      }
-      set((s) => ({
-        compactions: [record, ...s.compactions],
-        compactionPending: null,
-        compactionFreed: s.compactionFreed + freed,
-        compactionSnoozeAt: 0,
-      }))
-      useUI.getState().toast('success', `上下文已压缩（${strategyLabel}）：释放 ${freed.toLocaleString('zh-CN')} tokens`)
-    },
-
-    dismissCompaction: () => {
-      const st = get()
-      const active = Math.max(0, st.tokensIn + st.tokensOut - st.compactionFreed)
-      set({ compactionPending: null, compactionSnoozeAt: active })
-      useUI.getState().toast('info', '已稍后处理：上下文再增长 5% 后会再次提醒')
     },
 
     // ---------------- 数据权限审批（独立于工具审批，不阻塞 Run） ----------------
