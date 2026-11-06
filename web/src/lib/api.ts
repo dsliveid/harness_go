@@ -39,6 +39,7 @@ import {
   type PairCodeDTO,
   type ProviderDTO,
   type ProviderInput,
+  type ProviderModelsInput,
   type ProviderModelsResult,
   type ProviderSecretResult,
   type ProviderTestInput,
@@ -72,7 +73,12 @@ export const API_MODE_STORAGE_KEY = 'harness.apiMode'
  * 解析当前数据模式：
  *   1. `VITE_API_MODE`（构建期注入，便于 CI/预览强制指定）
  *   2. `localStorage['harness.apiMode']`（运行期手动切换，便于对比 mock 基线）
- *   3. 默认：**开发态 mock**（可离线调 UI）/ **构建产物 real**（B-2 起接真实接口）
+ *   3. 默认：**一律 real**（dev 与构建产物同口径）。
+ *
+ * ⚠️ 默认值历史（2026-11 翻转）：dev 曾默认 mock，导致「用前端脚本启动 → 永远是 demo 页面」，
+ * 用户无法察觉自己看的是演示数据。现统一默认 real。
+ * 要演示数据没有脚本开关（web/run.sh 只服务正式前端），请改用原型入口 demo/run.sh（端口 5610），
+ * 或在控制台 `localStorage.setItem('harness.apiMode','mock')` 后刷新。
  */
 export function resolveApiMode(): ApiMode {
   const env = (import.meta as unknown as { env?: Record<string, string | boolean | undefined> }).env
@@ -84,8 +90,8 @@ export function resolveApiMode(): ApiMode {
   } catch {
     /* 工作于非浏览器环境（SSR/测试）时忽略 */
   }
-  // 生产构建默认 real：单二进制内嵌产物直连本机后端；dev 默认 mock 保留 demo 基线
-  return env?.DEV === true || env?.DEV === 'true' ? 'mock' : 'real'
+  // 默认 real：dev 与单二进制内嵌产物同口径，绝不默认给用户看演示数据
+  return 'real'
 }
 
 export const apiMode: ApiMode = resolveApiMode()
@@ -204,8 +210,8 @@ export interface ApiClient {
   deleteProvider(id: string): Promise<void>
   /** 连通测试：用该厂商发一次极小请求，返回延迟与错误码；入参可携带草稿未保存值（所见即所测） */
   testProvider(id: string, input?: ProviderTestInput): Promise<ProviderTestResult>
-  /** 获取上游真实模型清单（失败直接抛错，不回退本地兜底） */
-  listProviderModels(id: string): Promise<ProviderModelsResult>
+  /** 获取上游真实模型清单（失败直接抛错，不回退本地兜底）；入参可携带草稿未保存值 */
+  listProviderModels(id: string, input?: ProviderModelsInput): Promise<ProviderModelsResult>
   /** 读取厂商密钥明文（眼睛图标显示 / 复制） */
   revealProviderKey(id: string): Promise<ProviderSecretResult>
   // 配置 / 统计 / 日志（B-4）
@@ -1526,10 +1532,11 @@ export const realApi: ApiClient = {
       body: JSON.stringify(input),
     })
   },
-  async listProviderModels(id) {
+  async listProviderModels(id: string, input: ProviderModelsInput = {}) {
     return request<ProviderModelsResult>(API_PATHS.providerModels(id), {
-      method: 'GET',
+      method: 'POST',
       headers: authHeaders(),
+      body: JSON.stringify(input),
     })
   },
   async revealProviderKey(id) {

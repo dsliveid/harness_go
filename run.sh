@@ -1,15 +1,12 @@
 #!/usr/bin/env bash
 #
-# harness-go 启动脚本
+# harness-go 后端启动脚本（只起后端；前端热更新请用 web/run.sh）
 # 用法：./run.sh [选项] [-- 透传给二进制的参数...]   （Windows：run.cmd）
 #
 # 选项：
-#   --dev            开发模式：后端用 go run ./cmd/harness-go（改 Go 代码重启即生效，不产出二进制）
-#                    ⚠️ 前端**不会**热更新：web/dist 是编译期内嵌的，只有 npm run build 才更新。
-#                    本脚本会在「前端源码比 dist 新」时自动重建一次（--no-web-rebuild 跳过）；
-#                    要前端热更新请用 --web（vite dev server，接口经 proxy 转给后端）。
-#   --web            起前端 vite dev server（5612，dev 态默认 mock 数据；Ctrl+C 退出）
-#   --port N         监听端口（等价于 -addr 127.0.0.1:N，默认 8080）
+#   --dev            开发模式：用 go run ./cmd/harness-go（改 Go 代码后重启即生效，
+#                    不产出二进制）。注意：go run 不是热重载，改完仍需 Ctrl+C 重跑。
+#   --port N         监听端口（等价于 -addr 127.0.0.1:N，默认 5611）
 #   --data DIR       数据目录（等价于 -data DIR，默认 ./data）
 #   --config FILE    配置文件（等价于 -config FILE，默认 data/config.yaml）
 #   --open           服务就绪后自动打开浏览器
@@ -24,17 +21,31 @@
 #   ./run.sh --port 9000 -- -log-level debug -mode server
 #
 # 停止：Ctrl+C（脚本会把信号转发给子进程并等待其优雅退出）
+#
+# ⚠️ 关于前端热更新（这是本脚本**不**做的事）：
+#   web/dist 通过 //go:embed 在**编译期**打进二进制，Go 侧完全不感知它的变化。
+#   本脚本只在「前端源码比 web/dist 新」时**重建一次**再启动，属于冷更新。
+#   要真正的 HMR（改组件即时生效），请另开终端跑前端 dev server：
+#     终端 A：./run.sh --dev --port 5611
+#     终端 B：./web/run.sh                （vite，5612，proxy 转给 5611）
+#   详见 web/run.sh --help。
 
 set -uo pipefail
 
 # 无论从哪里调用，都先切到脚本所在目录（= 项目根）
-cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+
+# 公共库：say / warn / die / web_stale / ensure_web / harness_bin_path
+. "$ROOT/scripts/lib/common.sh"
 
 # ---------------------------------------------------------------------------
 # 参数解析
 # ---------------------------------------------------------------------------
-MODE="dev"          # run | dev | web
-PORT="5612"
+MODE="dev"          # run | dev
+PORT="5611"         # ⚠️ 必须与 web/vite.config.ts 的 proxy 默认 target 一致（5611），
+                    #    否则 ./run.sh 与 ./web/run.sh 两个终端互相连不上。
+                    #    5611 同时与 internal/config 的默认监听地址保持一致。
 DATA_DIR=""
 CONFIG_FILE=""
 DO_OPEN=""
@@ -50,7 +61,6 @@ need_val() { [ $# -ge 2 ] || { echo "错误：$1 需要参数值。" >&2; exit 2
 while [ $# -gt 0 ]; do
   case "$1" in
     --dev)      MODE="dev" ;;
-    --web)      MODE="web" ;;
     --port)     need_val "$@"; PORT="$2"; shift ;;
     --port=*)   PORT="${1#*=}" ;;
     --data)     need_val "$@"; DATA_DIR="$2"; shift ;;
@@ -63,8 +73,15 @@ while [ $# -gt 0 ]; do
     --dry-run)  DRY_RUN=1 ;;
     --no-health) NO_HEALTH=1 ;;
     --no-web-rebuild) NO_WEB_REBUILD=1 ;;
+    --web)
+      # 旧版 run.sh 的 --web 直接起 vite；现已拆到 web/run.sh，这里给出明确指引
+      echo "[错误] --web 已迁移到前端专属脚本，不再由本脚本处理。" >&2
+      echo "       请用：./web/run.sh    （Windows：web\\run.cmd）" >&2
+      echo "       本脚本现在只负责后端启动；前后端同时开发需开两个终端。" >&2
+      exit 2
+      ;;
     -h|--help)
-      sed -n '3,25p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '3,32p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     --)
@@ -80,10 +97,6 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-
-say()  { echo "==> $*"; }
-warn() { echo "[警告] $*" >&2; }
-die()  { echo "[错误] $*" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
 # 端口规整
@@ -109,7 +122,7 @@ done
 if [ -n "$PORT" ]; then
   ADDR="127.0.0.1:${PORT}"
 fi
-[ -n "$ADDR" ] || ADDR="127.0.0.1:8080"
+[ -n "$ADDR" ] || ADDR="127.0.0.1:5611"
 
 # 监听 "0.0.0.0" / "::" 时本机访问用 127.0.0.1
 URL_HOST="${ADDR%:*}"
@@ -153,38 +166,16 @@ wait_ready() {
   fi
   # 无 curl 时退化为 TCP 探活（只能证明端口在听，不能证明 HTTP 正常）
   local host="${url#*//}"; host="${host%%/*}"; host="${host%:*}"
-  local port="${url##*:}"
-  i=0
   while [ "$i" -lt "$tries" ]; do
-    if (exec 3<>"/dev/tcp/${host}/${port}") 2>/dev/null; then exec 3>&- 2>/dev/null; return 0; fi
+    if (exec 3<>"/dev/tcp/${host}/${URL_PORT}") 2>/dev/null; then
+      exec 3>&- 2>/dev/null || true
+      return 0
+    fi
     i=$((i + 1))
     sleep 0.25
   done
   return 1
 }
-
-# ---------------------------------------------------------------------------
-# --web：只起前端 vite dev server（前端源码热更新，接口经 dev proxy 转给后端）
-#
-# 注意：本模式**只启动前端**，后端需另行启动（默认跑在 8080，可用
-#       HARNESS_BACKEND=http://127.0.0.1:PORT 指定，vite.config.ts 会据此代理 /api 与 /healthz）。
-# ---------------------------------------------------------------------------
-if [ "$MODE" = "web" ]; then
-  command -v node >/dev/null 2>&1 || die "未找到 node，请先安装：https://nodejs.org"
-  command -v npm  >/dev/null 2>&1 || die "未找到 npm。"
-  [ -d web/node_modules ] || { say "安装前端依赖（npm install）..."; ( cd web && npm install ); }
-
-  say "启动前端开发服务器（vite，默认 http://127.0.0.1:5612，支持热更新）..."
-  say "接口会经 dev proxy 转发到后端 ${HARNESS_BACKEND:-http://127.0.0.1:8080}（可用 HARNESS_BACKEND 覆盖）。"
-  say "提示：dev 态默认 mock 数据；要连真实后端，浏览器控制台执行"
-  say "      localStorage.setItem('harness.apiMode','real') 后刷新。"
-  if [ -n "$DRY_RUN" ]; then
-    echo "    [dry-run] (cd web && npm run dev)"
-    exit 0
-  fi
-  ( cd web && exec npm run dev )
-  exit $?
-fi
 
 # ---------------------------------------------------------------------------
 # 组装二进制启动参数
@@ -204,100 +195,42 @@ if [ ${#PASSTHRU[@]} -gt 0 ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 前端产物（web/dist）新鲜度保障
-#
-# 痛点：web/dist 通过 //go:embed 在**编译期**打进二进制，Go 侧完全不感知它的变化。
-#       因此 `--dev`（go run）虽然后端改代码即生效，前端改了源码却**不会**生效：
-#       页面仍是上一次 npm run build 的产物，用户会误以为「前端没变化 / 代码没生效」。
-# 对策：只要 web/src 或 web/index.html 里有文件比 web/dist/index.html 新，
-#       就自动重建一次前端（可加 --no-web-rebuild 跳过）。
-#
-# 实现约束（踩过的坑）：**禁止使用外部 find / sort / head**。
-#   run.cmd 会把 %SystemRoot%\System32 前置到 PATH，而 Windows 自带同名工具：
-#     System32\find.exe 是「字符串查找」而非 GNU find → `-newer` 参数报错被吞、结果恒为空；
-#     System32\sort.exe 同样不支持 -u。混用会让新鲜度判断静默失效。
-#   故这里只用 bash 内建比较（[ a -nt b ]）与 glob，跨 Git Bash / MSYS 行为一致。
+# 前端产物：本脚本只做「判定 + 委托 web/build.sh」，不再内联任何 npm 逻辑。
+#   --no-web-rebuild → skip；其余情况按需（dist 缺失或源码更新才重建）
 # ---------------------------------------------------------------------------
-web_stale() {
-  [ -f web/dist/index.html ] || return 0   # 无产物 → 视为需要构建
-  local f hit=""
-  local prev_nullglob prev_globstar
-  prev_nullglob="$(shopt -p nullglob 2>/dev/null || true)"
-  prev_globstar="$(shopt -p globstar 2>/dev/null || true)"
-  shopt -s nullglob globstar 2>/dev/null || true
-  for f in web/src/**/*.ts web/src/**/*.tsx web/src/**/*.css web/src/**/*.json \
-           web/index.html web/vite.config.ts web/tailwind.config.js \
-           web/postcss.config.js web/package.json web/tsconfig.json; do
-    if [ "$f" -nt web/dist/index.html ]; then hit="$f"; break; fi
-  done
-  eval "${prev_nullglob:-shopt -u nullglob}" 2>/dev/null || true
-  eval "${prev_globstar:-shopt -u globstar}" 2>/dev/null || true
-  [ -n "$hit" ]
-}
-
-# 清理 index.html 不再引用的历史产物。原因：vite 配了 emptyOutDir:false（为保住 .gitkeep），
-# 旧 index-<hash>.js 不会自动删除，会被 //go:embed all:dist 全量打进二进制。
-prune_assets() {
-  local html="web/dist/index.html" f base content removed=0
-  [ -f "$html" ] && [ -d web/dist/assets ] || return 0
-  content="$(cat "$html")"
-  for f in web/dist/assets/*; do
-    [ -f "$f" ] || continue
-    base="${f##*/}"
-    case "$base" in .*) continue ;; esac
-    case "$content" in
-      *"$base"*) ;;
-      *) rm -f "$f"; removed=$((removed + 1)) ;;
-    esac
-  done
-  [ "$removed" -gt 0 ] && say "已清理 $removed 个历史前端产物（避免被 embed 打进二进制）。"
+ensure_web_for_run() {
+  if [ -n "$NO_WEB_REBUILD" ]; then
+    ensure_web skip || true
+    return 0
+  fi
+  ensure_web || warn "前端构建失败，继续使用旧产物启动（页面可能是旧版本 UI）。"
   return 0
 }
 
-ensure_web_fresh() {
-  [ -n "$NO_WEB_REBUILD" ] && return 0
-  command -v node >/dev/null 2>&1 || {
-    warn "未找到 node，跳过前端产物重建（页面将显示旧版本 UI）。"
-    return 0
-  }
-  web_stale || return 0
-  say "检测到前端源码比产物 web/dist 更新，重建前端（跳过请加 --no-web-rebuild）..."
-  [ -d web/node_modules ] || { say "安装前端依赖（npm install）..."; ( cd web && npm install ) || die "前端依赖安装失败。"; }
-  if ( cd web && npm run build ); then
-    prune_assets
-    say "前端产物已更新。"
-  else
-    warn "前端构建失败，继续使用旧产物启动（页面可能是旧版本 UI）。"
-  fi
-}
-
 # ---------------------------------------------------------------------------
-# dev 模式：go run（改动即生效）
+# dev 模式：go run（改动即生效，但需要重启进程）
 # ---------------------------------------------------------------------------
 if [ "$MODE" = "dev" ]; then
   command -v go >/dev/null 2>&1 || die "未找到 go，请先安装：https://go.dev/dl/"
   say "开发模式启动（go run ./cmd/harness-go ${ARGS[*]}）"
-  say "停止：Ctrl+C"
+  say "监听地址：${ADDR}    访问：${BASE_URL}"
+  say "停止：Ctrl+C（改 Go 代码后需重启；前端热更新请用 ./web/run.sh）"
   if [ -n "$DRY_RUN" ]; then
     echo "    [dry-run] go run ./cmd/harness-go ${ARGS[*]}"
     if web_stale && [ -z "$NO_WEB_REBUILD" ]; then
-      echo "    [dry-run] (cd web && npm run build)   # 前端源码比 web/dist 新，启动前会重建"
+      echo "    [dry-run] bash web/build.sh   # 前端源码比 web/dist 新，启动前会重建"
     fi
     exit 0
   fi
   # 前端产物是编译期内嵌的，dev 模式不会自动跟随源码变化，必须显式重建一次
-  ensure_web_fresh
-  go run ./cmd/harness-go "${ARGS[@]}"
-  exit $?
+  ensure_web_for_run
+  exec go run ./cmd/harness-go "${ARGS[@]}"
 fi
 
 # ---------------------------------------------------------------------------
 # 默认模式：单二进制
 # ---------------------------------------------------------------------------
-BIN="bin/harness-go"
-case "$(go env GOOS 2>/dev/null || echo unknown)" in
-  windows) BIN="bin/harness-go.exe" ;;
-esac
+BIN="$(harness_bin_path)"
 
 build_needed=""
 if [ -n "$REBUILD" ]; then
@@ -320,11 +253,11 @@ elif web_stale; then
 fi
 
 if [ -n "$build_needed" ]; then
-  [ -x ./build.sh ] || die "缺少 build.sh，无法自动构建。"
-  say "开始构建（前端有更新时 build.sh 会自动重建 web/dist）..."
+  [ -f ./build.sh ] || die "缺少 build.sh，无法自动构建。"
+  say "开始构建（需要时 build.sh 会委托 web/build.sh 重建前端）..."
   BUILD_ARGS=()
   if web_stale; then BUILD_ARGS+=(--web); fi
-  ./build.sh "${BUILD_ARGS[@]}" || die "构建失败，已中止启动。"
+  bash ./build.sh "${BUILD_ARGS[@]}" || die "构建失败，已中止启动。"
 fi
 
 echo

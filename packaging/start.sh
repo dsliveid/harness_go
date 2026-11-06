@@ -9,7 +9,7 @@
 #      browser when possible)
 #
 # Optional arguments are forwarded to the binary, for example:
-#   ./start.sh -addr 0.0.0.0:8080       expose to the local network
+#   ./start.sh -addr 0.0.0.0:5611       expose to the local network
 #   ./start.sh -log-level debug         verbose logging
 #   ./start.sh -config my.yaml          use a custom config file
 #
@@ -39,8 +39,8 @@ fi
 
 mkdir -p data
 
-# 解析监听地址（用于探测与打印访问 URL），与二进制默认值保持一致
-ADDR="127.0.0.1:8080"
+# 解析监听地址（用于探测与打印访问 URL），与二进制默认值保持一致（127.0.0.1:5611）
+ADDR="127.0.0.1:5611"
 prev=""
 for a in "$@"; do
   case "$prev" in

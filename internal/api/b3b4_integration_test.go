@@ -186,7 +186,7 @@ func TestProviderSecretAndModels(t *testing.T) {
 		Items []string `json:"items"`
 		Count int      `json:"count"`
 	}
-	doJSON(t, http.MethodGet, base+"/providers/"+created.ID+"/models", token, nil, http.StatusOK, &models)
+	doJSON(t, http.MethodPost, base+"/providers/"+created.ID+"/models", token, map[string]any{}, http.StatusOK, &models)
 	if models.Count != 2 || len(models.Items) != 2 {
 		t.Fatalf("期望 2 个上游模型，得到 %+v", models)
 	}
@@ -206,7 +206,18 @@ func TestProviderSecretAndModels(t *testing.T) {
 		"models":   []string{"m"},
 		"enabled":  true,
 	}, http.StatusCreated, &bad)
-	doJSON(t, http.MethodGet, base+"/providers/"+bad.ID+"/models", token, nil, http.StatusServiceUnavailable, nil)
+	doJSON(t, http.MethodPost, base+"/providers/"+bad.ID+"/models", token, map[string]any{}, http.StatusServiceUnavailable, nil)
+
+	// ④-2 未保存厂商（草稿 id）+ 草稿 base_url：可直接拉清单（回归：新厂商报「厂商不存在」）
+	var draftModels struct {
+		Items []string `json:"items"`
+		Count int      `json:"count"`
+	}
+	doJSON(t, http.MethodPost, base+"/providers/pv-unsaved-draft/models", token,
+		map[string]any{"base_url": upstream.URL}, http.StatusOK, &draftModels)
+	if draftModels.Count != 2 {
+		t.Fatalf("未保存厂商凭草稿 base_url 应拉到 2 个模型，得到 %+v", draftModels)
+	}
 
 	// ⑤ 未配置密钥的厂商：secret 回空串而非报错（前端据 has_key 置灰复制）
 	var noKey struct {
@@ -223,9 +234,9 @@ func TestProviderSecretAndModels(t *testing.T) {
 		t.Fatalf("未配置密钥时应回空串: %+v", secret)
 	}
 
-	// ⑥ 厂商不存在 → 404
+	// ⑥ 厂商不存在且无草稿 base_url → 404
 	doJSON(t, http.MethodGet, base+"/providers/nonexistent/secret", token, nil, http.StatusNotFound, nil)
-	doJSON(t, http.MethodGet, base+"/providers/nonexistent/models", token, nil, http.StatusNotFound, nil)
+	doJSON(t, http.MethodPost, base+"/providers/nonexistent/models", token, map[string]any{}, http.StatusNotFound, nil)
 }
 
 // providerGetHeader 取指定端点的 Cache-Control 头（用于断言密钥响应禁止缓存）。

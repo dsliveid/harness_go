@@ -25,7 +25,11 @@
 
 set -euo pipefail
 
-cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+
+# 公共库：say / warn / die / human_size / harness_versions / harness_ldflags / ensure_web
+. "$ROOT/scripts/lib/common.sh"
 
 # ---------------------------------------------------------------------------
 # 参数解析
@@ -57,10 +61,6 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$TARGETS" ] || { echo "错误：--targets 不能为空。" >&2; exit 2; }
-
-say()  { echo "==> $*"; }
-warn() { echo "[警告] $*" >&2; }
-die()  { echo "[错误] $*" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
 # 校验和（跨平台，统一输出 sha256sum 兼容格式 "<hex>  <文件名>"）
@@ -115,88 +115,28 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 2. 前端产物（内嵌进二进制的 UI）
+# 2. 前端产物（内嵌进二进制的 UI；唯一构建入口是 web/build.sh）
 # ---------------------------------------------------------------------------
-need_web=""
 if [ -n "$FORCE_WEB" ]; then
-  need_web=1
+  ensure_web force || die "前端构建失败，已中止（如要复用旧产物请加 --no-web）。"
 elif [ -n "$NO_WEB" ]; then
-  need_web=""
-elif [ ! -f web/dist/index.html ]; then
-  say "未发现前端产物 web/dist/index.html，将先构建前端。"
-  need_web=1
-fi
-
-if [ -n "$need_web" ]; then
-  command -v node >/dev/null 2>&1 || die "构建前端需要 Node.js，未找到 node：https://nodejs.org"
-  command -v npm  >/dev/null 2>&1 || die "构建前端需要 npm。"
-  [ -d web/node_modules ] || { say "安装前端依赖（npm install）..."; ( cd web && npm install ); }
-  say "构建前端产物（npm run build）..."
-  ( cd web && npm run build )
+  ensure_web skip
 else
-  if [ -f web/dist/index.html ]; then
-    say "复用已有前端产物（需要重建请加 --web）。"
-  else
-    warn "web/dist/index.html 不存在，打包产物将不含前端 UI（/ 显示提示页）。"
-  fi
+  # 按需：dist 缺失或前端源码更新时重建（源码比产物新同样要重建，否则包里是旧 UI）
+  ensure_web || die "前端构建失败，已中止（如要复用旧产物请加 --no-web）。"
 fi
-
-# 清掉不被当前 index.html 引用的历史产物：vite 配了 emptyOutDir:false，
-# 旧 index-<hash>.js 不会自动删除，会被 //go:embed all:dist 全量打进二进制。
-clean_stale_assets() {
-  local dist="web/dist" html="web/dist/index.html"
-  [ -f "$html" ] || return 0
-  [ -d "$dist/assets" ] || return 0
-
-  local keep removed=0 f base
-  keep="$(mktemp)"
-  grep -o 'assets/[A-Za-z0-9._-]*' "$html" 2>/dev/null | sed 's|assets/||' | sort -u >"$keep" || true
-
-  for f in "$dist"/assets/*; do
-    [ -f "$f" ] || continue
-    base="$(basename "$f")"
-    case "$base" in .*) continue ;; esac
-    if ! grep -qx -- "$base" "$keep"; then
-      rm -f "$f"
-      removed=$((removed + 1))
-    fi
-  done
-  rm -f "$keep"
-
-  [ "$removed" -gt 0 ] && say "已清理 $removed 个历史前端产物。"
-  return 0
-}
-clean_stale_assets
+if [ ! -f web/dist/index.html ]; then
+  warn "web/dist/index.html 不存在，打包产物将不含前端 UI（/ 显示提示页）。"
+fi
 
 # ---------------------------------------------------------------------------
-# 3. 版本信息（与 build.sh 同口径）
+# 3. 版本信息 + LDFLAGS（与 build.sh 同口径，统一由 common.sh 生成）
 # ---------------------------------------------------------------------------
-VERSION="${VERSION:-}"
-if [ -z "$VERSION" ]; then
-  if command -v git >/dev/null 2>&1; then
-    VERSION="$(git describe --tags --abbrev=0 2>/dev/null || true)"
-    VERSION="${VERSION#v}"
-  fi
-fi
-[ -n "$VERSION" ] || VERSION="0.1.0"
-
-COMMIT="none"
-if command -v git >/dev/null 2>&1; then
-  COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo none)"
-  if [ "$COMMIT" != "none" ] && [ -n "$(git status --porcelain 2>/dev/null || true)" ]; then
-    COMMIT="${COMMIT}-dirty"
-  fi
-fi
-
-BUILDAT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
-LDFLAGS="-X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildTime=${BUILDAT}"
-if [ -z "$DEBUG" ]; then
-  LDFLAGS="-s -w ${LDFLAGS}"
-  BUILD_PROFILE="release"
-else
-  BUILD_PROFILE="debug"
-fi
+harness_versions
+harness_ldflags "$DEBUG"
+VERSION="$HARNESS_VERSION"
+LDFLAGS="$HARNESS_LDFLAGS"
+BUILD_PROFILE="$HARNESS_PROFILE"
 
 # ---------------------------------------------------------------------------
 # 4. 逐目标交叉编译 + 组装分发包
@@ -210,7 +150,7 @@ rm -rf "$DIST"/harness-go-* "$DIST"/SHA256SUMS.txt "$DIST"/installer.nsi
 [ -f packaging/README.txt ] || die "缺少 packaging/README.txt（分发包说明模板）。"
 [ -f config.example.yaml ]  || die "缺少 config.example.yaml（分发包配置模板）。"
 
-say "开始打包（version: ${VERSION}, commit: ${COMMIT}, profile: ${BUILD_PROFILE}）"
+say "开始打包（version: ${HARNESS_VERSION}, commit: ${HARNESS_COMMIT}, profile: ${BUILD_PROFILE}）"
 say "目标平台：${TARGETS}"
 
 IFS=',' read -r -a target_list <<<"$TARGETS"

@@ -451,6 +451,15 @@ export interface ProviderModelsResult {
   count: number;
 }
 
+/**
+ * 获取模型列表入参（均可选）：携带草稿里「尚未保存」的当前值，实现所见即所测。
+ * 厂商未落库时 base_url 必填；api_key 仅本次请求使用，不落库、不进日志。
+ */
+export interface ProviderModelsInput {
+  base_url?: string;
+  api_key?: string;
+}
+
 /** 厂商密钥明文（眼睛图标显示 / 复制）；未配置时 api_key 为空串、has_key=false。 */
 export interface ProviderSecretResult {
   api_key: string;

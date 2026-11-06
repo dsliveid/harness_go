@@ -160,45 +160,64 @@ type ProviderTestInput struct {
 	Models  []string `json:"models"`
 }
 
+// resolveDraft 解析「本次操作用的厂商配置」：已落库取库值 + 草稿覆盖，未落库凭草稿临时构造。
+//
+// 这是 Test / ListModels 共用的覆盖语义（所见即所测）：前端把尚未保存的 base_url / api_key
+// 一并传来即可测试与拉取模型清单，全程不落库、密钥不进日志。
+// 未落库且草稿未给 base_url 时返回 CodeNotFound（此时确实无从发起请求）。
+func (s *ProviderService) resolveDraft(ctx context.Context, id, baseURL, apiKey string, models []string, modelsSet bool) (*model.Provider, string, error) {
+	p, err := s.main.Providers().Get(ctx, id)
+	switch {
+	case err == nil:
+		// 已落库：草稿里改过但未保存的字段以请求覆盖为准
+		if strings.TrimSpace(baseURL) != "" {
+			p.BaseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+		}
+		if modelsSet {
+			p.Models = models
+		}
+	case errors.Is(err, store.ErrNotFound) && strings.TrimSpace(baseURL) != "":
+		// 未落库厂商：凭草稿直接请求（所见即所测），不落库
+		p = &model.Provider{
+			ID:      id,
+			Name:    "未保存厂商",
+			BaseURL: strings.TrimRight(strings.TrimSpace(baseURL), "/"),
+			Models:  models,
+		}
+	default:
+		return nil, "", wrapStoreErr(err, apperr.CodeNotFound, "厂商不存在")
+	}
+
+	key := strings.TrimSpace(apiKey)
+	if key == "" {
+		if key, err = s.decryptKey(p); err != nil {
+			return nil, "", err
+		}
+	}
+	return p, key, nil
+}
+
 // Test 连通测试：用该厂商配置发一次极小 chat 请求，返回延迟与错误。
 //
 // 刻意不返回上游响应体（防泄漏配额/账号信息），只回错误码 + 简短原因。
 // 覆盖语义见 ProviderTestInput；测试本身不产生任何落库副作用。
 func (s *ProviderService) Test(ctx context.Context, id string, in ProviderTestInput) (ProviderTestResult, error) {
-	p, err := s.main.Providers().Get(ctx, id)
-	switch {
-	case err == nil:
-		// 已落库：草稿里改过但未保存的字段以请求覆盖为准
-		if strings.TrimSpace(in.BaseURL) != "" {
-			p.BaseURL = strings.TrimRight(strings.TrimSpace(in.BaseURL), "/")
-		}
-		if in.Models != nil {
-			p.Models = in.Models
-		}
-	case errors.Is(err, store.ErrNotFound) && strings.TrimSpace(in.BaseURL) != "":
-		// 未落库厂商：凭请求配置直接测（所见即所测），不落库
-		p = &model.Provider{
-			ID:      id,
-			Name:    "未保存厂商",
-			BaseURL: strings.TrimRight(strings.TrimSpace(in.BaseURL), "/"),
-			Models:  in.Models,
-		}
-	default:
-		return ProviderTestResult{}, wrapStoreErr(err, apperr.CodeNotFound, "厂商不存在")
+	p, key, err := s.resolveDraft(ctx, id, in.BaseURL, in.APIKey, in.Models, in.Models != nil)
+	if err != nil {
+		return ProviderTestResult{}, err
 	}
 
-	key := strings.TrimSpace(in.APIKey)
-	if key == "" {
-		if key, err = s.decryptKey(p); err != nil {
-			return ProviderTestResult{}, err
-		}
-	}
+	// 模型候选优先级：显式指定 > 草稿/库内首个模型。全空时给可操作提示（前端据此引导先取模型）。
 	name := strings.TrimSpace(in.Model)
 	if name == "" && len(p.Models) > 0 {
 		name = p.Models[0]
 	}
 	if name == "" {
-		return ProviderTestResult{Model: "", Code: "missing_model", Error: "厂商未配置可用模型"}, nil
+		return ProviderTestResult{
+			Model: "",
+			Code:  "missing_model",
+			Error: "尚未选择模型：请先点「获取模型列表」或手动添加模型 ID，再测试连接",
+		}, nil
 	}
 
 	prov, err := llm.NewOpenAICompat(llm.OpenAICompatConfig{
@@ -245,22 +264,27 @@ func (s *ProviderService) Test(ctx context.Context, id string, in ProviderTestIn
 	}, nil
 }
 
+// ProviderModelsInput 「获取模型列表」的草稿覆盖入参。
+//
+// 语义与 ProviderTestInput 完全一致：未保存的厂商也能拉清单，base_url/api_key 仅本次使用不落库。
+type ProviderModelsInput struct {
+	BaseURL string `json:"base_url"`
+	APIKey  string `json:"api_key"`
+}
+
 // ListModels 拉取该厂商在上游的真实模型清单（「获取模型列表」）。
 //
-// 与 Test 一样需要解密密钥；差异在于这里不发 chat 请求而是读模型目录。
+// 与 Test 一样需要密钥，且同样支持草稿覆盖（见 resolveDraft）：厂商尚未保存时
+// 前端传 base_url/api_key 即可直接拉取，不落库。
 // 上游全部候选失败时**原样上抛可读错误**（不返回任何本地兜底清单），
 // 让前端明确告知用户「未获取到模型 + 原因」，避免假成功。
-func (s *ProviderService) ListModels(ctx context.Context, id string) (ProviderModelsResult, error) {
-	p, err := s.main.Providers().Get(ctx, id)
+func (s *ProviderService) ListModels(ctx context.Context, id string, in ProviderModelsInput) (ProviderModelsResult, error) {
+	p, key, err := s.resolveDraft(ctx, id, in.BaseURL, in.APIKey, nil, false)
 	if err != nil {
-		return ProviderModelsResult{}, wrapStoreErr(err, apperr.CodeNotFound, "厂商不存在")
+		return ProviderModelsResult{}, err
 	}
 	if strings.TrimSpace(p.BaseURL) == "" {
-		return ProviderModelsResult{}, invalidArg("该厂商未配置 Base URL")
-	}
-	key, kErr := s.decryptKey(p)
-	if kErr != nil {
-		return ProviderModelsResult{}, kErr
+		return ProviderModelsResult{}, invalidArg("请先填写 Base URL（厂商地址），再获取模型列表")
 	}
 	prov, nErr := llm.NewOpenAICompat(llm.OpenAICompatConfig{
 		Name:       p.Name,

@@ -154,11 +154,31 @@ func (h *handlers) testProvider(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, res)
 }
 
-// listProviderModels 拉取上游真实模型清单：GET /api/v1/providers/{pid}/models
+// listProviderModels 拉取上游真实模型清单：POST /api/v1/providers/{pid}/models
 //
-// 失败时按上游原因返回可读错误（4xx/5xx），**不做本地目录兜底**。
+// 支持草稿覆盖（与 test 一致）：厂商尚未保存时传 base_url/api_key 即可直接拉取，
+// 仅本次请求使用、不落库。失败时按上游原因返回可读错误（4xx/5xx），**不做本地目录兜底**。
 func (h *handlers) listProviderModels(w http.ResponseWriter, r *http.Request) {
-	res, err := h.d.Providers.ListModels(r.Context(), r.PathValue("pid"))
+	var req providerTestReq
+	// 允许空 body（已保存厂商直接读库内配置）
+	if err := decodeJSON(r, &req); err != nil {
+		if !isBodyEmpty(err) {
+			writeError(w, r, err)
+			return
+		}
+		req = providerTestReq{}
+	}
+	// 兼容 query 传参（旧 GET 调用 / 命令行调试）
+	if v := strings.TrimSpace(r.URL.Query().Get("base_url")); v != "" && req.BaseURL == "" {
+		req.BaseURL = v
+	}
+	if v := strings.TrimSpace(r.URL.Query().Get("api_key")); v != "" && req.APIKey == "" {
+		req.APIKey = v
+	}
+	res, err := h.d.Providers.ListModels(r.Context(), r.PathValue("pid"), service.ProviderModelsInput{
+		BaseURL: req.BaseURL,
+		APIKey:  req.APIKey,
+	})
 	if err != nil {
 		writeError(w, r, err)
 		return

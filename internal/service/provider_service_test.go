@@ -106,4 +106,54 @@ func TestProviderTestDraftOverrides(t *testing.T) {
 	if res4.OK || res4.Code != "missing_model" {
 		t.Fatalf("期望 ok=false code=missing_model，得到 %+v", res4)
 	}
+	if res4.Error == "" {
+		t.Fatal("missing_model 应带可操作提示文案")
+	}
+}
+
+// TestProviderListModelsDraft 获取模型列表的草稿覆盖语义：
+//   - 未落库厂商 + 草稿 base_url：直接拉上游清单（回归：新厂商未保存报「厂商不存在」）；
+//   - 已落库厂商 + 草稿 base_url 覆盖：用草稿地址而非库内地址；
+//   - 未落库且无 base_url：404 类错误。
+func TestProviderListModelsDraft(t *testing.T) {
+	ctx := context.Background()
+	main, err := store.OpenMain(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("打开主库失败: %v", err)
+	}
+	t.Cleanup(func() { _ = main.Close() })
+	svc := NewProviderService(ProviderServiceOptions{Main: main})
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"id":"draft-1"},{"id":"draft-2"}]}`))
+	}))
+	t.Cleanup(upstream.Close)
+
+	// ① 未落库厂商：凭草稿 base_url 拉清单
+	res, err := svc.ListModels(ctx, "pv-unsaved", ProviderModelsInput{BaseURL: upstream.URL})
+	if err != nil {
+		t.Fatalf("未落库厂商带 base_url 应能拉清单: %v", err)
+	}
+	if res.Count != 2 || len(res.Items) != 2 {
+		t.Fatalf("期望 2 个模型，得到 %+v", res)
+	}
+
+	// ② 已落库厂商 + 草稿 base_url 覆盖：草稿地址生效（库内地址不可达）
+	saved, err := svc.Create(ctx, model.Provider{Name: "p", BaseURL: "http://127.0.0.1:1"})
+	if err != nil {
+		t.Fatalf("创建厂商失败: %v", err)
+	}
+	res2, err := svc.ListModels(ctx, saved.ID, ProviderModelsInput{BaseURL: upstream.URL})
+	if err != nil {
+		t.Fatalf("草稿 base_url 覆盖应成功: %v", err)
+	}
+	if res2.Count != 2 {
+		t.Fatalf("期望草稿地址拉到 2 个模型，得到 %+v", res2)
+	}
+
+	// ③ 未落库且无 base_url：404 类错误
+	if _, err := svc.ListModels(ctx, "pv-nowhere", ProviderModelsInput{}); err == nil {
+		t.Fatal("未落库且无 base_url 应返回 404 类错误")
+	}
 }

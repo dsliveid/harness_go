@@ -39,7 +39,7 @@ const (
 
 // ServerConfig HTTP 服务参数。
 type ServerConfig struct {
-	Addr          string `yaml:"addr"`            // 默认 127.0.0.1:8080
+	Addr          string `yaml:"addr"`            // 默认 127.0.0.1:5611
 	ReadTimeoutS  int    `yaml:"read_timeout_s"`  // 秒
 	WriteTimeoutS int    `yaml:"write_timeout_s"` // 秒（SSE 需为 0 或足够大）
 }
@@ -164,7 +164,7 @@ type Config struct {
 // Default 返回内置默认值（local 形态、本机监听）。
 func Default() Config {
 	return Config{
-		Server:     ServerConfig{Addr: "127.0.0.1:8080", ReadTimeoutS: 30, WriteTimeoutS: 0},
+		Server:     ServerConfig{Addr: "127.0.0.1:5611", ReadTimeoutS: 30, WriteTimeoutS: 0},
 		Deployment: DeploymentConfig{Mode: ModeLocal},
 		Data:       DataConfig{Dir: "./data"},
 		Auth: AuthConfig{

@@ -94,9 +94,7 @@ export function ModelSettingsSection() {
       const msg = e instanceof Error ? e.message : '网络异常'
       setTested((t) => ({ ...t, [p.id]: 'fail' }))
       setTestMsg((m) => ({ ...m, [p.id]: msg }))
-      // 新建厂商尚未落库（id 为本地临时值）时后端必 404，给出可操作提示
-      const hint = p.id.startsWith('pv-') ? '（该厂商尚未保存，请先点「应用」）' : ''
-      toast('error', `连接测试失败：${msg}${hint}`)
+      toast('error', `连接测试失败：${msg}`)
     }
   }
 
@@ -119,7 +117,11 @@ export function ModelSettingsSection() {
       return
     }
     try {
-      const res = await api.listProviderModels(p.id)
+      // 所见即所测：携带草稿里未保存的 Base URL / 刚输入的密钥，厂商未落库也能拉清单
+      const res = await api.listProviderModels(p.id, {
+        base_url: p.baseUrl,
+        ...(p.apiKeyMasked && p.apiKeyMasked !== PROVIDER_KEY_MASK ? { api_key: p.apiKeyMasked } : {}),
+      })
       const list = res.items ?? []
       setFetched((m) => ({ ...m, [p.id]: list }))
       setMenuOpen((o) => ({ ...o, [p.id]: true }))
@@ -129,8 +131,7 @@ export function ModelSettingsSection() {
       // 失败时清空本地缓存，避免残留上一次的清单被误当作本次结果
       setFetched((m) => ({ ...m, [p.id]: [] }))
       setMenuOpen((o) => ({ ...o, [p.id]: false }))
-      const hint = p.id.startsWith('pv-') ? '（该厂商尚未保存，请先点「应用」）' : ''
-      toast('error', `获取模型列表失败：${msg}${hint}`)
+      toast('error', `获取模型列表失败：${msg}`)
     } finally {
       setFetching((f) => ({ ...f, [p.id]: false }))
     }
@@ -230,7 +231,6 @@ export function ModelSettingsSection() {
         <div className="flex flex-col gap-2.5">
           {d.providers.map((p) => {
             const isExpanded = !!expanded[p.id]
-            const isDefault = d.defaultProviderId === p.id
             const list = fetched[p.id] ?? []
             const filterText = (modelFilter[p.id] ?? '').toLowerCase()
             const filtered = list.filter((m) => m.toLowerCase().includes(filterText))
@@ -246,8 +246,7 @@ export function ModelSettingsSection() {
                   </span>
                   <div className="flex items-center gap-2 min-w-0 flex-1">
                     <span className="text-[13px] font-semibold text-ink truncate max-w-[160px]">{p.name || '未命名厂商'}</span>
-                    {isDefault && <Badge tone="green">默认对话</Badge>}
-                    {!isDefault && <Badge tone={p.enabled ? 'blue' : 'gray'}>{p.enabled ? '已启用' : '已停用'}</Badge>}
+                    <Badge tone={p.enabled ? 'blue' : 'gray'}>{p.enabled ? '已启用' : '已停用'}</Badge>
                     {!isExpanded && (
                       <span className="text-[12px] text-inkdim truncate ml-1 min-w-0" title={p.baseUrl}>
                         {p.models.length > 0
@@ -326,26 +325,6 @@ export function ModelSettingsSection() {
                     <div className="flex items-center gap-2.5 flex-wrap pt-1">
                       <span className="text-[13px] text-ink font-medium">启用厂商</span>
                       <Switch checked={p.enabled} onChange={(v) => patch((cur) => updateProvider(cur, p.id, { enabled: v }))} />
-                      <span className="flex-1" />
-                      <Button size="sm" variant={isDefault ? 'soft' : 'outline'} title="设为默认对话厂商"
-                        onClick={() => { patch((cur) => ({ ...cur, defaultProviderId: p.id })); toast('success', `已将 ${p.name} 设为默认对话厂商`) }}>
-                        默认对话
-                      </Button>
-                      <Button size="sm" variant="outline" onClick={() => handleTest(p)}>
-                        {tested[p.id] === 'testing' ? '测试中…' : '连接测试'}
-                      </Button>
-                      {tested[p.id] === 'ok' && (
-                        <span className="text-ok text-[12px] flex items-center gap-1 font-medium" title={testMsg[p.id]}>
-                          <Check size={12} />
-                          <span>可用{testMsg[p.id] ? `（${testMsg[p.id]}）` : ''}</span>
-                        </span>
-                      )}
-                      {tested[p.id] === 'fail' && (
-                        <span className="text-err text-[12px] flex items-center gap-1 font-medium" title={testMsg[p.id]}>
-                          <X size={12} />
-                          <span className="max-w-[220px] truncate">不可用{testMsg[p.id] ? `：${testMsg[p.id]}` : ''}</span>
-                        </span>
-                      )}
                     </div>
 
                     {/* 模型列表（去掉 overflow-hidden，避免把「可用模型」下拉弹窗裁掉；圆角由内部贴边条补） */}
@@ -509,6 +488,28 @@ export function ModelSettingsSection() {
                           </div>
                         )}
                       </div>
+                    </div>
+
+                    {/* 连接测试：依赖模型，故置于模型列表下方（对齐桌面端布局） */}
+                    <div className="flex items-center gap-2.5 flex-wrap">
+                      <Button size="sm" variant="outline" onClick={() => handleTest(p)}>
+                        {tested[p.id] === 'testing' ? '测试中…' : '连接测试'}
+                      </Button>
+                      <span className="text-[11px] text-inkfaint">
+                        用该厂商的首个模型发一次极小请求，无需保存即可测试
+                      </span>
+                      {tested[p.id] === 'ok' && (
+                        <span className="text-ok text-[12px] flex items-center gap-1 font-medium" title={testMsg[p.id]}>
+                          <Check size={12} />
+                          <span>可用{testMsg[p.id] ? `（${testMsg[p.id]}）` : ''}</span>
+                        </span>
+                      )}
+                      {tested[p.id] === 'fail' && (
+                        <span className="text-err text-[12px] flex items-center gap-1 font-medium" title={testMsg[p.id]}>
+                          <X size={12} />
+                          <span className="max-w-[260px] truncate">不可用{testMsg[p.id] ? `：${testMsg[p.id]}` : ''}</span>
+                        </span>
+                      )}
                     </div>
                   </div>
                 )}

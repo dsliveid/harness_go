@@ -4,13 +4,18 @@ import react from '@vitejs/plugin-react'
 /**
  * 后端地址：`--web`（vite dev server）只负责前端热更新，
  * 真实接口通过 dev proxy 转发给后端，避免跨端口 CORS / Cookie 丢失。
- * 可用环境变量 HARNESS_BACKEND 覆盖（如 http://127.0.0.1:8080）。
+ * 可用环境变量 HARNESS_BACKEND 覆盖（如 http://127.0.0.1:5611）。
+ *
+ * ⚠️ 默认值 5611 必须与以下三处保持一致，否则 proxy 会打到空端口：
+ *    internal/config/config.go 的 Default().Server.Addr
+ *    run.sh 的 PORT 默认值
+ *    packaging/start.sh / start.cmd 的默认 ADDR
  *
  * 注意：这里读的是 Node 的 process.env（vite.config 运行在 Node 侧，不进浏览器包），
  * 加上 declare 是为了在无 @types/node 的纯前端工程里也能通过 tsc -b 的类型检查。
  */
 declare const process: { env: Record<string, string | undefined> }
-const BACKEND = process.env.HARNESS_BACKEND || 'http://127.0.0.1:8080'
+const BACKEND = process.env.HARNESS_BACKEND || 'http://127.0.0.1:5611'
 
 export default defineConfig({
   // 单二进制内嵌部署：前端由 Go 从根路径提供，故用绝对 base（/assets/*）

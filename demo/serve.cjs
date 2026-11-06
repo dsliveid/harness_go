@@ -1,11 +1,12 @@
 // 原型预览用零依赖静态服务器：node serve.cjs [port] [host]
 // host 缺省 0.0.0.0（允许局域网/其他设备访问）；只想本机可见时传 127.0.0.1
+// 端口默认 5610（原型专用）：务必避开后端 5611 与 web dev server 5612
 const http = require('http')
 const fs = require('fs')
 const os = require('os')
 const path = require('path')
 
-const port = Number(process.argv[2] || 5611)
+const port = Number(process.argv[2] || 5610)
 const host = process.argv[3] || process.env.HOST || '0.0.0.0'
 const root = path.join(__dirname, 'dist')
 const types = {

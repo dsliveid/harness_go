@@ -94,7 +94,8 @@ func NewRouter(d Deps) http.Handler {
 	mux.HandleFunc("DELETE /api/v1/providers/{pid}", h.deleteProvider)
 	mux.HandleFunc("POST /api/v1/providers/{pid}/test", h.testProvider)
 	// 上游真实模型清单 + 密钥明文（眼睛图标显示/复制；handler 内加 no-store）
-	mux.HandleFunc("GET /api/v1/providers/{pid}/models", h.listProviderModels)
+	// POST 以支持草稿覆盖（厂商未保存时传 base_url/api_key 也能拉取）
+	mux.HandleFunc("POST /api/v1/providers/{pid}/models", h.listProviderModels)
 	mux.HandleFunc("GET /api/v1/providers/{pid}/secret", h.revealProviderKey)
 	mux.HandleFunc("GET /api/v1/settings", h.getSettings)
 	mux.HandleFunc("PATCH /api/v1/settings", h.patchSettings)

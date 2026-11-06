@@ -8,7 +8,7 @@ rem   2) runs harness-go.exe with a data directory next to this script
 rem   3) opens the browser once GET /healthz answers
 rem
 rem Optional arguments are forwarded to the binary, for example:
-rem   start.cmd -addr 0.0.0.0:8080            expose to the local network
+rem   start.cmd -addr 0.0.0.0:5611            expose to the local network
 rem   start.cmd -log-level debug              verbose logging
 rem   start.cmd -config my.yaml               use a custom config file
 rem
@@ -39,15 +39,15 @@ rem Use a per-package data directory unless the caller passes -data explicitly.
 if not exist "data" mkdir "data"
 
 rem Derive the port from a forwarded "-addr host:port" argument so the browser
-rem probe opens the right URL (default 127.0.0.1:8080). Only the last colon
+rem probe opens the right URL (default 127.0.0.1:5611). Only the last colon
 rem component is used, which also handles "-addr 0.0.0.0:9000" and "[::]:9000".
-set "ADDR=127.0.0.1:8080"
+set "ADDR=127.0.0.1:5611"
 set "PREV="
 rem Guard required: "for %%A in () do" is a cmd syntax error when no args given.
 if not "%~1"=="" for %%A in (%*) do call :scan_arg "%%~A"
 set "PORT=%ADDR%"
 for %%P in (%ADDR::= %) do set "PORT=%%P"
-if "%PORT%"=="" set "PORT=8080"
+if "%PORT%"=="" set "PORT=5611"
 set "BASE_URL=http://127.0.0.1:%PORT%"
 
 rem Probe /healthz in a detached helper and open the browser once it is ready.

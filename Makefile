@@ -26,14 +26,15 @@ all: build
 ## 仅编译 Go 二进制（前端产物由 //go:embed all:dist 内嵌）
 ## 注意：web/dist/.gitkeep 必须入库，否则 embed 目录不存在会导致编译失败；
 ##       未构建前端时二进制仍可启动，`/` 返回「前端未构建」提示页
+## 等价于 ./build.sh；本目标不负责前端，需前端时用 `make web` 或 `make build-all`
 build:
 	go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/$(BINARY) ./cmd/harness-go
 
-## 编译前端产物
+## 编译前端产物（唯一前端构建入口：web/build.sh，含 stale asset 清理）
 web:
-	cd web && npm ci && npm run build
+	bash web/build.sh --install
 
-## 完整构建：前端 → 后端单二进制
+## 完整构建：前端 → 后端单二进制（等价于 ./build.sh --web）
 build-all: web build
 
 ## 静态检查（golangci-lint v2，含 depguard 分层规则）
@@ -51,9 +52,10 @@ test:
 test-race:
 	CGO_ENABLED=1 go test -race ./...
 
+## 前端源码格式化（prettier 配置在 web/ 内）
 fmt:
 	gofmt -l -w .
-	cd web && npx prettier --write "src/**/*.{ts,tsx,css}" 2>/dev/null || true
+	bash -c 'cd web && npx prettier --write "src/**/*.{ts,tsx,css}" 2>/dev/null || true'
 
 tidy:
 	go mod tidy
