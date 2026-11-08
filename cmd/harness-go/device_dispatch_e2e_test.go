@@ -162,7 +162,7 @@ func newDevE2EEnv(t *testing.T, rounds [][]llm.Chunk, localInvoke func() (string
 		t.Fatal(err)
 	}
 	sessSvc := service.NewSessionService(main, sessions)
-	sess, err := sessSvc.Create(ctx, "device-e2e", "", "")
+	sess, err := sessSvc.Create(ctx, service.CreateSessionInput{Title: "device-e2e"})
 	if err != nil {
 		t.Fatal(err)
 	}

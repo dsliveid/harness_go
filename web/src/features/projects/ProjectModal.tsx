@@ -1,9 +1,11 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import { FileText, Shield, FolderGit2, ShieldAlert, Settings, Zap, Folder, Database } from 'lucide-react'
+import { FileText, Shield, FolderGit2, ShieldAlert, Settings, Zap, Folder, Database, FolderSearch } from 'lucide-react'
 import type { DataScope, DataScopeMode, PlanMode, Project } from '../../types'
 import { Button, Modal, Tabs, cn, inputCls } from '../../components/ui'
 import { MarkdownLite } from '../../components/MarkdownLite'
 import { RealModeNotice } from '../../components/RealModeNotice'
+import { DirectoryPicker } from '../../components/DirectoryPicker'
+import { hostStatus } from '../../lib/workspaceHost'
 import { DATA_MODE_META, DATA_SCOPES } from '../../lib/dataScopes'
 import { useSessions } from '../../stores/sessionStore'
 import { useUI } from '../../stores/uiStore'
@@ -160,10 +162,16 @@ function LinksPane({
   const links = projectLinks.filter((l) => l.projectId === project.id)
   // 行内表单：id 缺省 = 新增，否则为编辑该条
   const [form, setForm] = useState<{ id?: string; path: string; description: string } | null>(null)
+  const [browseOpen, setBrowseOpen] = useState(false)
   const pathRef = useRef<HTMLInputElement | null>(null)
   const descRef = useRef<HTMLTextAreaElement | null>(null)
 
-  // Web 端无本地目录选择插件，改为手动输入目录路径
+  // 目录列举宿主由**当前工作空间**决定：切到哪个空间就只选那个空间的目录。
+  // L0 仅服务端宿主可列举，客户端宿主置灰并给出手填退路。
+  const { workspaces, activeWorkspaceId } = useSessions()
+  const wsHost = hostStatus(workspaces.find((w) => w.id === activeWorkspaceId))
+  const wsHostLabel = workspaces.find((w) => w.id === activeWorkspaceId)?.name ?? '服务端'
+
   const startAdd = () => setForm({ path: '', description: '' })
 
   const commitForm = () => {
@@ -215,14 +223,29 @@ function LinksPane({
           <div className="border border-accent/40 rounded-xl p-3 bg-panel2/40 flex flex-col gap-2 shrink-0">
             <label className="block">
               <div className="text-[12px] text-inkdim mb-1">关联目录</div>
-              <input
-                ref={pathRef}
-                className={inputCls}
-                placeholder="输入关联项目的目录路径，如 F:/WorkSpace/Other/harness_mini"
-                value={form.path}
-                onChange={(e) => setForm({ ...form, path: e.target.value })}
-              />
-              <div className="text-[11px] text-inkfaint mt-1">Web 端无法打开本地目录选择器，请手动输入路径</div>
+              <div className="flex items-center gap-1.5">
+                <input
+                  ref={pathRef}
+                  className={inputCls}
+                  placeholder="点「浏览」选择，或直接粘贴路径"
+                  value={form.path}
+                  onChange={(e) => setForm({ ...form, path: e.target.value })}
+                />
+                <Button
+                  size="sm"
+                  variant="soft"
+                  className="shrink-0"
+                  disabled={!wsHost.canList}
+                  title={wsHost.canList ? `在「${wsHostLabel}」中选择目录` : wsHost.reason}
+                  onClick={() => setBrowseOpen(true)}
+                >
+                  <FolderSearch size={13} />
+                  浏览
+                </Button>
+              </div>
+              <div className="text-[11px] text-inkfaint mt-1">
+                {wsHost.canList ? `将从当前工作区（${wsHostLabel}）列举目录` : wsHost.reason}
+              </div>
             </label>
             <label className="block">
               <div className="text-[12px] text-inkdim mb-1">说明</div>
@@ -292,15 +315,29 @@ function LinksPane({
           </div>
         )}
       </div>
+
+      {/* 目录选择器：宿主由当前工作空间决定，选中即回填路径 */}
+      <DirectoryPicker
+        open={browseOpen}
+        host={wsHost.id}
+        hostLabel={wsHostLabel}
+        initialPath={form?.path ?? ''}
+        onClose={() => setBrowseOpen(false)}
+        onPick={(p) => {
+          setForm((f) => (f ? { ...f, path: p } : { path: p, description: '' }))
+          setBrowseOpen(false)
+        }}
+      />
     </div>
   )
 }
 
 // ---------------- 审批规则页（原设置弹窗「审批规则」迁入，项目级） ----------------
 function ApprovalsPane({ projectId }: { projectId: string }) {
-  const { approvalRules, addApprovalRule, removeApprovalRule } = useSessions()
+  const { approvalRules, addApprovalRule, removeApprovalRule, projects, setProjectDefaultAccessMode } = useSessions()
   const toast = useUI((s) => s.toast)
   const rules = approvalRules.filter((r) => r.projectId === projectId)
+  const project = projects.find((p) => p.id === projectId)
   const [toolName, setToolName] = useState('')
   const [pattern, setPattern] = useState('')
   const toolRef = useRef<HTMLInputElement | null>(null)
@@ -330,6 +367,50 @@ function ApprovalsPane({ projectId }: { projectId: string }) {
       </div>
 
       <div className="flex-1 min-h-0 overflow-y-auto flex flex-col gap-3 pr-1">
+        {/* 默认控制权限：项目级继承源，只影响此后新建的对话 */}
+        <div className="rounded-xl border border-edge bg-panel2/40 p-3 shrink-0">
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <div className="font-medium text-[13px]">默认控制权限</div>
+              <div className="text-[11px] text-inkfaint mt-0.5">
+                仅对**之后在该项目内新建**的对话生效；已有对话各自保留当前设置
+              </div>
+            </div>
+            <div className="flex items-center gap-1 shrink-0">
+              {(['confirm', 'full'] as const).map((mode) => {
+                const active = (project?.defaultAccessMode ?? 'confirm') === mode
+                return (
+                  <button
+                    key={mode}
+                    type="button"
+                    onClick={() => {
+                      // 成功提示必须等保存结果返回后再弹：否则与失败提示同时出现（用户看到互相矛盾的两条）
+                      void setProjectDefaultAccessMode(projectId, mode)
+                        .then(() =>
+                          toast(
+                            'success',
+                            mode === 'full' ? '已设为完全访问（仅影响新对话）' : '已设为变更前确认（仅影响新对话）',
+                          ),
+                        )
+                        .catch(() => {
+                          /* 失败提示由 store 统一给出，此处不再重复 */
+                        })
+                    }}
+                    className={cn(
+                      'px-2.5 py-1 rounded-md text-[12px] border transition-colors',
+                      active
+                        ? 'bg-sky-500/15 border-sky-400/60 text-sky-300'
+                        : 'border-edge text-inkdim hover:text-ink hover:border-inkfaint',
+                    )}
+                  >
+                    {mode === 'full' ? '完全访问' : '变更前确认'}
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+        </div>
+
         {/* 添加表单 */}
         <div className="rounded-xl border border-edge bg-panel2/40 p-3 flex flex-col sm:flex-row gap-2 shrink-0">
           <input

@@ -37,6 +37,10 @@ func (p *plugin) Tools() []toolapi.Tool {
 	return []toolapi.Tool{
 		&kitToolAdapter{p: p, name: "browser_probe", fn: invokeProbe},
 		&kitToolAdapter{p: p, name: "browser_text", fn: invokeText},
+		&kitToolAdapter{p: p, name: "browser_click", fn: invokeClick},
+		&kitToolAdapter{p: p, name: "browser_type", fn: invokeType},
+		&kitToolAdapter{p: p, name: "browser_scroll", fn: invokeScroll},
+		&kitToolAdapter{p: p, name: "browser_screenshot", fn: invokeScreenshot},
 	}
 }
 
@@ -149,15 +153,53 @@ func invokeText(ctx context.Context, h toolapi.Host, call *toolapi.Call) (*toola
 
 // renderText 起 headless 进程 → CDP WS → navigate → evaluate。
 func renderText(ctx context.Context, bin, pageURL string, wait time.Duration) (string, error) {
+	var text string
+	err := withPage(ctx, bin, pageURL, wait, func(c *cdp) error {
+		res, err := c.call(ctx, "Runtime.evaluate", map[string]any{
+			"expression":    "document.body ? document.body.innerText : ''",
+			"returnByValue": true,
+			"awaitPromise":  false,
+		})
+		if err != nil {
+			return fmt.Errorf("取文本失败: %w", err)
+		}
+		var out struct {
+			Result struct {
+				Value string `json:"value"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal(res, &out); err != nil {
+			return err
+		}
+		text = out.Result.Value
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return text, nil
+}
+
+// pageWait 默认渲染等待（未显式给 wait_ms 时的兜底）。
+const pageWait = 1500 * time.Millisecond
+
+// withPage 复用的「起浏览器 → 抓 ws URL → 开页面 target → dialCDP → navigate → fn」链路。
+//
+// 生命周期保证：无论 fn 是否出错，都会 Kill 浏览器子进程并关闭 WS（不泄漏子进程）；
+// 浏览器不可用/启动失败等错误按原样返回，由调用方转成显式 IsError 结果。
+func withPage(ctx context.Context, bin, pageURL string, wait time.Duration, fn func(c *cdp) error) error {
+	if wait <= 0 {
+		wait = pageWait
+	}
 	// --remote-debugging-port=0：内核选端口并把 ws URL 打到 stderr
 	cmd := exec.Command(bin, "--headless=new", "--disable-gpu", "--no-first-run",
 		"--remote-debugging-port=0", "about:blank")
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return "", err
+		return err
 	}
 	if err := cmd.Start(); err != nil {
-		return "", fmt.Errorf("启动浏览器失败: %w", err)
+		return fmt.Errorf("启动浏览器失败: %w", err)
 	}
 	defer func() {
 		_ = cmd.Process.Kill()
@@ -176,43 +218,55 @@ func renderText(ctx context.Context, bin, pageURL string, wait time.Duration) (s
 		}
 	}
 	if browserWS == "" {
-		return "", fmt.Errorf("读取调试端口失败（浏览器未输出 ws URL）")
+		return fmt.Errorf("读取调试端口失败（浏览器未输出 ws URL）")
 	}
 	// ② 创建页面 target：浏览器级端点不支持 Page 域，必须先经 /json/new 开页面
 	port := extractDebugPort(browserWS)
 	pageWS, err := createPageTarget(ctx, port, pageURL)
 	if err != nil {
-		return "", err
+		return err
 	}
 	// ③ 连接页面 target 的 WS（Page/Runtime 域可用）
-	cdp, err := dialCDP(ctx, pageWS)
+	c, err := dialCDP(ctx, pageWS)
 	if err != nil {
-		return "", err
+		return err
 	}
-	defer func() { _ = cdp.Close() }()
-	if _, err := cdp.call(ctx, "Page.enable", nil); err != nil {
-		return "", err
+	defer func() { _ = c.Close() }()
+	if _, err := c.call(ctx, "Page.enable", nil); err != nil {
+		return err
 	}
 	// 显式导航（/json/new 已带 url，重复导航保证确定性）+ 等渲染
-	if _, err := cdp.call(ctx, "Page.navigate", map[string]any{"url": pageURL}); err != nil {
-		return "", fmt.Errorf("导航失败: %w", err)
+	if _, err := c.call(ctx, "Page.navigate", map[string]any{"url": pageURL}); err != nil {
+		return fmt.Errorf("导航失败: %w", err)
 	}
 	time.Sleep(wait)
-	res, err := cdp.call(ctx, "Runtime.evaluate", map[string]any{
-		"expression":    "document.body ? document.body.innerText : ''",
-		"returnByValue": true,
-		"awaitPromise":  false,
+	return fn(c)
+}
+
+// evalValue 执行 JS 表达式并取回 returnByValue 的值（raw JSON）。
+func evalValue(ctx context.Context, c *cdp, expr string) (json.RawMessage, error) {
+	res, err := c.call(ctx, "Runtime.evaluate", map[string]any{
+		"expression":            expr,
+		"returnByValue":         true,
+		"awaitPromise":          false,
+		"allowUnsafeEvalBlockedByCSP": true,
 	})
 	if err != nil {
-		return "", fmt.Errorf("取文本失败: %w", err)
+		return nil, err
 	}
 	var out struct {
 		Result struct {
-			Value string `json:"value"`
+			Value json.RawMessage `json:"value"`
 		} `json:"result"`
+		ExceptionDetails *struct {
+			Text string `json:"text"`
+		} `json:"exceptionDetails"`
 	}
 	if err := json.Unmarshal(res, &out); err != nil {
-		return "", err
+		return nil, err
+	}
+	if out.ExceptionDetails != nil && out.ExceptionDetails.Text != "" {
+		return nil, fmt.Errorf("页面脚本异常: %s", out.ExceptionDetails.Text)
 	}
 	return out.Result.Value, nil
 }

@@ -106,7 +106,9 @@ type Session struct {
 	ID            string `json:"id"`
 	Title         string `json:"title"`
 	WorkspacePath string `json:"workspace_path"`
-	AccessMode    string `json:"access_mode"`
+	// ProjectID 会话归属项目（空串 = 纯对话，不隶属任何项目）。
+	ProjectID  string `json:"project_id,omitempty"`
+	AccessMode string `json:"access_mode"`
 	ModelRef      string `json:"model_ref"`
 	UserID        string `json:"user_id"`
 	// Source 会话来源：ui（默认）/ openai（OpenAI 兼容端点的隐藏会话，P1）。

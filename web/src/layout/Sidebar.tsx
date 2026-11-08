@@ -11,6 +11,7 @@ import { Button, cn } from '../components/ui'
 import { PromptModal, type PromptField } from '../components/PromptModal'
 import { ProjectModal } from '../features/projects/ProjectModal'
 import { WorkspaceSwitcher } from '../components/WorkspaceSwitcher'
+import { hostStatus, hostOfWorkspace } from '../lib/workspaceHost'
 
 interface MenuItem {
   label: string
@@ -24,6 +25,11 @@ interface PromptState {
   confirmText?: string
   fields: PromptField[]
   onSubmit: (v: Record<string, string>) => void
+  /** 需要「浏览」按钮的字段 key（目录路径字段） */
+  browseFieldKey?: string
+  browseHost?: import('../lib/workspaceHost').HostID
+  browseHostLabel?: string
+  browseDisabledReason?: string
 }
 
 /** 每个分组默认展示的对话条数（对齐桌面端：超出收进「更多」） */
@@ -46,6 +52,10 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
 
   // 仅展示当前工作空间下的项目与会话（工作空间是项目/会话的归属边界）
   const activeWs = workspaces.find((w) => w.id === activeWorkspaceId)
+  // 目录列举宿主：由**当前工作空间**唯一决定（纯映射，不按在线情况自动挑）。
+  // L0 仅服务端宿主可列举；客户端宿主如实置灰并给出手填退路。
+  const wsHostLabel = activeWs?.name ?? '服务端'
+  const wsHost = hostStatus(activeWs)
   const wsProjects = projects.filter((p) => wsOfProject(p) === activeWorkspaceId)
   const active = sessions.filter(
     (s) => !s.archivedAt && wsOfSession(s, projects) === activeWorkspaceId,
@@ -123,8 +133,13 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
     confirmText: '创建',
     fields: [
       { key: 'name', label: '项目名称', value: '', placeholder: '如 harness_go' },
-      { key: 'path', label: '工作区目录（可选）', value: '', placeholder: 'F:/WorkSpace/Other/harness_go', hint: '仅作项目标识，不会访问本地文件' },
+      { key: 'path', label: '工作区目录（可选）', value: '', placeholder: '点「浏览」选择，或直接粘贴路径', hint: wsHost.canList ? `将在此工作区（${wsHostLabel}）中定位目录` : wsHost.reason },
     ],
+    // 目录可视化选择：宿主由**当前工作空间**决定，切到哪个空间就只能选那个空间的目录
+    browseFieldKey: 'path',
+    browseHost: wsHost.id,
+    browseHostLabel: wsHostLabel,
+    browseDisabledReason: wsHost.canList ? undefined : wsHost.reason,
     onSubmit: (v) => {
       createProject(v.name, v.path ?? '')
       setPrompt(null)
@@ -345,6 +360,10 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
         title={prompt?.title ?? ''}
         confirmText={prompt?.confirmText}
         fields={prompt?.fields ?? []}
+        browseFieldKey={prompt?.browseFieldKey}
+        browseHost={prompt?.browseHost}
+        browseHostLabel={prompt?.browseHostLabel}
+        browseDisabledReason={prompt?.browseDisabledReason}
         onCancel={() => setPrompt(null)}
         onSubmit={(v) => prompt?.onSubmit(v)}
       />

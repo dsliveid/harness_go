@@ -31,7 +31,7 @@ type fakeSessionDB struct {
 	usageC     int64
 }
 
-func (f *fakeSessionDB) AddRunUsage(_ context.Context, _ string, promptTokens, completionTokens int64) error {
+func (f *fakeSessionDB) AddRunUsage(_ context.Context, _ string, promptTokens, completionTokens, _ int64, _ bool) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.usageP = promptTokens
@@ -341,6 +341,127 @@ func TestEngineTerminalStatusCarriesUsage(t *testing.T) {
 	}
 	if got["input_tokens"] != float64(33) || got["output_tokens"] != float64(2) {
 		t.Fatalf("终态事件应携带 usage 33/2，得到 %v/%v", got["input_tokens"], got["output_tokens"])
+	}
+}
+
+// 思考过程（reasoning_content）全链路不变量：
+//  1. 每片非空 Reasoning 都发 message.reasoning 事件（payload 只带增量）；
+//  2. 完整思考过程随 assistant 消息落库（Reasoning 字段）；
+//  3. message.end 事件携带 reasoning 终值，供前端断线对齐；
+//  4. reasoning 绝不混入正文 delta（正文只含 Delta 片段）。
+func TestEnginePublishesAndPersistsReasoning(t *testing.T) {
+	provider := &fakeProvider{rounds: [][]llm.Chunk{{
+		{Reasoning: "先看目录"},
+		{Delta: "答"},
+		{Reasoning: "再改文件"},
+		{Delta: "案"},
+		{FinishReason: "stop"},
+	}}}
+	eng, sdb, bus, _ := newTestEngine(t, provider)
+
+	sub, err := bus.Subscribe("run-1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bus.Unsubscribe(sub)
+
+	if err := eng.Execute(context.Background(), baseRunRequest()); err != nil {
+		t.Fatalf("Run 应完成: %v", err)
+	}
+
+	// 落库口径：正文与思考过程分别落库，互不污染
+	if len(sdb.messages) != 1 {
+		t.Fatalf("应落 1 条消息，得到 %d", len(sdb.messages))
+	}
+	msg := sdb.messages[0]
+	if msg.Content != "答案" {
+		t.Fatalf("正文应只含 delta 片段，得到 %q", msg.Content)
+	}
+	if msg.Reasoning != "先看目录再改文件" {
+		t.Fatalf("思考过程落库错误: %q", msg.Reasoning)
+	}
+
+	// 事件口径：逐片 message.reasoning + message.end 携带终值
+	var reasoningDeltas []string
+	var endPayload map[string]any
+	all := []events.Type{}
+	for {
+		ev, ok := <-sub.C()
+		if !ok {
+			break
+		}
+		all = append(all, ev.Type)
+		switch ev.Type {
+		case events.TypeMessageReasoning:
+			var p struct {
+				Delta string `json:"delta"`
+			}
+			if err := json.Unmarshal(ev.Payload, &p); err != nil {
+				t.Fatalf("message.reasoning payload 解析失败: %v", err)
+			}
+			if p.Delta == "" {
+				t.Fatal("message.reasoning 不应为空增量")
+			}
+			reasoningDeltas = append(reasoningDeltas, p.Delta)
+		case events.TypeMessageEnd:
+			if err := json.Unmarshal(ev.Payload, &endPayload); err != nil {
+				t.Fatalf("message.end payload 解析失败: %v", err)
+			}
+		}
+	}
+	if len(reasoningDeltas) != 2 {
+		t.Fatalf("应发 2 条 message.reasoning，得到 %d（%v）", len(reasoningDeltas), reasoningDeltas)
+	}
+	if endPayload["reasoning"] != "先看目录再改文件" {
+		t.Fatalf("message.end 应携带 reasoning 终值，得到 %v", endPayload["reasoning"])
+	}
+	if endPayload["content"] != "答案" {
+		t.Fatalf("message.end content 应只含正文，得到 %v", endPayload["content"])
+	}
+	// 事件类型必须包含新增的 reasoning 事件（保证前端可订阅）
+	found := false
+	for _, ty := range all {
+		if ty == events.TypeMessageReasoning {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("事件序列缺少 message.reasoning")
+	}
+}
+
+// 无思考过程时 message.reasoning 一次都不发，message.end 的 reasoning 为空串（不伪造）。
+func TestEngineNoReasoningEventWhenProviderSilent(t *testing.T) {
+	provider := &fakeProvider{rounds: [][]llm.Chunk{{
+		{Delta: "直接答"},
+		{FinishReason: "stop"},
+	}}}
+	eng, _, bus, _ := newTestEngine(t, provider)
+
+	sub, err := bus.Subscribe("run-1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bus.Unsubscribe(sub)
+
+	if err := eng.Execute(context.Background(), baseRunRequest()); err != nil {
+		t.Fatalf("Run 应完成: %v", err)
+	}
+
+	var endPayload map[string]any
+	for ev := range sub.C() {
+		if ev.Type == events.TypeMessageReasoning {
+			t.Fatal("模型未返回思考过程时不得发 message.reasoning")
+		}
+		if ev.Type == events.TypeMessageEnd {
+			_ = json.Unmarshal(ev.Payload, &endPayload)
+		}
+	}
+	if endPayload == nil {
+		t.Fatal("未收到 message.end")
+	}
+	if endPayload["reasoning"] != "" {
+		t.Fatalf("无思考过程时 reasoning 应为空串，得到 %v", endPayload["reasoning"])
 	}
 }
 

@@ -40,6 +40,12 @@ export interface Project {
   planMode?: PlanMode
   /** 归属工作空间（缺省视为内置服务端空间） */
   workspaceId?: string
+  /**
+   * 项目级默认控制权限（服务端 projects.default_access_mode）：
+   * **只对之后在该项目内新建的对话生效**，已有对话各自保留自身 access_mode 快照。
+   * 前端绝不用它推导新会话的 accessMode —— 裁决权在服务端。
+   */
+  defaultAccessMode: AccessMode
 }
 
 // 关联项目：项目设置中对另一目录的引用 + 说明（只存路径，不存对方 id）
@@ -132,7 +138,24 @@ export interface Approval {
   createdAt: number
 }
 
+/**
+ * 审批规则（项目级）。
+ *
+ * 说明：`ProjectApprovalRule` 是该项目级规则在服务端的**权威形态**
+ * （projects/{pid}/approval-rules 端点的出参，snake_case → camelCase 后与之同构）。
+ * 本接口为既有 UI / 演示数据的承载形态而被保留（字段与 ProjectApprovalRule 完全一致，
+ * 结构兼容可直接互赋），避免一次性改动 ProjectModal 与 mock 样例造成的大面积回归。
+ */
 export interface ApprovalRule {
+  id: string
+  projectId: string
+  toolName: string
+  pattern: string
+  createdAt: number
+}
+
+/** 项目级审批规则的服务端权威形态（由 api.listProjectRules / addProjectRule 产出） */
+export interface ProjectApprovalRule {
   id: string
   projectId: string
   toolName: string

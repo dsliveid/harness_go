@@ -35,7 +35,7 @@ type Spec struct {
     SchemaJSON   json.RawMessage // JSON Schema（全额计入注入成本）
     Tier         Tier            // core | deferred | on_demand
     Executor     Executor        // server | device | any
-    Capabilities []string        // workspace.read / workspace.write / process / network / llm / device
+    Capabilities []string        // workspace.list / workspace.read / workspace.write / process / network / llm / device
     CostTokens   int             // 单条注入成本（估算，>0）
     Risk         Risk            // readonly | write | command | danger
     Requires     []string        // 运行期依赖（chromium、git …）

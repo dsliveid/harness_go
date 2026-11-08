@@ -110,3 +110,40 @@ func TestNewDefaultsWorkDir(t *testing.T) {
 		t.Fatalf("默认工作目录应为进程 cwd，得到 %s", h.Workspace().Root())
 	}
 }
+
+// fakeImageProvider 图像能力桩（不触网）。
+type fakeImageProvider struct{}
+
+func (fakeImageProvider) Generate(context.Context, toolapi.ImageGenRequest) (toolapi.ImageGenResult, error) {
+	return toolapi.ImageGenResult{MIME: "image/png"}, nil
+}
+
+func (fakeImageProvider) Describe(context.Context, toolapi.ImageUnderstandRequest) (string, error) {
+	return "描述", nil
+}
+
+// TestImagesOptionalCapability 验证：未注入时 Images() 为 nil（诚实缺失信号），
+// 注入后可通过 toolapi.ImageHost 类型断言取到。
+func TestImagesOptionalCapability(t *testing.T) {
+	h := New(Options{WorkDir: t.TempDir()})
+
+	ih, ok := any(h).(toolapi.ImageHost)
+	if !ok {
+		t.Fatal("hostimpl.Host 应实现可选接口 toolapi.ImageHost")
+	}
+	if ih.Images() != nil {
+		t.Fatal("未注入时 Images() 必须返回 nil")
+	}
+
+	// 关键约束：Images() 不在 toolapi.Host 接口内，保证零破坏扩展。
+	var _ toolapi.Host = h
+
+	h.SetImages(fakeImageProvider{})
+	if ih.Images() == nil {
+		t.Fatal("注入后 Images() 不应为 nil")
+	}
+	if _, err := ih.Images().Generate(context.Background(), toolapi.ImageGenRequest{}); err != nil {
+		t.Fatalf("注入的 provider 应可调用: %v", err)
+	}
+}
+

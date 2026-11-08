@@ -18,23 +18,21 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"unicode"
 
 	"harness-go/internal/pluginkit"
+	"harness-go/internal/sop"
 	"harness-go/pkg/toolapi"
 )
 
 //go:embed manifest.json
 var manifestJSON []byte
 
-// SOP 目录与硬上限（D10）。
+// SOP 目录与硬上限（真源统一在 internal/sop，此处保留别名以兼容既有引用）。
 const (
 	// SOPDir SOP 文件目录（工作区相对）。
-	SOPDir = ".harness/sop"
+	SOPDir = sop.EntriesDir
 	// MaxEntries 条数硬上限。
-	MaxEntries = 6
-	// MaxEntryTokens 单条 token 硬上限（启发式估算）。
-	MaxEntryTokens = 150
+	MaxEntries = sop.MaxEntries
 )
 
 // Manifest 返回插件清单。
@@ -57,15 +55,15 @@ func Factory() toolapi.Factory {
 }
 
 // SOPEntry 单条 SOP（注入与列表共用形状）。
-type SOPEntry struct {
-	ID     string `json:"id"`
-	Title  string `json:"title"`
-	Body   string `json:"body"`
-	Tokens int    `json:"tokens"`
-}
+//
+// 保留本别名是为了不破坏既有调用方；真源类型见 internal/sop.Entry。
+type SOPEntry = sop.Entry
 
-// LoadAll 读取全部 SOP（内核装配点注入用；按文件名排序保证注入稳定）。
-// 目录不存在 = 项目未配置 SOP（返回空，不是错误）。
+// LoadAll 读取全部 SOP（经 host.Workspace() 沙箱读取，供 save_sop 校验用）。
+//
+// 架构说明：**注入路径已不再走本函数** —— 内核装配点改为直接调用
+// sop.LoadEntries(wsPath)，从而摆脱 host root 启动期固化导致的跨项目串味。
+// 本函数仅保留给插件工具自身在沙箱内做「条数上限」校验使用。
 func LoadAll(host toolapi.Host) []SOPEntry {
 	entries, err := host.Workspace().List(context.Background(), SOPDir)
 	if err != nil {
@@ -85,12 +83,8 @@ func LoadAll(host toolapi.Host) []SOPEntry {
 		if body == "" {
 			continue
 		}
-		out = append(out, SOPEntry{
-			ID:     strings.TrimSuffix(filepath.Base(e.Path), ".md"),
-			Title:  strings.TrimSuffix(filepath.Base(e.Path), ".md"),
-			Body:   body,
-			Tokens: EstimateTokens(body),
-		})
+		id := strings.TrimSuffix(filepath.Base(e.Path), ".md")
+		out = append(out, SOPEntry{ID: id, Title: id, Body: body, Tokens: sop.EstimateTokens(body)})
 	}
 	return out
 }
@@ -147,28 +141,19 @@ func invokeSave(_ context.Context, host toolapi.Host, call *toolapi.Call) (*tool
 	if body == "" {
 		return pluginkit.ErrorResult("save_sop: content 不能为空（删除条目请用 delete=true）"), nil
 	}
-	tokens := EstimateTokens(body)
-	if tokens > MaxEntryTokens {
-		return pluginkit.ErrorResult(
-			"save_sop: 该条 ≈%d token，超过单条上限 %d（D10 硬上限，拒绝写入不截断）——请精简正文或沉淀到 skill",
-			tokens, MaxEntryTokens), nil
-	}
+	tokens := sop.EstimateTokens(body)
 	existing := LoadAll(host)
 	known := false
+	ids := make([]string, 0, len(existing))
 	for _, e := range existing {
 		if e.ID == id {
 			known = true
-			break
 		}
+		ids = append(ids, e.ID)
 	}
-	if !known && len(existing) >= MaxEntries {
-		ids := make([]string, 0, len(existing))
-		for _, e := range existing {
-			ids = append(ids, e.ID)
-		}
-		return pluginkit.ErrorResult(
-			"save_sop: 已有 %d 条 SOP（%s），达到条数上限 %d（D10 硬上限）——请先删除或合并低价值条目",
-			len(existing), strings.Join(ids, ", "), MaxEntries), nil
+	// 条数上限与「拒绝不截断」口径统一由 internal/sop 提供（前端 REST 同源）。
+	if err := sop.ValidateEntry(id, body, ids, known); err != nil {
+		return pluginkit.ErrorResult("save_sop: %v", err), nil
 	}
 	if err := ws.WriteFile(context.Background(), SOPDir+"/"+id+".md", []byte(body+"\n"), 0o644); err != nil {
 		return pluginkit.ErrorResult("save_sop: 写入 %s 失败: %v", id, err), nil
@@ -183,42 +168,8 @@ func invokeSave(_ context.Context, host toolapi.Host, call *toolapi.Call) (*tool
 	), nil
 }
 
-// EstimateTokens 启发式 token 估算：CJK/全角 ≈ 1 token/字符，其余 ≈ 1 token/4 字符。
-// 只用于硬上限校验（与 tokenizer.Heuristic 同数量级，不追求精确）。
-func EstimateTokens(s string) int {
-	cjk, other := 0, 0
-	for _, r := range s {
-		if unicode.Is(unicode.Han, r) || unicode.Is(unicode.Hiragana, r) ||
-			unicode.Is(unicode.Katakana, r) || unicode.Is(unicode.Hangul, r) ||
-			(r > 0x2E80 && r <= 0x9FFF) || (r >= 0xFF00 && r <= 0xFFEF) {
-			cjk++
-			continue
-		}
-		if !unicode.IsSpace(r) {
-			other++
-		}
-	}
-	return cjk + (other+3)/4
-}
+// EstimateTokens 启发式 token 估算（真源在 internal/sop，此处保留别名以兼容既有引用）。
+func EstimateTokens(s string) int { return sop.EstimateTokens(s) }
 
-// slugify 标题 → 条目 ID（文件名安全；保留 CJK 与字母数字，其余折叠为 -）。
-func slugify(title string) string {
-	var b strings.Builder
-	lastDash := false
-	for _, r := range strings.TrimSpace(title) {
-		switch {
-		case unicode.IsLetter(r) || unicode.IsDigit(r):
-			b.WriteRune(unicode.ToLower(r))
-			lastDash = false
-		case r == ' ' || r == '-' || r == '_' || r == '/' || r == '\\':
-			if !lastDash && b.Len() > 0 {
-				b.WriteByte('-')
-				lastDash = true
-			}
-		}
-		if b.Len() > 80 {
-			break
-		}
-	}
-	return strings.Trim(b.String(), "-")
-}
+// slugify 标题 → 条目 ID（真源在 internal/sop，此处保留别名以兼容既有引用）。
+func slugify(title string) string { return sop.Slugify(title) }

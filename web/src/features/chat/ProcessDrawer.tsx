@@ -3,6 +3,7 @@ import { ChevronDown, ChevronRight, Cpu, Clock, Zap } from 'lucide-react'
 import type { Message } from '../../types'
 import { MarkdownLite } from '../../components/MarkdownLite'
 import { ToolCard } from '../../components/ToolCard'
+import { ReasoningCard } from './ReasoningCard'
 
 export function formatStepMs(ms?: number): string {
   if (!ms || ms <= 0) return ''
@@ -35,7 +36,14 @@ export function ProcessDrawer({ steps, running, reasoning }: {
   const [userOpen, setUserOpen] = useState<boolean | null>(null)
   const open = userOpen ?? running
 
-  if (stepCount === 0) return null
+  // 零步骤但有待展示的实时思考：抽屉仍要渲染（思考过程按设计只属于抽屉内部）。
+  //
+  // 历史缺陷：这里曾无条件 `if (stepCount === 0) return null`，而首步工具调用之前
+  // 模型已在流式输出 reasoning → 抽屉不渲染 → 页面只能在进程卡片**外面**补一张
+  // 独立的 ReasoningCard 兜底 → 表现为「思考过程跑到执行过程卡片外面」。
+  // 现在把兜底收回抽屉：有思考就渲染抽屉，抽屉内部展示这段思考。
+  const hasLiveReasoning = Boolean(reasoning && reasoning.trim())
+  if (stepCount === 0 && !hasLiveReasoning) return null
 
   const totalMs = steps.reduce((a, s) => a + (s.durationMs ?? 0), 0)
   const totalTok = steps.reduce((a, s) => a + (s.tokens ?? 0), 0)
@@ -53,7 +61,9 @@ export function ProcessDrawer({ steps, running, reasoning }: {
         <div className="flex items-center gap-1.5 shrink-0">
           <Cpu size={13} className="text-accent" />
           <span className="text-[13px] text-inkdim font-medium">执行过程</span>
-          <span className="text-[12px] font-semibold text-ink font-mono">({stepCount} 个步骤)</span>
+          <span className="text-[12px] font-semibold text-ink font-mono">
+            {stepCount > 0 ? `(${stepCount} 个步骤)` : '(准备中)'}
+          </span>
         </div>
 
         <span className="flex-1" />
@@ -64,7 +74,7 @@ export function ProcessDrawer({ steps, running, reasoning }: {
               <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-accent opacity-75" />
               <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-accent" />
             </span>
-            <span>正在执行第 {stepCount} 步…</span>
+            <span>{stepCount > 0 ? `正在执行第 ${stepCount} 步…` : '正在思考…'}</span>
           </span>
         ) : (
           <div className="flex items-center gap-2.5 text-[11px] text-inkfaint font-mono shrink-0">
@@ -86,11 +96,11 @@ export function ProcessDrawer({ steps, running, reasoning }: {
 
       {open && (
         <div className="border-t border-edge px-3.5 py-3 space-y-3 bg-panel">
-          {running && reasoning && (
-            <div className="text-[13px] text-inkfaint border-l-2 border-accent pl-3 py-1 bg-panel2 rounded-r-lg">
-              <span className="text-[10px] uppercase font-mono tracking-wider text-accent font-semibold">思考中</span>
-              <div className="mt-1 leading-relaxed text-inkdim">{reasoning}</div>
-            </div>
+          {/* 实时思考兜底卡：当前步消息尚未写入 reasoning 时，用流式缓冲展示。
+              零步骤场景（尚未产生任何工具/步骤消息）也走这里——兜底卡始终在抽屉内部，
+              绝不再放到抽屉外面，见 TurnBlock 的历史缺陷注释。 */}
+          {reasoning && !steps[steps.length - 1]?.reasoning && (
+            <ReasoningCard text={reasoning} streaming={running} />
           )}
 
           {steps.map((s, i) => (
@@ -104,6 +114,10 @@ export function ProcessDrawer({ steps, running, reasoning }: {
                   <span className="font-mono">{formatStepTokens(s.tokens)}</span>
                 )}
               </div>
+
+              {s.reasoning && s.reasoning.trim() && (
+                <ReasoningCard text={s.reasoning} streaming={Boolean(s.streaming)} />
+              )}
 
               {s.toolCalls && s.toolCalls.length > 0 && (
                 <div className="space-y-1.5">

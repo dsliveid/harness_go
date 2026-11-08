@@ -32,6 +32,14 @@ func TestDefaultValues(t *testing.T) {
 	if c.Tools.DynamicTopK != 6 || c.Tools.DynamicMinTopK != 2 {
 		t.Fatalf("动态工具注入默认值错误（应为 top_k=6 / min_top_k=2）: %+v", c.Tools)
 	}
+	// Agent 执行循环默认值：100 步 + 每 10 步一次进度提示
+	// （原 MaxSteps 硬编码 20，复杂任务易被误截断）。
+	if c.Agent.MaxSteps != 100 {
+		t.Fatalf("agent.max_steps 默认值应为 100，实际 %d", c.Agent.MaxSteps)
+	}
+	if c.Agent.StepNoticeEvery != 10 {
+		t.Fatalf("agent.step_notice_every 默认值应为 10，实际 %d", c.Agent.StepNoticeEvery)
+	}
 	if !c.Auth.SSOEnabled || c.Auth.SSOMode != SSOPlain {
 		t.Fatalf("local 形态下 SSO 应默认开启且为 plain: %+v", c.Auth)
 	}
@@ -143,6 +151,17 @@ func TestValidateRejectsBadValues(t *testing.T) {
 		{"budget.history_ratio=0", func(c *Config) { c.Budget.HistoryRatio = 0 }},
 		{"budget.history_ratio>1", func(c *Config) { c.Budget.HistoryRatio = 1.5 }},
 		{"budget.history_ratio 负数", func(c *Config) { c.Budget.HistoryRatio = -0.1 }},
+		// 核心 SOP 总预算：负数无意义（0 = 不限），必须拒绝而非静默归零。
+		{"sop.core_max_tokens 负数", func(c *Config) { c.SOP.CoreMaxTokens = -1 }},
+		// Agent 步数预算：0/负数会让所有 Run 立刻 max_steps_exceeded；
+		// 提示间隔 > 总步数则提示永不触发（自相矛盾配置）。
+		{"agent.max_steps=0", func(c *Config) { c.Agent.MaxSteps = 0 }},
+		{"agent.max_steps 负数", func(c *Config) { c.Agent.MaxSteps = -5 }},
+		{"agent.step_notice_every 负数", func(c *Config) { c.Agent.StepNoticeEvery = -1 }},
+		{"agent.step_notice_every > max_steps", func(c *Config) {
+			c.Agent.MaxSteps = 20
+			c.Agent.StepNoticeEvery = 50
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

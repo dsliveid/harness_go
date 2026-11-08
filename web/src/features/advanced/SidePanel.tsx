@@ -98,10 +98,18 @@ export function SidePanel() {
 function TaskListPanel({ mode }: { mode: 'todo' | 'plan' }) {
   const { todos, toggleTodo, plans } = useWorkspace()
   const activePlan = plans.find((p) => p.active)
+  // real 模式下清单来自 agent 的 todo_write 工具调用（后端唯一真源），
+  // 本地勾选没有任何回写端点，下一次工具事件派生即被覆盖 → 只读展示，不做假交互。
+  const real = apiMode === 'real'
 
   if (mode === 'todo') {
     if (todos.length === 0) {
-      return <div className="py-6 text-center text-[12px] text-inkfaint">本轮对话暂无任务清单</div>
+      return (
+        <div className="py-6 text-center text-[12px] text-inkfaint">
+          本轮对话暂无任务清单
+          {real && <div className="mt-1 text-[11px]">agent 调用 todo_write 写入清单后，此处会实时出现</div>}
+        </div>
+      )
     }
     return (
       <div>
@@ -115,9 +123,12 @@ function TaskListPanel({ mode }: { mode: 'todo' | 'plan' }) {
           {todos.map((t) => (
             <button
               key={t.id}
-              className="w-full flex items-start gap-2 rounded-lg border border-edge px-2.5 py-2 text-left hover:bg-panel2 transition-colors"
-              onClick={() => toggleTodo(t.id)}
-              title="点击切换完成状态"
+              className={cn(
+                'w-full flex items-start gap-2 rounded-lg border border-edge px-2.5 py-2 text-left transition-colors',
+                real ? 'cursor-default' : 'hover:bg-panel2',
+              )}
+              onClick={() => { if (!real) toggleTodo(t.id) }}
+              title={real ? '状态以 agent 的 todo_write 为准（服务端无单项回写端点）' : '点击切换完成状态'}
             >
               {t.status === 'done'
                 ? <Check size={13} className="mt-0.5 text-ok shrink-0" />
@@ -137,14 +148,21 @@ function TaskListPanel({ mode }: { mode: 'todo' | 'plan' }) {
 
   // plan 模式：方案详细信息 + 执行进度
   if (!activePlan) {
-    return <div className="py-6 text-center text-[12px] text-inkfaint">当前没有进行中的方案</div>
+    return (
+      <div className="py-6 text-center text-[12px] text-inkfaint">
+        当前没有进行中的方案
+        {real && <div className="mt-1 text-[11px]">agent 调用 plan_set 登记计划后，此处会实时出现</div>}
+      </div>
+    )
   }
 
   return (
     <div>
       <div className="text-[12px] text-inkdim mb-1.5">
         方案 · {activePlan.title}
-        <span className="ml-1.5 font-mono text-[11px] text-inkfaint">v{activePlan.version}</span>
+        {apiMode !== 'real' && (
+          <span className="ml-1.5 font-mono text-[11px] text-inkfaint">v{activePlan.version}</span>
+        )}
         <span className="ml-2 font-mono text-[11px] text-ok">
           {activePlan.steps.filter((s) => s.status === 'done').length}/{activePlan.steps.length}
         </span>
@@ -233,22 +251,37 @@ function CommandsPanel() {
   const { commands, stopCommand } = useWorkspace()
   const toast = useUI((s) => s.toast)
   const running = commands.filter((c) => c.status === 'running')
+  const real = apiMode === 'real'
 
   if (running.length === 0) {
-    return <div className="py-6 text-center text-[12px] text-inkfaint">当前没有正在执行的命令行</div>
+    return (
+      <div className="py-6 text-center text-[12px] text-inkfaint">
+        当前没有正在执行的命令行
+        {real && <div className="mt-1 text-[11px]">agent 调用 run_command 执行命令时会实时出现在这里</div>}
+      </div>
+    )
   }
 
   return (
     <div className="space-y-3">
-      <div className="text-[12px] text-inkdim">正在执行（{running.length}）· 点击停止终止进程组</div>
+      <div className="text-[12px] text-inkdim">
+        正在执行（{running.length}）{real ? ' · 实时输出来自 tool.progress 事件' : ' · 点击停止终止进程组'}
+      </div>
       <div className="space-y-1.5">
-        {running.map((c) => <CommandRow key={c.id} cmd={c} onStop={() => { stopCommand(c.id); toast('info', `已停止命令行（PID ${c.pid}，终止进程组）`) }} />)}
+        {running.map((c) => (
+          <CommandRow
+            key={c.id}
+            cmd={c}
+            canStop={!real}
+            onStop={() => { stopCommand(c.id); toast('info', `已停止命令行（PID ${c.pid}，终止进程组）`) }}
+          />
+        ))}
       </div>
     </div>
   )
 }
 
-function CommandRow({ cmd, onStop }: { cmd: CommandRun; onStop: () => void }) {
+function CommandRow({ cmd, onStop, canStop }: { cmd: CommandRun; onStop: () => void; canStop: boolean }) {
   const elapsed = formatElapsed(Date.now() - cmd.startedAt)
   return (
     <div className="rounded-lg border border-edge p-2.5">
@@ -258,11 +291,19 @@ function CommandRow({ cmd, onStop }: { cmd: CommandRun; onStop: () => void }) {
         <StateBadge state="running" />
       </div>
       <div className="mt-1.5 flex items-center gap-2 text-[11px] text-inkfaint font-mono">
-        <span>PID {cmd.pid}</span>
+        {/* real 模式服务端不下发进程号 → pid 为 0 时不渲染，绝不编造 */}
+        {cmd.pid > 0 && <span>PID {cmd.pid}</span>}
         <span>已运行 {elapsed}</span>
         <span className="flex-1" />
-        <Button size="sm" variant="outline" onClick={onStop}>停止</Button>
+        {canStop
+          ? <Button size="sm" variant="outline" onClick={onStop}>停止</Button>
+          : <span className="text-[11px] normal-case">停止需通过对话中断</span>}
       </div>
+      {cmd.output && (
+        <pre className="mt-1.5 max-h-24 overflow-y-auto rounded-md bg-panel2/70 px-2 py-1.5 font-mono text-[11px] text-inkdim whitespace-pre-wrap break-all">
+          {cmd.output}
+        </pre>
+      )}
     </div>
   )
 }
@@ -278,9 +319,15 @@ const formatElapsed = (ms: number) => {
 function SubagentsListPanel() {
   const { subagents } = useWorkspace()
   const { openRunsDetail } = useUI()
+  const real = apiMode === 'real'
 
   if (subagents.length === 0) {
-    return <div className="py-6 text-center text-[12px] text-inkfaint">本轮对话暂无子进程</div>
+    return (
+      <div className="py-6 text-center text-[12px] text-inkfaint">
+        本轮对话暂无子进程
+        {real && <div className="mt-1 text-[11px]">agent 调用 spawn_subagent 派生子代理后会实时出现在这里</div>}
+      </div>
+    )
   }
 
   return (
@@ -372,6 +419,9 @@ function toThreadMsgs(agent: Subagent): Message[] {
 function SubagentDetailHeader({ agent }: { agent: Subagent }) {
   const { stopSubagent, resumeSubagent } = useWorkspace()
   const toast = useUI((s) => s.toast)
+  // real 模式：后端没有子 Run 的 stop/resume 端点（只有父 Run 的 stop），
+  // 且 spawn_subagent 是阻塞等待子 Run 终态的工具调用 → 不提供会撒谎的按钮。
+  const real = apiMode === 'real'
 
   return (
     <div className="px-3 pt-3 pb-2 space-y-2 border-b border-edge shrink-0">
@@ -380,14 +430,21 @@ function SubagentDetailHeader({ agent }: { agent: Subagent }) {
         <Badge>{agent.role}</Badge>
         <StateBadge state={agent.status} />
         <span className="flex-1" />
-        <span className="font-mono text-[11px] text-inkfaint shrink-0">{agent.tokens} tok</span>
-        {agent.status === 'running'
+        {agent.tokens > 0 && (
+          <span className="font-mono text-[11px] text-inkfaint shrink-0">{agent.tokens} tok</span>
+        )}
+        {!real && (agent.status === 'running'
           ? <Button size="sm" variant="danger" onClick={() => { stopSubagent(agent.id); toast('info', `已停止子进程「${agent.name}」`) }}>停止</Button>
           : (agent.status === 'interrupted' || agent.status === 'cancelled' || agent.status === 'failed') && (
             <Button size="sm" variant="primary" onClick={() => { resumeSubagent(agent.id); toast('success', `已恢复子进程「${agent.name}」（新建 Run）`) }}>恢复</Button>
-          )}
+          ))}
       </div>
       <div className="text-[11px] text-inkfaint border-l-2 border-edge pl-2.5">{agent.summary}</div>
+      {real && agent.status === 'running' && (
+        <div className="text-[11px] text-inkfaint">
+          子代理由 spawn_subagent 工具阻塞执行，需中断请停止主对话（服务端未提供子 Run 单独停止端点）。
+        </div>
+      )}
     </div>
   )
 }

@@ -355,10 +355,23 @@ func (r *RunRepo) ListUnfinished(ctx context.Context) ([]model.Run, error) {
 }
 
 // AddUsage 累加单次 Run 的 token 用量（P1：引擎终态回写；预埋列的落点）。
-func (r *RunRepo) AddUsage(ctx context.Context, runID string, promptTokens, completionTokens int64) error {
+//
+// is_estimated 与 cached_tokens 是 0001_init.sql:44-45 的预留列，此前从不写入，
+// 导致「缓存命中率无分子分母」「估算值无法与真实值区分」。此处一并落库。
+// is_estimated 采用 OR 语义累加：只要本 Run 任一轮用量是估算值，整次即标记估算 ——
+// 宁可标记为估算，也不把估算值伪装成真实值。
+func (r *RunRepo) AddUsage(ctx context.Context, runID string, promptTokens, completionTokens, cachedTokens int64, isEstimated bool) error {
+	est := 0
+	if isEstimated {
+		est = 1
+	}
 	_, err := r.s.conn().ExecContext(ctx,
-		`UPDATE runs SET input_tokens = input_tokens + ?, output_tokens = output_tokens + ? WHERE id = ?`,
-		promptTokens, completionTokens, runID)
+		`UPDATE runs SET input_tokens  = input_tokens  + ?,
+		                 output_tokens = output_tokens + ?,
+		                 cached_tokens = cached_tokens + ?,
+		                 is_estimated  = MAX(is_estimated, ?)
+		 WHERE id = ?`,
+		promptTokens, completionTokens, cachedTokens, est, runID)
 	if err != nil {
 		return fmt.Errorf("store: 回写 Run 用量失败: %w", err)
 	}

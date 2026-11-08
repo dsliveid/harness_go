@@ -10,6 +10,10 @@ import { cn } from '../../components/ui'
 // （状态徽标 + 模型 + 活跃 tokens/上限 + 进度条 + 剩余/缓存命中）。
 // 说明：上下文「智能压缩」交互已整体下线（后端无压缩能力，保留即静默失败），
 // 本组件只展示 Provider usage 返回的真实 token 水位（tokensIn/tokensOut/cachedTokens）。
+//
+// 口径：水位按**当前会话**记账（chatStore 的 usageBySession 账本），新开对话从 0 起算、
+// 切回旧会话恢复其自身水位；页面刷新后内存账本清空，展示回到 0（delta 不落库是既定铁律，
+// 服务端只有 sessions.total_tokens 合计，无法拆出输入/输出/缓存，故不做近似回填以免伪造数据）。
 export function ContextGauge() {
   const { tokensIn, tokensOut, cachedTokens } = useChat()
   const { sessions, currentId } = useSessions()

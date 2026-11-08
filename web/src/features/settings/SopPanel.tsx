@@ -1,94 +1,208 @@
-import { agentSops } from '../../mock/settingsData'
-import { toggleDisabled, useSettings } from '../../stores/settingsStore'
-import { Badge, Button, Switch } from '../../components/ui'
+import { useEffect, useState } from 'react'
+import { api } from '../../lib/api'
+import type { SOPCore } from '../../lib/apiTypes'
+import { Badge, Button } from '../../components/ui'
 import { RealModeNotice } from '../../components/RealModeNotice'
 import { cn } from '../../components/ui'
-import { ShieldCheck } from 'lucide-react'
+import { ShieldCheck, RotateCcw, Copy, Check } from 'lucide-react'
 
-const CATEGORY_CLS: Record<string, string> = {
-  thinking: 'text-cyan-400 bg-cyan-500/12 border-cyan-500/30',
-  memory: 'text-ok bg-ok/12 border-ok/30',
-  orchestration: 'text-accent2 bg-accent2/12 border-accent2/30',
-  quality: 'text-accent bg-accent/12 border-accent/30',
-  workflow: 'text-warn bg-warn/12 border-warn/30',
-}
+type Mode = 'builtin' | 'custom'
 
-// Agent SOP：标准作业程序规范启停（对齐桌面端「Agent SOP」）
+/**
+ * Agent 核心 SOP 编辑器（agent-core）。
+ *
+ * 三态语义（由「data/sop/agent-core.md 文件是否存在」单一裁决，不存独立模式字段）：
+ *   系统内置：文件不存在 → 用出厂 embed 内容，**只读预览**；
+ *   自定义　：文件存在　 → 用文件内容，可编辑保存；
+ *   重置　　：删除文件　 → 回落出厂（需二次确认）。
+ *
+ * 红线：切到「系统内置」页签**绝不删除**自定义文件 —— 否则手滑一次就丢失调教成果。
+ */
 export function SopPanel() {
-  const { draft, patchDraft } = useSettings()
-  if (!draft) return null
-  const d = draft
-  const isEnabled = (id: string) => !d.disabledSops.includes(id)
-  const toggle = (id: string) => patchDraft((cur) => ({ ...cur, disabledSops: toggleDisabled(cur.disabledSops, id) }))
-  const enableAll = () => patchDraft((cur) => ({ ...cur, disabledSops: [] }))
-  const disabledCount = d.disabledSops.length
+  const [core, setCore] = useState<SOPCore | null>(null)
+  const [mode, setMode] = useState<Mode>('builtin')
+  const [draft, setDraft] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [msg, setMsg] = useState<{ tone: 'ok' | 'err'; text: string } | null>(null)
+  const [copied, setCopied] = useState(false)
+
+  const load = async () => {
+    try {
+      const res = await api.getSOPCore()
+      setCore(res)
+      setMode(res.overridden ? 'custom' : 'builtin')
+      setDraft(res.overridden ? res.content : res.builtin_content)
+    } catch (e) {
+      setMsg({ tone: 'err', text: e instanceof Error ? e.message : '读取核心 SOP 失败' })
+    }
+  }
+
+  useEffect(() => {
+    void load()
+  }, [])
+
+  if (!core) {
+    return (
+      <div className="flex flex-col gap-4">
+        <div className="text-[12px] text-inkdim">正在读取核心 SOP…</div>
+      </div>
+    )
+  }
+
+  const estTokens = (s: string) => {
+    let cjk = 0
+    let other = 0
+    for (const ch of s) {
+      const c = ch.codePointAt(0) ?? 0
+      if ((c > 0x2e80 && c <= 0x9fff) || (c >= 0xff00 && c <= 0xffef)) cjk++
+      else if (!/\s/.test(ch)) other++
+    }
+    return cjk + Math.ceil(other / 4)
+  }
+
+  const tokens = estTokens(draft)
+  const overBudget = core.budget > 0 && tokens > core.budget
+
+  const switchMode = (next: Mode) => {
+    setMsg(null)
+    setMode(next)
+    // 切页签只切换**视图**，不写不删 —— 自定义内容原封不动留在服务端。
+    setDraft(next === 'custom' ? core.content : core.builtin_content)
+  }
+
+  const save = async () => {
+    setBusy(true)
+    setMsg(null)
+    try {
+      const res = await api.putSOPCore(draft)
+      setCore(res)
+      setMode('custom')
+      setMsg({ tone: 'ok', text: '已保存，下一轮对话立即生效（无需重启）' })
+    } catch (e) {
+      setMsg({ tone: 'err', text: e instanceof Error ? e.message : '保存失败' })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const reset = async () => {
+    if (!window.confirm('将删除你的自定义内容，恢复为出厂内置。此操作不可撤销，确认继续？')) return
+    setBusy(true)
+    setMsg(null)
+    try {
+      const res = await api.resetSOPCore()
+      setCore(res)
+      setMode('builtin')
+      setDraft(res.builtin_content)
+      setMsg({ tone: 'ok', text: '已重置为出厂内置' })
+    } catch (e) {
+      setMsg({ tone: 'err', text: e instanceof Error ? e.message : '重置失败' })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const copyAll = async () => {
+    try {
+      await navigator.clipboard.writeText(mode === 'custom' ? draft : core.builtin_content)
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 1500)
+    } catch {
+      setMsg({ tone: 'err', text: '复制失败，请手动选择文本复制' })
+    }
+  }
 
   return (
     <div className="flex flex-col gap-4">
-      <RealModeNotice text="SOP 清单仍是前端内置样例：服务端未提供 SOP 规范的增删启停端点，此处开关仅写本地设置，不会下发到执行引擎。" />
+      <RealModeNotice text="核心 SOP 已接入服务端：出厂内置内容内嵌于程序（只读），自定义内容保存在 data/sop/agent-core.md，保存后下一轮对话立即生效。" />
+
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">
-          <div className="text-[13px] font-medium">Agent SOP 规范管理</div>
-          <div className="text-[12px] text-inkdim mt-0.5 leading-relaxed max-w-[520px]">
-            配置 Agent 在执行任务时遵循的标准作业程序规范（SOP）。禁用后模型将免除对应的硬性提示词约束与相关自动化行为。
+          <div className="text-[13px] font-medium flex items-center gap-2">
+            <ShieldCheck size={15} className="text-accent" />
+            Agent 核心 SOP（agent-core）
+          </div>
+          <div className="text-[12px] text-inkdim mt-1 leading-relaxed max-w-[560px]">
+            这是 Agent 的基础行为规范，直接作为系统提示注入每轮对话。调教满意后可用「复制全文」贴回源码固化，不满意可一键重置出厂。
           </div>
         </div>
-        <div className="flex items-center gap-2.5 shrink-0">
-          <Badge tone={disabledCount > 0 ? 'yellow' : 'green'}>已启用 {agentSops.length - disabledCount} / {agentSops.length}</Badge>
-          {disabledCount > 0 && (
-            <Button size="sm" variant="ghost" onClick={enableAll} className="text-accent">全部启用</Button>
-          )}
-        </div>
+        <Badge tone={mode === 'custom' ? 'yellow' : 'green'}>
+          {mode === 'custom' ? '自定义' : '系统内置'}
+        </Badge>
       </div>
 
-      {/* SOP 体系说明卡片 */}
-      <div className="p-3 rounded-xl border border-edge/80 bg-panel2/40 flex items-start gap-3 text-[12px] leading-relaxed">
-        <ShieldCheck size={18} className="text-accent shrink-0 mt-0.5" />
-        <div className="flex flex-col gap-1">
-          <div className="font-medium">标准作业程序 (SOP) 与自动化规范说明</div>
-          <div className="text-inkdim">
-            SOP 是 Agent 保持谨慎、工程规范与高质量交付的底层约束。关闭某项规范后，Agent 将在该维度解除硬性规则束缚（例如：关闭方案先行后可直接动手编码；关闭边读边记后将不强制记录并跳过任务完成后的后台自动提炼）。
-          </div>
-        </div>
+      {/* 模式切换 */}
+      <div className="flex items-center gap-1.5 p-1 rounded-xl bg-panel2/60 border border-edge/80 w-fit">
+        {(['builtin', 'custom'] as Mode[]).map((m) => (
+          <button
+            key={m}
+            onClick={() => switchMode(m)}
+            className={cn(
+              'px-3 py-1.5 rounded-lg text-[12px] transition-colors',
+              mode === m ? 'bg-accent/15 text-accent font-medium' : 'text-inkdim hover:text-ink',
+            )}
+          >
+            {m === 'builtin' ? '系统内置' : '自定义'}
+          </button>
+        ))}
       </div>
 
+      {/* 编辑器 */}
       <div className="flex flex-col gap-2">
-        <div className="flex items-center gap-2 text-[12px] font-semibold text-accent px-0.5">
-          <span className="w-2 h-2 rounded-full bg-accent" />
-          <span>标准作业程序 (SOP) 与工程落地规范</span>
-          <span className="text-[11px] font-normal text-inkfaint">方案先行、任务状态自愈、协作编排、代码精读与精确编辑</span>
+        <div className="flex items-center justify-between text-[11px] text-inkfaint">
+          <span>
+            {mode === 'builtin' ? '出厂内置（只读）' : '自定义内容（可编辑）'}
+            {core.overridden && mode === 'builtin' ? ' · 当前生效的是自定义版本' : ''}
+          </span>
+          <span className={cn(overBudget ? 'text-danger font-medium' : '')}>
+            ≈{tokens} / {core.budget > 0 ? core.budget : '不限'} token
+          </span>
         </div>
+        <textarea
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          readOnly={mode === 'builtin'}
+          spellCheck={false}
+          className={cn(
+            'w-full h-[320px] p-3 rounded-xl border bg-panel2/40 font-mono text-[12px] leading-relaxed resize-y',
+            'focus:outline-none focus:border-accent/50',
+            mode === 'builtin' ? 'border-edge/60 text-inkdim cursor-default' : 'border-edge/80',
+            overBudget && mode === 'custom' ? 'border-danger/60' : '',
+          )}
+        />
+        {overBudget && mode === 'custom' && (
+          <div className="text-[11px] text-danger">
+            超出总预算，保存会被服务端拒绝（不会截断）。请精炼内容，或调大 config.sop.core_max_tokens。
+          </div>
+        )}
+      </div>
 
-        {agentSops.map((s) => {
-          const enabled = isEnabled(s.id)
-          return (
-            <div key={s.id} className={cn(
-              'border rounded-xl p-3 flex items-start justify-between gap-3 transition-colors',
-              enabled ? 'border-edge bg-panel2/30' : 'border-edge/50 opacity-75',
-            )}>
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-2 flex-wrap">
-                  <code className="text-[13px] font-mono font-medium bg-panel2 px-1.5 py-0.5 rounded border border-edge/60">{s.id}</code>
-                  <span className="text-[12px] font-medium">{s.name}</span>
-                  <span className={cn('text-[11px] px-1.5 py-0.5 rounded-md border font-medium', CATEGORY_CLS[s.category])}>
-                    {s.categoryLabel}
-                  </span>
-                </div>
-                <div className="text-[12px] text-inkdim mt-1.5 leading-relaxed">{s.description}</div>
-                <div className="text-[11px] text-inkfaint mt-1.5 flex items-start gap-1">
-                  <span>↳</span>
-                  <span>{s.disableEffect}</span>
-                </div>
-              </div>
-              <div className="flex items-center gap-2 shrink-0 pt-0.5">
-                <span className={cn('text-[12px] select-none whitespace-nowrap', enabled ? 'text-ok font-medium' : 'text-inkdim')}>
-                  {enabled ? '启用' : '禁用'}
-                </span>
-                <Switch checked={enabled} onChange={() => toggle(s.id)} title={`${enabled ? '禁用' : '启用'} ${s.name}`} />
-              </div>
-            </div>
-          )
-        })}
+      {msg && (
+        <div className={cn('text-[11px]', msg.tone === 'ok' ? 'text-ok' : 'text-danger')}>{msg.text}</div>
+      )}
+
+      {/* 操作区 */}
+      <div className="flex items-center gap-2 flex-wrap">
+        {mode === 'custom' && (
+          <Button size="sm" onClick={save} disabled={busy || overBudget || !draft.trim()}>
+            {busy ? '保存中…' : '保存'}
+          </Button>
+        )}
+        {mode === 'builtin' && (
+          <Button size="sm" onClick={() => switchMode('custom')}>
+            切换为自定义编辑
+          </Button>
+        )}
+        <Button size="sm" variant="ghost" onClick={copyAll} className="gap-1.5">
+          {copied ? <Check size={13} /> : <Copy size={13} />}
+          {copied ? '已复制' : '复制全文'}
+        </Button>
+        {core.overridden && (
+          <Button size="sm" variant="ghost" onClick={reset} disabled={busy} className="text-danger gap-1.5">
+            <RotateCcw size={13} />
+            重置为内置
+          </Button>
+        )}
       </div>
     </div>
   )

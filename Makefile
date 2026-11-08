@@ -19,7 +19,7 @@ LDFLAGS := -s -w \
 	-X main.commit=$(COMMIT) \
 	-X main.buildTime=$(BUILDAT)
 
-.PHONY: all build web build-all lint vet test fmt tidy run clean check check-eol
+.PHONY: all build web build-all lint vet test fmt tidy run clean check check-eol e2e-device
 
 all: build
 
@@ -51,6 +51,11 @@ test:
 ## 带竞态检测（需 CGO + gcc；CI 上跑）
 test-race:
 	CGO_ENABLED=1 go test -race ./...
+
+## 设备协同跨仓联调（服务端 ↔ 桌面端主链：配对→WS→心跳→派发→回执）
+## 自包含模式，无需先启动服务端；详见 cmd/device-e2e/README.md
+e2e-device:
+	go run ./cmd/device-e2e
 
 ## 前端源码格式化（prettier 配置在 web/ 内）
 fmt:

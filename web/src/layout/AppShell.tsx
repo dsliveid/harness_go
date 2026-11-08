@@ -37,16 +37,21 @@ export function AppShell() {
   useBreakpoint()
   const { breakpoint, sidebarOpen, setSidebar, theme, panel } = useUI()
   const loadSessions = useSessions((s) => s.load)
+  const loadProjects = useSessions((s) => s.loadProjects)
   const loadProviders = useSettings((s) => s.loadProviders)
   useEffect(() => {
     void initPwa()
   }, [])
 
-  // 进入工作台即从主库拉取会话列表与厂商配置（real 模式；mock 模式为空操作）
+  // 进入工作台即从主库拉取会话列表、项目列表与厂商配置（real 模式；mock 模式为空操作）。
+  // 项目必须早于会话落地，否则会话归属（projectId）会因项目列表为空而反查失败、掉进纯对话。
   useEffect(() => {
-    void loadSessions()
-    void loadProviders()
-  }, [loadSessions, loadProviders])
+    void (async () => {
+      await loadProjects()
+      await loadSessions()
+      void loadProviders()
+    })()
+  }, [loadSessions, loadProjects, loadProviders])
 
   useEffect(() => {
     const root = document.documentElement

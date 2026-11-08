@@ -53,6 +53,15 @@ func NewRouter(d Deps) http.Handler {
 	// 归档（对齐桌面端「归档中心」；状态落主库，刷新/重启不丢）
 	mux.HandleFunc("POST /api/v1/sessions/{sid}/archive", h.archiveSession)
 	mux.HandleFunc("POST /api/v1/sessions/{sid}/unarchive", h.unarchiveSession)
+	// 项目域（项目落库为服务端一等实体：默认控制权限 + 项目审批规则）
+	mux.HandleFunc("GET /api/v1/projects", h.listProjects)
+	mux.HandleFunc("POST /api/v1/projects", h.createProject)
+	mux.HandleFunc("GET /api/v1/projects/{pid}", h.getProject)
+	mux.HandleFunc("PATCH /api/v1/projects/{pid}", h.updateProject)
+	mux.HandleFunc("DELETE /api/v1/projects/{pid}", h.deleteProject)
+	mux.HandleFunc("GET /api/v1/projects/{pid}/approval-rules", h.listProjectRules)
+	mux.HandleFunc("POST /api/v1/projects/{pid}/approval-rules", h.addProjectRule)
+	mux.HandleFunc("DELETE /api/v1/projects/{pid}/approval-rules/{rid}", h.deleteProjectRule)
 	// P1：Webhook 事件订阅管理（需求 §4.4）
 	mux.HandleFunc("GET /api/v1/webhooks", h.listWebhooks)
 	mux.HandleFunc("POST /api/v1/webhooks", h.createWebhook)
@@ -75,6 +84,9 @@ func NewRouter(d Deps) http.Handler {
 
 	// Run（嵌套在会话下：分库架构中 Run 必然属于某个会话，避免跨库查找）
 	mux.HandleFunc("POST /api/v1/sessions/{sid}/runs", h.createRun)
+	// 会话当前进行中的 Run（前端刷新后重建流式态/SSE 订阅的唯一事实来源）。
+	// 必须注册在 /runs/{rid} 之前语义上也不冲突：路径段 "active-run" 在 /runs/ 之外。
+	mux.HandleFunc("GET /api/v1/sessions/{sid}/active-run", h.activeRun)
 	mux.HandleFunc("GET /api/v1/sessions/{sid}/runs/{rid}", h.getRun)
 	mux.HandleFunc("POST /api/v1/sessions/{sid}/runs/{rid}/stop", h.stopRun)
 	// 运行中引导（需求 §4.2）：消息立即落库，引擎轮次边界回灌上下文
@@ -101,11 +113,27 @@ func NewRouter(d Deps) http.Handler {
 	mux.HandleFunc("PATCH /api/v1/settings", h.patchSettings)
 	mux.HandleFunc("GET /api/v1/stats", h.stats)
 	mux.HandleFunc("GET /api/v1/logs", h.logs)
+	// 日志与审计查询（admin scope：日志含他人会话内容、IP、错误堆栈）
+	mux.HandleFunc("GET /api/v1/logs/config", h.getLogConfig)
+	mux.HandleFunc("PATCH /api/v1/logs/config", h.patchLogConfig)
+	mux.HandleFunc("GET /api/v1/audit/tool-events", h.auditToolEvents)
+	// LLM 调用流水：全局查询（session_id 可选）+ 旧单会话路径作为兼容别名，
+	// 两者指向同一 handler，避免「工具审计全局、报文查询绑死单会话」的双轨割裂。
+	mux.HandleFunc("GET /api/v1/audit/llm-calls", h.auditLLMCalls)
+	mux.HandleFunc("GET /api/v1/stats/tokens", h.tokenStats)
+	mux.HandleFunc("GET /api/v1/sessions/{sid}/llm-trace", h.auditLLMCalls)
 
 	// 工具（A-10 协议层可观测与注入配置）
 	mux.HandleFunc("GET /api/v1/tools", h.listTools)
 	mux.HandleFunc("GET /api/v1/tools/injection", h.toolsInjection)
 	mux.HandleFunc("PATCH /api/v1/tools/tiers", h.patchToolTiers)
+
+	// 核心 SOP（agent-core）：出厂内置（embed）+ 运行时覆盖（data/sop）。
+	// 改完下一轮对话即生效，无需重启；重置 = 删除覆盖层回落出厂。
+	mux.HandleFunc("GET /api/v1/sop/core", h.getSOPCore)
+	mux.HandleFunc("PUT /api/v1/sop/core", h.putSOPCore)
+	mux.HandleFunc("DELETE /api/v1/sop/core", h.deleteSOPCore)
+	mux.HandleFunc("GET /api/v1/sop/effective", h.getSOPEffective)
 
 	// 阶段 E：外部插件与工具市场
 	mux.HandleFunc("GET /api/v1/mcp/servers", h.listMCPServers)
@@ -133,6 +161,12 @@ func NewRouter(d Deps) http.Handler {
 	mux.HandleFunc("DELETE /api/v1/devices/{did}", h.revokeDevice)
 	// 设备长连接（C-3 WS 网关）：设备令牌在升级前独立鉴权，不走用户令牌中间件
 	mux.HandleFunc("GET /api/v1/devices/ws", h.deviceWS)
+
+	// 工作区宿主目录列举（L0 服务端宿主；docs/工作区宿主与目录选择对接约定.md）
+	// —— 只读、只列目录；落在 /api/** 下由全局 Auth 中间件强制令牌。
+	// host=device:<id> 本期返回 409 fs.host_unsupported（L1 待客户端就绪），绝不降级为服务端本地列举。
+	mux.HandleFunc("GET /api/v1/fs/roots", h.listFSRoots)
+	mux.HandleFunc("GET /api/v1/fs/dirs", h.listFSDirs)
 
 	// 制品下载 / 数据导出备份（R2 / R4，docs/基础功能边界与插件化可行性评估.md）
 	// —— 均落在 /api/** 前缀下，由全局 Auth 中间件强制令牌。

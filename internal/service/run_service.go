@@ -23,11 +23,26 @@ type RunServiceOptions struct {
 	Sessions   *store.SessionStore
 	Engine     *agent.Engine
 	SystemBase string
+	// CoreSOPFunc 动态核心 SOP 源（agent-core）。
+	//
+	// 每 Run 调用一次，返回的是「SystemBase 的实质内容」——即出厂内置
+	// （internal/sop/builtin/agent-core.md，embed）或运行时覆盖（data/sop/agent-core.md）。
+	// 不缓存 → 界面改完**下一轮对话即生效**，无需重启/重编译。
+	//
+	// 为 nil 或返回空串时退回 SystemBase 静态值（降级不注入空系统提示）。
+	CoreSOPFunc func() string
+	// WorkDir 服务端进程工作目录（工具相对路径的实际落盘根）。
+	// 仅用于在「会话未绑定工作区」时向模型如实交代边界，不冒充用户的绑定目录。
+	WorkDir string
 	// SOP 静态 SOP 注入（启动期固定；测试/降级用）。
 	SOP []string
-	// SOPFunc 动态 SOP 源（阶段 G：sop 插件落盘 <ws>/.harness/sop/*.md 后
-	// 下一轮生效）。非 nil 时优先于静态 SOP。返回空切片表示项目无 SOP。
-	SOPFunc func() []string
+	// SOPFunc 动态 SOP 源（阶段 G），按**会话绑定的工作区**读取
+	// <ws>/.harness/sop/*.md，返回空切片表示项目无 SOP。
+	//
+	// 参数 wsPath 由 RunService 在每 Run 时按当前会话传入 —— 改造前本函数不接收
+	// 参数、经 host.Workspace() 读目录，而该 root 在进程启动时固化，导致切到
+	// 别的项目会话仍读到旧项目 SOP 的串味问题（本次修复）。
+	SOPFunc func(wsPath string) []string
 	Tools   []prompt.ToolRef
 	// ToolRefs 动态工具注入（优先于静态 Tools）：每轮重新取，
 	// 保证 PATCH /tools/tiers 改档后「下一轮对话生效」。
@@ -52,8 +67,11 @@ type RunService struct {
 	sessions   *store.SessionStore
 	engine     *agent.Engine
 	systemBase string
+	// coreSOPFunc 动态核心 SOP 源（agent-core）；nil 表示用静态 systemBase。
+	coreSOPFunc func() string
+	workDir     string
 	sop        []string
-	sopFunc    func() []string
+	sopFunc    func(wsPath string) []string
 	tools      []prompt.ToolRef
 	toolRefs   func() []prompt.ToolRef
 	gate       *approval.Gate
@@ -78,6 +96,8 @@ func NewRunService(opts RunServiceOptions) *RunService {
 		sessions:       opts.Sessions,
 		engine:         opts.Engine,
 		systemBase:     opts.SystemBase,
+		coreSOPFunc:    opts.CoreSOPFunc,
+		workDir:        opts.WorkDir,
 		sop:            opts.SOP,
 		sopFunc:        opts.SOPFunc,
 		tools:          opts.Tools,
@@ -90,6 +110,17 @@ func NewRunService(opts RunServiceOptions) *RunService {
 	}
 }
 
+// SetTraceSink 后置注入审计日志端口（启动装配期调用一次）。
+//
+// 后置注入的原因：审计日志库族依赖 settings 服务，而引擎在 settings 之前构造。
+// 禁止在 Run 运行期间热替换（调用方须保证只在启动阶段调用）。
+func (s *RunService) SetTraceSink(sink agent.TraceSink) {
+	if s == nil || s.engine == nil {
+		return
+	}
+	s.engine.SetTraceSink(sink)
+}
+
 // currentTools 返回本轮应注入的工具定义（动态优先）。
 func (s *RunService) currentTools() []prompt.ToolRef {
 	if s.toolRefs != nil {
@@ -99,9 +130,12 @@ func (s *RunService) currentTools() []prompt.ToolRef {
 }
 
 // currentSOP 返回本轮 SOP 全量注入（动态源优先；空 = 项目未配置 SOP）。
-func (s *RunService) currentSOP() []string {
+//
+// wsPath 传当前会话绑定的工作区，保证「读的是本会话所属项目」的 SOP ——
+// 不再依赖进程启动时固化的 host root（原串味问题根因）。
+func (s *RunService) currentSOP(wsPath string) []string {
 	if s.sopFunc != nil {
-		return s.sopFunc()
+		return s.sopFunc(wsPath)
 	}
 	return s.sop
 }
@@ -211,6 +245,15 @@ func (s *RunService) CreateRunWithSystem(ctx context.Context, sessionID, userInp
 	if err := sdb.Runs().Create(ctx, run); err != nil {
 		return nil, err
 	}
+	// 主库投影跟随真相（单一真相铁律）：Run 一创建就写 last_run_status=pending。
+	//
+	// sessions.last_run_status 是 session.db.runs.status 的**投影**，此前只在 Run 终态时
+	// 由 SummaryWriter.AddTokensAndStatus 回写 → Run 运行期间主库仍挂着上一轮的 completed，
+	// 造成两处实测缺陷：① RecoverInterrupted 按主库筛选时漏扫，进程重启后卡死的 running
+	// Run 永远不会被置 interrupted；② 会话列表的「运行中」徽标判据同样永不命中。
+	// 这里补写一次即可让投影全程跟随真相，无需新增接口/表/字段。
+	// 失败不阻断 Run（投影是展示项，真相在会话库），与 TouchMessage 同口径。
+	_ = s.main.Sessions().AddTokensAndStatus(ctx, sessionID, 0, model.RunPending)
 
 	// ④ 记忆召回（D-3）：每 Run 一次，core 进稳定前缀、tail 置尾。
 	// 召回失败降级为空块（记忆是优化项，绝不阻断对话 —— 与工具检索同口径）。
@@ -224,6 +267,15 @@ func (s *RunService) CreateRunWithSystem(ctx context.Context, sessionID, userInp
 	if strings.TrimSpace(systemBase) != "" {
 		system = systemBase
 	}
+	// 核心 SOP（agent-core）动态源：每 Run 取一次 → 界面改完下一轮即生效。
+	// 返回空串表示降级（服务未装配），此时保留静态提示，绝不注入空系统提示。
+	if s.coreSOPFunc != nil {
+		if core := strings.TrimSpace(s.coreSOPFunc()); core != "" {
+			system = core
+		}
+	}
+	// 工作区事实按会话注入：绑定/未绑定如实分叉，杜绝「未绑定却说自己在工作区内」的幻觉。
+	system = ComposeSystemBase(system, sess.WorkspacePath, s.workDir)
 	req := agent.RunRequest{
 		RunID:           run.ID,
 		SessionID:       sessionID,
@@ -231,7 +283,7 @@ func (s *RunService) CreateRunWithSystem(ctx context.Context, sessionID, userInp
 		ModelRef:        modelRef,
 		AccessMode:      approval.AccessMode(normalizeAccessMode(sess.AccessMode)),
 		SystemBase:      system,
-		SOP:             s.currentSOP(),
+		SOP:             s.currentSOP(sess.WorkspacePath),
 		ProjectSummary:  "",
 		Tools:           s.currentTools(),
 		ActiveTools:     s.selectTools(ctx, userInput),
@@ -331,6 +383,32 @@ func (s *RunService) ToolEvents(ctx context.Context, sessionID, runID string) ([
 		return nil, err
 	}
 	return sdb.ToolEvents().ListByRun(ctx, runID)
+}
+
+// ActiveRun 返回某会话当前「进行中」的 Run（无则 nil）。
+//
+// 用途：前端刷新（F5）后本地流式态全部丢失，但服务端 Run 仍在跑。此用例是
+// UI 重建订阅的唯一事实来源——**无进行中 Run 不是错误，返回 (nil, nil)**，
+// 与项目既有语义铁律「无租约不是 404」同口径（见 SessionLeaseDTO 注释）。
+//
+// 取 created_at 最新的一条：同一会话理论上不该并行多个未完成 Run（引擎串行），
+// 但进程重启/异常残留可能留下多条，此时以最新者为准（旧的已被 FailOpenRuns 收口）。
+func (s *RunService) ActiveRun(ctx context.Context, sessionID string) (*model.Run, error) {
+	sdb, err := s.sessions.Acquire(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	runs, err := sdb.Runs().ListUnfinished(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var latest *model.Run
+	for i := range runs {
+		if latest == nil || runs[i].CreatedAt >= latest.CreatedAt {
+			latest = &runs[i]
+		}
+	}
+	return latest, nil
 }
 
 // RunningCount 当前在运行的 Run 数（维护接口用）。

@@ -20,6 +20,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -31,6 +32,7 @@ import (
 	"harness-go/internal/device"
 	"harness-go/internal/events"
 	"harness-go/internal/llm"
+	"harness-go/internal/logvault"
 	"harness-go/internal/market"
 	"harness-go/internal/mcp"
 	"harness-go/internal/memory"
@@ -57,8 +59,17 @@ var (
 	buildTime = "unknown"
 )
 
-// defaultSystemBase 默认系统提示（后续由 SOP/项目约束/技能扩展）。
-const defaultSystemBase = `你是 harness-go 的编码助手，运行在用户的工作区内。
+// defaultSystemBase 默认系统提示兜底。
+//
+// 注意：Agent 真正的「出厂内置 SOP」已外化到 internal/sop/builtin/agent-core.md
+// （go:embed），运行期由 SOPService.CoreText() 提供，可被 data/sop/agent-core.md
+// 覆盖并**热生效**。本常量仅在 SOP 服务未装配时作为兜底（测试/降级路径），
+// 内容与 agent-core.md 保持一致，避免两条路径行为分叉。
+//
+// 这里只写**与运行时无关**的角色与规则。会话是否绑定工作区属于运行时事实，
+// 由 service.ComposeSystemBase 按会话注入——不要在此断言「运行在用户的工作区内」，
+// 否则未绑定工作区的纯对话会话会出现「顶栏说未绑定、模型却自称在工作区内」的自相矛盾。
+const defaultSystemBase = `你是 harness-go 的编码助手。
 
 规则：
 1. 修改文件前先读取确认内容，不要凭猜测改动。
@@ -83,18 +94,36 @@ func run() error {
 		return err
 	}
 
-	// 日志双写：stdout + data/app.log（`GET /api/v1/logs` 尾行读取该文件）。
-	// 日志文件打开失败不阻断启动（只退化为 stdout），但必须打印告警。
+	// 日志双写：stdout + data/app.log（`GET /api/v1/logs` 读取该文件族）。
+	//
+	// 轮转：按大小切分 app.log → app.log.1 .. app.log.N。
+	// 为什么必须轮转：日志无上限增长会让「读尾行」退化为扫整个大文件的线性 IO，
+	// 且最终写满磁盘；20MB/天 × 30 天 = 600MB 单文件时单次查询就要秒级。
+	// 打开失败不阻断启动（只退化为 stdout），但必须打印告警。
 	logWriter := io.Writer(os.Stdout)
-	if logFile, lErr := os.OpenFile(filepath.Join(dataDir, "app.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); lErr == nil {
-		logWriter = io.MultiWriter(os.Stdout, logFile)
-		defer func() { _ = logFile.Close() }()
+	if rot, rErr := observ.NewRotationWriter(observ.RotationOptions{
+		Path:    filepath.Join(dataDir, "app.log"),
+		MaxMB:   cfg.Log.RotationMB,
+		MaxKeep: cfg.Log.RotationKeep,
+	}); rErr == nil {
+		logWriter = io.MultiWriter(os.Stdout, rot)
+		defer func() { _ = rot.Close() }()
 	} else {
-		fmt.Fprintf(os.Stderr, "harness-go: 无法打开 data/app.log（日志面板将为空）: %v\n", lErr)
+		fmt.Fprintf(os.Stderr, "harness-go: 无法打开 data/app.log（日志面板将为空）: %v\n", rErr)
 	}
 
-	logger := observ.NewLogger(cfg.Log.Level, cfg.Log.Format, logWriter)
+	// 日志级别用 slog.LevelVar 承载，支持运行期热调（PATCH /api/v1/logs/config）。
+	//
+	// 关键：控制台（os.Stdout）与 data/app.log 共用同一个 MultiWriter、同一个 logger，
+	// 所以一次 SetLevel 同时作用于两者 —— 这正是「界面与控制台显示同一套」的实现基础，
+	// 也是不能把两者拆成不同 handler 级别的原因（拆开会导致界面看到的与终端看到的不一致）。
+	logger, logLevelVar := observ.NewLoggerWithLevel(cfg.Log.Level, cfg.Log.Format, logWriter)
 	slog.SetDefault(logger)
+	logger.Info("日志系统就绪",
+		"level", cfg.Log.Level,
+		"format", cfg.Log.Format,
+		"file", filepath.Join(dataDir, "app.log"),
+		"note", "级别可在「设置 → 日志查询」热调，控制台与日志文件同步生效")
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -250,6 +279,9 @@ func run() error {
 	}
 
 	// ⑧ 引擎
+	// 审批规则合并器（会话级「本会话允许」+ 项目级声明规则）：合并/去重/降级策略唯一实现，
+	// 引擎只消费结果，不感知「项目」概念。失败一律降级为更保守的逐次审批，绝不阻断 Run。
+	approvalPolicy := service.NewApprovalPolicy(mainStore, sessionStore)
 	engine, err := agent.New(agent.Deps{
 		Sessions:      service.NewSessionProvider(sessionStore),
 		Summary:       service.NewSummaryWriter(mainStore),
@@ -262,7 +294,9 @@ func run() error {
 		Gate:          gate,
 		Leases:        leasePort,
 		MaxConcurrent: 8,
-		MaxSteps:      20,
+		MaxSteps:      cfg.Agent.MaxSteps,
+		// 每 N 步向模型注入「当前步数 X/总步数 N」进度提示（0 = 关闭）。
+		StepNoticeEvery: cfg.Agent.StepNoticeEvery,
 		// 访问模式切换即时生效（对齐桌面端）：每次审批决策前实时重读会话行；
 		// 读取失败回落 Run 启动快照（引擎内空值回落 confirm，与 normalizeAccessMode 同口径）。
 		AccessModeProvider: func(ctx context.Context, sessionID string) (approval.AccessMode, error) {
@@ -275,20 +309,27 @@ func run() error {
 			}
 			return approval.AccessMode(sess.AccessMode), nil
 		},
+		Rules: approvalPolicy,
 	})
 	if err != nil {
 		return err
 	}
 
 	// ⑧' F：Host 能力接线（命令执行 / LLM / 事件 / 嵌套 Run）+ 记忆文件同步。
+	// 核心 SOP（agent-core）：出厂内置（embed）+ 运行时覆盖（data/sop）。
+	// 每 Run 动态读取 → 界面改完下一轮即生效，无需重启/重编译。
+	sopSvc := service.NewSOPService(dataDir, cfg.SOP.CoreMaxTokens)
 	childRunner := service.NewChildRunner(service.ChildRunnerOptions{
 		Sessions:   sessionStore,
 		Engine:     engine,
 		Main:       mainStore,
 		ToolRefs:   toolRunner.PromptRefs,
 		SystemBase: defaultSystemBase,
-		// G：SOP 动态源（sop 插件落盘 .harness/sop/*.md 后下一轮生效）
-		SOPFunc: func() []string { return sopBodies(toolHost) },
+		WorkDir:    workDir,
+		// G：项目级 SOP 动态源，按**会话工作区**读取（每轮重读 → 改完即生效）。
+		SOPFunc: sopBodies,
+		// 核心 SOP（agent-core）动态源：子 Run 与父 Run 同口径（体感一致）。
+		CoreSOPFunc: sopSvc.BindCore(),
 	})
 	toolHost.SetChildRunner(childRunner)
 	toolHost.SetCommandRunner(hostimpl.NewCommandRunner(hostimpl.CommandOptions{
@@ -297,6 +338,11 @@ func run() error {
 	}))
 	toolHost.SetLLM(&llmAdapter{resolver: modelResolver})
 	toolHost.SetEvents(&eventsAdapter{bus: bus})
+	// D：图像能力（generate_image / recognize_image）。仅在配置了图像端点时注入，
+	// 未配置则保持 nil —— 插件会返回「图像能力未启用」，绝不假装成功。
+	if imgProvider := buildImageProvider(logger); imgProvider != nil {
+		toolHost.SetImages(imgProvider)
+	}
 	syncMemoryFiles(ctx, workDir, mainStore, func(msg string, args ...any) {
 		logger.Info(msg, args...)
 	})
@@ -340,6 +386,9 @@ func run() error {
 		Sessions:   sessionStore,
 		Engine:     engine,
 		SystemBase: defaultSystemBase,
+		WorkDir:    workDir,
+		// 核心 SOP（agent-core）动态源：每 Run 读取，界面改完下一轮即生效。
+		CoreSOPFunc: sopSvc.BindCore(),
 		// 每轮重新取工具定义：PATCH /tools/tiers 改档后下一轮对话即生效
 		ToolRefs: toolRunner.PromptRefs,
 		// B-3：审批决策端点需经同一闸门提交（引擎在此登记待决项）
@@ -356,7 +405,7 @@ func run() error {
 		// D-3：记忆召回（L0/L1 稳定前缀 + L2/L3 检索置尾）
 		Memory: memoryStore,
 		// G：SOP 动态源（sop 插件唯一真源 <ws>/.harness/sop/*.md，全量注入）
-		SOPFunc: func() []string { return sopBodies(toolHost) },
+		SOPFunc: sopBodies,
 		// C-7：高风险审批是否仅限执行端设备确认（默认 false = 只审计不阻断）
 		StrictApprovalDevice: cfg.Devices.StrictApprovalDevice,
 	})
@@ -436,7 +485,83 @@ func run() error {
 		Cipher: secretCipher,
 	})
 	settingsSvc := service.NewSettingsService(mainStore)
+	// ⑩' B-4：厂商（api_key 密文落库）+ 配置 + 日志尾行、审计日志库族
 	logSvc := service.NewLogService(filepath.Join(dataDir, "app.log"), 500)
+
+	// ⑩'' 审计日志天分片库族（与业务库物理隔离；可丢弃，有保留期）
+	//
+	// 布局：data/logs/logs-YYYYMMDD.db + blob/<day>/<xx>/<sha256>
+	// 铁律：写入走有界队列 + 批量事务，绝不进入 Run 关键路径。
+	logRoot := cfg.Log.Dir
+	if logRoot == "" {
+		logRoot = filepath.Join(dataDir, "logs")
+	}
+	logShard, sErr := logvault.NewShard(logRoot)
+	if sErr != nil {
+		return sErr
+	}
+	defer func() { _ = logShard.Close() }()
+	logBlobs := logvault.NewBlobStore(logShard)
+	if n := logBlobs.CleanupTmp(); n > 0 {
+		logger.Info("已清理残留日志正文临时文件", "count", n)
+	}
+	// 抓取档位：settings 表优先，未配置时用 config 兜底（界面可运行时切换）
+	logModes := logvault.NewModeProvider(cfg.Log.SnapshotMode)
+	logRetention := logvault.NewRetention(logvault.RetentionOptions{
+		Shard:           logShard,
+		RetentionDays:   cfg.Log.RetentionDays,
+		ColdArchiveDays: cfg.Log.ColdArchiveDays,
+		MaxTotalBytes:   int64(cfg.Log.MaxTotalGB) << 30,
+		Logger:          logger,
+	})
+	logCfgSvc := service.NewLogConfigService(service.LogConfigOptions{
+		Settings:             settingsSvc,
+		Modes:                logModes,
+		Retention:            logRetention,
+		DefaultMode:          cfg.Log.SnapshotMode,
+		DefaultRetentionDays: cfg.Log.RetentionDays,
+		DefaultLevel:         cfg.Log.Level,
+		LevelVar:             logLevelVar,
+	})
+	// 用 settings 中的值刷新一次（把界面上次设置的档位带进本轮启动）
+	logModes.Refresh(logCfgSvc.SnapshotMode(ctx))
+	// 日志级别同理：界面上次保存的级别要覆盖本轮启动默认值，否则重启会「回到 config」。
+	// ApplyStoredLevel 只读库并改进程内 LevelVar，不重复写库。
+	if applied := logCfgSvc.ApplyStoredLevel(ctx); applied != cfg.Log.Level {
+		logger.Info("日志级别已按上次设置恢复", "level", applied, "config_default", cfg.Log.Level)
+	}
+
+	logWriterPipe := logvault.NewWriter(logvault.WriterOptions{
+		Shard:     logShard,
+		Blobs:     logBlobs,
+		Modes:     logModes,
+		Logger:    logger,
+		QueueCap:  cfg.Log.QueueCap,
+		BatchSize: cfg.Log.BatchSize,
+		FlushMs:   cfg.Log.FlushMS,
+	})
+	defer func() {
+		// 优雅关闭：排空队列，避免丢失尾部日志
+		if cErr := logWriterPipe.Close(); cErr != nil {
+			logger.Warn("关闭日志写入管道异常", "err", cErr)
+		}
+	}()
+	// 保留期清理器在档位服务之前已构造，这里复用它执行一次启动清理
+	// 启动即清理一次（把上次运行期间过期的天库回收），之后每小时检查一次
+	// （用 1h 而非 24h：跨零点后用户期望尽快看到「最早可查日期」前移）
+	retentionRep := logRetention.Sweep(ctx)
+	logRetention.Start(ctx, time.Hour)
+	logger.Info("审计日志库族已就绪",
+		"root", logShard.Root(),
+		"snapshot_mode", logCfgSvc.SnapshotMode(ctx),
+		"retention_days", cfg.Log.RetentionDays,
+		"earliest_day", retentionRep.EarliestDay,
+		"latest_day", retentionRep.LatestDay,
+		"total_mb", retentionRep.TotalAfterBytes>>20)
+	logvaultQuery := logvault.NewQuerier(logShard, logBlobs)
+	// 把审计端口注入引擎（nil 时不记日志，行为与之前完全一致）
+	runSvc.SetTraceSink(service.NewTraceSink(logWriterPipe))
+
 
 	// ⑩'' C-2：设备域（配对 / 列表 / 吊销）。配置来自 config.Devices 段。
 	// C-6：deviceLeases 已在引擎构造前建立（⑦''），这里注入到用例层。
@@ -513,6 +638,15 @@ func run() error {
 	}
 
 	// ⑪ 路由
+	// 工作区宿主目录列举的白名单根（L0）：默认只放开数据目录的**父级**（即本工作区根），
+	// 另可用 HARNESS_FS_ROOTS（分号分隔）追加。为空 = 前端目录选择器不可用（失败即关闭）。
+	fsRoots := resolveFSRoots(dataDir, os.Getenv("HARNESS_FS_ROOTS"))
+	if len(fsRoots) > 0 {
+		logger.Info("工作区目录列举已启用", "roots", fsRoots)
+	} else {
+		logger.Warn("未配置工作区目录列举根，前端目录选择将不可用（可设 HARNESS_FS_ROOTS）")
+	}
+
 	httpHandler := api.NewRouter(api.Deps{
 		Version:     version,
 		Log:         logger,
@@ -523,6 +657,10 @@ func run() error {
 		Providers:   providerSvc,
 		Settings:    settingsSvc,
 		Logs:        logSvc,
+		LogConfig:   logCfgSvc,
+		Vault:       logvaultQuery,
+		LogWriter:   logWriterPipe,
+		Shard:       logShard,
 		Devices:     deviceSvc,
 		MCP:         mcpSvc,
 		Packages:    pkgSvc,
@@ -532,6 +670,9 @@ func run() error {
 		Backups:     service.NewBackupService(service.BackupServiceOptions{DataDir: dataDir}),
 		Webhooks:    webhookSvc,
 		OpenAI:      openaiSvc,
+		Projects:    service.NewProjectService(mainStore),
+		SOP:         sopSvc,
+		FSRoots:     fsRoots,
 		DeviceWS:    deviceWSHandler(deviceGateway),
 		Bus:         bus,
 		Auth:        authSvc,
@@ -597,6 +738,51 @@ func run() error {
 	return nil
 }
 
+// resolveFSRoots 计算「允许浏览的目录根」白名单（工作区宿主目录列举，L0）。
+//
+// 规则（docs/工作区宿主与目录选择对接约定.md §4）：
+//   - 默认放开数据目录的**父级**：数据目录形如 <workspaceRoot>/data，
+//     故默认可浏览范围即该工作区根及其子树；
+//   - extra（HARNESS_FS_ROOTS，分号分隔）用于显式追加额外根，便于把工作区放在别处；
+//   - 结果全部 Abs + Clean，去重后返回；为空表示「拒绝列举」（失败即关闭语义）。
+func resolveFSRoots(dataDir, extra string) []string {
+	candidates := make([]string, 0, 4)
+	if parent := filepath.Dir(filepath.Clean(dataDir)); parent != "" && parent != "." {
+		candidates = append(candidates, parent)
+	} else {
+		candidates = append(candidates, dataDir)
+	}
+	for _, seg := range strings.Split(extra, ";") {
+		if seg = strings.TrimSpace(seg); seg != "" {
+			candidates = append(candidates, seg)
+		}
+	}
+
+	out := make([]string, 0, len(candidates))
+	seen := make(map[string]struct{}, len(candidates))
+	for _, c := range candidates {
+		abs, err := filepath.Abs(c)
+		if err != nil {
+			continue
+		}
+		abs = filepath.Clean(abs)
+		// 只保留真实存在的目录，避免把拼错的路径塞进白名单
+		if st, sErr := os.Stat(abs); sErr != nil || !st.IsDir() {
+			continue
+		}
+		key := abs
+		if runtime.GOOS == "windows" {
+			key = strings.ToLower(abs)
+		}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, abs)
+	}
+	return out
+}
+
 // deviceWSHandler 把网关包装为可 nil 的 http.Handler（未启用设备域时返回 nil，
 // 由 api 层 handler 直接回 503 device.disabled，避免路由指向空指针）。
 func deviceWSHandler(g *device.Gateway) http.Handler {
@@ -626,6 +812,43 @@ func buildProvider(logger *slog.Logger) (llm.Provider, string) {
 	}
 	fake := llm.NewFakeProvider()
 	return fake, fake.Describe()
+}
+
+// buildImageProvider 按环境变量构造 OpenAI 兼容图像能力；未配置返回 nil。
+//
+//	HARNESS_IMAGE_BASE_URL   例：https://api.openai.com/v1（缺省回退 HARNESS_LLM_BASE_URL）
+//	HARNESS_IMAGE_API_KEY    缺省回退 HARNESS_LLM_API_KEY
+//	HARNESS_IMAGE_MODEL      生成模型，缺省 gpt-image-1
+//	HARNESS_IMAGE_VISION_MODEL 理解模型，缺省 gpt-4o-mini
+//
+// 未显式配置 HARNESS_IMAGE_BASE_URL 且 LLM 端点未配置时返回 nil：
+// image 插件的两个工具将诚实返回「图像能力未启用」，而不是伪造结果。
+func buildImageProvider(logger *slog.Logger) toolapi.ImageProvider {
+	baseURL := strings.TrimSpace(os.Getenv("HARNESS_IMAGE_BASE_URL"))
+	apiKey := strings.TrimSpace(os.Getenv("HARNESS_IMAGE_API_KEY"))
+	if baseURL == "" {
+		baseURL = strings.TrimSpace(os.Getenv("HARNESS_LLM_BASE_URL"))
+		if apiKey == "" {
+			apiKey = strings.TrimSpace(os.Getenv("HARNESS_LLM_API_KEY"))
+		}
+	}
+	if baseURL == "" {
+		logger.Info("未配置图像端点（HARNESS_IMAGE_BASE_URL），generate_image/recognize_image 将报「图像能力未启用」")
+		return nil
+	}
+	p, err := llm.NewOpenAIImages(llm.OpenAIImagesConfig{
+		Name:        "openai-images",
+		BaseURL:     baseURL,
+		APIKey:      apiKey,
+		Model:       strings.TrimSpace(os.Getenv("HARNESS_IMAGE_MODEL")),
+		VisionModel: strings.TrimSpace(os.Getenv("HARNESS_IMAGE_VISION_MODEL")),
+	})
+	if err != nil {
+		logger.Error("初始化图像能力失败，图像工具将报「图像能力未启用」", "err", err)
+		return nil
+	}
+	logger.Info("图像能力已启用", "base_url", baseURL)
+	return p
 }
 
 // staticResolver 单 provider 解析器（A 阶段占位，B 阶段已由 service.ProviderResolver 取代）。

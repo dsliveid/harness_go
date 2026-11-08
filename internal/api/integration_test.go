@@ -70,6 +70,8 @@ func newTestServerWithDevices(t *testing.T) (*httptest.Server, string, *service.
 		Gate:     gate,
 		Leases:   deviceLeases,
 		MaxSteps: 5,
+		// 审批规则合并器（会话级 + 项目级下发）：与生产装配一致，验证项目规则真正进闸门
+		Rules: service.NewApprovalPolicy(mainStore, sessionStore),
 	})
 	if err != nil {
 		t.Fatalf("创建引擎失败: %v", err)
@@ -140,7 +142,10 @@ func newTestServerWithDevices(t *testing.T) (*httptest.Server, string, *service.
 		Logs:        logSvc,
 		Devices:     deviceSvc,
 		DeviceWS:    deviceGW,
-		Bus:         bus,
+		Projects:    service.NewProjectService(mainStore),
+		// 核心 SOP：出厂内置 + 运行时覆盖（dataDir 即 t.TempDir，天然隔离）。
+		SOP: service.NewSOPService(dir, 800),
+		Bus: bus,
 		Auth:        tokenSvc,
 		AuthConfig: AuthConfig{
 			SSOEnabled:   true,
@@ -202,6 +207,54 @@ func doJSON(t *testing.T, method, url, token string, body any, wantStatus int, o
 		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
 			t.Fatalf("解析响应失败: %v", err)
 		}
+	}
+}
+
+// activeRun 端点语义：无进行中 Run 不是 404（返回 200 + run_id 空串），有则回真实 run_id。
+//
+// 该端点是「刷新后界面看不到进行中状态」缺陷的服务端事实来源，语义一旦漂移
+// （例如改成 404）前端恢复链路会静默失效，故用测试锁死契约。
+func TestActiveRunEndpoint(t *testing.T) {
+	srv, token := newTestServer(t)
+
+	var sess struct {
+		ID string `json:"id"`
+	}
+	doJSON(t, http.MethodPost, srv.URL+"/api/v1/sessions", token,
+		map[string]any{"title": "活跃 Run 测试", "model_ref": "fake-model"}, http.StatusCreated, &sess)
+
+	// ① 空闲会话：200 + run_id 空串（**不是 404**）
+	var idle struct {
+		RunID  string `json:"run_id"`
+		Status string `json:"status"`
+	}
+	doJSON(t, http.MethodGet, srv.URL+"/api/v1/sessions/"+sess.ID+"/active-run", token,
+		nil, http.StatusOK, &idle)
+	if idle.RunID != "" {
+		t.Fatalf("空闲会话不应有进行中 Run，得到 %q", idle.RunID)
+	}
+
+	// ② 起 Run 后（fake provider 极快，此处只校验端点可正常读取且形态正确）：
+	//    不强断言「必然处于 running」—— 时序不稳会变成 flaky 测试。
+	var runResp struct {
+		RunID string `json:"run_id"`
+	}
+	doJSON(t, http.MethodPost, srv.URL+"/api/v1/sessions/"+sess.ID+"/runs", token,
+		map[string]any{"input": "你好"}, http.StatusAccepted, &runResp)
+	if runResp.RunID == "" {
+		t.Fatal("run_id 为空")
+	}
+	// 排空 SSE，确保 Run 走到终态后再查（终态会话必须回到「无进行中 Run」）
+	_ = collectSSE(t, srv.URL, token, sess.ID, runResp.RunID)
+
+	var after struct {
+		RunID  string `json:"run_id"`
+		Status string `json:"status"`
+	}
+	doJSON(t, http.MethodGet, srv.URL+"/api/v1/sessions/"+sess.ID+"/active-run", token,
+		nil, http.StatusOK, &after)
+	if after.RunID != "" {
+		t.Fatalf("Run 已终态，active-run 应为空，得到 %q（status=%s）", after.RunID, after.Status)
 	}
 }
 

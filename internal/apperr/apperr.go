@@ -73,6 +73,23 @@ const (
 	CodeApprovalDeviceMismatch Code = "approval.device_mismatch"
 )
 
+// 文件系统（工作区宿主目录列举，docs/工作区宿主与目录选择对接约定.md）
+//
+// 语义约定：这些端点**只读列举目录**，绝不读文件内容；host 决定由谁列举
+// （server = 服务端本地，device:<id> = 经由设备通道转发）。
+const (
+	// CodeFSPathDenied 路径越界或非法（穿越防护 / 不在根白名单内）
+	CodeFSPathDenied Code = "fs.path_denied"
+	// CodeFSPathNotFound 路径不存在，或存在但不是目录
+	CodeFSPathNotFound Code = "fs.path_not_found"
+	// CodeFSHostOffline 目标宿主不在线（仅在显式指定 host 时出现，绝不静默换机）
+	CodeFSHostOffline Code = "fs.host_offline"
+	// CodeFSHostUnsupported 宿主不具备目录列举能力（未申报 workspace.list）
+	CodeFSHostUnsupported Code = "fs.host_unsupported"
+	// CodeFSHostTimeout 端侧列举超时
+	CodeFSHostTimeout Code = "fs.host_timeout"
+)
+
 // 设备与多端协同（阶段 C / 多端协同 HALO M5）
 const (
 	// CodeDevicePairCodeInvalid 配对码不存在 / 已消费 / 已过期（三者统一，防枚举）
@@ -188,7 +205,7 @@ func From(err error) *Error {
 // StatusFor 错误码 → HTTP 状态码的默认映射。
 func StatusFor(code Code) int {
 	switch code {
-	case CodeInvalidArgument, CodeToolBadArgs, CodeAuthPasswordPolicy:
+	case CodeInvalidArgument, CodeToolBadArgs, CodeAuthPasswordPolicy, CodeFSPathDenied:
 		return http.StatusBadRequest
 	case CodeUnauthorized, CodeAuthInvalidCredentials, CodeAuthSignExpired,
 		CodeAuthSessionExpired, CodeDevicePairCodeInvalid, CodeDeviceRevoked:
@@ -196,13 +213,15 @@ func StatusFor(code Code) int {
 	case CodeForbidden, CodeAuthSSODisabled, CodeToolDenied, CodeApprovalDeviceMismatch:
 		return http.StatusForbidden
 	case CodeNotFound, CodeSessionNotFound, CodeRunNotFound, CodeToolNotFound,
-		CodeApprovalNotFound, CodeDeviceNotFound:
+		CodeApprovalNotFound, CodeDeviceNotFound, CodeFSPathNotFound:
 		return http.StatusNotFound
 	case CodeConflict, CodeRunStateConflict, CodeApprovalAlreadyDecide,
-		CodeDeviceProtocolMismatch:
+		CodeDeviceProtocolMismatch, CodeFSHostOffline, CodeFSHostUnsupported:
 		return http.StatusConflict
 	case CodeRateLimited, CodeAuthRateLimited:
 		return http.StatusTooManyRequests
+	case CodeFSHostTimeout:
+		return http.StatusGatewayTimeout
 	case CodeStorageBlobTooLarge:
 		return http.StatusRequestEntityTooLarge
 	case CodeUnavailable, CodeToolUnavailable, CodePluginDegraded,

@@ -8,6 +8,7 @@ import { cn } from '../../components/ui'
 import { useUI } from '../../stores/uiStore'
 import { Check, Clock, Copy, GitBranch, GitCompare, RotateCcw, RotateCw, Trash2, Zap, Sparkles, MessageSquare, Terminal, FileCode2 } from 'lucide-react'
 import { ProcessDrawer, formatStepMs, formatStepTokens } from './ProcessDrawer'
+import { ReasoningCard } from './ReasoningCard'
 import type { Message } from '../../types'
 
 interface TurnGroup {
@@ -216,27 +217,47 @@ function TurnBlock({ turn, isLast, running, reasoning, actions, showCopy }: {
   const assistants = turn.items.filter((m) => m.role === 'assistant')
   const hasTools = (m: Message) => (m.toolCalls?.length ?? 0) > 0
   const hasReasoning = (m: Message) => Boolean(m.reasoning?.trim())
+  // 过程步骤的判据：有工具调用，或「只有思考过程、尚无正文」的纯思考轮。
+  // 注意：带正文的答复即便带 thinking，也必须留在交付轨，否则思考卡片会把最终答复藏进过程抽屉。
+  const isProcessStep = (m: Message) => hasTools(m) || (hasReasoning(m) && !m.content.trim())
 
   const active = running && isLast
 
   let process: Message[] = []
   let deliverable: Message | null = null
+  // A1（对齐老版本）：最后一步仍带工具调用（正在执行 或 中途停止）时，
+  // 它既进抽屉展示过程，也作交付轨展示其总结文本（交付轨渲染前会剥空过程字段）。
+  // 仅在有正文时才发交付，避免空白气泡。
+  const canAlsoDeliver = (m: Message) => !active && Boolean(m.content.trim())
   if (assistants.length === 1) {
     const only = assistants[0]
-    if (hasTools(only) || hasReasoning(only)) process = [only]
-    else deliverable = only
+    if (isProcessStep(only)) {
+      process = [only]
+      if (canAlsoDeliver(only)) deliverable = only
+    } else deliverable = only
   } else if (assistants.length > 1) {
     const last = assistants[assistants.length - 1]
-    if (!hasTools(last)) {
+    if (!isProcessStep(last)) {
       deliverable = last
       process = assistants.slice(0, -1)
     } else {
       process = assistants
+      // A1：中途停止时最后一步仍带工具调用 → 同时发交付轨（展示其总结文本）
+      if (canAlsoDeliver(last)) deliverable = last
     }
   }
 
-  const showReasoningInline = active && reasoning.length > 0 && process.length === 0
+  const lastAssistantReasoning = assistants[assistants.length - 1]?.reasoning ?? ''
   const reverted = turn.items.some((m) => m.revertedAt)
+
+  // 中途停止/最后一步仍带工具调用时，最后一步既要进抽屉（看过程），又要作交付轨（看总结文本）。
+  // 对齐老版本 ExecutionProcessBlock 的做法，但**必须剥空过程字段**再交给交付轨：
+  // 老版本 emit deliverable 时强制 `reasoning: null, toolEvents: [], toolCalls: []`，
+  // 而本仓库此前直接把原始 Message 传进 MessageItem → 同一条消息的思考与工具卡片
+  // 会在「执行过程卡片外面」再显示一份。
+  const deliverableForRender = deliverable
+    ? { ...deliverable, reasoning: undefined, toolCalls: undefined }
+    : null
 
   return (
     <div className="pb-8">
@@ -247,17 +268,10 @@ function TurnBlock({ turn, isLast, running, reasoning, actions, showCopy }: {
           <ProcessDrawer steps={process} running={active} reasoning={active ? reasoning : undefined} />
         )}
 
-        {deliverable && <MessageItem key={deliverable.id} msg={deliverable} actions={actions} />}
+        {deliverableForRender && <MessageItem key={deliverableForRender.id} msg={deliverableForRender} actions={actions} />}
 
         {/* 轮次底部指标栏 */}
         <TurnFooterBar turn={turn} streaming={active} actions={actions} showCopy={showCopy} />
-
-        {showReasoningInline && (
-          <div className="text-[13px] text-inkfaint border-l-2 border-accent/60 pl-3 py-1 bg-panel2/40 rounded-r-lg">
-            <span className="text-[10px] uppercase font-mono tracking-wider text-accent font-semibold">思考中</span>
-            <div className="mt-1 leading-relaxed text-inkdim">{reasoning}</div>
-          </div>
-        )}
       </div>
     </div>
   )
@@ -426,6 +440,10 @@ function MessageItem({ msg, actions }: { msg: Message; actions: ThreadActions })
   // assistant（交付轨）
   return (
     <div className="flex flex-col gap-1.5 py-1">
+      {msg.reasoning && msg.reasoning.trim() && (
+        <ReasoningCard text={msg.reasoning} streaming={Boolean(msg.streaming && !msg.content)} />
+      )}
+
       {msg.content && (
         <div className="text-[14px] leading-relaxed text-ink">
           <MarkdownLite text={msg.content} />

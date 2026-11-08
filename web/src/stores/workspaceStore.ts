@@ -1,10 +1,11 @@
 import { create } from 'zustand'
 import type {
   PlanDoc, Snapshot, Subagent, TodoItem,
-  CommandRun,
+  CommandRun, Message,
 } from '../types'
 import type { Snapshot as SnapshotAnchor } from '../lib/apiTypes'
 import { api, apiMode } from '../lib/api'
+import { deriveWorkspace } from '../lib/workspaceDerive'
 import {
   commands as mockCommands, plans as mockPlans,
   snapshots as mockSnapshots, subagents as mockSubagents,
@@ -58,6 +59,12 @@ interface WorkspaceState {
   snapshotsError: string | null
   /** 拉取指定会话的真实快照锚点；mock 模式保持本地演示数据不请求 */
   loadSnapshots: (sessionId: string) => Promise<void>
+  /**
+   * 由真实工具调用实时派生运行态四类数据（todos / plans / subagents / commands）。
+   * 由 chatStore 在消息落地后调用（SSE 增量与历史回灌共用同一入口）。
+   * mock 模式为空操作——演示数据仍由 mock/data 提供，不被真实通道覆盖。
+   */
+  syncFromMessages: (messages: Message[]) => void
   /** 停止正在执行的命令（进程组终止） */
   stopCommand: (id: string) => void
   revertSnapshot: (id: string) => void
@@ -68,13 +75,27 @@ interface WorkspaceState {
 }
 
 export const useWorkspace = create<WorkspaceState>((set) => ({
-  plans: mockPlans,
-  todos: mockTodos,
-  snapshots: mockSnapshots,
-  subagents: mockSubagents,
-  commands: mockCommands,
+  // real 模式初始为空态：绝不先闪一屏演示数据再被真实数据覆盖（冒充真实）。
+  // mock 模式才用 mock/data 的演示行。
+  plans: apiMode === 'mock' ? mockPlans : [],
+  todos: apiMode === 'mock' ? mockTodos : [],
+  snapshots: apiMode === 'mock' ? mockSnapshots : [],
+  subagents: apiMode === 'mock' ? mockSubagents : [],
+  commands: apiMode === 'mock' ? mockCommands : [],
   snapshotsLoading: false,
   snapshotsError: null,
+
+  syncFromMessages: (messages) => {
+    // mock 模式：演示数据由 mock/data 持有，真实派生通道不介入（不伪造「已接真」）
+    if (apiMode !== 'real') return
+    const derived = deriveWorkspace(messages)
+    set({
+      todos: derived.todos,
+      plans: derived.plans,
+      subagents: derived.subagents,
+      commands: derived.commands,
+    })
+  },
 
   loadSnapshots: async (sessionId) => {
     // mock 模式：保留 mock/data 的演示行，不发请求（不伪造「已接真」）

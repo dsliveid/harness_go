@@ -236,16 +236,8 @@ func (h *handlers) stats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, stats)
 }
 
-func (h *handlers) logs(w http.ResponseWriter, r *http.Request) {
-	limit := intParam(r, "limit", 200)
-	level := r.URL.Query().Get("level")
-	lines, err := h.d.Logs.Tail(limit, level)
-	if err != nil {
-		writeError(w, r, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": lines, "limit": limit})
-}
+// 注：旧 logs handler 已迁移至 log_handler.go —— 新增 from/to/traceId/keyword/offset
+// 与保留策略元信息，并保持响应向后兼容（items[{level,text}]）。
 
 // isBodyEmpty 判断解析失败是否仅仅因为请求体为空（EOF）。
 //

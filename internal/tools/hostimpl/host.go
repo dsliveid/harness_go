@@ -43,6 +43,9 @@ type Options struct {
 	Snapshots toolapi.SnapshotStore
 	// Bundles 会话导出包（G：session-bundle；SetBundles 注入）。
 	Bundles toolapi.BundleStore
+	// Images 图像能力（D：generate_image / recognize_image；SetImages 注入）。
+	// 为可选能力：未注入时 Images() 返回 nil，插件据此返回「图像能力未启用」的诚实错误。
+	Images toolapi.ImageProvider
 	// CommandEnvWhitelist 子进程继承的宿主环境变量键。
 	CommandEnvWhitelist []string
 }
@@ -127,6 +130,14 @@ func (h *Host) SetLLM(l toolapi.LLM) { h.opts.Models = l }
 
 // SetEvents 后置注入事件发布（阶段 F）。
 func (h *Host) SetEvents(e toolapi.Events) { h.opts.Events = e }
+
+// Images 可选图像能力（阶段 D：generate_image / recognize_image）。
+// 未注入时返回 nil —— 这是**诚实的缺失信号**，插件据此返回「图像能力未启用」。
+// 注意：本方法不在 toolapi.Host 接口内，通过 toolapi.ImageHost 类型断言获取。
+func (h *Host) Images() toolapi.ImageProvider { return h.opts.Images }
+
+// SetImages 后置注入图像能力（阶段 D）。
+func (h *Host) SetImages(p toolapi.ImageProvider) { h.opts.Images = p }
 
 // Tasks 实现 toolapi.Host（阶段 G 填实；未注入时诚实报错）。
 func (h *Host) Tasks() toolapi.TaskManager {

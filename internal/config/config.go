@@ -106,6 +106,25 @@ type DevicesConfig struct {
 	StrictApprovalDevice bool `yaml:"strict_approval_device"` // 高风险审批是否仅限执行端设备确认
 }
 
+// AgentConfig Agent 执行循环参数（步数预算与进度提示）。
+//
+// 背景（2026-11 实测）：此前 `MaxSteps` 在 cmd/harness-go/main.go 中**硬编码 20**，
+// 无任何配置入口，也无提示告知模型剩余步数。后果是复杂任务（如全仓结构勘察）
+// 在执行到第 20 步时被硬性截断，runs 表终态为
+// `failed / max_steps_exceeded / 超过最大步数 20`，
+// 而模型全程不知预算，无法在接近上限时收敛输出、交出阶段性结论。
+//
+// 契约：
+//   - MaxSteps：单 Run 最大步数，**默认 100**。<=0 时引擎回落默认值（不在此处兜底）。
+//   - StepNoticeEvery：每 N 步向模型注入一行「当前步数 X/总步数 N」进度提示，
+//     默认 10；0 表示关闭该提示（不再注入）。
+//
+// 两者均在 Validate 中硬校验，非法值直接拒绝加载，不做静默兜底。
+type AgentConfig struct {
+	MaxSteps        int `yaml:"max_steps"`         // 单 Run 最大步数，默认 100
+	StepNoticeEvery int `yaml:"step_notice_every"` // 步数提示间隔（每 N 步提示一次），默认 10；0 = 关闭
+}
+
 // BudgetConfig 预算闸门（阶段 D-4）参数。
 //
 // 契约：
@@ -123,6 +142,21 @@ type BudgetConfig struct {
 	HistoryRatio float64 `yaml:"history_ratio"` // 历史段占比上限 (0,1]，默认 0.6
 }
 
+// SOPConfig 核心 SOP（agent-core）参数。
+//
+// 语义澄清：这里的 SOP **不是**项目级 .harness/sop/*.md 那些条目，而是
+// 「Agent 内置行为规范」本身 —— 出厂内容 embed 在 internal/sop/builtin/agent-core.md，
+// 运行时可被 data/sop/agent-core.md 覆盖（见 internal/sop 包）。
+//
+// CoreMaxTokens 是**总预算**（不是单条上限）：
+//   - 单条 token 上限已按需求取消，改为整篇文本的总量控制；
+//   - > 0 时超预算显式拒绝保存（拒绝不截断）；= 0 表示不限。
+//
+// 默认 800：出厂内容约 90 token，留出充足余量供用户在界面逐步调教细化规则。
+type SOPConfig struct {
+	CoreMaxTokens int `yaml:"core_max_tokens"` // 核心 SOP 总 token 预算，0 = 不限
+}
+
 // MCPConfig 外部插件接入（阶段 E / MCP + 工具市场）参数。
 //
 // 安全边界（docs/MCP接入设计.md §10）：
@@ -138,10 +172,96 @@ type MCPConfig struct {
 	AllowUnsigned bool     `yaml:"allow_unsigned"` // 允许安装未签名包（默认拒绝）
 }
 
-// LogConfig 日志。
+// LogConfig 日志（文本运维日志 + 天分片审计日志库族）。
+//
+// 两套数据分层（见 docs/日志与审计查询方案.md）：
+//   - 文本运维日志：data/app.log（轮转），人看 —— 启动、panic、访问日志
+//   - 结构化审计日志：data/logs/logs-YYYYMMDD.db（天分片），机器查 —— 报文快照、工具调用
+//
+// ⚠️ SnapshotMode 在此**仅作初始默认**：本包对象一经 Load 即为只读，
+// 运行期抓取档位以 settings 表 `log.snapshot_mode` 为准（界面可切）。
+//
+// ⚠️ Level 同理：此处只是**初始默认**（默认 warn），运行期以 settings 表 `log.level`
+// 为准，可通过 PATCH /api/v1/logs/config 热调（slog.LevelVar，免重启）。
+// 因为控制台与 data/app.log 共用同一个 logger，级别调整对两者同时生效。
 type LogConfig struct {
-	Level  string `yaml:"level"`  // debug | info | warn | error
+	Level  string `yaml:"level"`  // debug | info | warn | error（默认 warn）
 	Format string `yaml:"format"` // json | text
+
+	// Dir 审计日志库族根目录（空 = <data.dir>/logs）。
+	Dir string `yaml:"dir"`
+
+	// RetentionDays 审计日志在线保留天数（超期整天库物理删除）。默认 30。
+	RetentionDays int `yaml:"retention_days"`
+
+	// ColdArchiveDays 冷归档天数：>0 时超期库先 gzip 到 archive/ 再删；
+	// 0（默认）= 直接删除，不留归档。
+	ColdArchiveDays int `yaml:"cold_archive_days"`
+
+	// MaxTotalGB 审计日志总量上限（GB）。超限时强制删除最早天库。
+	// 0 = 不限（仅靠 RetentionDays）。
+	MaxTotalGB int `yaml:"max_total_gb"`
+
+	// SnapshotMode 报文抓取档位初始默认：off | preview | full。默认 preview。
+	// 运行期以 settings 表 log.snapshot_mode 为准。
+	SnapshotMode string `yaml:"snapshot_mode"`
+
+	// 写入管道参数（批量事务，保证不阻塞 Run 关键路径）。
+	QueueCap  int `yaml:"queue_cap"`  // 有界队列容量，默认 4096
+	BatchSize int `yaml:"batch_size"` // 单事务批量条数，默认 500
+	FlushMS   int `yaml:"flush_ms"`   // 批量提交超时（毫秒），默认 200
+
+	// RotationMB 文本日志单文件轮转阈值（MB），默认 32。
+	RotationMB int `yaml:"rotation_mb"`
+	// RotationKeep 文本日志保留份数（app.log.1 .. app.log.N），默认 5。
+	RotationKeep int `yaml:"rotation_keep"`
+}
+
+// 报文抓取档位（log.snapshot_mode 的合法取值）。
+const (
+	// SnapshotOff 只记元数据（model/endpoint/tokens/ttft），不记任何报文。
+	SnapshotOff = "off"
+	// SnapshotPreview 表内存脱敏预览 + sha256 + 字节数，正文不落盘（默认）。
+	SnapshotPreview = "preview"
+	// SnapshotFull 正文落 data/logs/blob/<day>/<xx>/<sha256>，可获得原始出入参。
+	SnapshotFull = "full"
+)
+
+// 日志级别（log.level 的合法取值）。
+//
+// 默认 LogLevelWarn：控制台只留必要的告警与错误。
+// 为什么默认不是 info：控制台与 data/app.log 共用同一个 slog logger（同一 io.MultiWriter），
+// info 会让启动流水账与请求访问日志刷满控制台；而运行期可用
+// PATCH /api/v1/logs/config {"level":"info"} 热调回来（slog.LevelVar，免重启）。
+const (
+	LogLevelDebug = "debug"
+	LogLevelInfo  = "info"
+	LogLevelWarn  = "warn"
+	LogLevelError = "error"
+)
+
+// DefaultLogLevel 内置默认日志级别（控制台降噪的落点）。
+const DefaultLogLevel = LogLevelWarn
+
+// ValidLogLevel 判断日志级别是否合法。
+//
+// 与 observ.ParseLevel 的分工：本函数用于**写入路径的严格校验**（非法值必须拒绝，
+// 不能静默兜底成 info 让人以为设置生效了）；ParseLevel 用于启动期容错解析。
+func ValidLogLevel(l string) bool {
+	switch l {
+	case LogLevelDebug, LogLevelInfo, LogLevelWarn, LogLevelError:
+		return true
+	}
+	return false
+}
+
+// ValidSnapshotMode 判断抓取档位是否合法。
+func ValidSnapshotMode(m string) bool {
+	switch m {
+	case SnapshotOff, SnapshotPreview, SnapshotFull:
+		return true
+	}
+	return false
 }
 
 // Config 聚合配置。
@@ -153,7 +273,9 @@ type Config struct {
 	Storage    StorageConfig    `yaml:"storage"`
 	Tools      ToolsConfig      `yaml:"tools"`
 	Devices    DevicesConfig    `yaml:"devices"`
+	Agent      AgentConfig      `yaml:"agent"`
 	Budget     BudgetConfig     `yaml:"budget"`
+	SOP        SOPConfig        `yaml:"sop"`
 	MCP        MCPConfig        `yaml:"mcp"`
 	Log        LogConfig        `yaml:"log"`
 
@@ -176,9 +298,10 @@ func Default() Config {
 		Storage: StorageConfig{
 			MaxOpenSessions: 8,
 			MaxBlobMB:       64,
-			DataQuotaGB:     8,
-			IdleEvictMin:    10,
-			BlobGCGraceH:    24,
+			// 64GB：审计日志 30 天在 preview 档约 15GB，8GB 会在十余天即持续告警。
+			DataQuotaGB:  64,
+			IdleEvictMin: 10,
+			BlobGCGraceH: 24,
 		},
 		Tools: ToolsConfig{
 			CoreSoftLimit:     8,
@@ -194,9 +317,17 @@ func Default() Config {
 			TaskTTLS:             600,
 			StrictApprovalDevice: false, // 默认只审计不阻断
 		},
+		Agent: AgentConfig{
+			MaxSteps:        100, // 默认 100 步（原硬编码 20，复杂任务易被截断）
+			StepNoticeEvery: 10,  // 每 10 步向模型注入一次「当前步数 X/总步数 N」
+		},
 		Budget: BudgetConfig{
 			MaxTotal:     0,   // 默认不限预算（闸门直通）；配置后超限走五级降级
 			HistoryRatio: 0.6, // 历史段占比上限，仅 MaxTotal>0 时生效
+		},
+		SOP: SOPConfig{
+			// 800：出厂内容约 90 token，留足余量供用户在界面逐步调教细化规则。
+			CoreMaxTokens: 800,
 		},
 		MCP: MCPConfig{
 			Enabled:       true,  // 外部插件默认启用（未配置 Server/包时零副作用）
@@ -204,7 +335,21 @@ func Default() Config {
 			TrustedKeys:   nil,   // 受信公钥（空 = 签名包无法安装）
 			AllowUnsigned: false, // 出口铁律：未签名包默认被拒
 		},
-		Log: LogConfig{Level: "info", Format: "text"},
+		Log: LogConfig{
+			Level:         DefaultLogLevel,
+			Format:        "text",
+			RetentionDays: 30,
+			// ColdArchiveDays=0：用户要求「超 30 天自动清理」，不留归档。
+			// 保留该配置项是为了将来合规需要时改一行即可开启，不用重构。
+			ColdArchiveDays: 0,
+			MaxTotalGB:      0,   // 0 = 不限，仅靠 RetentionDays（界面提示实际占用）
+			SnapshotMode:    SnapshotPreview,
+			QueueCap:        4096,
+			BatchSize:       500,
+			FlushMS:         200,
+			RotationMB:      32,
+			RotationKeep:    5,
+		},
 	}
 }
 
@@ -330,6 +475,16 @@ func applyEnv(cfg *Config, env func(string) string) error {
 		{"HARNESS_DATA_DIR", strVal(&cfg.Data.Dir)},
 		{"HARNESS_LOG_LEVEL", strVal(&cfg.Log.Level)},
 		{"HARNESS_LOG_FORMAT", strVal(&cfg.Log.Format)},
+		{"HARNESS_LOG_DIR", strVal(&cfg.Log.Dir)},
+		{"HARNESS_LOG_RETENTION_DAYS", intVal(&cfg.Log.RetentionDays)},
+		{"HARNESS_LOG_COLD_ARCHIVE_DAYS", intVal(&cfg.Log.ColdArchiveDays)},
+		{"HARNESS_LOG_MAX_TOTAL_GB", intVal(&cfg.Log.MaxTotalGB)},
+		{"HARNESS_LOG_SNAPSHOT_MODE", strVal(&cfg.Log.SnapshotMode)},
+		{"HARNESS_LOG_QUEUE_CAP", intVal(&cfg.Log.QueueCap)},
+		{"HARNESS_LOG_BATCH_SIZE", intVal(&cfg.Log.BatchSize)},
+		{"HARNESS_LOG_FLUSH_MS", intVal(&cfg.Log.FlushMS)},
+		{"HARNESS_LOG_ROTATION_MB", intVal(&cfg.Log.RotationMB)},
+		{"HARNESS_LOG_ROTATION_KEEP", intVal(&cfg.Log.RotationKeep)},
 		{"HARNESS_SSO_ENABLED", boolVal(&cfg.Auth.SSOEnabled)},
 		{"HARNESS_SSO_MODE", func(v string) error { cfg.Auth.SSOMode = SSOMode(v); return nil }},
 		{"HARNESS_SSO_SECRET", strVal(&cfg.Auth.SSOSecret)},
@@ -343,12 +498,15 @@ func applyEnv(cfg *Config, env func(string) string) error {
 		{"HARNESS_DEFERRED_SOFT_LIMIT", intVal(&cfg.Tools.DeferredSoftLimit)},
 		{"HARNESS_DYNAMIC_TOPK", intVal(&cfg.Tools.DynamicTopK)},
 		{"HARNESS_DYNAMIC_MIN_TOPK", intVal(&cfg.Tools.DynamicMinTopK)},
+		{"HARNESS_SOP_CORE_MAX_TOKENS", intVal(&cfg.SOP.CoreMaxTokens)},
 		{"HARNESS_DEVICES_ENABLED", boolVal(&cfg.Devices.Enabled)},
 		{"HARNESS_DEVICES_PAIR_TTL_S", intVal(&cfg.Devices.PairTTLS)},
 		{"HARNESS_DEVICES_HEARTBEAT_S", intVal(&cfg.Devices.HeartbeatS)},
 		{"HARNESS_DEVICES_OFFLINE_AFTER_S", intVal(&cfg.Devices.OfflineAfterS)},
 		{"HARNESS_DEVICES_TASK_TTL_S", intVal(&cfg.Devices.TaskTTLS)},
 		{"HARNESS_DEVICES_STRICT_APPROVAL", boolVal(&cfg.Devices.StrictApprovalDevice)},
+		{"HARNESS_AGENT_MAX_STEPS", intVal(&cfg.Agent.MaxSteps)},
+		{"HARNESS_AGENT_STEP_NOTICE_EVERY", intVal(&cfg.Agent.StepNoticeEvery)},
 		{"HARNESS_BUDGET_MAX_TOTAL", intVal(&cfg.Budget.MaxTotal)},
 		{"HARNESS_BUDGET_HISTORY_RATIO", floatVal(&cfg.Budget.HistoryRatio)},
 	}
@@ -370,6 +528,8 @@ func applyFlags(cfg *Config, args []string) error {
 	dataDir := fs.String("data", "", "数据目录")
 	mode := fs.String("mode", "", "部署形态 local|server|cloud")
 	logLevel := fs.String("log-level", "", "日志级别 debug|info|warn|error")
+	maxSteps := fs.Int("agent-max-steps", 0, "单 Run 最大步数（覆盖配置文件/环境变量）")
+	stepNoticeEvery := fs.Int("agent-step-notice-every", 0, "步数提示间隔（每 N 步提示一次，0 = 用配置值）")
 	_ = fs.String("config", "", "配置文件路径（在 Load 早期已解析）")
 
 	if err := fs.Parse(args); err != nil {
@@ -385,6 +545,11 @@ func applyFlags(cfg *Config, args []string) error {
 			cfg.Deployment.Mode = DeploymentMode(*mode)
 		case "log-level":
 			cfg.Log.Level = *logLevel
+		case "agent-max-steps":
+			cfg.Agent.MaxSteps = *maxSteps
+		case "agent-step-notice-every":
+			// 显式传 0 表示「关闭提示」，故用 Visit 判「是否设置过」而非判非零值。
+			cfg.Agent.StepNoticeEvery = *stepNoticeEvery
 		}
 	})
 	return nil
@@ -429,6 +594,19 @@ func (c *Config) Validate() error {
 	if c.Auth.SessionTTLH <= 0 {
 		return errors.New("config: auth.session_ttl_h 必须 > 0")
 	}
+	// Agent 执行循环：步数预算与进度提示。取值非法会让「长任务不被误截断」
+	// 与「模型感知剩余预算」两个目标静默失效，故一律硬拒绝而非兜底。
+	if c.Agent.MaxSteps <= 0 {
+		return errors.New("config: agent.max_steps 必须 > 0（0 会让所有 Run 立即以 max_steps_exceeded 失败）")
+	}
+	if c.Agent.StepNoticeEvery < 0 {
+		return errors.New("config: agent.step_notice_every 不能为负（0 = 关闭步数提示）")
+	}
+	if c.Agent.StepNoticeEvery > c.Agent.MaxSteps {
+		// 间隔大于总步数 = 提示永远不会触发，属自相矛盾配置，直接拒绝。
+		return fmt.Errorf("config: agent.step_notice_every(%d) 不能大于 agent.max_steps(%d)（否则步数提示永不触发）",
+			c.Agent.StepNoticeEvery, c.Agent.MaxSteps)
+	}
 	// 阶段 D-2 动态工具注入：两个参数直接决定「模型每轮看得见多少工具」，
 	// 取值非法会让 Token 治理静默失效，故一律硬拒绝而非兜底。
 	if c.Tools.DynamicTopK <= 0 {
@@ -441,6 +619,10 @@ func (c *Config) Validate() error {
 		// 归一化会把它压成 DynamicTopK，但那是掩盖配置错误：用户写了自相矛盾的值。
 		return fmt.Errorf("config: tools.dynamic_min_top_k(%d) 不能大于 tools.dynamic_top_k(%d)",
 			c.Tools.DynamicMinTopK, c.Tools.DynamicTopK)
+	}
+	// 核心 SOP 总预算：负数无意义（0 才是「不限」），直接拒绝而非静默归零。
+	if c.SOP.CoreMaxTokens < 0 {
+		return errors.New("config: sop.core_max_tokens 不能为负（0 = 不限）")
 	}
 	if c.Devices.PairTTLS <= 0 {
 		return errors.New("config: devices.pair_ttl_s 必须 > 0")
@@ -480,6 +662,42 @@ func (c *Config) Validate() error {
 		c.Log.Format = strings.ToLower(c.Log.Format)
 	default:
 		return fmt.Errorf("config: log.format 非法: %q", c.Log.Format)
+	}
+
+	// 审计日志保留期：非法值会让「自动清理」静默失效（日志永久堆积），故硬校验。
+	// 上限 3650 天（10 年）防误配成天文数字导致永不清理。
+	if c.Log.RetentionDays <= 0 || c.Log.RetentionDays > 3650 {
+		return fmt.Errorf("config: log.retention_days 必须在 (0,3650] 区间，得到 %d", c.Log.RetentionDays)
+	}
+	if c.Log.ColdArchiveDays < 0 {
+		return errors.New("config: log.cold_archive_days 不能为负（0 = 不归档，直接删除）")
+	}
+	// 冷归档天数必须大于在线保留天数，否则「归档」与「删除」同时触发，归档形同虚设。
+	if c.Log.ColdArchiveDays > 0 && c.Log.ColdArchiveDays <= c.Log.RetentionDays {
+		return fmt.Errorf("config: log.cold_archive_days(%d) 必须大于 log.retention_days(%d)，否则归档与删除同时触发",
+			c.Log.ColdArchiveDays, c.Log.RetentionDays)
+	}
+	if c.Log.MaxTotalGB < 0 {
+		return errors.New("config: log.max_total_gb 不能为负（0 = 不限）")
+	}
+	if !ValidSnapshotMode(strings.ToLower(c.Log.SnapshotMode)) {
+		return fmt.Errorf("config: log.snapshot_mode 非法: %q（可选 off|preview|full）", c.Log.SnapshotMode)
+	}
+	c.Log.SnapshotMode = strings.ToLower(c.Log.SnapshotMode)
+	if c.Log.QueueCap <= 0 {
+		return errors.New("config: log.queue_cap 必须 > 0")
+	}
+	if c.Log.BatchSize <= 0 {
+		return errors.New("config: log.batch_size 必须 > 0")
+	}
+	if c.Log.FlushMS <= 0 {
+		return errors.New("config: log.flush_ms 必须 > 0")
+	}
+	if c.Log.RotationMB <= 0 {
+		return errors.New("config: log.rotation_mb 必须 > 0")
+	}
+	if c.Log.RotationKeep <= 0 {
+		return errors.New("config: log.rotation_keep 必须 > 0")
 	}
 	return nil
 }

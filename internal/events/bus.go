@@ -27,7 +27,11 @@ const (
 	// 消息
 	TypeMessageStart Type = "message.start" // payload: {message_id, role, seq}
 	TypeMessageDelta Type = "message.delta" // payload: {message_id, delta}（不落库，仅预览）
-	TypeMessageEnd   Type = "message.end"   // payload: {message_id, content, token_count}
+	// TypeMessageReasoning 思考过程增量（如 DeepSeek/OpenAI 兼容端点返回 reasoning_content）。
+	// payload: {message_id, delta}；与 delta 同语义「不落库、仅预览」，
+	// 最终完整文本随 message.end 的 reasoning 字段与 DB 快照下发。
+	TypeMessageReasoning Type = "message.reasoning"
+	TypeMessageEnd       Type = "message.end" // payload: {message_id, content, token_count, reasoning}
 	// TypeMessageAppended 运行中引导消息已落库（需求 §4.2 引导：引擎轮次边界回灌上下文）。
 	// payload: {message_id, role, content, seq}；前端以 reloadMessages/POST 响应对齐，不驱动流式 UI。
 	TypeMessageAppended Type = "message.appended"

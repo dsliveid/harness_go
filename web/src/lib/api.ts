@@ -10,7 +10,7 @@
  *   - 错误统一为 `ApiError`（携带 code / status / trace_id，trace_id 与后端日志一致）。
  */
 
-import type { AccessMode, Message, Run, RunStatus, Session, ToolCall, Risk, ToolStatus } from '../types'
+import type { AccessMode, ApprovalRule, Message, Project, ProjectApprovalRule, Run, RunStatus, Session, ToolCall, Risk, ToolStatus } from '../types'
 import * as mockData from '../mock/data'
 import { toolList } from '../mock/settingsData'
 import { startMockRun, type Decision, type StreamEvent } from '../mock/stream'
@@ -18,12 +18,20 @@ import { SseClient, type SseState as SseStateName, type SseStateInfo } from './s
 import { extractFileDiff, extractResultContent } from './toolDiff'
 import {
   API_PATHS,
+  type ActiveRunDTO,
   type ChangePasswordRequest,
   type CreateDevicePairCodeRequest,
   type CreateRunResponse,
   type DeviceListResponse,
   type DeviceDTO,
-  type LogLine,
+  type LogsQuery,
+  type LogsResponse,
+  type AuditLlmCallsQuery,
+  type AuditLlmCallsResponse,
+  type AuditToolEventsResponse,
+  type SOPCore,
+  type SOPEffective,
+  type TokenStatsResult,
   type LoginRequest,
   type LoginResponse,
   type Message as ApiMessage,
@@ -44,6 +52,8 @@ import {
   type ProviderSecretResult,
   type ProviderTestInput,
   type ProviderTestResult,
+  type Project as ApiProject,
+  type ProjectApprovalRule as ApiProjectApprovalRule,
   type Rollback,
   type Run as ApiRun,
   type RunStatus as ApiRunStatus,
@@ -119,8 +129,14 @@ export interface RunHandle {
   readonly runId: string
   /** 停止 Run（服务端幂等） */
   stop(): void
-  /** 审批决定（阶段 B-3 接入 approval 端点后生效） */
-  resume(decision: Decision, reason?: string): void
+  /**
+   * 立即重连事件流（跳过退避）。
+   *
+   * 用途：收到服务端 `resync` 且查明 Run **尚未终态**时，重新订阅继续收事件。
+   * 语义边界：SseClient 收到 resync 后**不自动重连**（Terminal Run 重连只会拿到
+   * 「事件源已关闭」，形成重连风暴）；是否重连必须由上层依据 Run 真实状态决定。
+   */
+  reconnect(): void
 }
 
 export interface StartRunOptions {
@@ -150,10 +166,67 @@ export interface StartRunOptions {
   onSseEventSeq?: (seq: number) => void
 }
 
+/**
+ * 订阅一个**已存在** Run 的事件流（StartRunOptions 的订阅部分 + 目标 Run 标识）。
+ *
+ * 存在意义：`startRun` 原本把「POST 创建 Run」与「new SseClient 订阅事件」焊死在一起，
+ * 导致页面刷新（F5）后无法重新接上服务端仍在跑的 Run —— 这正是「刷新后看不到进行中状态」的根因。
+ * 抽出后，创建路径与恢复路径共用同一套订阅/事件映射/状态上报逻辑，杜绝两份状态机。
+ */
+export interface AttachRunOptions {
+  sessionId: string
+  runId: string
+  /**
+   * 起始事件序号（服务端 Bus.Subscribe 的 fromSeq 语义）：
+   *   - 缺省 0：从头补发历史（新建 Run 时不会漏掉首屏事件）；
+   *   - **-1：只要新事件、绝不补发历史** —— 刷新恢复场景必须用它。
+   *
+   * ⚠️ 刷新恢复时必须传 -1：此时前端已通过 DB 快照拿到消息全文，
+   * 若再补发历史 `message.delta`，文本会被重复追加一遍（脏数据级缺陷）。
+   */
+  fromSeq?: number
+  onEvent: (e: StreamEvent) => void
+  onResync?: () => void
+  onSseState?: (state: SseStateName, info: SseStateInfo) => void
+  onSseEventSeq?: (seq: number) => void
+}
+
 export interface CreateSessionInput {
   title?: string
   modelRef?: string
   workspacePath?: string
+  /**
+   * 归属项目（服务端 sessions.project_id）。**仅**用于告诉服务端「这个会话属于哪个项目」；
+   * 该会话的初始控制权限由服务端按项目的 default_access_mode 裁决并快照。
+   */
+  projectId?: string
+  /**
+   * 显式控制权限。铁律：**前端常规创建会话时绝不可传**（默认权限继承由服务端裁决），
+   * 仅在服务端接口层面保留该字段以支持显式指定场景。
+   */
+  accessMode?: AccessMode
+}
+
+/* ---- 项目级治理（阶段七）：入参类型（字段全部可选/最小必要，real 分支只发送存在的字段） ---- */
+
+/** 新建项目入参（对应 POST /projects body: {name,path,default_access_mode}） */
+export interface CreateProjectInput {
+  name: string
+  path: string
+  defaultAccessMode?: AccessMode
+}
+
+/** 更新项目入参（对应 PATCH /projects/{id}）—— 未提供的字段不发送，避免覆盖成空值 */
+export interface UpdateProjectInput {
+  name?: string
+  defaultAccessMode?: AccessMode
+  pinned?: boolean
+}
+
+/** 新增项目审批规则入参（对应 POST /projects/{pid}/approval-rules body） */
+export interface CreateProjectRuleInput {
+  toolName: string
+  pattern: string
 }
 
 export interface ApiClient {
@@ -188,12 +261,48 @@ export interface ApiClient {
   listRollbacks(sessionId: string): Promise<Rollback[]>
   /** 会话快照锚点（后端时间倒序；GET /sessions/{sid}/snapshots → {items}） */
   listSessionSnapshots(sessionId: string): Promise<Snapshot[]>
+
+  // ---- 项目级治理（阶段七：项目为服务端一等实体 + 项目审批规则） ----
+  /** 全部项目（GET /projects → {items}） */
+  listProjects(): Promise<Project[]>
+  /** 新建项目（POST /projects → 201 Project）；defaultAccessMode 缺省由服务端定 */
+  createProject(input: CreateProjectInput): Promise<Project>
+  /** 更新项目（PATCH /projects/{id} → 204）：只发送传入的字段 */
+  updateProject(id: string, patch: UpdateProjectInput): Promise<void>
+  /** 删除项目（DELETE /projects/{id} → 204） */
+  deleteProject(id: string): Promise<void>
+  /** 项目审批规则（GET /projects/{pid}/approval-rules → {items}） */
+  listProjectRules(projectId: string): Promise<ProjectApprovalRule[]>
+  /** 新增项目审批规则（POST → 201 ProjectApprovalRule） */
+  addProjectRule(projectId: string, input: CreateProjectRuleInput): Promise<ProjectApprovalRule>
+  /** 删除项目审批规则（DELETE → 204） */
+  removeProjectRule(projectId: string, ruleId: string): Promise<void>
   // 消息
   listMessages(sessionId: string, afterSeq?: number): Promise<Message[]>
   // Run
   startRun(opts: StartRunOptions): Promise<RunHandle>
+  /**
+   * 订阅一个**已存在** Run 的事件流（刷新恢复入口）。
+   * `fromSeq: -1` = 只要新事件、不补发历史（恢复场景必须用它，否则正文重复）。
+   */
+  attachRun(opts: AttachRunOptions): RunHandle
+  /** 会话当前进行中的 Run；无则 null（服务端语义：无进行中 Run 不是 404） */
+  getActiveRun(sessionId: string): Promise<ActiveRunDTO | null>
   getRun(sessionId: string, runId: string): Promise<Run>
   stopRun(sessionId: string, runId: string): Promise<void>
+  /**
+   * 提交审批决策（B-3）：POST /sessions/{sid}/runs/{rid}/approvals/{aid}/decide
+   *
+   * 唯一凭据是 `approvalId`（= tool_event id = 服务端 approval_id），
+   * **不依赖事件闭包**——刷新恢复后前端未必收到过 approval.request 事件。
+   */
+  decideApproval(
+    sessionId: string,
+    runId: string,
+    approvalId: string,
+    decision: Decision,
+    reason?: string,
+  ): Promise<void>
   /** 运行中引导（§4.2）：消息立即落库并就地返回，引擎在轮次边界回灌上下文；Run 已结束抛 409 */
   sendGuidance(sessionId: string, runId: string, input: string): Promise<{ id: string; seq: number; content: string }>
   listToolEvents(sessionId: string, runId: string): Promise<ApiToolEvent[]>
@@ -201,6 +310,14 @@ export interface ApiClient {
   getTools(): Promise<ToolSnapshot>
   getToolsInjection(): Promise<ToolInjection>
   patchToolTiers(tiers: Record<string, ToolTier>): Promise<ToolSnapshot>
+  /** 核心 SOP：读取生效快照（含 builtin_content，切页签无需再请求） */
+  getSOPCore(): Promise<SOPCore>
+  /** 核心 SOP：保存自定义（首次保存即 fork，下一轮对话生效） */
+  putSOPCore(content: string): Promise<SOPCore>
+  /** 核心 SOP：重置为出厂内置（完整 undo） */
+  resetSOPCore(): Promise<SOPCore>
+  /** 核心 SOP：生效预览（核心 + 项目级条目 + token 合计） */
+  getSOPEffective(sessionId?: string): Promise<SOPEffective>
   // 运维
   getMaintenance(): Promise<Record<string, unknown>>
   // 厂商（B-4）
@@ -218,7 +335,35 @@ export interface ApiClient {
   getSettings(): Promise<Record<string, unknown>>
   patchSettings(patch: Record<string, unknown>): Promise<Record<string, unknown>>
   getStats(): Promise<Record<string, unknown>>
-  getLogs(params?: { limit?: number; level?: string }): Promise<LogLine[]>
+  getLogs(params?: LogsQuery): Promise<LogsResponse>
+  /** LLM 调用流水（跨会话；天库结构化审计，非 app.log 文本日志） */
+  getAuditLlmCalls(params?: AuditLlmCallsQuery): Promise<AuditLlmCallsResponse>
+  /** 工具调用审计（跨会话；天库副本） */
+  getAuditToolEvents(params?: {
+    from?: number
+    to?: number
+    session_id?: string
+    run_id?: string
+    tool?: string
+    status?: string
+    keyword?: string
+    limit?: number
+    offset?: number
+  }): Promise<AuditToolEventsResponse>
+  /** 用量聚合（rollup 预聚合；group_by: model|provider|day） */
+  getTokenStats(params?: { from?: number; to?: number; group_by?: string }): Promise<TokenStatsResult>
+  /** 日志配置（抓取档位 / 保留天数 / 当前生效日志级别） */
+  getLogConfig(): Promise<{
+    snapshot_mode: string
+    retention_days: number
+    level: string
+    estimated_daily_mb?: Record<string, number>
+    earliest_available_day?: string
+    latest_available_day?: string
+    total_bytes?: number
+    dropped?: number
+    written?: number
+  }>
   // 设备与多端协同（阶段 C）
   /** 生成 6 位一次性配对码（TTL 由 devices.pair_ttl_s 决定，默认 120s） */
   createDevicePairCode(req?: CreateDevicePairCodeRequest): Promise<PairCodeDTO>
@@ -453,12 +598,36 @@ export function toUiSession(s: ApiSession): Session {
   return {
     id: s.id,
     title: s.title,
+    projectId: s.project_id || undefined,
     workspacePath: s.workspace_path || undefined,
     accessMode: toAccessMode(s.access_mode),
     modelRef: s.model_ref,
     updatedAt: s.updated_at,
     running: s.last_run_status === 'running' || s.last_run_status === 'pending',
     archivedAt: s.archived_at,
+  }
+}
+
+// 项目 DTO → UI：服务端是唯一权威源，defaultAccessMode 只做展示与项目设置回填，
+// **绝不用它推导新会话的 accessMode**（裁决权在服务端，避免前后端两套默认值逻辑）。
+export function toUiProject(p: ApiProject): Project {
+  return {
+    id: p.id,
+    name: p.name,
+    path: p.path,
+    pinned: p.pinned,
+    defaultAccessMode: toAccessMode(p.default_access_mode),
+  }
+}
+
+export function toUiProjectRule(r: ApiProjectApprovalRule): ProjectApprovalRule {
+  return {
+    id: r.id,
+    projectId: r.project_id,
+    toolName: r.tool_name,
+    pattern: r.pattern,
+    // createdAt 统一为毫秒时间戳：与前端既有 ApprovalRule 形态一致（两接口可直接互赋）
+    createdAt: r.created_at,
   }
 }
 
@@ -532,8 +701,15 @@ export function toUiMessages(list: ApiMessage[], sessionId: string): Message[] {
   const out: Message[] = []
   for (const m of list) {
     if (m.role === 'user') turnCounter += 1
-    // 已归并进 assistant.toolCalls 的 tool 消息不再单独成条，避免时间线出现空壳卡片
-    if (m.role === 'tool' && m.tool_call_id && toolResults.has(m.tool_call_id)) continue
+    // 工具结果消息一律不进对话轨：其结果只通过 ToolCard 呈现（在 ProcessDrawer 内）。
+    //
+    // 对齐老版本桌面端 MessageItem.tsx 的 `if (msg.role === "tool") return null`：
+    // 这里是**无条件**跳过，而非「tool_call_id 存在且已收集到结果才跳过」。
+    // 旧写法是三条件与，任一不满足（历史数据缺 tool_call_id、结果未收集到、
+    // 异常中断导致配不上对）就会漏过过滤 → 该消息的 content 是整包工具输出 JSON
+    // （实测 4274 字符）→ 被 MessageItem 当正文渲染 → 视觉上表现为
+    // 「工具卡片在执行过程外面又显示了一份」。结构性保证不能依赖数据完整性。
+    if (m.role === 'tool') continue
     out.push({
       id: m.id,
       sessionId,
@@ -791,11 +967,15 @@ export const mockApi: ApiClient = {
     return clone(found)
   },
   async createSession(input) {
+    // mock 侧同样遵守「项目默认权限快照一次」语义，保持与 real 行为一致（便于对比调试）。
+    const proj = input.projectId ? mockData.projects.find((p) => p.id === input.projectId) : undefined
     const sess: Session = {
       id: `s-mock-${Date.now()}`,
       title: input.title || '新对话',
+      projectId: input.projectId || undefined,
       workspacePath: input.workspacePath,
-      accessMode: 'confirm',
+      // 显式值 > 项目默认 > confirm（与服务端 SessionService.Create 裁决链同口径）
+      accessMode: input.accessMode ?? proj?.defaultAccessMode ?? 'confirm',
       modelRef: input.modelRef || 'openai/gpt-4o-mini',
       updatedAt: Date.now(),
     }
@@ -881,6 +1061,62 @@ export const mockApi: ApiClient = {
     if (i >= 0) mockData.sessions.splice(i, 1)
   },
 
+  // ---- 项目域（mock：内存态，语义与 real 对齐） ----
+  async listProjects() {
+    return clone(mockData.projects)
+  },
+  async createProject(input) {
+    const p: Project = {
+      id: `p-mock-${Date.now()}`,
+      name: input.name,
+      path: input.path,
+      // 缺省由「服务端」定 confirm（mock 侧同口径）
+      defaultAccessMode: input.defaultAccessMode ?? 'confirm',
+    }
+    mockData.projects.push(p)
+    return clone(p)
+  },
+  async updateProject(id, patch) {
+    const found = mockData.projects.find((p) => p.id === id)
+    if (!found) throw new ApiError('项目不存在', 'project.not_found', 404)
+    if (patch.name !== undefined) found.name = patch.name
+    if (patch.defaultAccessMode !== undefined) found.defaultAccessMode = patch.defaultAccessMode
+    if (patch.pinned !== undefined) found.pinned = patch.pinned
+  },
+  async deleteProject(id) {
+    const i = mockData.projects.findIndex((p) => p.id === id)
+    if (i >= 0) mockData.projects.splice(i, 1)
+    // 级联：清规则 + 会话归属归零（对齐服务端 DeleteProjectCascade）
+    for (let j = mockData.approvalRules.length - 1; j >= 0; j -= 1) {
+      if (mockData.approvalRules[j].projectId === id) mockData.approvalRules.splice(j, 1)
+    }
+    mockData.sessions.forEach((s) => {
+      if (s.projectId === id) s.projectId = undefined
+    })
+  },
+  async listProjectRules(projectId) {
+    return clone(mockData.approvalRules.filter((r) => r.projectId === projectId))
+  },
+  async addProjectRule(projectId, input) {
+    const exists = mockData.approvalRules.find(
+      (r) => r.projectId === projectId && r.toolName === input.toolName && r.pattern === input.pattern,
+    )
+    if (exists) return clone(exists) // 幂等：与服务端唯一索引语义一致
+    const rule: ApprovalRule = {
+      id: `ar-mock-${Date.now()}`,
+      projectId,
+      toolName: input.toolName,
+      pattern: input.pattern,
+      createdAt: Date.now(),
+    }
+    mockData.approvalRules.push(rule)
+    return clone(rule)
+  },
+  async removeProjectRule(projectId, ruleId) {
+    const i = mockData.approvalRules.findIndex((r) => r.id === ruleId && r.projectId === projectId)
+    if (i >= 0) mockData.approvalRules.splice(i, 1)
+  },
+
   async listMessages(sessionId) {
     const list = mockData.messages.filter((m) => m.sessionId === sessionId)
     // demo 的 messages 是跨会话样例：无匹配时回退到 s1 的全量样例
@@ -903,7 +1139,20 @@ export const mockApi: ApiClient = {
         handle.stop()
         opts.onSseState?.('closed', { reason: 'client_closed' })
       },
-      resume: (decision, reason) => handle.resume(decision, reason),
+      // mock 无服务端事件流可重连（演示流不跨刷新存活）：空实现，不假装在跑
+      reconnect: () => undefined,
+    }
+  },
+  async getActiveRun() {
+    // mock 无真实服务端 Run（演示流不跨刷新存活），恒为空闲态
+    return null
+  },
+  attachRun(opts) {
+    // mock 无真实 EventSource：无法重放演示流，返回空句柄（不假装在跑）
+    return {
+      runId: opts.runId,
+      stop: () => undefined,
+      reconnect: () => undefined,
     }
   },
   async getRun(sessionId, runId) {
@@ -911,6 +1160,10 @@ export const mockApi: ApiClient = {
   },
   async stopRun() {
     /* mock 由 RunHandle.stop 处理 */
+  },
+  async decideApproval() {
+    // mock 的审批由 startMockRun 内部的 resumeResolve 驱动（chatStore 走 handle.resume），
+    // 无服务端端点可调；空实现保持契约完整（不伪造决策结果）。
   },
   async sendGuidance(_sessionId, _runId, input) {
     // mock：无服务端轮次边界，引导以普通用户消息呈现
@@ -938,6 +1191,38 @@ export const mockApi: ApiClient = {
   },
   async patchToolTiers() {
     return mockToolsSnapshot()
+  },
+
+  // ---- 核心 SOP（agent-core）：mock 走内存样例，仅用于无后端演示 ----
+  async getSOPCore() {
+    const c = '你是 harness-go 的编码助手。\n\n规则：\n1. 修改文件前先读取确认内容，不要凭猜测改动。\n2. 危险操作（删除、覆盖、执行命令）需用户确认。\n3. 回答简洁，先给结论再给细节。'
+    return {
+      content: c,
+      source: 'builtin' as const,
+      tokens: 90,
+      budget: 800,
+      builtin_content: c,
+      overridden: false,
+    }
+  },
+  async putSOPCore(content: string) {
+    const base = await this.getSOPCore()
+    return { ...base, content, source: 'custom' as const, overridden: true }
+  },
+  async resetSOPCore() {
+    return this.getSOPCore()
+  },
+  async getSOPEffective() {
+    const core = await this.getSOPCore()
+    return {
+      core,
+      entries: [],
+      workspace: '',
+      total_tokens: core.tokens,
+      system_preview: core.content,
+      truncated: false,
+      entry_limit: 6,
+    }
   },
 
   async getMaintenance() {
@@ -1003,7 +1288,37 @@ export const mockApi: ApiClient = {
     return { mode: 'mock' }
   },
   async getLogs() {
-    return []
+    // mock 模式：前端演示数据由 mock/settingsData 提供，服务端接口只回空列表。
+    return { items: [] } as LogsResponse
+  },
+  async getAuditLlmCalls() {
+    // mock 模式无天库：回空列表并显式标注档位，让面板显示「无调用记录」而非报错。
+    return {
+      items: [],
+      total: 0,
+      snapshot_mode: 'preview',
+      retention_days: 30,
+      earliest_available_day: '',
+    } as AuditLlmCallsResponse
+  },
+  async getAuditToolEvents() {
+    return { items: [], total: 0, retention_days: 30, earliest_available_day: '' } as AuditToolEventsResponse
+  },
+  async getTokenStats() {
+    return {
+      from: 0,
+      to: 0,
+      group_by: 'model',
+      items: [],
+      total_calls: 0,
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      cached_tokens: 0,
+      cache_hit_rate: 0,
+    } as TokenStatsResult
+  },
+  async getLogConfig() {
+    return { snapshot_mode: 'preview', retention_days: 30, level: 'warn' }
   },
 
   // ---- 阶段 C：设备（mock 走内存样例，与真实端点同签名） ----
@@ -1175,6 +1490,24 @@ export const mockApi: ApiClient = {
 
 /* ============ real 实现（B-2 起逐端点启用） ============ */
 
+/**
+ * 把「可能是 JSON 字符串、也可能是对象」的参数归一成对象。
+ *
+ * 服务端不同事件的 args 形状不一致：`tool.started` 下发对象，而 `approval.request`
+ * 为兼容既有 payload 形状下发 **JSON 字符串**。这里集中归一，
+ * 避免每个消费点各写一套 `typeof === 'string'` 判断（也避免像旧版那样恒取空）。
+ */
+function parseArgsField(v: unknown): Record<string, unknown> {
+  if (v && typeof v === 'object') return v as Record<string, unknown>
+  if (typeof v !== 'string' || v.trim() === '') return {}
+  try {
+    const parsed: unknown = JSON.parse(v)
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {}
+  } catch {
+    return {}
+  }
+}
+
 /** SSE data（即 events.Event.payload）→ UI 流式事件 */
 function mapSseToStreamEvent(type: string, data: string): StreamEvent | null {
   let payload: Record<string, unknown> = {}
@@ -1189,8 +1522,16 @@ function mapSseToStreamEvent(type: string, data: string): StreamEvent | null {
       return null
     case 'message.delta':
       return { type: 'delta', text: String(payload.delta ?? '') }
+    case 'message.reasoning':
+      // 思考过程增量（reasoning_content）：与 delta 同语义，前端累积到当前步消息
+      return { type: 'reasoning', text: String(payload.delta ?? '') }
     case 'message.end':
-      return { type: 'step', tokens: Number(payload.token_count ?? 0) }
+      return {
+        type: 'step',
+        tokens: Number(payload.token_count ?? 0),
+        // 终值以 message.end 为准（delta 只是预览，可能因重连缺失）
+        reasoning: typeof payload.reasoning === 'string' ? payload.reasoning : undefined,
+      }
     case 'tool.started':
       return {
         type: 'tool_start',
@@ -1238,7 +1579,9 @@ function mapSseToStreamEvent(type: string, data: string): StreamEvent | null {
           toolCallId: String(payload.tool_event_id ?? ''),
           toolName: String(payload.tool_name ?? ''),
           risk: (payload.risk as Risk) ?? 'write',
-          args: (payload.args as Record<string, unknown>) ?? {},
+          // 服务端 args 是 **JSON 字符串**（与 tool.started 的 args 形状不同）：
+          // 直接当对象取会恒为空，导致审批条看不到「要放行什么参数」。
+          args: parseArgsField(payload.args),
           summary: String(payload.summary ?? ''),
           createdAt: Date.now(),
         },
@@ -1279,25 +1622,26 @@ function mapSseToStreamEvent(type: string, data: string): StreamEvent | null {
 /**
  * 提交审批决策（B-3）：POST /sessions/{sid}/runs/{rid}/approvals/{aid}/decide
  *
- * 决策后服务端解除闸门阻塞，Run 继续在**同一条事件流**上推送（订阅不关闭）。
- * 失败（409 已被决策 / 404 审批不存在）不打断本地 UI，由后续 run.status 事件收口。
+ * 决策后服务端解除闸门阻塞，Run 继续在**同一条事件流**上推送。
+ * 实现已收敛到 `realApi.decideApproval`（唯一入口），此处不再保留同名私有函数。
  */
-async function decideApproval(
-  sessionId: string,
-  runId: string,
-  approvalId: string,
-  decision: Decision,
-  reason?: string,
-): Promise<void> {
-  await request<void>(API_PATHS.approvalDecide(sessionId, runId, approvalId), {
-    method: 'POST',
-    headers: authHeaders(),
-    body: JSON.stringify({ decision, reason: reason ?? '' }),
-  })
-}
 
 export const realApi: ApiClient = {
   mode: 'real',
+
+  /**
+   * 提交审批决策（B-3）：POST /sessions/{sid}/runs/{rid}/approvals/{aid}/decide
+   *
+   * 决策后服务端解除闸门阻塞，Run 继续在**同一条事件流**上推送（订阅不关闭）。
+   * 失败（409 已被决策 / 404 审批不存在）由调用方决定是否提示；不在此静默吞掉。
+   */
+  async decideApproval(sessionId, runId, approvalId, decision, reason) {
+    await request<void>(API_PATHS.approvalDecide(sessionId, runId, approvalId), {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({ decision, reason: reason ?? '' }),
+    })
+  },
 
   async me() {
     try {
@@ -1347,7 +1691,15 @@ export const realApi: ApiClient = {
     return toUiSession(await request<ApiSession>(API_PATHS.session(id), { headers: authHeaders() }))
   },
   async createSession(input) {
-    const body = { title: input.title, model_ref: input.modelRef, workspace_path: input.workspacePath }
+    // project_id 与 access_mode 只在存在时发送：不传 access_mode 即由服务端按项目默认权限裁决，
+    // 前端不复刻裁决逻辑（单一权威源）。
+    const body: Record<string, unknown> = {
+      title: input.title,
+      model_ref: input.modelRef,
+      workspace_path: input.workspacePath,
+    }
+    if (input.projectId) body.project_id = input.projectId
+    if (input.accessMode) body.access_mode = input.accessMode
     return toUiSession(
       await request<ApiSession>(API_PATHS.sessions, { method: 'POST', headers: authHeaders(), body: JSON.stringify(body) }),
     )
@@ -1409,6 +1761,57 @@ export const realApi: ApiClient = {
     return res.items ?? []
   },
 
+  // ---- 项目域（real：服务端为准） ----
+  async listProjects() {
+    const res = await request<{ items: ApiProject[] }>(API_PATHS.projects, { headers: authHeaders() })
+    return (res.items ?? []).map(toUiProject)
+  },
+  async createProject(input) {
+    const body: Record<string, unknown> = { name: input.name, path: input.path }
+    if (input.defaultAccessMode) body.default_access_mode = input.defaultAccessMode
+    const p = await request<ApiProject>(API_PATHS.projects, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify(body),
+    })
+    return toUiProject(p)
+  },
+  async updateProject(id, patch) {
+    // 只发送传入字段：服务端对缺省字段按「保留原值」处理（尤其 default_access_mode 不能被误重置）
+    const body: Record<string, unknown> = {}
+    if (patch.name !== undefined) body.name = patch.name
+    if (patch.defaultAccessMode !== undefined) body.default_access_mode = patch.defaultAccessMode
+    if (patch.pinned !== undefined) body.pinned = patch.pinned
+    await request<void>(API_PATHS.project(id), {
+      method: 'PATCH',
+      headers: authHeaders(),
+      body: JSON.stringify(body),
+    })
+  },
+  async deleteProject(id) {
+    await request<void>(API_PATHS.project(id), { method: 'DELETE', headers: authHeaders() })
+  },
+  async listProjectRules(projectId) {
+    const res = await request<{ items: ApiProjectApprovalRule[] }>(API_PATHS.projectRules(projectId), {
+      headers: authHeaders(),
+    })
+    return (res.items ?? []).map(toUiProjectRule)
+  },
+  async addProjectRule(projectId, input) {
+    const r = await request<ApiProjectApprovalRule>(API_PATHS.projectRules(projectId), {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({ tool_name: input.toolName, pattern: input.pattern }),
+    })
+    return toUiProjectRule(r)
+  },
+  async removeProjectRule(projectId, ruleId) {
+    await request<void>(API_PATHS.projectRule(projectId, ruleId), {
+      method: 'DELETE',
+      headers: authHeaders(),
+    })
+  },
+
   async listMessages(sessionId, afterSeq) {
     const q = afterSeq ? `?after_seq=${afterSeq}` : ''
     const res = await request<{ items: ApiMessage[] }>(`${API_PATHS.messages(sessionId)}${q}`, {
@@ -1423,10 +1826,26 @@ export const realApi: ApiClient = {
       headers: authHeaders(),
       body: JSON.stringify({ input: opts.input, model_ref: opts.modelRef }),
     })
-    // 当前挂起的审批 id（由 approval.request 事件携带），resume 时回填给 decide 端点
-    let approvalId = ''
+    // 创建后立刻订阅（fromSeq 缺省 = 从头补发，新建 Run 不能漏首屏事件）
+    return realApi.attachRun({ ...opts, runId: created.run_id })
+  },
+  /**
+   * 订阅一个已存在 Run 的事件流（刷新恢复的入口）。
+   *
+   * 与 startRun 共用同一份 SseClient 装配逻辑；差异仅在「谁给的 runId」与 fromSeq。
+   *
+   * ⚠️ 审批决策**不放这里**：曾经的 `resume()` 依赖闭包变量 approvalId，
+   * 而该变量只在收到 approval.request 事件时赋值；刷新恢复用 fromSeq=-1 不补发历史，
+   * 于是恢复出的审批条「能看见、点不动」（resume 静默 return）。审批决策改由
+   * chatStore 以 store 里的 approval.id 直接调 `decideApproval`，事件与恢复两条路径合一。
+   */
+  attachRun(opts) {
     const sse = new SseClient({
-      url: toAbsolute(API_PATHS.runEvents(opts.sessionId, created.run_id)),
+      url: toAbsolute(API_PATHS.runEvents(opts.sessionId, opts.runId)),
+      // fromSeq < 0 = 「只要新事件、绝不补发历史」（服务端 bus.go 的 Subscribe 语义）。
+      // 用一个足够大的 last_event_id 表达：刷新恢复时前端已有 DB 快照全文，
+      // 若补发历史 message.delta，正文会被重复追加一遍。
+      lastEventId: opts.fromSeq !== undefined && opts.fromSeq < 0 ? String(Number.MAX_SAFE_INTEGER) : undefined,
       onEvent: (ev) => {
         // 真实 lastEventId 游标上报（无 id 帧不报，不做估算）
         if (ev.id) {
@@ -1440,7 +1859,6 @@ export const realApi: ApiClient = {
         }
         const mapped = mapSseToStreamEvent(ev.type, ev.data)
         if (!mapped) return
-        if (mapped.type === 'approval') approvalId = mapped.approval.id
         opts.onEvent(mapped)
       },
       onResync: () => {
@@ -1452,18 +1870,17 @@ export const realApi: ApiClient = {
     })
     sse.connect()
     return {
-      runId: created.run_id,
+      runId: opts.runId,
       stop: () => {
         sse.close()
-        void realApi.stopRun(opts.sessionId, created.run_id)
+        void realApi.stopRun(opts.sessionId, opts.runId)
       },
-      resume: (decision, reason) => {
-        if (!approvalId) return
-        const aid = approvalId
-        approvalId = ''
-        void decideApproval(opts.sessionId, created.run_id, aid, decision, reason).catch(() => undefined)
-      },
+      reconnect: () => sse.reconnectNow(),
     }
+  },
+  async getActiveRun(sessionId) {
+    const res = await request<ActiveRunDTO>(API_PATHS.activeRun(sessionId), { headers: authHeaders() })
+    return res.run_id ? res : null
   },
   async getRun(sessionId, runId) {
     return toUiRun(await request<ApiRun>(API_PATHS.run(sessionId, runId), { headers: authHeaders() }), sessionId)
@@ -1497,6 +1914,29 @@ export const realApi: ApiClient = {
       headers: authHeaders(),
       body: JSON.stringify({ tiers }),
     })
+  },
+
+  // ---- 核心 SOP（agent-core）：出厂内置 + 运行时覆盖 ----
+  /** 读取核心 SOP 生效快照（含 builtin_content，切页签无需再请求）。 */
+  async getSOPCore() {
+    return request<SOPCore>(API_PATHS.sopCore, { headers: authHeaders() })
+  },
+  /** 保存自定义核心 SOP（首次保存即 fork，下一轮对话生效）。 */
+  async putSOPCore(content: string) {
+    return request<SOPCore>(API_PATHS.sopCore, {
+      method: 'PUT',
+      headers: authHeaders(),
+      body: JSON.stringify({ content }),
+    })
+  },
+  /** 重置为出厂内置（删除覆盖层，完整 undo）。 */
+  async resetSOPCore() {
+    return request<SOPCore>(API_PATHS.sopCore, { method: 'DELETE', headers: authHeaders() })
+  },
+  /** 生效预览：核心 SOP + 项目级条目 + token 合计。 */
+  async getSOPEffective(sessionId?: string) {
+    const q = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''
+    return request<SOPEffective>(`${API_PATHS.sopEffective}${q}`, { headers: authHeaders() })
   },
 
   async getMaintenance() {
@@ -1566,9 +2006,94 @@ export const realApi: ApiClient = {
     const q = new URLSearchParams()
     if (params?.limit) q.set('limit', String(params.limit))
     if (params?.level) q.set('level', params.level)
+    if (params?.from) q.set('from', params.from)
+    if (params?.to) q.set('to', params.to)
+    if (params?.traceId) q.set('traceId', params.traceId)
+    if (params?.keyword) q.set('keyword', params.keyword)
+    if (params?.offset) q.set('offset', String(params.offset))
     const path = q.toString() ? `${API_PATHS.logs}?${q}` : API_PATHS.logs
-    const res = await request<{ items: LogLine[] }>(path, { headers: authHeaders() })
-    return res.items ?? []
+    // ⚠️ 诚实边界：服务端可能尚未返回 total/retention_days 等新字段（渐进升级中），
+    // 这里原样透传 undefined，由 UI 决定显示「保留策略未知」还是具体数值，绝不在此编造默认值。
+    const res = await request<LogsResponse>(path, { headers: authHeaders() })
+    return { ...res, items: res.items ?? [] }
+  },
+
+  /**
+   * LLM 调用流水（跨会话；session_id 可选过滤）。
+   *
+   * 与 getLogs 的本质区别：getLogs 读 data/app.log 的 Agent 运维文本日志，
+   * 本接口读 logvault 天库的**结构化对话审计**（模型/耗时/token/报文快照）。
+   * 两者数据源完全不同，不可互相替代。
+   */
+  async getAuditLlmCalls(params?: AuditLlmCallsQuery) {
+    const q = new URLSearchParams()
+    if (params?.from) q.set('from', String(params.from))
+    if (params?.to) q.set('to', String(params.to))
+    if (params?.session_id) q.set('session_id', params.session_id)
+    if (params?.run_id) q.set('run_id', params.run_id)
+    if (params?.message_id) q.set('message_id', params.message_id)
+    if (params?.trace_id) q.set('trace_id', params.trace_id)
+    if (params?.model) q.set('model', params.model)
+    if (params?.status) q.set('status', params.status)
+    if (params?.keyword) q.set('keyword', params.keyword)
+    if (params?.id) q.set('id', params.id)
+    if (params?.limit) q.set('limit', String(params.limit))
+    if (params?.offset) q.set('offset', String(params.offset))
+    const path = q.toString() ? `${API_PATHS.auditLlmCalls}?${q}` : API_PATHS.auditLlmCalls
+    const res = await request<AuditLlmCallsResponse>(path, { headers: authHeaders() })
+    return { ...res, items: res.items ?? [] }
+  },
+
+  /** 工具调用审计（跨会话；天库副本，机器查）。 */
+  async getAuditToolEvents(params?: {
+    from?: number
+    to?: number
+    session_id?: string
+    run_id?: string
+    tool?: string
+    status?: string
+    keyword?: string
+    limit?: number
+    offset?: number
+  }) {
+    const q = new URLSearchParams()
+    if (params?.from) q.set('from', String(params.from))
+    if (params?.to) q.set('to', String(params.to))
+    if (params?.session_id) q.set('session_id', params.session_id)
+    if (params?.run_id) q.set('run_id', params.run_id)
+    if (params?.tool) q.set('tool', params.tool)
+    if (params?.status) q.set('status', params.status)
+    if (params?.keyword) q.set('keyword', params.keyword)
+    if (params?.limit) q.set('limit', String(params.limit))
+    if (params?.offset) q.set('offset', String(params.offset))
+    const path = q.toString() ? `${API_PATHS.auditToolEvents}?${q}` : API_PATHS.auditToolEvents
+    const res = await request<AuditToolEventsResponse>(path, { headers: authHeaders() })
+    return { ...res, items: res.items ?? [] }
+  },
+
+  /** 用量聚合（走 rollup_hourly 预聚合，不扫明细；group_by: model|provider|day）。 */
+  async getTokenStats(params?: { from?: number; to?: number; group_by?: string }) {
+    const q = new URLSearchParams()
+    if (params?.from) q.set('from', String(params.from))
+    if (params?.to) q.set('to', String(params.to))
+    if (params?.group_by) q.set('group_by', params.group_by)
+    const path = q.toString() ? `${API_PATHS.tokenStats}?${q}` : API_PATHS.tokenStats
+    return request<TokenStatsResult>(path, { headers: authHeaders() })
+  },
+
+  /** 日志配置读取（含当前**真实生效**的日志级别）。 */
+  async getLogConfig() {
+    return request<{
+      snapshot_mode: string
+      retention_days: number
+      level: string
+      estimated_daily_mb?: Record<string, number>
+      earliest_available_day?: string
+      latest_available_day?: string
+      total_bytes?: number
+      dropped?: number
+      written?: number
+    }>(API_PATHS.logConfig, { headers: authHeaders() })
   },
 
   // ---- 阶段 C：设备与多端协同 ----

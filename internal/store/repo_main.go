@@ -35,10 +35,10 @@ func (r *SessionRepo) Create(ctx context.Context, sess *model.Session) error {
 		sess.Source = "ui"
 	}
 	_, err := r.s.conn().ExecContext(ctx,
-		`INSERT INTO sessions(id, title, workspace_path, access_mode, model_ref, user_id,
+		`INSERT INTO sessions(id, title, workspace_path, project_id, access_mode, model_ref, user_id,
 		                     created_at, updated_at, source)
-		 VALUES(?,?,?,?,?,?,?,?,?)`,
-		sess.ID, sess.Title, sess.WorkspacePath, sess.AccessMode, sess.ModelRef, sess.UserID,
+		 VALUES(?,?,?,?,?,?,?,?,?,?)`,
+		sess.ID, sess.Title, sess.WorkspacePath, sess.ProjectID, sess.AccessMode, sess.ModelRef, sess.UserID,
 		sess.CreatedAt, sess.UpdatedAt, sess.Source)
 	if err != nil {
 		return fmt.Errorf("store: 创建会话失败: %w", err)
@@ -46,7 +46,9 @@ func (r *SessionRepo) Create(ctx context.Context, sess *model.Session) error {
 	return nil
 }
 
-const sessionColumns = `id, title, workspace_path, access_mode, model_ref, user_id,
+// 铁律：sessionColumns 与 SessionRepo.Create 的列清单、scanSession 的 Scan 实参
+// **必须三处严格同步**（顺序一致），漏改一处即静默错列。
+const sessionColumns = `id, title, workspace_path, project_id, access_mode, model_ref, user_id,
 	message_count, last_message_at, total_tokens, last_run_status,
 	created_at, updated_at, deleted_at, source, archived_at`
 
@@ -59,7 +61,7 @@ func scanSession(sc interface{ Scan(...any) error }) (model.Session, error) {
 		source   sql.NullString
 		archived sql.NullInt64
 	)
-	err := sc.Scan(&s.ID, &s.Title, &s.WorkspacePath, &s.AccessMode, &s.ModelRef, &s.UserID,
+	err := sc.Scan(&s.ID, &s.Title, &s.WorkspacePath, &s.ProjectID, &s.AccessMode, &s.ModelRef, &s.UserID,
 		&s.MessageCount, &lastMsg, &s.TotalTokens, &status,
 		&s.CreatedAt, &s.UpdatedAt, &deleted, &source, &archived)
 	if err != nil {
@@ -167,6 +169,17 @@ func (r *SessionRepo) UpdateAccessMode(ctx context.Context, id, mode string) err
 		mode, NowMillis(), id)
 	if err != nil {
 		return fmt.Errorf("store: 更新访问模式失败: %w", err)
+	}
+	return ensureAffected(res, "会话 "+id)
+}
+
+// SetProject 更新会话归属项目（空串 = 移出项目，回纯对话）。
+func (r *SessionRepo) SetProject(ctx context.Context, id, projectID string) error {
+	res, err := r.s.conn().ExecContext(ctx,
+		`UPDATE sessions SET project_id=?, updated_at=? WHERE id=? AND deleted_at IS NULL`,
+		projectID, NowMillis(), id)
+	if err != nil {
+		return fmt.Errorf("store: 更新会话归属项目失败: %w", err)
 	}
 	return ensureAffected(res, "会话 "+id)
 }

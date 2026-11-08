@@ -79,8 +79,8 @@ func (a *sessionDBAdapter) AddApprovalRule(ctx context.Context, toolName, patter
 }
 
 // AddRunUsage 回写单次 Run 的 token 用量（P1）。
-func (a *sessionDBAdapter) AddRunUsage(ctx context.Context, runID string, promptTokens, completionTokens int64) error {
-	return a.sdb.Runs().AddUsage(ctx, runID, promptTokens, completionTokens)
+func (a *sessionDBAdapter) AddRunUsage(ctx context.Context, runID string, promptTokens, completionTokens, cachedTokens int64, isEstimated bool) error {
+	return a.sdb.Runs().AddUsage(ctx, runID, promptTokens, completionTokens, cachedTokens, isEstimated)
 }
 
 // NewSummaryWriter 把 store.MainStore 适配成 agent.SummaryWriter。

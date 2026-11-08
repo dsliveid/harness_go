@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from 'react'
 import { ListTodo, CheckSquare, TerminalSquare, Layers, GripHorizontal } from 'lucide-react'
 import { useWorkspace } from '../../stores/workspaceStore'
 import { useUI } from '../../stores/uiStore'
+import { apiMode } from '../../lib/api'
 import { cn } from '../../components/ui'
 
 // 会话期间记忆拖动停留的 Y 轴高度
@@ -25,6 +26,9 @@ export function SideRail() {
   const runningAgents = subagents.filter((a) => a.status === 'running').length
 
   const hasItems = todos.length > 0 || Boolean(activePlan) || runningCmds > 0 || subagents.length > 0
+  // real 模式的计数全部来自 agent 真实工具调用（workspaceStore 派生），
+  // 徽标不再有任何演示成分；计划版本号后端不下发，故 real 模式不显示假 vN。
+  const showPlanVersion = apiMode !== 'real'
 
   const [top, setTop] = useState(savedRailTop)
   const [dragOffset, setDragOffset] = useState<{ x: number; y: number } | null>(null)
@@ -33,6 +37,11 @@ export function SideRail() {
   const railRef = useRef<HTMLDivElement>(null)
   const dragStartRef = useRef<{ startX: number; startY: number; initialTop: number } | null>(null)
   const hasMovedRef = useRef(false)
+  // ⚠️ 所有 hooks 必须在此「提前 return」之前声明完毕（React error #310 铁律）。
+  // 本 ref 曾误写在 if (!hasItems) return null 之后：hasItems 由 todos/plan/commands/subagents
+  // 派生，会话为空时 false（4 个 hooks）、工具跑起来后 true（5 个 hooks）→ hooks 数量前后不一致
+  // → React 抛 #310 → 整棵树崩塌为黑屏。今后新增 hook 一律加在本行之前。
+  const activePointerRef = useRef<number | null>(null)
 
   // 视口尺寸变化时校正溢出边界
   useEffect(() => {
@@ -55,7 +64,7 @@ export function SideRail() {
   if (!hasItems) return null
 
   // ---------------- 拖拽与吸附逻辑 ----------------
-  const activePointerRef = useRef<number | null>(null)
+  // 注意：此处起不得再声明任何 hook（已在上方统一声明，见 error #310 注释）。
 
   const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     // 仅响应鼠标左键或单点触摸
@@ -204,7 +213,7 @@ export function SideRail() {
             )}
           >
             <ListTodo size={11} className="shrink-0" />
-            <span>v{activePlan.version} 方案</span>
+            <span>{showPlanVersion ? `v${activePlan.version} 方案` : '方案'}</span>
           </span>
           <span className="flex items-center gap-1 font-mono font-medium text-ink">
             <span className="text-emerald-400 font-bold">{planDone}</span>

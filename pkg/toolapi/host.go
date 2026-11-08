@@ -374,3 +374,48 @@ type BundleStore interface {
 	Import(ctx context.Context, zipPath string) (BundleInfo, error)
 	List(ctx context.Context, sessionID string) ([]BundleInfo, error)
 }
+
+// ============ 可选能力：图像（generate_image / recognize_image） ============
+//
+// 设计要点（零破坏扩展）：**不往 Host 接口里加方法**。Host 有两个实现
+// （internal/tools/hostimpl、internal/pluginkit/plugintest），加方法会强制全部
+// 同步改动并牵连大量测试。因此图像能力以**独立可选接口 ImageHost** 暴露，
+// 宿主按需额外实现，插件侧用类型断言获取：
+//
+//	if ih, ok := host.(toolapi.ImageHost); ok && ih.Images() != nil { ... }
+//
+// 未实现 / 未注入 provider 时，插件必须返回诚实错误（不得 panic、不得静默成功）。
+
+// ImageGenRequest 图像生成请求。
+type ImageGenRequest struct {
+	Prompt   string `json:"prompt"`
+	Size     string `json:"size,omitempty"` // 如 1024x1024
+	ModelRef string `json:"model_ref,omitempty"`
+	N        int    `json:"n,omitempty"`
+}
+
+// ImageGenResult 图像生成结果（二进制 + MIME，由插件负责落盘）。
+type ImageGenResult struct {
+	Data  []byte `json:"-"`
+	MIME  string `json:"mime"`
+	Model string `json:"model,omitempty"`
+}
+
+// ImageUnderstandRequest 图像理解（识别/描述）请求。
+type ImageUnderstandRequest struct {
+	Image    []byte `json:"-"`
+	MIME     string `json:"mime"`
+	Question string `json:"question"`
+	ModelRef string `json:"model_ref,omitempty"`
+}
+
+// ImageProvider 图像能力（生成 + 理解）。
+type ImageProvider interface {
+	Generate(ctx context.Context, req ImageGenRequest) (ImageGenResult, error)
+	Describe(ctx context.Context, req ImageUnderstandRequest) (string, error)
+}
+
+// ImageHost 可选图像能力宿主（Host 实现可按需额外实现本接口）。
+type ImageHost interface {
+	Images() ImageProvider
+}

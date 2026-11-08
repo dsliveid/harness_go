@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react'
-import { Cpu, Globe, Shield, BarChart3, FileText, MonitorSmartphone, Webhook } from 'lucide-react'
+import { Cpu, Globe, Shield, BarChart3, FileText, MonitorSmartphone, Webhook, MessagesSquare } from 'lucide-react'
 import { useUI } from '../../stores/uiStore'
 import { useSettings } from '../../stores/settingsStore'
 import { Button, Modal, ScrollFade } from '../../components/ui'
@@ -8,10 +8,11 @@ import { ModelSettingsSection } from './ModelSettingsSection'
 import { NetworkPanel } from './NetworkPanel'
 import { SopPanel } from './SopPanel'
 import { LogsPanel, TokenStatsPanel } from './StatsLogsPanel'
+import { LlmLogsPanel } from './LlmLogsPanel'
 import { WebhookPanel } from './WebhookPanel'
 import { DevicePanel } from '../devices/DevicePanel'
 
-type Tab = 'models' | 'network' | 'devices' | 'sop' | 'webhooks' | 'tokenstats' | 'logs'
+type Tab = 'models' | 'network' | 'devices' | 'sop' | 'webhooks' | 'tokenstats' | 'llmLogs' | 'logs'
 
 const NAV_MAIN: Array<{ key: Tab; label: string; icon: ReactNode }> = [
   { key: 'models', label: '模型设置', icon: <Cpu size={14} className="text-accent shrink-0" /> },
@@ -24,6 +25,7 @@ const NAV_MAIN: Array<{ key: Tab; label: string; icon: ReactNode }> = [
 
 const NAV_EXTRA: Array<{ key: Tab; label: string; icon: ReactNode }> = [
   { key: 'tokenstats', label: 'Token 统计', icon: <BarChart3 size={14} className="text-warn shrink-0" /> },
+  { key: 'llmLogs', label: '对话日志', icon: <MessagesSquare size={14} className="text-sky-400 shrink-0" /> },
   { key: 'logs', label: '日志查询', icon: <FileText size={14} className="text-accent shrink-0" /> },
 ]
 
@@ -124,6 +126,7 @@ export function SettingsModal() {
           {tab === 'sop' && <SopPanel />}
           {tab === 'webhooks' && <WebhookPanel />}
           {tab === 'tokenstats' && <TokenStatsPanel />}
+          {tab === 'llmLogs' && <LlmLogsPanel />}
           {tab === 'logs' && <LogsPanel />}
         </div>
       </div>

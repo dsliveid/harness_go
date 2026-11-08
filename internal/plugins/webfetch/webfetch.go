@@ -19,6 +19,9 @@ const (
 	maxBodyBytes = 1 << 20
 	defaultChars = 16000
 	fetchTimeout = 30 * time.Second
+
+	maxCharsCeiling = 65536 // 正文上限（钳制）
+	maxRedirects    = 5     // 重定向跳数上限
 )
 
 // invokeFetch 抓取 URL 并提取正文文本。
@@ -37,28 +40,9 @@ func invokeFetch(ctx context.Context, host toolapi.Host, call *toolapi.Call) (*t
 	if err := guardPrivateHost(u.Hostname()); err != nil {
 		return pluginkit.ErrorResult("web_fetch: %v", err), nil
 	}
-	maxChars := args.MaxChars
-	if maxChars <= 0 {
-		maxChars = defaultChars
-	}
-	if maxChars > 65536 {
-		maxChars = 65536
-	}
+	maxChars := clampMaxChars(args.MaxChars)
 
-	client := &http.Client{
-		Timeout: fetchTimeout,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
-			Proxy:           nil, // 不走系统代理（防代理侧绕过私网拦截）
-		},
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			if len(via) >= 5 {
-				return fmt.Errorf("重定向次数超限")
-			}
-			// 每一跳都重新校验目标网段（防重定向绕过 SSRF 防护）
-			return guardPrivateHost(req.URL.Hostname())
-		},
-	}
+	client := newHTTPClient()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
 		return pluginkit.ErrorResult("web_fetch: 构造请求失败: %v", err), nil
@@ -80,15 +64,61 @@ func invokeFetch(ctx context.Context, host toolapi.Host, call *toolapi.Call) (*t
 	if err != nil {
 		return pluginkit.ErrorResult("web_fetch: 读取失败: %v", err), nil
 	}
+	return buildResult(string(body), ct, args.URL, resp.StatusCode, maxChars), nil
+}
+
+// buildResult 把响应体转换为工具结果：状态码 → 类型 → 体积上限 → 正文提取 → 字符截断。
+func buildResult(body, ct, srcURL string, status, maxChars int) *toolapi.Result {
+	if status != http.StatusOK {
+		return pluginkit.ErrorResult("web_fetch: HTTP %d %s", status, http.StatusText(status))
+	}
+	if !isTextType(ct) {
+		return pluginkit.ErrorResult("web_fetch: 不支持的类型 %q（仅文本/HTML）", ct)
+	}
 	if len(body) > maxBodyBytes {
 		body = body[:maxBodyBytes]
 	}
-	text := extractText(string(body), ct)
+	text := extractText(body, ct)
 	if text == "" {
-		return pluginkit.ErrorResult("web_fetch: 页面无可提取文本"), nil
+		return pluginkit.ErrorResult("web_fetch: 页面无可提取文本")
 	}
 	return pluginkit.TextResult("%s\n\n[来源 %s，状态 %d，原文 %d 字节]",
-		pluginkit.TruncateRunes(text, maxChars), args.URL, resp.StatusCode, len(body)), nil
+		pluginkit.TruncateRunes(text, maxChars), srcURL, status, len(body))
+}
+
+// clampMaxChars 归一化 max_chars（<=0 取默认，超过上限钳制）。
+func clampMaxChars(n int) int {
+	if n <= 0 {
+		return defaultChars
+	}
+	if n > maxCharsCeiling {
+		return maxCharsCeiling
+	}
+	return n
+}
+
+// newHTTPClient 构造抓取客户端（安全参数集中于此，便于单测断言）。
+//   - TLS 最低 1.2；
+//   - Proxy=nil：不走系统代理（防代理侧绕过私网拦截）；
+//   - CheckRedirect：跳数上限 + 每一跳都重新校验目标网段（防重定向绕过 SSRF 防护）。
+func newHTTPClient() *http.Client {
+	return &http.Client{
+		Timeout: fetchTimeout,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+			Proxy:           nil, // 不走系统代理（防代理侧绕过私网拦截）
+		},
+		CheckRedirect: checkRedirect,
+	}
+}
+
+// checkRedirect 重定向策略：限跳 + 每跳重新做 SSRF 网段校验。
+func checkRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= maxRedirects {
+		return fmt.Errorf("重定向次数超限")
+	}
+	// 每一跳都重新校验目标网段（防重定向绕过 SSRF 防护）
+	return guardPrivateHost(req.URL.Hostname())
 }
 
 // guardPrivateHost 拦截环回/私有/链路本地网段（SSRF 防护）。

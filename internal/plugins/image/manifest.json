@@ -1,8 +1,8 @@
 {
   "id": "image",
   "name": "图片",
-  "description": "仅图片落盘校验与元信息读取（PNG/JPEG/GIF/WebP 魔数 + 宽高/格式/大小）；不提供图像生成与像素识别工具（需图像模型槽位，provider 面暂无 capability 路由）",
-  "version": "1.0.0",
+  "description": "图片落盘校验与元信息读取（PNG/JPEG/GIF/WebP 魔数 + 宽高/格式/大小）；另提供图像生成（generate_image）与图像理解/识别（recognize_image），二者依赖内核注入的可选图像模型 provider，未配置时返回「图像能力未启用」诚实错误",
+  "version": "1.1.0",
   "kind": "builtin",
   "default_tier": "on_demand",
   "protocol_version": 1,
@@ -18,6 +18,20 @@
       "name": "read_image_meta",
       "description": "读取工作区图片的元信息（格式/尺寸/大小，不经像素识别）",
       "schema_json": {"type":"object","properties":{"path":{"type":"string"}},"required":["path"]},
+      "tier": "on_demand",
+      "risk": "readonly"
+    },
+    {
+      "name": "generate_image",
+      "description": "按文本提示词生成图片并写入工作区（结果须通过 PNG/JPEG/GIF/WebP 魔数校验）",
+      "schema_json": {"type":"object","properties":{"prompt":{"type":"string","description":"图片内容描述（必填）"},"path":{"type":"string","description":"工作区相对落盘路径（必填）"},"size":{"type":"string","description":"尺寸，如 1024x1024（可选）"},"model_ref":{"type":"string","description":"指定图像生成模型（可选，缺省用内核默认）"}},"required":["prompt","path"]},
+      "tier": "on_demand",
+      "risk": "write"
+    },
+    {
+      "name": "recognize_image",
+      "description": "识别/描述工作区图片的内容（多模态视觉理解，返回文本）",
+      "schema_json": {"type":"object","properties":{"path":{"type":"string","description":"工作区相对图片路径（必填）"},"question":{"type":"string","description":"对图片提出的问题，缺省为「请描述这张图片的内容」"}},"required":["path"]},
       "tier": "on_demand",
       "risk": "readonly"
     }

@@ -136,7 +136,7 @@ func newFSApprovalEnv(t *testing.T, gateTimeout time.Duration, rounds [][]llm.Ch
 		t.Fatal(err)
 	}
 	sessSvc := service.NewSessionService(main, sessions)
-	sess, err := sessSvc.Create(ctx, "fs-approval", "", "")
+	sess, err := sessSvc.Create(ctx, service.CreateSessionInput{Title: "fs-approval"})
 	if err != nil {
 		t.Fatal(err)
 	}

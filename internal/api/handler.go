@@ -12,6 +12,7 @@ import (
 	"harness-go/internal/apperr"
 	"harness-go/internal/auth"
 	"harness-go/internal/events"
+	"harness-go/internal/logvault"
 	"harness-go/internal/service"
 )
 
@@ -26,7 +27,15 @@ type Deps struct {
 	Providers   *service.ProviderService
 	Settings    *service.SettingsService
 	Logs        *service.LogService
-	Devices     *service.DeviceService
+	// LogConfig 报文抓取档位与保留天数的运行时配置（nil 时相关端点降级）
+	LogConfig *service.LogConfigService
+	// Vault 审计日志天分片库族（nil 时审计端点返回 unavailable）
+	Vault *logvault.Querier
+	// LogWriter 审计日志写入管道（仅用于暴露 dropped/written 诊断计数）
+	LogWriter *logvault.Writer
+	// Shard 天分片管理器（暴露 AvailableRange/TotalSizeBytes 给界面明示保留边界）
+	Shard   *logvault.Shard
+	Devices *service.DeviceService
 	// MCP / Packages 外部插件子系统（阶段 E；nil 时相关端点返回 unavailable）
 	MCP      *service.MCPService
 	Packages *service.PackageService
@@ -41,6 +50,14 @@ type Deps struct {
 	// Webhooks / OpenAI 接入增强（P1；nil 时相关端点返回 unavailable）
 	Webhooks *service.WebhookService
 	OpenAI   *service.OpenAICompatService
+	// Projects 项目域（项目 CRUD + 默认控制权限 + 项目审批规则；nil 时返回 unavailable）
+	Projects *service.ProjectService
+	// SOP 核心 SOP（agent-core 出厂内置 + 运行时覆盖；nil 时返回 unavailable）
+	SOP *service.SOPService
+	// FSRoots 允许浏览的目录根白名单（工作区宿主目录列举，L0 服务端宿主）：
+	// 由 cmd 注入（HARNESS_FS_ROOTS + 数据目录兜底，均已 Abs）。为空表示**拒绝列举**
+	// （失败即关闭，绝不放行全盘）。docs/工作区宿主与目录选择对接约定.md §4
+	FSRoots []string
 	// DeviceWS 设备长连接网关（阶段 C-3；nil 时 /devices/ws 返回 503 device.disabled）
 	DeviceWS    http.Handler
 	Bus         *events.Bus
@@ -60,6 +77,10 @@ type createSessionReq struct {
 	Title         string `json:"title"`
 	ModelRef      string `json:"model_ref"`
 	WorkspacePath string `json:"workspace_path"`
+	// ProjectID 归属项目；非空且未显式传 access_mode 时，服务端按项目默认控制权限快照继承。
+	ProjectID string `json:"project_id"`
+	// AccessMode 可选显式覆盖（confirm|full）；留空 = 走项目默认权限继承。
+	AccessMode string `json:"access_mode"`
 }
 
 func (h *handlers) listSessions(w http.ResponseWriter, r *http.Request) {
@@ -79,7 +100,13 @@ func (h *handlers) createSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, err)
 		return
 	}
-	sess, err := h.d.Sessions.Create(r.Context(), req.Title, req.ModelRef, req.WorkspacePath)
+	sess, err := h.d.Sessions.Create(r.Context(), service.CreateSessionInput{
+		Title:         req.Title,
+		ModelRef:      req.ModelRef,
+		WorkspacePath: req.WorkspacePath,
+		ProjectID:     req.ProjectID,
+		AccessMode:    req.AccessMode,
+	})
 	if err != nil {
 		writeError(w, r, err)
 		return
@@ -98,11 +125,13 @@ func (h *handlers) getSession(w http.ResponseWriter, r *http.Request) {
 
 // updateSessionReq PATCH /api/v1/sessions/{sid} 入参（均可选）：
 // title 非空时重命名；model_ref 用指针区分「未传」与「显式清空（未选择模型）」；
-// access_mode 非空时更新访问模式（confirm/full，切换即时生效）。
+// access_mode 非空时更新访问模式（confirm/full，切换即时生效）；
+// project_id 用指针区分「未传」与「显式移出项目（空串）」。
 type updateSessionReq struct {
 	Title      string  `json:"title"`
 	ModelRef   *string `json:"model_ref"`
 	AccessMode string  `json:"access_mode"`
+	ProjectID  *string `json:"project_id"`
 }
 
 func (h *handlers) renameSession(w http.ResponseWriter, r *http.Request) {
@@ -125,6 +154,12 @@ func (h *handlers) renameSession(w http.ResponseWriter, r *http.Request) {
 	}
 	if strings.TrimSpace(req.AccessMode) != "" {
 		if err := h.d.Sessions.SetAccessMode(r.Context(), r.PathValue("sid"), req.AccessMode); err != nil {
+			writeError(w, r, err)
+			return
+		}
+	}
+	if req.ProjectID != nil {
+		if err := h.d.Sessions.SetProject(r.Context(), r.PathValue("sid"), *req.ProjectID); err != nil {
 			writeError(w, r, err)
 			return
 		}
@@ -207,6 +242,26 @@ func (h *handlers) getRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, run)
+}
+
+// activeRun 查询会话当前进行中的 Run：GET /api/v1/sessions/{sid}/active-run
+//
+// 前端刷新（F5）后本地流式态归零，靠本端点重建 SSE 订阅与「进行中」UI。
+// 语义铁律：**无进行中 Run 不是 404** —— 返回 200 + run_id:""，前端无需分支处理。
+// 刻意不放在 /runs/ 下，避免与 GET /runs/{rid} 的 ServeMux 模式优先级产生歧义
+// （"active-run" 会被 {rid} 通配吃掉）。
+func (h *handlers) activeRun(w http.ResponseWriter, r *http.Request) {
+	run, err := h.d.Runs.ActiveRun(r.Context(), r.PathValue("sid"))
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	resp := map[string]any{"run_id": "", "status": ""}
+	if run != nil {
+		resp["run_id"] = run.ID
+		resp["status"] = string(run.Status)
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (h *handlers) stopRun(w http.ResponseWriter, r *http.Request) {

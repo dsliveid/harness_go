@@ -280,6 +280,88 @@ paths:
         "204": { description: 已取消归档 }
         "404":
           $ref: "#/components/responses/NotFound"
+  # ============ 项目域（项目为服务端一等实体：默认控制权限 + 项目审批规则） ============
+  /api/v1/projects:
+    get:
+      tags: [projects]
+      summary: 项目列表（置顶优先，其次更新时间倒序）
+      responses:
+        "200": { description: 项目列表（items） }
+    post:
+      tags: [projects]
+      summary: 新建项目（default_access_mode 缺省为 confirm）
+      responses:
+        "201": { description: 已创建 }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+  /api/v1/projects/{pid}:
+    parameters:
+      - name: pid
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [projects]
+      summary: 取单个项目
+      responses:
+        "200": { description: 项目 }
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [projects]
+      summary: 更新项目（名称 / 默认控制权限 / 置顶；缺省字段保留原值）
+      responses:
+        "204": { description: 已更新 }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [projects]
+      summary: 删除项目（事务级联：软删 + 清规则 + 会话 project_id 归零）
+      responses:
+        "204": { description: 已删除 }
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/v1/projects/{pid}/approval-rules:
+    parameters:
+      - name: pid
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [projects]
+      summary: 项目审批规则列表
+      responses:
+        "200": { description: 规则列表（items） }
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      tags: [projects]
+      summary: 新增项目审批规则（命中即直接放行；重复添加幂等）
+      responses:
+        "201": { description: 已创建 }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/v1/projects/{pid}/approval-rules/{rid}:
+    parameters:
+      - name: pid
+        in: path
+        required: true
+        schema: { type: string }
+      - name: rid
+        in: path
+        required: true
+        schema: { type: string }
+    delete:
+      tags: [projects]
+      summary: 删除项目审批规则
+      responses:
+        "204": { description: 已删除 }
+        "404":
+          $ref: "#/components/responses/NotFound"
   /api/v1/sessions/{sid}/messages:
     parameters:
       - $ref: "#/components/parameters/SessionID"
@@ -533,6 +615,34 @@ paths:
                   items:
                     type: array
                     items: { $ref: "#/components/schemas/Snapshot" }
+  /api/v1/sessions/{sid}/active-run:
+    parameters:
+      - $ref: "#/components/parameters/SessionID"
+    get:
+      tags: [runs]
+      summary: 会话当前进行中的 Run（前端刷新后重建流式态/SSE 订阅的唯一事实来源）
+      description: |
+        语义铁律：**无进行中 Run 不是 404** —— 返回 200 且 `run_id` 为空串即表示空闲
+        （与 `/sessions/{sid}/lease` 的 `active=false` 同口径），前端无需分支处理错误码。
+
+        刻意不放在 `/runs/` 下：`GET /runs/active-run` 会被 `GET /runs/{rid}` 的通配吞掉。
+      responses:
+        "200":
+          description: 查询成功（`run_id` 为空串 = 无进行中 Run）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  run_id:
+                    type: string
+                    description: 进行中的 Run ID；空串表示该会话当前空闲
+                  status:
+                    allOf:
+                      - $ref: "#/components/schemas/RunStatus"
+                    description: 仅 `run_id` 非空时有意义
+        "404":
+          $ref: "#/components/responses/NotFound"
   /api/v1/sessions/{sid}/runs:
     parameters:
       - $ref: "#/components/parameters/SessionID"
@@ -713,6 +823,78 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "503":
           $ref: "#/components/responses/ToolUnavailable"
+  # ===== 核心 SOP（agent-core）：出厂内置 + 运行时覆盖 =====
+  /api/v1/sop/core:
+    get:
+      tags: [sop]
+      summary: 核心 SOP 生效快照（来源 / token / 预算 / 出厂原文）
+      description: |
+        source=builtin 表示使用**出厂内置**（embed，永不落盘）；
+        source=custom 表示存在运行时覆盖 data/sop/agent-core.md。
+        前端「系统内置」页签渲染 builtin_content，故切换页签**不需要任何读写请求**。
+      responses:
+        "200":
+          description: 生效快照
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SOPCore" }
+        "503":
+          $ref: "#/components/responses/Unavailable"
+    put:
+      tags: [sop]
+      summary: 保存自定义核心 SOP（首次保存即完成「内置 → 自定义」fork，下一轮对话生效）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [content]
+              properties:
+                content:
+                  type: string
+                  description: 核心 SOP 全文（空内容会被拒绝，恢复出厂请用 DELETE）
+      responses:
+        "200":
+          description: 保存后的生效快照
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SOPCore" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+    delete:
+      tags: [sop]
+      summary: 重置为出厂内置（删除运行时覆盖层，完整 undo）
+      responses:
+        "200":
+          description: 重置后的生效快照（source 必为 builtin）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SOPCore" }
+        "503":
+          $ref: "#/components/responses/Unavailable"
+  /api/v1/sop/effective:
+    get:
+      tags: [sop]
+      summary: 生效预览（核心 SOP + 项目级条目 + token 合计），不跑对话即可确认改动生效
+      parameters:
+        - name: session_id
+          in: query
+          required: false
+          schema: { type: string }
+          description: 给出时按该会话绑定的工作区列出项目级条目；缺省只列核心 SOP
+      responses:
+        "200":
+          description: 生效预览
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SOPEffective" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "503":
+          $ref: "#/components/responses/Unavailable"
   # ===== 阶段 C：设备与多端协同（HALO M5） =====
   /api/v1/devices/pair-codes:
     post:
@@ -781,6 +963,78 @@ paths:
           $ref: "#/components/responses/RateLimited"
         "503":
           $ref: "#/components/responses/DeviceUnavailable"
+  /api/v1/fs/roots:
+    get:
+      tags: [fs]
+      summary: 列出工作区宿主可浏览的根目录（L0 服务端宿主）
+      description: |
+        工作区宿主（WorkspaceHost）目录列举契约，见 `docs/工作区宿主与目录选择对接约定.md`。
+
+        - `host=server`（缺省）= 服务端本地列举，范围受白名单 `HARNESS_FS_ROOTS` 约束；
+        - `host=device:<id>` = 客户端宿主，**L1 未实现前统一返回 409 `fs.host_unsupported`**
+          （绝不静默降级为服务端本地列举，否则会把服务端目录列进客户端空间）。
+        - **只读**：仅目录元数据，不读任何文件内容。
+      parameters:
+        - { name: host, in: query, required: false, schema: { type: string }, description: "server | device:<id>" }
+      responses:
+        "200":
+          description: 根目录列表
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [host, separator, roots]
+                properties:
+                  host: { type: string }
+                  separator: { type: string, description: "路径分隔符：Windows \\\\，POSIX /" }
+                  roots:
+                    type: array
+                    items: { $ref: "#/components/schemas/FsDirEntry" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/FsHostUnsupported"
+  /api/v1/fs/dirs:
+    get:
+      tags: [fs]
+      summary: 列出工作区宿主某个目录下的子目录
+      description: |
+        - **只返回目录**，文件一律不出现（本端点是目录选择器，不是文件浏览器）；
+        - 路径必须为绝对路径，含 `..` 段一律 400 `fs.path_denied`；
+        - 到白名单根层级时 `parent` 为 `null`（绝不返回 `..`）；
+        - 目录过多时截断并置 `truncated: true`；
+        - `path` 为空表示「尚未定位」，只回 `roots` 供前端从根开始浏览。
+      parameters:
+        - { name: host, in: query, required: false, schema: { type: string }, description: "server | device:<id>" }
+        - { name: path, in: query, required: false, schema: { type: string }, description: 绝对路径（宿主本地口径） }
+      responses:
+        "200":
+          description: 目录列表
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [host, path, separator, dirs]
+                properties:
+                  host: { type: string }
+                  path: { type: string }
+                  parent: { type: string, nullable: true, description: "已在根层级时为 null" }
+                  separator: { type: string }
+                  roots:
+                    type: array
+                    items: { $ref: "#/components/schemas/FsDirEntry" }
+                  dirs:
+                    type: array
+                    items: { $ref: "#/components/schemas/FsDirEntry" }
+                  truncated: { type: boolean }
+        "400":
+          $ref: "#/components/responses/FsPathDenied"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/FsHostUnsupported"
   /api/v1/devices:
     get:
       tags: [devices]
@@ -1072,13 +1326,22 @@ paths:
   /api/v1/logs:
     get:
       tags: [ops]
-      summary: 应用日志尾行（仅返回尾部 N 行，永不返回全文）
+      summary: 文本运维日志查询（倒序早停，仅返回尾部 N 行，永不返回全文）
+      description: |
+        支持时间范围（from/to，Unix 毫秒）、级别、trace_id、关键字与分页。
+        响应额外携带保留策略元信息（retention_days / earliest_available_day / snapshot_mode），
+        供界面明示「日志在线保留 N 天、更早数据已清理」——禁止前端硬编码这些数字。
       parameters:
         - { name: limit, in: query, schema: { type: integer, default: 200, maximum: 2000 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
         - { name: level, in: query, schema: { type: string, enum: [error, warn, info, debug] } }
+        - { name: traceId, in: query, schema: { type: string }, description: 按 trace_id 检索（排障主入口） }
+        - { name: keyword, in: query, schema: { type: string, maxLength: 128 } }
+        - { name: from, in: query, schema: { type: integer }, description: Unix 毫秒（0 = 不限） }
+        - { name: to, in: query, schema: { type: integer }, description: Unix 毫秒（0 = 不限） }
       responses:
         "200":
-          description: 日志行
+          description: 日志行 + 保留策略元信息
           content:
             application/json:
               schema:
@@ -1091,7 +1354,187 @@ paths:
                       properties:
                         level: { type: string }
                         text: { type: string }
-                  limit: { type: integer }
+                  total: { type: integer }
+                  has_more: { type: boolean }
+                  retention_days: { type: integer, description: 在线保留天数（超期自动清理） }
+                  earliest_available_day: { type: string, description: 最早可查天键 YYYYMMDD }
+                  snapshot_mode: { type: string, enum: [off, preview, full] }
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /api/v1/logs/config:
+    get:
+      tags: [ops]
+      summary: 读取报文抓取档位与保留策略（含预估日增与当前占用）
+      responses:
+        "200":
+          description: 日志配置
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LogConfig" }
+        "403":
+          $ref: "#/components/responses/Forbidden"
+    patch:
+      tags: [ops]
+      summary: 切换报文抓取档位 / 调整保留天数（运行时生效）
+      description: |
+        切换仅影响之后的新调用：切到 full 不补录历史；切到 off 不删除已有数据。
+        非法取值返回 400（不静默兜底，避免"以为切成功了"的静默失效）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                snapshot_mode: { type: string, enum: [off, preview, full] }
+                retention_days: { type: integer, minimum: 1, maximum: 365 }
+      responses:
+        "200":
+          description: 更新后的配置
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LogConfig" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /api/v1/audit/tool-events:
+    get:
+      tags: [ops]
+      summary: 跨会话工具调用审计（按时间范围，无需 run_id）
+      description: |
+        数据源是天分片日志库族的 tool_call_logs（会话库 tool_events 的查询副本）。
+        副本可丢弃：丢失只影响本端点，不影响业务。默认时间范围为最近 24 小时。
+      parameters:
+        - { name: from, in: query, schema: { type: integer } }
+        - { name: to, in: query, schema: { type: integer } }
+        - { name: session_id, in: query, schema: { type: string } }
+        - { name: run_id, in: query, schema: { type: string } }
+        - { name: tool, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string } }
+        - { name: keyword, in: query, schema: { type: string, maxLength: 128 } }
+        - { name: limit, in: query, schema: { type: integer, default: 100, maximum: 1000 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses:
+        "200":
+          description: 审计结果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { type: object, additionalProperties: true } }
+                  total: { type: integer }
+                  retention_days: { type: integer }
+                  earliest_available_day: { type: string }
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /api/v1/audit/llm-calls:
+    get:
+      tags: [ops]
+      summary: LLM 调用流水（跨会话全局查询；session_id 可选）
+      description: |
+        数据源为天分片日志库族的 llm_requests（与单会话兼容别名
+        `/api/v1/sessions/{sid}/llm-trace` 指向同一 handler）。
+        默认时间范围为最近 24 小时。正文是否可得取决于当前抓取档位：
+        preview 只存脱敏摘要与校验值，full 才有正文；不可得时返回 payload_hint。
+      parameters:
+        - { name: from, in: query, schema: { type: integer } }
+        - { name: to, in: query, schema: { type: integer } }
+        - { name: session_id, in: query, schema: { type: string } }
+        - { name: run_id, in: query, schema: { type: string } }
+        - { name: message_id, in: query, schema: { type: string } }
+        - { name: trace_id, in: query, schema: { type: string } }
+        - { name: model, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string } }
+        - { name: keyword, in: query, schema: { type: string, maxLength: 128 } }
+        - { name: id, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, default: 100, maximum: 1000 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses:
+        "200":
+          description: 调用流水
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { type: object, additionalProperties: true } }
+                  total: { type: integer }
+                  payload: { type: string }
+                  payload_hint: { type: string }
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /api/v1/stats/tokens:
+    get:
+      tags: [ops]
+      summary: Token 用量聚合（按模型/厂商/天，数据源为小时预聚合表）
+      parameters:
+        - { name: from, in: query, schema: { type: integer } }
+        - { name: to, in: query, schema: { type: integer } }
+        - { name: group_by, in: query, schema: { type: string, enum: [model, provider, day], default: model } }
+      responses:
+        "200":
+          description: 聚合结果（estimated_calls 显式暴露估算占比）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  from: { type: integer }
+                  to: { type: integer }
+                  group_by: { type: string }
+                  items: { type: array, items: { type: object, additionalProperties: true } }
+                  total_calls: { type: integer }
+                  total_prompt_tokens: { type: integer }
+                  total_completion_tokens: { type: integer }
+                  total_cached_tokens: { type: integer }
+                  total_tokens: { type: integer }
+                  estimated_calls: { type: integer }
+                  earliest_day: { type: string }
+                  latest_day: { type: string }
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /api/v1/sessions/{sid}/llm-trace:
+    get:
+      tags: [ops]
+      summary: 报文回溯（按 message/run/trace 回查当时的模型入参出参）
+      description: |
+        数据源为天分片日志库族的 llm_requests。正文是否可得取决于当前抓取档位：
+        preview 只存脱敏摘要与校验值，full 才有正文；不可得时返回 payload_hint 说明原因。
+      parameters:
+        - { name: sid, in: path, required: true, schema: { type: string } }
+        - { name: message_id, in: query, schema: { type: string } }
+        - { name: run_id, in: query, schema: { type: string } }
+        - { name: trace_id, in: query, schema: { type: string } }
+        - { name: model, in: query, schema: { type: string } }
+        - { name: status, in: query, schema: { type: string } }
+        - { name: id, in: query, schema: { type: string }, description: 单条精确回查时顺带取正文 }
+        - { name: from, in: query, schema: { type: integer } }
+        - { name: to, in: query, schema: { type: integer } }
+        - { name: limit, in: query, schema: { type: integer, default: 100, maximum: 1000 } }
+        - { name: offset, in: query, schema: { type: integer, default: 0 } }
+      responses:
+        "200":
+          description: 报文记录（含 payload 全文或不可得原因）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { type: object, additionalProperties: true } }
+                  total: { type: integer }
+                  payload: { type: string }
+                  payload_hint: { type: string }
+                  snapshot_mode: { type: string, enum: [off, preview, full] }
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
   # ============ 阶段 E：外部插件与工具市场 ============
   /api/v1/mcp/servers:
     get:
@@ -1518,12 +1961,34 @@ components:
       content:
         application/json:
           schema: { $ref: "#/components/schemas/ErrorBody" }
+    Unavailable:
+      description: 对应子系统未接入（服务端装配缺失）
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorBody" }
     DeviceUnavailable:
       description: 设备域未接入或被配置关闭（`device.disabled`）
       content:
         application/json:
           schema: { $ref: "#/components/schemas/ErrorBody" }
+    FsPathDenied:
+      description: 路径越界或非法（`fs.path_denied`）：含 `..` 段、非绝对路径、或不在白名单 `HARNESS_FS_ROOTS` 内
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorBody" }
+    FsHostUnsupported:
+      description: 宿主不具备目录列举能力（`fs.host_unsupported`）：`host=device:<id>` 在 L1 实现前返回此码
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorBody" }
   schemas:
+    FsDirEntry:
+      type: object
+      description: 一个目录项（只含目录名与宿主本地绝对路径，不含任何文件元数据）
+      required: [name, path]
+      properties:
+        name: { type: string }
+        path: { type: string }
     # ============ 阶段 E：外部插件与工具市场 DTO ============
     MCPServerView:
       type: object
@@ -1960,3 +2425,39 @@ components:
           description: 当前是否仍有效（false = 无写者或已过期，**不是错误**）
         expires_at: { type: integer, format: int64, description: 毫秒；0 = 无租约 }
         heartbeat_at: { type: integer, format: int64, description: 毫秒；0 = 无租约 }
+
+    # ===== 核心 SOP（agent-core） =====
+    SOPCore:
+      type: object
+      description: 核心 SOP 生效快照（出厂内置 embed 或运行时覆盖 data/sop/agent-core.md）
+      properties:
+        content: { type: string, description: 实际生效正文 }
+        source:
+          type: string
+          enum: [builtin, custom]
+          description: builtin = 出厂内置（永不落盘）；custom = 存在运行时覆盖
+        tokens: { type: integer, description: 正文的启发式 token 估算 }
+        budget: { type: integer, description: 总 token 预算（0 = 不限） }
+        builtin_content: { type: string, description: 出厂原文（前端内置页签渲染它，切页签无需请求） }
+        overridden: { type: boolean, description: 是否存在运行时覆盖（等价于「处于自定义模式」） }
+    SOPEntry:
+      type: object
+      description: 项目级 SOP 条目（<ws>/.harness/sop/<id>.md）
+      properties:
+        id: { type: string }
+        title: { type: string }
+        body: { type: string }
+        tokens: { type: integer }
+    SOPEffective:
+      type: object
+      description: 生效预览（核心 SOP + 项目级条目 + token 合计）
+      properties:
+        core: { $ref: "#/components/schemas/SOPCore" }
+        entries:
+          type: array
+          items: { $ref: "#/components/schemas/SOPEntry" }
+        workspace: { type: string, description: 会话绑定的工作区路径（空 = 未绑定） }
+        total_tokens: { type: integer }
+        system_preview: { type: string, description: 最终系统提示预览（基础提示 + SOP 段） }
+        truncated: { type: boolean, description: 是否有条目因条数上限被截断（D10：必须可见） }
+        entry_limit: { type: integer, description: 项目级条目条数上限 }

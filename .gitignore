@@ -65,7 +65,12 @@ desktop.ini
 secret.key
 
 # ---------- Harness Agent 运行时数据 ----------
-.harness/
+# ⚠️ 必须写成 .harness/* 而不是 .harness/ —— Git 有个经典陷阱：父目录被整体忽略时，
+# 子目录的 ! 否定规则**完全失效**。写成 .harness/ 会导致下面的 !.harness/sop/ 形同虚设。
+# 需求背景：项目级 SOP / skill 需要能随项目提交给团队；没 add 的就等价于本机私有。
+.harness/*
+!.harness/sop/
+!.harness/skills/
 *.pid
 
 # ---------- demo 调试快照与浏览器录制宏 ----------
@@ -80,6 +85,14 @@ demo/test-results/
 demo/*.png
 demo/serve.out.log
 demo/serve.err.log
+
+# ---------- 本机验证/调试遗留（严禁入库） ----------
+# data_verify：本地联调用的临时数据目录（含 initial_password / secret.key / db）
+/data_verify/
+# 根目录自测截图与误重定向产生的临时文件
+/check*.png
+/query
+/status.txt
 
 # ---------- 其他 ----------
 *.zip

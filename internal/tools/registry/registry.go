@@ -116,6 +116,10 @@ type Registry struct {
 	plugins   map[string]*pluginEntry
 	overrides map[string]toolapi.Tier
 	warnings  []string
+	// loggedWarnings 上一次**已打印**的告警内容（仅用于日志去重，不对外暴露）。
+	// 与 warnings 职责不同：warnings 是当前真实告警（Warnings()/Snapshot 暴露），
+	// loggedWarnings 是「上次打过的」快照——两者混用会让去重失效（每次重算都重打日志）。
+	loggedWarnings []string
 }
 
 // New 创建空注册表。
@@ -485,11 +489,40 @@ func (r *Registry) refreshWarningsLocked() {
 			len(deferred), r.opts.DeferredSoftLimit))
 	}
 	r.warnings = warns
-	if len(warns) > 0 && r.opts.Logger != nil {
-		for _, w := range warns {
-			r.opts.Logger.Warn("工具注入预算告警", "detail", w)
+	// 只在告警内容**发生变化**时打日志。
+	//
+	// 为什么必须去重：本函数被 Register/RegisterPlugin/SetOverrides/卸载等多条路径调用，
+	// 而启动时工具是逐个注册的——若每次重算都打日志，同一条静态配置告警会重复输出
+	// 十几次，把控制台刷满（这属于"日志噪声"，不是"日志过细"）。
+	// 去重后：首次超限时告警一次，配置变化（工具增减/覆盖调整）再告警一次，语义更准确。
+	// 注意：告警归零时也要同步清空去重快照，否则「超限→恢复→再超限」会被静默吞掉。
+	if len(warns) == 0 {
+		r.loggedWarnings = nil
+		return
+	}
+	if r.opts.Logger == nil {
+		return
+	}
+	if equalStrings(warns, r.loggedWarnings) {
+		return
+	}
+	r.loggedWarnings = warns
+	for _, w := range warns {
+		r.opts.Logger.Warn("工具注入预算告警", "detail", w)
+	}
+}
+
+// equalStrings 判断两个字符串切片是否逐项相等（告警去重用的最小工具）。
+func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
 		}
 	}
+	return true
 }
 
 func toolNames(tools []toolapi.Tool) []string {

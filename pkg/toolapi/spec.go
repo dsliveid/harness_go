@@ -95,6 +95,13 @@ const (
 	CapWorkspaceRead = "workspace.read"
 	// CapWorkspaceWrite 写入工作区文件。
 	CapWorkspaceWrite = "workspace.write"
+	// CapWorkspaceList 只读列举目录（fs.list / fs.roots）。
+	//
+	// 与 CapWorkspaceRead 的区别是**阅界更窄**：只允许 readdir 级元数据，
+	// 绝不读文件内容；语义为「工作区宿主目录可视化选择」。
+	// 未申报该能力的宿主，服务端必须回 fs.host_unsupported 且**禁止降级**
+	// 到服务端本地目录（详见 docs/工作区宿主与目录选择对接约定.md）。
+	CapWorkspaceList = "workspace.list"
 	// CapProcess 派生子进程。
 	CapProcess = "process"
 	// CapNetwork 出网访问。

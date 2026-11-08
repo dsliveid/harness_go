@@ -42,17 +42,32 @@ type Deps struct {
 	Leases        LeaseManager // 可为 nil（nil 时不做跨端租约，行为与 C 阶段前一致）
 	MaxConcurrent int
 	MaxSteps      int
-	ToolTimeout   time.Duration
+	// StepNoticeEvery 步数进度提示间隔：每 N 步向模型注入一行
+	// 「当前步数 X/总步数 N」，让模型感知剩余预算、在接近上限时主动收敛。
+	// <=0 时回落默认 10；显式关闭请配 0 以外的语义（引擎内 <=0 即视为默认值）。
+	StepNoticeEvery int
+	ToolTimeout     time.Duration
 	Now           func() int64
 	// AccessModeProvider 实时读取会话访问模式（可选）。
 	// 对齐桌面端语义：顶栏「变更前确认/完全访问」切换即时生效——对话进行中同样立即生效，
 	// 因此每次审批决策前重读一次；读取失败回落 RunRequest.AccessMode（Run 启动快照）。
 	// nil 时维持旧行为（始终用启动快照）。
 	AccessModeProvider func(ctx context.Context, sessionID string) (approval.AccessMode, error)
+	// Rules 审批规则来源（可选）：非 nil 时由它统一提供「会话级 + 项目级」合并后的规则集；
+	// nil 时退回 sdb.ApprovalRules（仅会话级，旧行为不变）。
+	Rules RuleSource
 	// RiskOverride 按参数升级工具风险级（可选）：入参 (工具名, 参数 JSON, 契约静态风险级)，
 	// 返回实际用于审批的风险级。用于高危命令特征检测（run_command 命中 → danger）；
 	// nil 时始终用契约静态风险级。
 	RiskOverride func(toolName string, argsJSON []byte, base model.Risk) model.Risk
+	// Traces 审计日志写入（可选，nil 时不记任何审计日志）。
+	//
+	// 实现必须非阻塞：这是 Run 关键路径上的调用，写入侧有界队列 + 满即丢弃。
+	// 对齐 docs/基础服务设计.md:301「快照写入不阻塞 TTFT」。
+	Traces TraceSink
+	// TraceID 取当前请求的 trace_id（可选）：nil 或返回空串时审计日志的
+	// trace_id 字段为空（不影响功能，只是无法从日志反查请求链路）。
+	TraceID func(ctx context.Context) string
 }
 
 // Engine Run 执行引擎。
@@ -83,7 +98,10 @@ func New(deps Deps) (*Engine, error) {
 		deps.MaxConcurrent = 8
 	}
 	if deps.MaxSteps <= 0 {
-		deps.MaxSteps = 20
+		deps.MaxSteps = 100 // 默认 100 步（原 20：复杂任务易被误截断）
+	}
+	if deps.StepNoticeEvery <= 0 {
+		deps.StepNoticeEvery = 10 // 每 10 步注入一次步数进度提示
 	}
 	if deps.ToolTimeout <= 0 {
 		deps.ToolTimeout = 120 * time.Second
@@ -221,6 +239,10 @@ func (e *Engine) Execute(ctx context.Context, req RunRequest) error {
 type runUsage struct {
 	prompt     int64
 	completion int64
+	// cached 缓存命中 token（此前从不写入 runs.cached_tokens，导致命中率无分母）。
+	cached int64
+	// estimated 本次 Run 是否含估算用量（宁可标记估算，也不伪装成真实值）。
+	estimated bool
 }
 
 // loop 主循环：组装 → 流式 → 落消息 → 工具 → 回灌，直到终态或步数上限。
@@ -232,7 +254,7 @@ func (e *Engine) loop(ctx context.Context, sdb SessionDB, req RunRequest, usage 
 	// WithoutCancel 保证写入不被请求取消吞掉）。
 	defer func() {
 		if usage != nil {
-			_ = sdb.AddRunUsage(context.WithoutCancel(ctx), req.RunID, usage.prompt, usage.completion)
+			_ = sdb.AddRunUsage(context.WithoutCancel(ctx), req.RunID, usage.prompt, usage.completion, usage.cached, usage.estimated)
 		}
 	}()
 
@@ -252,6 +274,12 @@ func (e *Engine) loop(ctx context.Context, sdb SessionDB, req RunRequest, usage 
 		// 轮次边界消费运行中引导（§4.2）：当前流结束后模型即看到引导内容
 		e.drainGuidance(ctx, sdb, req, &history)
 
+		// 步数进度提示（每 StepNoticeEvery 步注入一次）：
+		// 让模型感知剩余预算，在接近上限时主动收敛输出。
+		// 走 DynamicTail 通道（Builder 保证置尾到本轮 user 消息前），
+		// **绝不进 system 稳定前缀**，否则每步变化的进度文本会击穿前缀缓存。
+		dynamicTail := stepNotice(step, e.deps.MaxSteps, e.deps.StepNoticeEvery)
+
 		res := e.deps.Builder.Build(prompt.Input{
 			Model:          req.ModelRef,
 			SystemBase:     req.SystemBase,
@@ -262,6 +290,7 @@ func (e *Engine) loop(ctx context.Context, sdb SessionDB, req RunRequest, usage 
 			ActiveTools:    req.ActiveTools,
 			MemoryCore:     req.MemoryCore,
 			MemoryTail:     req.MemoryTail,
+			DynamicTail:    dynamicTail,
 			UserInput:      userInput,
 		})
 
@@ -291,6 +320,10 @@ func (e *Engine) loop(ctx context.Context, sdb SessionDB, req RunRequest, usage 
 		if usage != nil {
 			usage.prompt += out.promptTokens
 			usage.completion += out.completionTokens
+			usage.cached += out.cachedTokens
+			if out.estimated {
+				usage.estimated = true
+			}
 		}
 		if status != "" { // 非空表示本轮异常终止
 			return status, "", code, failMsg, tokens
@@ -302,6 +335,7 @@ func (e *Engine) loop(ctx context.Context, sdb SessionDB, req RunRequest, usage 
 			RunID:     req.RunID,
 			Role:      model.RoleAssistant,
 			Content:   out.content,
+			Reasoning: out.reasoning,
 			CreatedAt: e.deps.Now(),
 		}
 		if len(out.toolCalls) > 0 {
@@ -319,6 +353,7 @@ func (e *Engine) loop(ctx context.Context, sdb SessionDB, req RunRequest, usage 
 			"message_id": assistantMsg.ID,
 			"content":    out.content,
 			"seq":        assistantMsg.Seq,
+			"reasoning":  out.reasoning,
 		})
 
 		if len(out.toolCalls) == 0 {
@@ -378,7 +413,15 @@ func (e *Engine) drainGuidance(ctx context.Context, sdb SessionDB, req RunReques
 // streamOutcome 单轮流式结果。
 type streamOutcome struct {
 	content   string
+	reasoning string
 	toolCalls []llm.ToolCall
+	// messageID 本轮 assistant 消息 ID（审计日志按它关联「这次调用产出哪条消息」）。
+	messageID string
+	// cachedTokens 本轮缓存命中 token（runs 表 cached_tokens 的落点）。
+	cachedTokens int64
+	// estimated 本轮用量是否为估算值（runs 表 is_estimated 的落点）。
+	// 绝不隐藏估算值：任一段 usage 被标记估算，整次调用即记 1。
+	estimated bool
 	// promptTokens / completionTokens 本轮流式用量（P1：随终态回写 runs 表，
 	// OpenAI 兼容端点与 UI 的 usage 以此为准）。
 	promptTokens     int64
@@ -390,17 +433,28 @@ type streamOutcome struct {
 func (e *Engine) streamOnce(ctx context.Context, req RunRequest, provider llm.Provider, res prompt.BuildResult) (
 	out streamOutcome, status model.RunStatus, errCode, errMsg string, tokens int64,
 ) {
+	// 审计埋点：仅当注入了 Traces 才收集（nil 时零开销，行为与之前完全一致）。
+	startedAt := e.now()
+	firstTokenAt := int64(0)
+	var payloadJSON string
+	if e.deps.Traces != nil {
+		payloadJSON = marshalForTrace(res.Request)
+	}
+
 	stream, err := provider.ChatStream(ctx, res.Request)
 	if err != nil {
 		if ctx.Err() != nil {
+			e.recordLLMTrace(ctx, req, provider, res, startedAt, firstTokenAt, payloadJSON, out, tokens, "cancelled", "context_canceled", "")
 			return out, model.RunCancelled, "context_canceled", "", 0
 		}
 		le := llm.AsError(err)
+		e.recordLLMTrace(ctx, req, provider, res, startedAt, firstTokenAt, payloadJSON, out, tokens, "error", string(le.Kind), le.Message)
 		return out, model.RunFailed, string(le.Kind), le.Message, 0
 	}
 	defer func() { _ = stream.Close() }()
 
 	var content strings.Builder
+	var reasoning strings.Builder
 	msgID := newID()
 	e.publish(req.RunID, events.TypeMessageStart, map[string]any{
 		"message_id": msgID,
@@ -421,10 +475,16 @@ func (e *Engine) streamOnce(ctx context.Context, req RunRequest, provider llm.Pr
 		}
 		if rErr != nil {
 			if ctx.Err() != nil {
+				e.recordLLMTrace(ctx, req, provider, res, startedAt, firstTokenAt, payloadJSON, out, tokens, "cancelled", "context_canceled", "")
 				return out, model.RunCancelled, "context_canceled", "", tokens
 			}
 			le := llm.AsError(rErr)
+			e.recordLLMTrace(ctx, req, provider, res, startedAt, firstTokenAt, payloadJSON, out, tokens, "error", string(le.Kind), le.Message)
 			return out, model.RunFailed, string(le.Kind), le.Message, tokens
+		}
+		// 首次收到任何增量（正文/思考/工具调用）即记 TTFT
+		if firstTokenAt == 0 && (ch.Delta != "" || ch.Reasoning != "" || ch.ToolCall != nil) {
+			firstTokenAt = e.now()
 		}
 		if ch.Delta != "" {
 			content.WriteString(ch.Delta)
@@ -434,10 +494,23 @@ func (e *Engine) streamOnce(ctx context.Context, req RunRequest, provider llm.Pr
 				"delta":      ch.Delta,
 			})
 		}
+		if ch.Reasoning != "" {
+			// 思考过程增量：与 delta 同语义只发事件不落库（最终整段落库于 assistant 消息）
+			reasoning.WriteString(ch.Reasoning)
+			e.publish(req.RunID, events.TypeMessageReasoning, map[string]any{
+				"message_id": msgID,
+				"delta":      ch.Reasoning,
+			})
+		}
 		if ch.Usage != nil {
 			tokens += int64(ch.Usage.TotalTokens)
 			out.promptTokens += int64(ch.Usage.PromptTokens)
 			out.completionTokens += int64(ch.Usage.CompletionTokens)
+			out.cachedTokens += int64(ch.Usage.CachedTokens)
+			// 任一段 usage 被标记为估算值，则整次调用按估算记账（不掩盖）
+			if ch.Usage.Estimated {
+				out.estimated = true
+			}
 		}
 		if ch.ToolCall != nil {
 			a, ok := accs[ch.ToolCall.Index]
@@ -456,6 +529,8 @@ func (e *Engine) streamOnce(ctx context.Context, req RunRequest, provider llm.Pr
 	}
 
 	out.content = content.String()
+	out.reasoning = reasoning.String()
+	out.messageID = msgID
 	// 按 index 排序输出，保证多工具调用的稳定顺序
 	indexes := make([]int, 0, len(accs))
 	for i := range accs {
@@ -470,6 +545,7 @@ func (e *Engine) streamOnce(ctx context.Context, req RunRequest, provider llm.Pr
 			Arguments: json.RawMessage(a.args.String()),
 		})
 	}
+	e.recordLLMTrace(ctx, req, provider, res, startedAt, firstTokenAt, payloadJSON, out, tokens, "ok", "", "")
 	return out, "", "", "", tokens
 }
 
@@ -484,6 +560,21 @@ func (e *Engine) effectiveAccessMode(ctx context.Context, req RunRequest) approv
 		return req.AccessMode
 	}
 	return mode
+}
+
+// approvalRules 取本次审批生效的规则集。
+//
+// 优先级：Deps.Rules（会话级 + 项目级合并）> 会话库规则（旧行为）。
+// 容错语义与原来完全一致：读取失败一律视作「无规则」——结果是更保守的逐次审批，
+// 绝不因规则表抖动而让 Run 失败。
+func (e *Engine) approvalRules(ctx context.Context, sdb SessionDB, req RunRequest) []approval.Rule {
+	if e.deps.Rules != nil {
+		if rules, err := e.deps.Rules.RulesFor(ctx, req.SessionID); err == nil {
+			return rules
+		}
+	}
+	rules, _ := sdb.ApprovalRules(ctx)
+	return rules
 }
 
 // execTool 执行单次工具调用（含审批）。返回的 cancelled 表示被中断。
@@ -527,8 +618,10 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 		"risk":          string(risk),
 	})
 
-	// 审批
-	rules, _ := sdb.ApprovalRules(ctx)
+	// 审批规则：Deps.Rules 非 nil 时由它统一提供「会话级 + 项目级」合并集，
+	// 否则退回会话库规则（旧行为）。合并策略在 service.ApprovalPolicy 中唯一实现，
+	// 引擎只消费结果，不做第二套判定。
+	rules := e.approvalRules(ctx, sdb, req)
 	// 跨端仲裁（C-7）：发起端 = 本次 Run 的执行端设备（空串 = 服务端本地执行面）。
 	requester := approvalRequester(req)
 	// 高风险 + 端侧发起 → 绑定「必须由该设备确认」（strict_approval_device 决定是否强制）。
@@ -556,6 +649,19 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 			_ = sdb.FinishToolEvent(ctx, eventID, model.ToolError, "", "", err.Error(), localExec)
 			return toolMessage(tc, "审批登记失败: "+err.Error()), false
 		}
+		// 状态机闭环（单一真相铁律）：审批等待**必须**落到 runs.status=waiting_approval。
+		//
+		// 此前这里只发 approval.request 事件就阻塞在 Gate.Await，从不迁移状态，
+		// 导致三处下游全部失真（历史缺陷，勿回退）：
+		//   ① DecideApproval 硬校验 run.Status==waiting_approval → 用户点「允许」永远 409；
+		//   ② GET /active-run 的 status 永不为 waiting_approval → 前端「刷新后重建审批条」是死代码；
+		//   ③ 跨端/审计看到的是 running，无法区分「在跑」与「在等人」。
+		// 迁移失败**必须硬失败**（绝不能静默降级回旧行为）：否则又回到「看得见审批、点不动」的死链。
+		if err := e.transition(ctx, sdb, req.RunID, model.RunWaitingApproval, "", "", ""); err != nil {
+			_ = sdb.FinishToolEvent(ctx, eventID, model.ToolError, "", "", err.Error(), localExec)
+			return toolMessage(tc, "审批状态迁移失败: "+err.Error()), false
+		}
+		e.publishStatus(req.RunID, req.SessionID, model.RunWaitingApproval, "", "", "", nil)
 		e.publish(req.RunID, events.TypeApprovalRequest, map[string]any{
 			"approval_id":   eventID,
 			"tool_event_id": eventID,
@@ -563,6 +669,10 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 			"risk":          string(risk),
 			"reason":        reason,
 			"session_id":    req.SessionID,
+			// run_id / args：前端审批条要显示「哪个 Run、放行什么参数」，
+			// 刷新恢复时也要靠 run_id 决定决策提交目标（此前缺这两个字段，前端读出来恒为空）。
+			"run_id": req.RunID,
+			"args":   string(normalizeArgs(tc.Arguments)),
 			// 新增字段（协议向后兼容，仅新增不改形状）：前端据此显示「需在端侧确认」
 			"requested_by_device": requester,
 			"required_device_id":  required,
@@ -571,6 +681,16 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 		decision = d
 		if r != "" {
 			reason = r
+		}
+		// 无论批准/拒绝/超时，闸门已解除 → 状态回到 running（Run 仍在跑，拒绝原因随后回灌模型）。
+		// 取消路径**不回迁**：让状态停在 waiting_approval，由上层收口为 cancelled
+		// （state.go 允许 waiting_approval → cancelled），避免与取消语义打架。
+		if ctx.Err() == nil {
+			if err := e.transition(ctx, sdb, req.RunID, model.RunRunning, "", "", ""); err != nil {
+				_ = sdb.FinishToolEvent(ctx, eventID, model.ToolError, "", "", err.Error(), localExec)
+				return toolMessage(tc, "审批后状态回迁失败: "+err.Error()), false
+			}
+			e.publishStatus(req.RunID, req.SessionID, model.RunRunning, "", "", "", nil)
 		}
 		e.publish(req.RunID, events.TypeApprovalDecision, map[string]any{
 			"approval_id":         eventID,
@@ -644,6 +764,9 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 	}.Normalized()
 	_ = sdb.FinishToolEvent(ctx, eventID, result.Status, result.ResultJSON, result.ResultBlob,
 		result.Error, execInfo)
+	// 审计副本（天库）：会话库的 tool_events 是事实源，这里额外投递一条可丢弃的查询副本。
+	// 丢失只影响跨会话按时间审计，不影响任何业务功能。
+	e.recordToolTrace(ctx, req, ev, result.ResultJSON, result.ResultBlob, result.Error, execInfo, result.Status)
 	e.publish(req.RunID, events.TypeToolResult, map[string]any{
 		"tool_event_id": eventID,
 		"status":        string(result.Status),
@@ -660,6 +783,37 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 		payload = result.Error
 	}
 	return toolMessage(tc, payload), false
+}
+
+// stepNotice 生成步数进度提示文本（走 prompt.Input.DynamicTail 通道）。
+//
+// 设计要点：
+//   - step 从 0 计，对外展示一律用 step+1（即「当前第几步」）；
+//   - 每 every 步注入一次（第 every、2×every … 步），every <= 0 表示关闭；
+//   - 最后一步额外追加收敛指令：此时已无余量继续调用工具，必须强制模型
+//     交出最终结论，避免像以往那样被硬截断后「无声停住」。
+//
+// 返回空串时 Builder 不会追加多余空行（joinTails 已过滤空段）。
+func stepNotice(step, maxSteps, every int) string {
+	if every <= 0 || maxSteps <= 0 {
+		return ""
+	}
+	current := step + 1
+
+	// 最后一步优先级最高：无论是否命中 every 的整数倍，都必须提示收敛。
+	if current >= maxSteps {
+		return fmt.Sprintf("【步数进度】当前步数 %d/总步数 %d。已到最后一步，"+
+			"后续无法再调用任何工具，请立即基于已有信息给出最终答复；"+
+			"若任务未完成，请说明已完成部分、剩余部分与建议的下一步。",
+			current, maxSteps)
+	}
+
+	if current%every != 0 {
+		return ""
+	}
+	return fmt.Sprintf("【步数进度】当前步数 %d/总步数 %d，剩余 %d 步。"+
+		"请据此规划剩余工作，优先保证能给出完整结论。",
+		current, maxSteps, maxSteps-current)
 }
 
 // degradeDetails 提取降级动作明细（事件 payload 用）。

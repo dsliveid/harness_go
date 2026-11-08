@@ -52,16 +52,13 @@ func TestSaveListAndLoad(t *testing.T) {
 	}
 }
 
-// TestSaveRejectsOverToken 单条超 150 token（启发式）显式拒绝——不截断。
-func TestSaveRejectsOverToken(t *testing.T) {
+// TestSaveAllowsLongContent 单条 token 上限已按需求取消：长内容必须可保存。
+func TestSaveAllowsLongContent(t *testing.T) {
 	h := plugintest.New(t)
 	big := strings.Repeat("长内容段落。", 120) // ≈ 600 CJK token
-	res := invoke(t, h, "save_sop", `{"title":"超限","content":"`+big+`"}`)
-	if !res.IsError {
-		t.Fatal("超 token 上限应拒绝")
-	}
-	if !strings.Contains(res.Content, "150") {
-		t.Fatalf("错误应说明上限: %s", res.Content)
+	res := invoke(t, h, "save_sop", `{"title":"长条目","content":"`+big+`"}`)
+	if res.IsError {
+		t.Fatalf("单条上限已取消，长内容应可保存: %s", res.Content)
 	}
 }
 

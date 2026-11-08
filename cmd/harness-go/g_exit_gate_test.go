@@ -253,11 +253,12 @@ func TestGSOPInjectedIntoPrompt(t *testing.T) {
 			t.Fatalf("save_sop 失败: %s", res.Content)
 		}
 	}
-	bodies := sopBodies(env.toolHost)
+	bodies := sopBodies(env.dataDir)
 	if len(bodies) != 1 || !strings.Contains(bodies[0], "make verify") {
 		t.Fatalf("装配点应读出 SOP 正文: %+v", bodies)
 	}
 	// 超上限拒绝（不静默截断）
+	// 单条 token 上限已按需求取消：长内容应当保存成功（不再因篇幅被拒）。
 	big := strings.Repeat("冗", 300)
 	for _, tool := range p.Tools() {
 		if tool.Spec().Name != "save_sop" {
@@ -265,13 +266,42 @@ func TestGSOPInjectedIntoPrompt(t *testing.T) {
 		}
 		res, iErr := tool.Invoke(context.Background(), &toolapi.Call{
 			CallID: "sop:2", Name: "save_sop",
-			Args: []byte(`{"title":"超限条目","content":"` + big + `"}`),
+			Args: []byte(`{"title":"长条目","content":"` + big + `"}`),
 		})
 		if iErr != nil {
 			t.Fatal(iErr)
 		}
-		if !res.IsError {
-			t.Fatal("超单条上限应显式拒绝")
+		if res.IsError {
+			t.Fatalf("单条上限已取消，长内容应可保存: %s", res.Content)
 		}
+	}
+	// 但条数上限仍须生效（D10 保留项）——装满 6 条后第 7 条必须被显式拒绝。
+	for i := 0; i < sop.MaxEntries; i++ {
+		for _, tool := range p.Tools() {
+			if tool.Spec().Name != "save_sop" {
+				continue
+			}
+			_, _ = tool.Invoke(context.Background(), &toolapi.Call{
+				CallID: "sop:fill", Name: "save_sop",
+				Args: []byte(`{"title":"条目` + string(rune('A'+i)) + `","content":"内容` + string(rune('A'+i)) + `"}`),
+			})
+		}
+	}
+	rejected := false
+	for _, tool := range p.Tools() {
+		if tool.Spec().Name != "save_sop" {
+			continue
+		}
+		res, iErr := tool.Invoke(context.Background(), &toolapi.Call{
+			CallID: "sop:over", Name: "save_sop",
+			Args: []byte(`{"title":"第七条","content":"溢出内容"}`),
+		})
+		if iErr != nil {
+			t.Fatal(iErr)
+		}
+		rejected = res.IsError
+	}
+	if !rejected {
+		t.Fatal("超过条数上限应显式拒绝（D10 保留项）")
 	}
 }

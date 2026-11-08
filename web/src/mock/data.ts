@@ -21,9 +21,9 @@ export const workspaces: Workspace[] = [
 
 // ---------------- 项目 ----------------
 export const projects: Project[] = [
-  { id: 'p1', name: 'harness_go', path: '/data/workspace/harness_go', pinned: true, workspaceId: 'ws-srv', constraints: '# 项目约束\n- 后端 Go 1.22+，前端 React 18\n- 先方案后编码，禁止跳步' },
-  { id: 'p2', name: 'harness_mini', path: 'F:/WorkSpace/Other/harness_mini', workspaceId: 'ws-desk', constraints: '- Tauri 2 + Rust 内核\n- 桌面端，勿引入 web 运行时' },
-  { id: 'p3', name: 'data-pipeline', path: 'D:/WorkSpace/data-pipeline', workspaceId: 'ws-office' },
+  { id: 'p1', name: 'harness_go', path: '/data/workspace/harness_go', pinned: true, workspaceId: 'ws-srv', defaultAccessMode: 'full', constraints: '# 项目约束\n- 后端 Go 1.22+，前端 React 18\n- 先方案后编码，禁止跳步' },
+  { id: 'p2', name: 'harness_mini', path: 'F:/WorkSpace/Other/harness_mini', workspaceId: 'ws-desk', defaultAccessMode: 'confirm', constraints: '- Tauri 2 + Rust 内核\n- 桌面端，勿引入 web 运行时' },
+  { id: 'p3', name: 'data-pipeline', path: 'D:/WorkSpace/data-pipeline', workspaceId: 'ws-office', defaultAccessMode: 'confirm' },
 ]
 
 // ---------------- 会话 ----------------
@@ -119,6 +119,7 @@ export const messages: Message[] = [
   {
     id: 'm2', sessionId: 's1', runId: 'r1', seq: 2, turnSeq: 1, role: 'assistant', createdAt: now - 39 * min,
     content: '我先读取 `internal/tools/registry.go` 确认现有结构。',
+    reasoning: '用户要加同名冲突检测。先确认 Registry 的存储结构与 Register 的加锁方式，再决定冲突检测放在哪一层；避免在不了解 mu 保护范围的情况下直接插入判断。',
     toolCalls: [{
       id: 'tc1', name: 'read_file', risk: 'readonly', status: 'ok', durationMs: 42,
       args: { path: 'internal/tools/registry.go', offset_line: 1, max_lines: 60 },

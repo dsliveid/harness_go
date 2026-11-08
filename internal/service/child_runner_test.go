@@ -62,7 +62,7 @@ func newChildTestEnv(t *testing.T) (*ChildRunner, *store.MainStore, *store.Sessi
 func TestChildRunnerSpawnCompletes(t *testing.T) {
 	cr, main, sessions, _ := newChildTestEnv(t)
 	ctx := context.Background()
-	if _, err := NewSessionService(main, sessions).Create(ctx, "嵌套测试", "", ""); err != nil {
+	if _, err := NewSessionService(main, sessions).Create(ctx, CreateSessionInput{Title: "嵌套测试"}); err != nil {
 		t.Fatal(err)
 	}
 	sess, _ := main.Sessions().List(ctx, 10, 0)
@@ -108,7 +108,7 @@ func TestChildRunnerRecursionForbidden(t *testing.T) {
 	cr, main, sessions, provider := newChildTestEnv(t)
 	provider.Delay = 2 * time.Second // 拉长子 Run 在途窗口，保证断言确定性
 	ctx := context.Background()
-	if _, err := NewSessionService(main, sessions).Create(ctx, "递归测试", "", ""); err != nil {
+	if _, err := NewSessionService(main, sessions).Create(ctx, CreateSessionInput{Title: "递归测试"}); err != nil {
 		t.Fatal(err)
 	}
 	sess, _ := main.Sessions().List(ctx, 10, 0)
@@ -137,7 +137,7 @@ func TestChildRunnerDepthBoundary(t *testing.T) {
 	cr, mainStore, sessions, _ := newChildTestEnv(t)
 	cr.opts.MaxDepth = 3
 	ctx := context.Background()
-	if _, err := NewSessionService(mainStore, sessions).Create(ctx, "深度边界", "", ""); err != nil {
+	if _, err := NewSessionService(mainStore, sessions).Create(ctx, CreateSessionInput{Title: "深度边界"}); err != nil {
 		t.Fatal(err)
 	}
 	list, _ := mainStore.Sessions().List(ctx, 10, 0)

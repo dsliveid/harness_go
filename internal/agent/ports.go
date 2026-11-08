@@ -35,13 +35,71 @@ type SessionDB interface {
 	AddApprovalRule(ctx context.Context, toolName, pattern string) error
 
 	// AddRunUsage 回写单次 Run 的 token 用量（P1：runs 表预埋列的落点）。
-	AddRunUsage(ctx context.Context, runID string, promptTokens, completionTokens int64) error
+	//
+	// cachedTokens / isEstimated 是 0001_init.sql:44-45 预留列，此前从不写入，
+	// 导致「缓存命中率」无分子分母、「估算 token」无法与真实值区分。
+	// 现随调用一并落库（不隐藏估算值）。
+	AddRunUsage(ctx context.Context, runID string, promptTokens, completionTokens, cachedTokens int64, isEstimated bool) error
 }
 
 // SummaryWriter 主库摘要回写（**与会话库不同事务，最终一致**）。
 type SummaryWriter interface {
 	TouchMessage(ctx context.Context, sessionID string, at int64) error
 	AddTokensAndStatus(ctx context.Context, sessionID string, tokens int64, status model.RunStatus) error
+}
+
+// ============ 审计日志端口（可为 nil） ============
+//
+// 这里用「窄结构 + 窄接口」而不是直接依赖 logvault 包：
+//   - agent 包的设计铁律是「不 import store」，同理也不 import logvault；
+//   - 上层用适配器把 LLMTrace → logvault.LLMRecord。
+//
+// 实现必须**非阻塞**（有界队列 + 队列满丢弃），因为这是 Run 关键路径上的调用，
+// 对齐 docs/基础服务设计.md:301「快照写入不阻塞 TTFT」。
+
+// LLMTrace 一次模型调用的追踪记录。
+type LLMTrace struct {
+	CreatedAt        int64
+	SessionID        string
+	RunID            string
+	MessageID        string
+	TraceID          string
+	Model            string
+	Provider         string
+	Endpoint         string
+	Payload          string // 请求报文 JSON（由适配器负责脱敏）
+	PromptTokens     int64
+	CompletionTokens int64
+	CachedTokens     int64
+	IsEstimated      bool
+	TTFTMs           int64
+	DurationMs       int64
+	TokensPerSec     float64
+	Status           string // ok | error | cancelled
+	ErrorCode        string
+	ErrorMessage     string
+}
+
+// ToolTrace 一次工具调用的追踪记录（会话库 tool_events 的查询副本）。
+type ToolTrace struct {
+	CreatedAt   int64
+	SessionID   string
+	RunID       string
+	ToolEventID string
+	ToolName    string
+	Namespace   string
+	ParamsJSON  string
+	ResultJSON  string
+	Status      string
+	Risk        string
+	Error       string
+	DurationMs  int64
+}
+
+// TraceSink 审计日志写入端口。
+type TraceSink interface {
+	RecordLLM(t LLMTrace)
+	RecordToolCall(t ToolTrace)
 }
 
 // EventPublisher 事件发布（per-Run）。
@@ -102,6 +160,17 @@ type ToolRunResult struct {
 // 且后续新增（如复检结论）只需扩结构体、不再改端口签名。
 // 定义在 model 包（跨层共享的数据类型），避免 agent/store/service 三方各建一份。
 type ToolEventExec = model.ToolEventExec
+
+// RuleSource 审批规则来源（可选端口）：引擎取规则的唯一入口。
+//
+// 之所以独立成端口而不是直接读 SessionDB.ApprovalRules：
+//   - 规则有多个来源（会话级「本会话允许」+ 项目级声明规则），合并/去重策略必须只有一份实现；
+//   - 引擎不应感知「项目」概念，也不该 import store 去查项目归属。
+//
+// nil 时引擎退回 SessionDB.ApprovalRules（旧行为完全不变）。
+type RuleSource interface {
+	RulesFor(ctx context.Context, sessionID string) ([]approval.Rule, error)
+}
 
 // Approver 审批闸门（approval.Gate 满足此接口）。
 type Approver interface {

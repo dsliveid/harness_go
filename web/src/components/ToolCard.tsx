@@ -37,7 +37,20 @@ function getToolIcon(name: string) {
 }
 
 export function ToolCard({ call, onRevertHunk }: { call: ToolCall; onRevertHunk?: (hunkId: string) => void }) {
-  const [open, setOpen] = useState(call.status === 'running' || call.status === 'pending')
+  // 折叠状态机（与 ProcessDrawer / ReasoningCard 统一）：
+  // - 执行中（running/pending）自动展开，便于看实时输出
+  // - 进入终态（ok/error/denied）后自动收起，避免历史卡片占满屏幕
+  // - 用户手动点击后以用户为准（userOpen 非 null），直到状态再次跃迁才复位
+  const live = call.status === 'running' || call.status === 'pending'
+  const [userOpen, setUserOpen] = useState<boolean | null>(null)
+  const open = userOpen ?? live
+  const prevStatus = useRef(call.status)
+  useEffect(() => {
+    const was = prevStatus.current === 'running' || prevStatus.current === 'pending'
+    prevStatus.current = call.status
+    // 运行态 → 终态：复位用户干预，回到「跟随状态」→ 自动收起
+    if (was && !live) setUserOpen(null)
+  }, [call.status, live])
   // 实时输出折叠面板：默认展开，用户可收起
   const [liveOpen, setLiveOpen] = useState(true)
   const risk = RISK[call.risk] || RISK.readonly
@@ -55,10 +68,16 @@ export function ToolCard({ call, onRevertHunk }: { call: ToolCall; onRevertHunk?
   const isSpawn = call.name === 'spawn_subagent' || call.name === 'spawn_subprocess'
   const { subagents } = useWorkspace()
   const { setSubagent, panel } = useUI()
-  const spawnId = isSpawn && typeof call.args?.subagentId === 'string' ? call.args.subagentId : ''
+  // real 模式：后端 spawn_subagent 的参数只有 {task, model_ref}，没有 subagentId，
+  // 但派生层把子代理 id 定为该次工具调用的 tool_event_id（即 call.id），
+  // 故回退用 call.id 匹配，否则真实子代理永远无法从工具卡片跳进详情。
+  const spawnId = isSpawn
+    ? (typeof call.args?.subagentId === 'string' ? call.args.subagentId : call.id)
+    : ''
   const spawnTarget = spawnId ? subagents.find((a) => a.id === spawnId) : undefined
 
-  // 多模态制品（generate_image / recognize_image）：提供下载入口（正式实现走制品 CAS 下载 API）
+  // 多模态制品（generate_image / recognize_image）：后端 image 插件已真实注册这两个工具
+  // （参数见 manifest：generate=prompt+path，recognize=path+question），此处提供制品下载入口。
   const isImageTool = call.name === 'generate_image' || call.name === 'recognize_image'
   const artifactName =
     typeof call.args?.filename === 'string'
@@ -78,7 +97,7 @@ export function ToolCard({ call, onRevertHunk }: { call: ToolCall; onRevertHunk?
       <button
         type="button"
         className="w-full flex items-center gap-2 px-3 h-9 text-left hover:bg-panel2/60 transition-colors select-none"
-        onClick={() => hasBody && setOpen(!open)}
+        onClick={() => hasBody && setUserOpen(!open)}
       >
         <span className="text-inkfaint w-4 h-4 flex items-center justify-center shrink-0">
           {hasBody ? (open ? <ChevronDown size={12} /> : <ChevronRight size={12} />) : '·'}

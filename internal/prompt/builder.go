@@ -90,6 +90,12 @@ type BuildResult struct {
 	// Degrade 预算降级动作记录（D-4）：空 = 本轮未降级；
 	// 非空时逐档记录实际动作（可观测铁律：每一级降级都必须可见）。
 	Degrade []DegradeAction
+	// SOPOverflow 因条数上限被**丢弃**的 SOP 条数（D10 可观测铁律）。
+	//
+	// 改造前这里是 `sop = sop[:MaxSOP]` 的静默截断：写入侧「超限拒绝不截断」，
+	// 读取侧却悄悄丢弃，同一系统两套矛盾策略且丢弃不可见。现在一律留下痕迹：
+	// >0 时上层应记录告警，前端 /sop/effective 也会显示 truncated。
+	SOPOverflow int
 }
 
 // Limits 预算与注入限制。
@@ -144,9 +150,12 @@ func (b *Builder) Build(in Input) BuildResult {
 	if len(deferred) > b.limits.MaxDeferredIndex {
 		deferred = deferred[:b.limits.MaxDeferredIndex]
 	}
-	// SOP 上限二次校验（防调用方绕过写入侧校验）
+	// SOP 条数上限二次校验（防调用方绕过写入侧校验）。
+	// 铁律：绝不静默丢弃 —— 被丢弃的条数必须留在 SOPOverflow 中可见。
 	sop := in.SOP
+	sopOverflow := 0
 	if len(sop) > b.limits.MaxSOP {
+		sopOverflow = len(sop) - b.limits.MaxSOP
 		sop = sop[:b.limits.MaxSOP]
 	}
 
@@ -220,6 +229,7 @@ func (b *Builder) Build(in Input) BuildResult {
 		Estimated:       b.counter.Estimated(),
 		OverBudget:      overBudget,
 		DroppedHistory:  dropped,
+		SOPOverflow:     sopOverflow,
 	}
 }
 

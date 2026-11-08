@@ -1,8 +1,8 @@
 {
   "id": "browser",
   "name": "浏览器",
-  "description": "无头浏览器（Chromium 系；requires 探测，缺失时工具显式不可用），抓取动态渲染页面的文本快照",
-  "version": "1.0.0",
+  "description": "无头浏览器（Chromium 系；requires 探测，缺失时工具显式不可用），抓取动态渲染页面文本，并支持点击 / 输入 / 滚动 / 截图交互",
+  "version": "1.1.0",
   "kind": "builtin",
   "default_tier": "on_demand",
   "protocol_version": 1,
@@ -21,6 +21,34 @@
       "schema_json": {"type":"object","properties":{}},
       "tier": "on_demand",
       "risk": "readonly"
+    },
+    {
+      "name": "browser_click",
+      "description": "无头浏览器中点击匹配 CSS 选择器的元素（选择器未命中时显式报错，不静默成功）",
+      "schema_json": {"type":"object","properties":{"url":{"type":"string","description":"可选：先导航到该 URL（http/https）；省略则在空白页执行"},"selector":{"type":"string","description":"CSS 选择器（必填）"},"wait_ms":{"type":"integer","description":"导航后渲染等待毫秒（默认 1500）"}},"required":["selector"]},
+      "tier": "on_demand",
+      "risk": "write"
+    },
+    {
+      "name": "browser_type",
+      "description": "无头浏览器中聚焦匹配元素、写入文本并派发 input/change 事件（表单填写）",
+      "schema_json": {"type":"object","properties":{"url":{"type":"string","description":"可选：先导航到该 URL（http/https）"},"selector":{"type":"string","description":"CSS 选择器（必填）"},"text":{"type":"string","description":"要写入的文本"},"wait_ms":{"type":"integer","description":"导航后渲染等待毫秒（默认 1500）"}},"required":["selector"]},
+      "tier": "on_demand",
+      "risk": "write"
+    },
+    {
+      "name": "browser_scroll",
+      "description": "无头浏览器中滚动页面（direction=up/down/top/bottom，pixels 省略则一屏），返回滚动后的 scrollY",
+      "schema_json": {"type":"object","properties":{"url":{"type":"string","description":"可选：先导航到该 URL（http/https）"},"direction":{"type":"string","enum":["up","down","top","bottom"],"description":"滚动方向（默认 down）"},"pixels":{"type":"integer","description":"滚动像素数（省略则一屏）"},"wait_ms":{"type":"integer","description":"导航后渲染等待毫秒（默认 1200）"}}},
+      "tier": "on_demand",
+      "risk": "readonly"
+    },
+    {
+      "name": "browser_screenshot",
+      "description": "无头浏览器截取页面 PNG 截图；给 path 则落盘到工作区相对路径（越界拒绝），否则返回 base64",
+      "schema_json": {"type":"object","properties":{"url":{"type":"string","description":"可选：先导航到该 URL（http/https）"},"path":{"type":"string","description":"可选：工作区相对落盘路径（如 shots/a.png）"},"full_page":{"type":"boolean","description":"是否整页截图（默认 false = 仅视口）"},"wait_ms":{"type":"integer","description":"导航后渲染等待毫秒（默认 1500）"}}},
+      "tier": "on_demand",
+      "risk": "write"
     }
   ]
 }

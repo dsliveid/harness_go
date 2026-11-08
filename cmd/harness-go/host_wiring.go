@@ -16,18 +16,24 @@ import (
 
 	"harness-go/internal/events"
 	"harness-go/internal/llm"
-	"harness-go/internal/plugins/sop"
+	"harness-go/internal/sop"
 	"harness-go/internal/service"
 	"harness-go/pkg/toolapi"
 )
 
 // ============ SOP 动态注入（阶段 G） ============
 
-// sopBodies 读取 sop 插件的唯一真源（<ws>/.harness/sop/*.md）正文列表。
+// sopBodies 读取项目级 SOP 条目正文列表（<ws>/.harness/sop/*.md）。
+//
+// 架构变更（重要）：改造前本函数经 host.Workspace() 读目录，而该 root 在
+// hostimpl.NewHost 时一次性固化，导致「切到别的项目会话仍读到旧项目的 SOP」
+// 的串味问题。现改为接受**显式会话工作区路径**，由 internal/sop 直接解析，
+// 内核不再依赖插件包，也不再受 host root 固化影响。
+//
 // 返回值进 prompt.Input.SOP（系统提示「## 项目规范（SOP）」段，全量注入）；
-// 项目未配置 SOP 时返回空切片（不注入该段）。
-func sopBodies(host toolapi.Host) []string {
-	entries := sop.LoadAll(host)
+// 未绑定工作区或项目未配置 SOP 时返回空切片（不注入该段）。
+func sopBodies(wsPath string) []string {
+	entries := sop.LoadEntries(wsPath)
 	out := make([]string, 0, len(entries))
 	for _, e := range entries {
 		out = append(out, e.Body)

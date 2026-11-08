@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -30,13 +31,52 @@ func (s *SessionService) SetDeletedHook(fn func(ctx context.Context, sessionID s
 	s.onDeleted = fn
 }
 
+// CreateSessionInput 新建会话入参（集中默认值裁决，避免长参数列表继续膨胀）。
+//
+// ProjectID 非空表示会话归属某项目；AccessMode 留空即走「项目默认权限继承」。
+type CreateSessionInput struct {
+	Title         string
+	ModelRef      string
+	WorkspacePath string
+	ProjectID     string
+	AccessMode    string
+}
+
 // Create 新建会话（**只写主库，不建会话库文件**；首次发消息时才建）。
-func (s *SessionService) Create(ctx context.Context, title, modelRef, workspacePath string) (*model.Session, error) {
+//
+// AccessMode 裁决链（顺序即优先级）：
+//  1. 显式传入的 in.AccessMode 合法（confirm|full）→ 直接采用；非空但非法 → 400 拒绝；
+//  2. 否则若 in.ProjectID 非空 → 继承项目 default_access_mode（**仅在新建这一刻快照一次**，
+//     之后项目改默认值不影响已建会话）；项目不存在 → 400「项目不存在」；
+//  3. 否则保持空串，交由 SessionRepo.Create 内部的 confirm 兜底（最后防线）。
+func (s *SessionService) Create(ctx context.Context, in CreateSessionInput) (*model.Session, error) {
+	mode := ""
+	if raw := strings.TrimSpace(in.AccessMode); raw != "" {
+		mode = normalizeAccessModeStrict(raw)
+		if mode == "" {
+			return nil, invalidArg("access_mode 必须是 confirm 或 full")
+		}
+	} else if pid := strings.TrimSpace(in.ProjectID); pid != "" {
+		p, err := s.main.Projects().Get(ctx, pid)
+		if err != nil {
+			// 权衡：apperr 中暂无项目级错误码，且「引用了不存在的项目」本质是调用方入参错误，
+			// 故就近用 invalidArg（400），避免误用 CodeSessionNotFound 混淆语义。
+			if errors.Is(err, store.ErrNotFound) {
+				return nil, invalidArg("项目不存在")
+			}
+			return nil, err
+		}
+		mode = normalizeAccessModeStrict(p.DefaultAccessMode)
+		// 项目里若存了非法值（历史脏数据），一律回落空串走 confirm 兜底，绝不放大权限。
+	}
+
 	sess := &model.Session{
 		ID:            newID(),
-		Title:         title,
-		ModelRef:      modelRef,
-		WorkspacePath: workspacePath,
+		Title:         in.Title,
+		ModelRef:      in.ModelRef,
+		WorkspacePath: in.WorkspacePath,
+		ProjectID:     strings.TrimSpace(in.ProjectID),
+		AccessMode:    mode,
 	}
 	if sess.Title == "" {
 		sess.Title = "新对话"
@@ -45,6 +85,22 @@ func (s *SessionService) Create(ctx context.Context, title, modelRef, workspaceP
 		return nil, err
 	}
 	return sess, nil
+}
+
+// SetProject 调整会话归属项目（projectID 为空 = 移出项目，回纯对话）。
+//
+// 非空时先校验项目存在，避免写入悬空引用。
+func (s *SessionService) SetProject(ctx context.Context, id, projectID string) error {
+	pid := strings.TrimSpace(projectID)
+	if pid != "" {
+		if _, err := s.main.Projects().Get(ctx, pid); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				return invalidArg("项目不存在")
+			}
+			return err
+		}
+	}
+	return wrapStoreErr(s.main.Sessions().SetProject(ctx, id, pid), apperr.CodeSessionNotFound, "会话不存在")
 }
 
 // List 分页列出会话。

@@ -44,9 +44,14 @@ type ChildRunnerOptions struct {
 	// ToolRefs 工具定义提供者（与 RunService 同一来源，保证子 Run 能调用同样工具）。
 	ToolRefs   func() []prompt.ToolRef
 	SystemBase string
-	SOP        []string
+	// WorkDir 服务端进程工作目录（与 RunService 同口径；用于未绑定工作区时如实交代边界）。
+	WorkDir string
+	SOP     []string
 	// SOPFunc 动态 SOP 源（阶段 G；非 nil 时优先于静态 SOP）。
-	SOPFunc func() []string
+	// 参数 wsPath 为子 Run 所属会话的工作区，保证读对项目的 SOP。
+	SOPFunc func(wsPath string) []string
+	// CoreSOPFunc 动态核心 SOP 源（agent-core）；与父 Run 同口径，nil 时用 SystemBase。
+	CoreSOPFunc func() string
 	// MaxDepth 深度上限（<=0 用默认 2）。
 	MaxDepth int
 	// MaxConcurrent 同会话在途上限（<=0 用默认 4）。
@@ -57,7 +62,7 @@ type ChildRunnerOptions struct {
 type ChildRunner struct {
 	opts ChildRunnerOptions
 	// sopFunc 动态 SOP 源缓存（构造期固化，避免每轮读盘的锁竞争面）。
-	sopFunc func() []string
+	sopFunc func(wsPath string) []string
 	mu      sync.Mutex
 	// parentOf childRunID → parentRunID（深度链）
 	parentOf map[string]string
@@ -88,9 +93,9 @@ func NewChildRunner(opts ChildRunnerOptions) *ChildRunner {
 }
 
 // currentSOP 返回子 Run 的 SOP 注入（动态源优先）。
-func (r *ChildRunner) currentSOP() []string {
+func (r *ChildRunner) currentSOP(wsPath string) []string {
 	if r.sopFunc != nil {
-		return r.sopFunc()
+		return r.sopFunc(wsPath)
 	}
 	return r.opts.SOP
 }
@@ -173,9 +178,16 @@ func (r *ChildRunner) Spawn(ctx context.Context, req toolapi.SpawnRequest) (tool
 		return nil, fmt.Errorf("service: 打开会话库失败: %w", err)
 	}
 	// ③ 模型回退链：显式指定 > 会话配置 > default（与 RunService.CreateRunAs 同口径）
+	// 顺带读取会话工作区事实：子 Run 与父 Run 的工作区声明必须一致（否则子 Run 会幻觉目录）。
 	modelRef := req.ModelRef
+	var sess *model.Session
+	if r.opts.Main != nil {
+		if got, gerr := r.opts.Main.Sessions().Get(ctx, req.SessionID); gerr == nil {
+			sess = got
+		}
+	}
 	if modelRef == "" {
-		if sess, gerr := r.opts.Main.Sessions().Get(ctx, req.SessionID); gerr == nil && sess.ModelRef != "" {
+		if sess != nil && sess.ModelRef != "" {
 			modelRef = sess.ModelRef
 		} else {
 			modelRef = "default"
@@ -204,14 +216,26 @@ func (r *ChildRunner) Spawn(ctx context.Context, req toolapi.SpawnRequest) (tool
 
 	// 审批口径与会话一致（子 Run 不因嵌套而放大权限）；锁键绕开父持有的会话锁。
 	accessMode := approval.AccessMode(normalizeAccessMode(sessAccessMode(ctx, r.opts.Main, req.SessionID)))
+	// 工作区事实与父 Run 同口径注入（子 Run 同样不许幻觉目录）。
+	wsPath := ""
+	if sess != nil {
+		wsPath = sess.WorkspacePath
+	}
+	// 核心 SOP（agent-core）动态源：与父 Run 同口径，子 Run 亦须感知最新规则。
+	basePrompt := r.opts.SystemBase
+	if r.opts.CoreSOPFunc != nil {
+		if core := strings.TrimSpace(r.opts.CoreSOPFunc()); core != "" {
+			basePrompt = core
+		}
+	}
 	areq := agent.RunRequest{
 		RunID:      run.ID,
 		SessionID:  req.SessionID,
 		UserInput:  input,
 		ModelRef:   modelRef,
 		AccessMode: accessMode,
-		SystemBase: r.opts.SystemBase,
-		SOP:        r.currentSOP(),
+		SystemBase: ComposeSystemBase(basePrompt, wsPath, r.opts.WorkDir),
+		SOP:        r.currentSOP(wsPath),
 		LockKey:    spawnLockKey(req.SessionID, run.ID),
 	}
 	if r.opts.ToolRefs != nil {

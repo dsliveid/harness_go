@@ -94,6 +94,8 @@ export interface Session {
   access_mode: 'readonly' | 'confirm' | 'full';
   model_ref: string;
   user_id: string;
+  /** 归属项目 ID（空串 = 纯对话，不隶属任何项目） */
+  project_id?: string;
   message_count: number;
   last_message_at?: number;
   total_tokens: number;
@@ -107,6 +109,32 @@ export interface CreateSessionRequest {
   title?: string;
   model_ref?: string;
   workspace_path?: string;
+  /** 归属项目；非空且未传 access_mode 时，服务端按项目默认控制权限快照继承 */
+  project_id?: string;
+  /** 可选显式覆盖（confirm|full）；留空 = 走项目默认权限继承 */
+  access_mode?: 'confirm' | 'full';
+}
+
+/* ============ 项目域（阶段七：项目为服务端一等实体） ============ */
+
+export interface Project {
+  id: string;
+  name: string;
+  path: string;
+  /** 项目级默认控制权限：只对之后新建的会话生效（快照一次） */
+  default_access_mode: 'confirm' | 'full';
+  pinned: boolean;
+  created_at: number;
+  updated_at: number;
+  deleted_at?: number;
+}
+
+export interface ProjectApprovalRule {
+  id: string;
+  project_id: string;
+  tool_name: string;
+  pattern: string;
+  created_at: number;
 }
 
 export interface Message {
@@ -155,6 +183,17 @@ export interface CreateRunRequest {
 export interface CreateRunResponse {
   run_id: string;
   status: RunStatus;
+}
+
+/**
+ * 会话当前进行中的 Run（GET /sessions/{sid}/active-run）。
+ *
+ * 语义铁律：**无进行中 Run 不是 404** —— `run_id` 为空串即表示空闲，
+ * 前端无需分支处理错误码（与 SessionLeaseDTO 的 `active=false` 同口径）。
+ */
+export interface ActiveRunDTO {
+  run_id: string;
+  status?: RunStatus;
 }
 
 export interface ToolEvent {
@@ -302,10 +341,21 @@ export const API_PATHS = {
   authPassword: '/api/v1/auth/password',
   sessions: '/api/v1/sessions',
   session: (sid: string) => `/api/v1/sessions/${sid}`,
+  // 项目域（阶段七）：项目 + 项目审批规则
+  projects: '/api/v1/projects',
+  project: (pid: string) => `/api/v1/projects/${pid}`,
+  projectRules: (pid: string) => `/api/v1/projects/${pid}/approval-rules`,
+  projectRule: (pid: string, rid: string) => `/api/v1/projects/${pid}/approval-rules/${rid}`,
   sessionArchive: (sid: string) => `/api/v1/sessions/${sid}/archive`,
   sessionUnarchive: (sid: string) => `/api/v1/sessions/${sid}/unarchive`,
   messages: (sid: string) => `/api/v1/sessions/${sid}/messages`,
   runs: (sid: string) => `/api/v1/sessions/${sid}/runs`,
+  /**
+   * 会话当前进行中的 Run（刷新后重建流式态用）。
+   * 刻意不嵌套在 runs 子路径下：那样会被 runs 详情端点（rid 通配）抢先匹配。
+   * 语义：无进行中 Run 返回 200 且 run_id 为空串（不是 404）。
+   */
+  activeRun: (sid: string) => `/api/v1/sessions/${sid}/active-run`,
   run: (sid: string, rid: string) => `/api/v1/sessions/${sid}/runs/${rid}`,
   runStop: (sid: string, rid: string) => `/api/v1/sessions/${sid}/runs/${rid}/stop`,
   runGuidance: (sid: string, rid: string) => `/api/v1/sessions/${sid}/runs/${rid}/guidance`,
@@ -318,6 +368,10 @@ export const API_PATHS = {
   tools: '/api/v1/tools',
   toolsInjection: '/api/v1/tools/injection',
   toolsTiers: '/api/v1/tools/tiers',
+  /** 核心 SOP（agent-core）：GET 快照 / PUT 保存自定义 / DELETE 重置为出厂内置 */
+  sopCore: '/api/v1/sop/core',
+  /** 生效预览（核心 SOP + 项目级条目 + token 合计） */
+  sopEffective: '/api/v1/sop/effective',
   maintenance: '/api/v1/settings/maintenance',
   /* B-4：厂商 / 配置 / 统计 / 日志 */
   providers: '/api/v1/providers',
@@ -328,6 +382,16 @@ export const API_PATHS = {
   settings: '/api/v1/settings',
   stats: '/api/v1/stats',
   logs: '/api/v1/logs',
+  /* 日志与审计查询（保留策略 / 审计副本 / 报文回溯 / 用量聚合） */
+  logConfig: '/api/v1/logs/config',
+  auditToolEvents: '/api/v1/audit/tool-events',
+  /** LLM 调用流水（跨会话；session_id 为可选过滤）。旧单会话路径 llmTrace 是它的别名。 */
+  auditLlmCalls: '/api/v1/audit/llm-calls',
+  tokenStats: '/api/v1/stats/tokens',
+  llmTrace: (sid: string) => `/api/v1/sessions/${sid}/llm-trace`,
+  /* 工作区宿主目录列举（L0 服务端宿主；docs/工作区宿主与目录选择对接约定.md） */
+  fsRoots: '/api/v1/fs/roots',
+  fsDirs: '/api/v1/fs/dirs',
   /* 阶段 C：设备（配对 / 列表 / 长连接 / 吊销） */
   devices: '/api/v1/devices',
   device: (did: string) => `/api/v1/devices/${did}`,
@@ -477,14 +541,163 @@ export interface LogLine {
   text: string;
 }
 
-/** 日志尾行响应（GET /api/v1/logs?limit=&level=）。 */
+/**
+ * 报文抓取档位（settings 键 `log.snapshot_mode`）。
+ * - off：不落报文快照，日增≈50MB（仅日志文本）
+ * - preview：落截断预览，日增≈500MB（30 天≈15GB）
+ * - full：落完整报文，日增≈5GB（30 天≈150GB，高风险）
+ */
+export type SnapshotMode = 'off' | 'preview' | 'full';
+
+/** 日志查询参数（GET /api/v1/logs，全部为可选 query）。 */
+export interface LogsQuery {
+  limit?: number;
+  /** 精确级别过滤（error / warn / info / debug），服务端过滤而非前端过滤 */
+  level?: string;
+  /** 起始时间（RFC3339） */
+  from?: string;
+  /** 结束时间（RFC3339） */
+  to?: string;
+  traceId?: string;
+  keyword?: string;
+  offset?: number;
+}
+
+/**
+ * 日志查询响应（GET /api/v1/logs）。
+ * ⚠️ 诚实边界：retention_days / earliest_available_day / snapshot_mode 由后端返回真实的
+ * 天分片日志库族现状；后端未返回时前端显示「保留策略未知」，绝不硬编码天数假装已知。
+ */
 export interface LogsResponse {
   items: LogLine[];
-  limit: number;
+  /** 命中总数（服务端统计，用于分页/提示；后端未返回时为 undefined） */
+  total?: number;
+  has_more?: boolean;
+  retention_days?: number;
+  /** 最早可查日，格式 YYYYMMDD */
+  earliest_available_day?: string;
+  snapshot_mode?: SnapshotMode | string;
+  limit?: number;
+}
+
+/* ============ 日志与审计查询（B-4 扩展：LLM 调用流水 / 用量聚合） ============ */
+
+/** LLM 调用流水查询参数（GET /api/v1/audit/llm-calls，全部为可选 query）。 */
+export interface AuditLlmCallsQuery {
+  /** Unix 毫秒；缺省 = 最近 24 小时（服务端默认，避免全量扫天库） */
+  from?: number;
+  to?: number;
+  /** 可选：只查某个会话。为空 = 跨会话全局查询 */
+  session_id?: string;
+  run_id?: string;
+  message_id?: string;
+  trace_id?: string;
+  model?: string;
+  /** ok | error */
+  status?: string;
+  keyword?: string;
+  /** 单条精确回查时传 id，服务端会顺带返回正文（full 档才有） */
+  id?: string;
+  limit?: number;
+  offset?: number;
+}
+
+/** LLM 调用流水行（对应后端 logvault.LLMRow）。 */
+export interface AuditLlmCallItem {
+  id: string;
+  created_at: number;
+  session_id: string;
+  run_id: string;
+  message_id: string;
+  trace_id: string;
+  model: string;
+  provider: string;
+  endpoint: string;
+  /** 脱敏预览（preview/full 档才有；off 档为空） */
+  payload_preview: string;
+  payload_inline?: string;
+  payload_sha256: string;
+  payload_bytes: number;
+  /** 正文是否可取（inline 或 blob 存在） */
+  payload_available: boolean;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cached_tokens: number;
+  is_estimated: boolean;
+  ttft_ms: number;
+  duration_ms: number;
+  tokens_per_sec: number;
+  status: string;
+  error_code?: string;
+  error_message?: string;
+}
+
+/** LLM 调用流水响应（GET /api/v1/audit/llm-calls）。 */
+export interface AuditLlmCallsResponse {
+  items: AuditLlmCallItem[];
+  total: number;
+  /** 单条回查时的正文（仅 full 档有值） */
+  payload?: string;
+  /** 正文不可得时的人话说明（preview/off 档） */
+  payload_hint?: string;
+  snapshot_mode: SnapshotMode | string;
+  retention_days: number;
+  earliest_available_day: string;
+}
+
+/** 工具调用审计行（对应后端 logvault.ToolRow）。 */
+export interface AuditToolEventItem {
+  id: string;
+  created_at: number;
+  session_id: string;
+  run_id: string;
+  tool_event_id: string;
+  tool_name: string;
+  namespace: string;
+  params_preview: string;
+  result_preview: string;
+  bytes: number;
+  status: string;
+  risk: string;
+  error?: string;
+  duration_ms: number;
+}
+
+/** 工具调用审计响应（GET /api/v1/audit/tool-events）。 */
+export interface AuditToolEventsResponse {
+  items: AuditToolEventItem[];
+  total: number;
+  retention_days: number;
+  earliest_available_day: string;
+}
+
+/** 用量聚合单行（对应后端 logvault.TokenStat）。
+ *  注意：与 web/src/types.ts 的 TokenStatRow（UI 形状，含 model/provider/calibRatio）
+ *  不是同一个东西——后者是前端展示模型，这里是后端原始形状，故加 Api 后缀区分。 */
+export interface TokenStatApiRow {
+  key: string;
+  calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cached_tokens: number;
+  estimated_calls: number;
+  cache_hit_rate: number;
+}
+
+/** 用量聚合汇总（GET /api/v1/stats/tokens）。 */
+export interface TokenStatsResult {
+  from: number;
+  to: number;
+  group_by: string;
+  items: TokenStatApiRow[];
+  total_calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cached_tokens: number;
+  cache_hit_rate: number;
 }
 
 /* ============ 阶段 C：设备（HALO M5，与 openapi.yaml 设备段对应） ============ */
-
 export type DeviceKind = 'desktop' | 'tablet' | 'mobile' | 'cli' | 'browser';
 export type DeviceStatus = 'online' | 'offline' | 'revoked';
 
@@ -781,4 +994,39 @@ export interface WebhookTestResult {
   status: number;
   ok: boolean;
   error: string;
+}
+
+/* ===== 核心 SOP（agent-core）：出厂内置 + 运行时覆盖 ===== */
+
+/** 核心 SOP 生效快照。source=builtin 为出厂 embed（永不落盘），custom 为运行时覆盖。 */
+export interface SOPCore {
+  content: string;
+  source: 'builtin' | 'custom';
+  tokens: number;
+  /** 总 token 预算（0 = 不限） */
+  budget: number;
+  /** 出厂原文：前端「系统内置」页签渲染它，切换页签不需要任何读写请求 */
+  builtin_content: string;
+  /** 是否存在运行时覆盖（等价于「处于自定义模式」） */
+  overridden: boolean;
+}
+
+/** 项目级 SOP 条目（<ws>/.harness/sop/<id>.md）。 */
+export interface SOPEntry {
+  id: string;
+  title: string;
+  body: string;
+  tokens: number;
+}
+
+/** 生效预览：核心 SOP + 项目级条目 + token 合计。 */
+export interface SOPEffective {
+  core: SOPCore;
+  entries: SOPEntry[];
+  workspace: string;
+  total_tokens: number;
+  system_preview: string;
+  /** 是否有条目因条数上限被截断（D10：必须可见） */
+  truncated: boolean;
+  entry_limit: number;
 }
