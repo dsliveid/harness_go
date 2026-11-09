@@ -59,14 +59,14 @@ go run ./cmd/device-e2e [flags]
 
 | flag | 默认 | 说明 |
 | --- | --- | --- |
-| `-mode` | `full` | `full`=跑到派发与回执；`pair-only`=只跑到配对 + WS 握手 + 心跳；`runner`=拉起**真实 hd-runner 二进制**做两端真实对撞（见第 4.5 节） |
+| `-mode` | `full` | `full`=跑到派发与回执；`pair-only`=只跑到配对 + WS 握手 + 心跳；`runner`=拉起**真实桌面端二进制**（单包 `hd-host.exe` + `--runner`）做两端真实对撞（见第 4.5 节） |
 | `-external` | `false` | `true`=连已启动的服务端（先 `/healthz` 探活）；`false`=进程内自起。**不可与 `-mode runner` 同用** |
 | `-base-url` | `http://127.0.0.1:5611` | 仅外部模式生效。**必须用 `127.0.0.1`，不要用 `localhost`**（Windows 上 `localhost` 可能解析到 `::1`，服务端只监听 IPv4 时表现为连接被拒） |
 | `-user` / `-password` | `e2e-admin` / `e2e-password-123` | 登录账号。自包含模式会自动创建该账号 |
 | `-data-dir` | 空（临时目录） | 自包含模式的数据目录；指定后可保留文件用于排查 |
 | `-v` | `false` | 打印被跳过的帧（`type` / `id` / `v`） |
 | `-disable-devices` | `false` | 自包含模式下**故意**关闭设备域，用于自检 `503 device.disabled` 的提示文案 |
-| `-runner-bin` | 空（自动探测） | 仅 `-mode runner`：hd-runner 可执行文件路径。空时按 `HD_RUNNER_BIN` 环境变量 → `../harness_desktop/target/debug/hd-runner[.exe]` → `.../release/...` 依次探测 |
+| `-runner-bin` | 空（自动探测） | 仅 `-mode runner`：**hd-host 可执行文件**路径（单包分发后不再有 `hd-runner.exe`）。空时按 `HD_RUNNER_BIN` 环境变量（语义已变更为 hd-host 路径）→ `../harness_desktop/target/debug/hd-host[.exe]` → `.../release/...` 依次探测；启动时脚本自动追加 `--runner` |
 | `-runner-no-dev` | `false` | 仅 `-mode runner`：不给二进制传 `--dev`。默认传，因为本地自包含服务端是 `ws://` 明文 |
 
 ### 示例
@@ -104,10 +104,14 @@ go run ./cmd/device-e2e -disable-devices
 
 ---
 
-## 4.5 `-mode runner`：拉起真实 hd-runner 二进制（两端真实对撞）
+## 4.5 `-mode runner`：拉起真实桌面端二进制（两端真实对撞）
 
 前三步 `[0]`/`[1]`/`[2]`（登录 / 签发配对码 / 配对换令牌）与普通模式**完全复用**，
-之后分支为 `[R1]`~`[R5]`，端侧不再是 `client.go` 里的 Go 假端侧，而是**真的 `hd-runner` 进程**。
+之后分支为 `[R1]`~`[R5]`，端侧不再是 `client.go` 里的 Go 假端侧，而是**真的桌面端端侧进程**。
+
+⚠️ **单包分发（2026-11 起）**：桌面端只产出 `hd-host.exe`，`hd-runner` 已不再作为独立可执行文件构建。
+`hd-host` 必须靠命令行参数 `--runner` 分流才以端侧身份运行；不带它就是 GUI 宿主（开窗口、不读 stdin JSONL）。
+本脚本探测 `hd-host[.exe]` 并**自动注入 `--runner`（恒为第一个参数）**，与 `--dev` 共存：`[--runner --dev]`。
 
 ```
 go run ./cmd/device-e2e -mode runner
@@ -115,7 +119,7 @@ go run ./cmd/device-e2e -mode runner
 
 | 步骤 | 动作 | 断言 |
 | --- | --- | --- |
-| `[R1]` | 探测二进制：`-runner-bin` → `HD_RUNNER_BIN` → `../harness_desktop/target/{debug,release}/hd-runner[.exe]` | 文件存在、非目录、非 0 字节。**找不到则 SKIP（退出码仍 0）**并打印构建命令 |
+| `[R1]` | 探测二进制：`-runner-bin` → `HD_RUNNER_BIN`（语义已变为 hd-host 路径）→ `../harness_desktop/target/{debug,release}/hd-host[.exe]` | 文件存在、非目录、非 0 字节。**找不到则 SKIP（退出码仍 0）**并打印构建命令 |
 | `[R2]` | `exec.Command` 拉起进程，向 **stdin** 写 `{"op":"auth","token":...}`（**保持 stdin 打开**） | 进程在 1.2s 观察窗内**没有**自行退出；再 best-effort 下发 `reload_policy` 让 `fs.list` 守卫有白名单根 |
 | `[R3]` | 轮询服务端 `Hub.Online(device_id)` | 设备进入在线表（真实 WS 握手 + 鉴权通过）；若进程提前死掉，立刻带 stderr 现场失败，不干等 |
 | `[R4]` | 进程内 `Dispatcher.Dispatch(fs.list)` | 收到真实端侧 `task.result`：非 `Degraded`、**`source_trust` 恒为 `untrusted`**。端侧回 `error`（如 `fs.path_denied`）也算链路成立 → PASS 并亮出原因 |

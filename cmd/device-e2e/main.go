@@ -45,11 +45,13 @@ func run(args []string) int {
 	password := fs.String("password", "e2e-password-123", "登录口令")
 	mode := fs.String("mode", "full",
 		"full=跑到任务派发与回执；pair-only=只跑到配对+WS 握手+心跳；"+
-			"runner=拉起真实 hd-runner 二进制做两端真实对撞（R1~R5）")
+			"runner=拉起真实桌面端二进制做两端真实对撞（R1~R5；单包形态下调起 hd-host.exe 并自动注入 --runner）")
 	external := fs.Bool("external", false,
 		"连已启动的服务端（true）还是进程内自起（false，默认）。外部模式无派发端点，仅跑到心跳")
 	runnerBin := fs.String("runner-bin", "",
-		"runner 模式下 hd-runner 可执行文件路径（空=自动探测 ../harness_desktop/target/{debug,release}/hd-runner[.exe]）")
+		"runner 模式下的 hd-host 可执行文件路径（单包分发后不再有 hd-runner.exe）："+
+			"空=自动探测 ../harness_desktop/target/{debug,release}/hd-host[.exe]，"+
+			"启动时脚本会自动追加 --runner 让它以端侧身份运行")
 	runnerNoDev := fs.Bool("runner-no-dev", false,
 		"runner 模式不给二进制传 --dev（默认传，因为本地自包含服务端是 ws:// 明文）")
 	dataDir := fs.String("data-dir", "", "自包含模式的数据目录（空=系统临时目录，退出即删）")
@@ -195,7 +197,8 @@ func (r *runner) summary() int {
 // runAll 按「配对 → 握手 → 心跳 → 派发 → 回执」顺序推进；任一步失败即停止后续步骤。
 //
 // -mode runner 时前 3 步（登录 / 签发配对码 / 配对拿令牌）完全复用，之后**分支**到 runner.go：
-// 后续握手、心跳、派发、回执全部由**真实 hd-runner 进程**完成，脚本只做服务端视角断言。
+// 后续握手、心跳、派发、回执全部由**真实桌面端进程**（单包 hd-host.exe + `--runner`）完成，
+// 脚本只做服务端视角断言。
 // 这样两种模式共享同一份前置代码，避免出现「两套配对逻辑各写一遍然后悄悄漂移」。
 func (r *runner) runAll(ctx context.Context, cli *http.Client, baseURL, user, password, mode string,
 	external bool, harness *harnessServer, flags runnerFlags) {
@@ -231,7 +234,7 @@ func (r *runner) runAll(ctx context.Context, cli *http.Client, baseURL, user, pa
 	fmt.Println("\n[2] 端侧凭码配对（免登录，令牌明文仅此一次）")
 	peerName := "device-e2e 端侧（脚本扮演）"
 	if mode == "runner" {
-		peerName = "device-e2e 端侧（真实 hd-runner 进程）"
+		peerName = "device-e2e 端侧（真实 hd-host --runner 进程）"
 	}
 	paired, err := pairDeviceNamed(ctx, cli, baseURL, pc.Code, peerName)
 	if err != nil {

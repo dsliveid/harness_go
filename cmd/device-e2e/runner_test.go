@@ -3,7 +3,7 @@ package main
 // 本文件为 runner 模式（-mode runner）的**纯逻辑**单测。
 //
 // 为什么只测纯逻辑、不在这里拉起真进程：
-//   - 拉起真进程需要真实 hd-runner 二进制，而它属于另一个仓库 `harness_desktop`，
+//   - 拉起真进程需要真实桌面端二进制（单包 hd-host.exe），而它属于另一个仓库 `harness_desktop`，
 //     本仓库的 `go test ./...` 不该依赖 cargo 产物（否则 clean checkout 必红）；
 //   - 端到端链路由 `go run ./cmd/device-e2e -mode runner` 这个**脚本**负责验证
 //     （它就是给人跑的联调工具），单测只兜住「路径探测 / URL 推导 / 输出截断」这三处
@@ -125,6 +125,20 @@ func TestDetectRunnerBinary_MissingReportsCandidates(t *testing.T) {
 			t.Errorf("候选 %q 缺少 Reason 说明", c.Path)
 		}
 	}
+	// 单包改造断言：自动探测的候选里必须出现 hd-host 文件名（路径已由 detectRunnerBinary 组装）。
+	sawHost := false
+	for _, c := range cands {
+		base := filepath.Base(c.Path)
+		if base == "hd-host" || base == "hd-host.exe" {
+			sawHost = true
+		}
+		if strings.HasPrefix(base, "hd-runner") {
+			t.Errorf("候选 %q 仍指向已废弃的 hd-runner（单包分发后只有 hd-host）", c.Path)
+		}
+	}
+	if !sawHost {
+		t.Errorf("候选清单里没有任何 hd-host 路径，排查方向会误导用户：%+v", cands)
+	}
 }
 
 // TestTailBuffer_KeepsTail 只保留尾部（错误现场在末尾，而不是开头）。
@@ -150,12 +164,84 @@ func TestTailBuffer_KeepsTail(t *testing.T) {
 }
 
 // TestRunnerBuildHint_IsActionable 提示必须是**可直接照抄执行**的命令，而不是「请自行编译」。
+//
+// ⚠️ 单包形态：命令必须指向 hd-host（带 --features gui），并显式说明自动追加 --runner，
+// 否则用户照抄旧命令 `cargo build -p hd-runner` 只会得到「package not found」。
 func TestRunnerBuildHint_IsActionable(t *testing.T) {
 	hint := runnerBuildHint()
-	for _, want := range []string{"cargo build", "hd-runner", "harness_desktop"} {
+	for _, want := range []string{"cargo build", "hd-host", "--features gui", "hd-runner", "harness_desktop", "--runner"} {
 		if !strings.Contains(hint, want) {
 			t.Errorf("构建提示缺少关键信息 %q：%s", want, hint)
 		}
+	}
+}
+
+// TestRunnerExeNames_SinglePackage 单包分发后探测的文件名必须只有 hd-host（不再有 hd-runner）。
+//
+// 为什么值得单测：文件名写错不会编译失败，只会让 -mode runner 永远 SKIP，
+// 而 SKIP 是「静默降级」—— 很容易被误读成「本机没构建」而长期无人察觉。
+func TestRunnerExeNames_SinglePackage(t *testing.T) {
+	names := runnerExeNames()
+	if len(names) == 0 {
+		t.Fatal("候选文件名不能为空")
+	}
+	if names[0] != exeName() {
+		t.Errorf("首个候选应为首选文件名 %q，实际 %q", exeName(), names[0])
+	}
+	for _, n := range names {
+		if !strings.HasPrefix(n, "hd-host") {
+			t.Errorf("候选文件名 %q 不是 hd-host 系列（单包分发后 hd-runner 已不存在）", n)
+		}
+	}
+	if runtime.GOOS == "windows" {
+		// Windows 首项必须带 .exe；同时保留不带后缀的兼容尝试。
+		if names[0] != "hd-host.exe" {
+			t.Errorf("Windows 首个候选必须带 .exe，实际 %q", names[0])
+		}
+		if len(names) < 2 || names[1] != "hd-host" {
+			t.Errorf("Windows 应保留不带后缀的兼容尝试，实际 %v", names)
+		}
+	}
+}
+
+// TestBuildRunnerArgs_RunnerFlagAlwaysFirst 这是单包改造的核心不变量：
+// 拉起 hd-host 时**必须**带 `--runner` 且放在第一个参数位。
+//
+// 丢了它不会编译失败，也不会立刻报错 —— 进程会以 GUI 宿主身份起来（开窗口、不读 stdin），
+// 症状是「联调卡在等待设备上线 20 秒后超时」，从现象几乎无法反推到参数缺失。故用单测钉死。
+func TestBuildRunnerArgs_RunnerFlagAlwaysFirst(t *testing.T) {
+	for _, withDev := range []bool{false, true} {
+		args := buildRunnerArgs(withDev)
+		if len(args) == 0 || args[0] != "--runner" {
+			t.Fatalf("withDev=%v：首个参数必须是 --runner，实际 %v", withDev, args)
+		}
+		for _, a := range args {
+			if a == "--runner" {
+				continue
+			}
+			if a != "--dev" {
+				t.Errorf("withDev=%v：出现未知参数 %q（%v）", withDev, a, args)
+			}
+		}
+		if withDev {
+			// --runner 与 --dev 必须共存，且 --runner 在前。
+			if len(args) != 2 || args[1] != "--dev" {
+				t.Errorf("withDev=true 时应为 [--runner --dev]，实际 %v", args)
+			}
+		} else if len(args) != 1 {
+			t.Errorf("withDev=false 时应只有 [--runner]，实际 %v", args)
+		}
+	}
+	// 命中数断言：保证 --runner 只出现一次（重复传参在部分 CLI 解析器下行为未定义）。
+	args := buildRunnerArgs(true)
+	n := 0
+	for _, a := range args {
+		if a == "--runner" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("--runner 必须恰好出现一次，实际 %d 次（%v）", n, args)
 	}
 }
 
@@ -175,9 +261,11 @@ func TestMaskToken_NeverLeaksFull(t *testing.T) {
 }
 
 // exeName 测试用：与 runnerExeNames 的首项保持一致。
+//
+// ⚠️ 单包分发后首项是 hd-host[.exe]（旧的 hd-runner.exe 已不再产出）。
 func exeName() string {
 	if runtime.GOOS == "windows" {
-		return "hd-runner.exe"
+		return "hd-host.exe"
 	}
-	return "hd-runner"
+	return "hd-host"
 }

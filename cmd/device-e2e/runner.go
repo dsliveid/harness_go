@@ -1,7 +1,11 @@
 // 本文件实现「真实 Rust Runner 二进制」联调模式（-mode runner）。
 //
 // 与同目录 client.go 的区别（一句话）：client.go 是**脚本自己扮演端侧**（只验服务端契约），
-// 本文件是**真的拉起桌面端的 hd-runner 进程**，让 Go 服务端与 Rust 端侧真实对撞。
+// 本文件是**真的拉起桌面端的 hd-host --runner 进程**，让 Go 服务端与 Rust 端侧真实对撞。
+//
+// ⚠️ 单包形态（2026-11 起）：桌面端不再产出独立的 hd-runner.exe，唯一可执行文件是 hd-host.exe，
+// 它通过命令行参数 `--runner` 自派生执行进程。因此本文件探测的是 **hd-host[.exe]**，
+// 且启动时必须注入 `--runner` —— 否则拉起的是一个 GUI 宿主窗口，不是端侧，联调会一直等到超时。
 //
 // 为什么值得多这一层：
 //   - 自包含模式里「端侧」是 Go 写的假端侧，两端都读同一份 Go 常量，**协议漂移不可能被发现**；
@@ -53,11 +57,13 @@ type runnerCandidate struct {
 	Reason string
 }
 
-// detectRunnerBinary 按「显式指定 → 环境变量 → debug → release」的顺序探测 hd-runner 可执行文件。
+// detectRunnerBinary 按「显式指定 → 环境变量 → debug → release」的顺序探测 hd-host 可执行文件。
 //
 // 为什么是这个顺序：显式参数永远优先（用户最清楚自己刚把二进制放哪）；环境变量次之（CI 注入）；
 // 之后才是约定路径 —— cargo 默认产物目录，且 debug 先于 release（开发期 debug 更常见、构建更快）。
 // 返回 (路径, 已尝试列表, 错误)。错误里要能看出**试过哪些地方**，否则用户只知道"找不到"。
+//
+// ⚠️ 单包形态：探测目标是 hd-host，不是已消失的 hd-runner；命中后由调用方追加 `--runner` 参数。
 func detectRunnerBinary(explicit string) (string, []runnerCandidate, error) {
 	if p := strings.TrimSpace(explicit); p != "" {
 		c := runnerCandidate{Path: p, Reason: "命令行 -runner-bin 显式指定"}
@@ -68,16 +74,18 @@ func detectRunnerBinary(explicit string) (string, []runnerCandidate, error) {
 	}
 
 	var cands []runnerCandidate
+	// 环境变量名沿用 HD_RUNNER_BIN 以保持向后兼容（CI/脚本里已设置过的不必改），
+	// 但语义已随单包变更为「hd-host[.exe] 的路径」。
 	if env := strings.TrimSpace(os.Getenv("HD_RUNNER_BIN")); env != "" {
-		cands = append(cands, runnerCandidate{Path: env, Reason: "环境变量 HD_RUNNER_BIN"})
+		cands = append(cands, runnerCandidate{Path: env, Reason: "环境变量 HD_RUNNER_BIN（单包形态下应为 hd-host 路径）"})
 	}
 	// 约定路径：本仓库与 harness_desktop 是同级目录（见项目关联关系），
-	// 因此从工作区根目录出发是 ..\harness_desktop\target\{debug,release}\hd-runner[.exe]。
+	// 因此从工作区根目录出发是 ..\harness_desktop\target\{debug,release}\hd-host[.exe]。
 	for _, profile := range []string{"debug", "release"} {
 		for _, name := range runnerExeNames() {
 			cands = append(cands, runnerCandidate{
 				Path:   filepath.Join("..", "harness_desktop", "target", profile, name),
-				Reason: "cargo " + profile + " 约定产物",
+				Reason: "cargo " + profile + " 约定产物（单包 hd-host，需配 --runner 启动）",
 			})
 		}
 	}
@@ -87,7 +95,7 @@ func detectRunnerBinary(explicit string) (string, []runnerCandidate, error) {
 			return resolved, cands, nil
 		}
 	}
-	return "", cands, errors.New("未找到 hd-runner 可执行文件")
+	return "", cands, errors.New("未找到 hd-host 可执行文件（单包分发后不再有 hd-runner）")
 }
 
 // runnerExeNames 返回当前平台下可能的文件名。
@@ -96,9 +104,9 @@ func detectRunnerBinary(explicit string) (string, []runnerCandidate, error) {
 // 多试一次的成本远低于让用户对着"找不到"发呆。
 func runnerExeNames() []string {
 	if runtime.GOOS == "windows" {
-		return []string{"hd-runner.exe", "hd-runner"}
+		return []string{"hd-host.exe", "hd-host"}
 	}
-	return []string{"hd-runner"}
+	return []string{"hd-host"}
 }
 
 // prepareRunnerPath 校验候选路径：存在、是普通文件、可执行。
@@ -121,13 +129,16 @@ func prepareRunnerPath(c runnerCandidate) (string, error) {
 }
 
 // runnerBuildHint 缺失时的可执行建议（照抄即可，不留「请自行编译」这种废话）。
+//
+// ⚠️ 单包形态：产物是 hd-host（GUI 宿主），不再是 hd-runner；因此 `--features gui` 必须带上，
+// 否则 cargo 构建出来的是不带 GUI 的骨架，自派生 / 单实例等宿主能力不完整。
 func runnerBuildHint() string {
 	sep := "/"
 	if runtime.GOOS == "windows" {
 		sep = "\\"
 	}
-	return "请先构建：cd .." + sep + "harness_desktop && cargo build -p hd-runner --bin hd-runner" +
-		"（或 -runner-bin 指向已有二进制）"
+	return "请先构建：cd .." + sep + "harness_desktop && cargo build -p hd-host --features gui" +
+		"（单包分发只有 hd-host.exe，旧 hd-runner 已不再产出；脚本会自动追加 --runner，或 -runner-bin 指向已有 hd-host）"
 }
 
 // ============ ② 子进程封装 ============
@@ -161,7 +172,7 @@ func (t *tailBuffer) String() string {
 	return strings.TrimSpace(string(t.data))
 }
 
-// runnerProcess 拉起后的 hd-runner 子进程句柄。
+// runnerProcess 拉起后的 hd-host --runner 子进程句柄。
 //
 // 关键不变量：stdin **保持打开**。Runner 的契约是「stdin EOF 时自杀」（防孤儿），
 // 所以写出 auth 行后立刻 Close 会让它刚连上就退出 —— 这是最容易踩的坑。
@@ -320,12 +331,36 @@ func indent(s, prefix string) string {
 	return strings.Join(lines, "\n")
 }
 
+// runnerModeFlag 单包分发的自派生开关。
+//
+// 语义（见 harness_desktop §2.3）：hd-host 是唯一可执行文件，**必须在命令行分流** ——
+// 带 `--runner` 才是端侧执行进程；不带就是 GUI 宿主（会打开窗口、不读 stdin JSONL）。
+// 因此本脚本拉起子进程时它必须始终存在。
+const runnerModeFlag = "--runner"
+
+// buildRunnerArgs 组装子进程参数。
+//
+// 顺序约定：`--runner` 恒为第一个参数（单包形态下它决定进程身份，任何情况下都不能被省略），
+// `--dev` 只是其后追加的可选开关（允许 ws:// 明文连接本地服务端）。
+// 抽成纯函数是为了让「--runner 绝不丢失」这条不变量可以被单测钉住 —— 它一旦丢了不会编译失败，
+// 只会表现为「联调卡在等待设备上线 20 秒后超时」，排查成本极高。
+func buildRunnerArgs(withDev bool) []string {
+	args := []string{runnerModeFlag}
+	if withDev {
+		args = append(args, "--dev")
+	}
+	return args
+}
+
 // startRunnerWithDevFallback 启动二进制，并在它「不认 --dev」时自动重试一次。
 //
 // 为什么要这套兜底：`--dev` 是端侧为「允许 ws:// 明文连接本地服务端」提供的开关，
-// 但不同版本的 hd-runner 对未知参数的处理不一样（有的忽略、有的直接 usage 报错退出）。
+// 但不同版本的端侧对未知参数的处理不一样（有的忽略、有的直接 usage 报错退出）。
 // 硬编码传 --dev 会让联调在「端侧刚好没实现该参数」时莫名其妙全红，
 // 所以：先试带 --dev，若 1.2s 内因参数问题退出，则去掉重试一次，行为可自愈。
+//
+// ⚠️ 重试只去掉 `--dev`，**`--runner` 永远保留**（由 buildRunnerArgs 保证）：
+// 去掉它会把「端侧进程」退化成「GUI 宿主」，那不是版本差异，而是语义完全变了。
 //
 // 返回值 err 非空时调用方必须**直接当作拉起失败**处理（此时子进程已被 kill 回收）。
 func startRunnerWithDevFallback(bin, workDir string, wantDev bool) (*runnerProcess, string, error) {
@@ -357,18 +392,16 @@ func startRunnerWithDevFallback(bin, workDir string, wantDev bool) (*runnerProce
 		}
 	}
 
-	args := []string{}
-	if wantDev {
-		args = append(args, "--dev")
-	}
-	p, res, err := try(args)
+	// 首轮：--runner 恒在，--dev 按开关追加（见 buildRunnerArgs 的顺序约定）。
+	p, res, err := try(buildRunnerArgs(wantDev))
 	if err != nil {
 		return nil, "", err
 	}
 	if res.exited && res.argProblem && wantDev {
-		note := "该二进制不认识 --dev，已自动去掉该参数重试（version 差异，不影响联调）"
+		note := "该二进制不认识 --dev，已自动去掉该参数重试（version 差异，不影响联调；--runner 保留）"
 		p.kill()
-		p, res, err = try(nil)
+		// 重试仍带 --runner：只回退 --dev，绝不把端侧进程退化成 GUI 宿主。
+		p, res, err = try(buildRunnerArgs(false))
 		if err != nil {
 			return nil, note, err
 		}
@@ -424,7 +457,7 @@ func (r *runner) runRunnerMode(ctx context.Context, h *harnessServer, baseURL st
 	paired *pairResult, flags runnerFlags) {
 
 	// ---------- R1 探测二进制 ----------
-	fmt.Println("\n[R1] 探测 hd-runner 真实二进制")
+	fmt.Println("\n[R1] 探测 hd-host 真实二进制（单包分发，启动时注入 --runner）")
 	bin, tried, err := detectRunnerBinary(flags.BinPath)
 	if err != nil {
 		// 降级：SKIP 而不是 FAIL。理由：本仓库的自包含模式自足可用，
@@ -439,14 +472,14 @@ func (r *runner) runRunnerMode(ctx context.Context, h *harnessServer, baseURL st
 	}
 	st, _ := os.Stat(bin)
 	sizeMB := float64(st.Size()) / (1 << 20)
-	r.pass("真实 Runner 二进制", fmt.Sprintf("%s（%.1f MB，探测自 %s）",
+	r.pass("真实 Runner 二进制", fmt.Sprintf("%s（%.1f MB，单包 hd-host，探测自 %s）",
 		bin, sizeMB, firstLine(reasonOf(tried, bin))))
 
 	// 收尾统一清理：无论从哪一步 return，都不能留下孤儿进程。
 	devNote := ""
 
 	// ---------- R2 拉起子进程 + stdin auth ----------
-	fmt.Println("\n[R2] 拉起 hd-runner 子进程，经 stdin 下发 auth（令牌不进 argv/env）")
+	fmt.Println("\n[R2] 拉起 hd-host --runner 子进程，经 stdin 下发 auth（令牌不进 argv/env）")
 	wsEndpoint, err := wsEndpointURL(baseURL)
 	if err != nil {
 		r.fail("拉起子进程", err.Error())
