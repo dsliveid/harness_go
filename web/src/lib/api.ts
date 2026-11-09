@@ -10,7 +10,7 @@
  *   - 错误统一为 `ApiError`（携带 code / status / trace_id，trace_id 与后端日志一致）。
  */
 
-import type { AccessMode, ApprovalRule, Message, Project, ProjectApprovalRule, Run, RunStatus, Session, ToolCall, Risk, ToolStatus } from '../types'
+import type { AccessMode, ApprovalRule, Message, Project, ProjectApprovalRule, Run, RunStatus, Session, ToolCall, Risk, ToolStatus, Workspace, WorkspaceKind } from '../types'
 import * as mockData from '../mock/data'
 import { toolList } from '../mock/settingsData'
 import { startMockRun, type Decision, type StreamEvent } from '../mock/stream'
@@ -70,6 +70,9 @@ import {
   type WebhookCreateInput,
   type WebhookListResponseDTO,
   type WebhookTestResult,
+  type CreateWorkspaceDTO,
+  type UpdateWorkspaceDTO,
+  type WorkspaceDTO,
 } from './apiTypes'
 
 /* ============ 模式选择 ============ */
@@ -229,6 +232,33 @@ export interface CreateProjectRuleInput {
   pattern: string
 }
 
+/* ---- 工作空间域：入参类型（字段与 internal/api/workspace_handler.go 逐一对齐） ---- */
+
+/**
+ * 新建工作空间入参（POST /workspaces body: {name,kind,device_id,root_path}）。
+ * kind 必填且**创建后不可改**：它是能力天花板依据（server|desktop|mobile|browser）。
+ * deviceId 留空 = 服务端内置空间语义（恒在线）。
+ */
+export interface CreateWorkspaceInput {
+  name: string
+  kind: WorkspaceKind
+  deviceId?: string
+  rootPath?: string
+}
+
+/**
+ * 更新工作空间入参（PATCH /workspaces/{wid}）：未提供字段不发送，服务端保留原值。
+ *
+ * 🚨 类型层面**故意不提供 kind**：kind 是权限天花板依据，改 kind = 提权。
+ * 服务端 PATCH 仅接受与原值相同的 kind，不同即 400
+ * （docs/工作空间模型与三端能力收口协议.md §3）。前端从类型上就不给这条提权路径。
+ */
+export interface UpdateWorkspaceInput {
+  name?: string
+  deviceId?: string
+  rootPath?: string
+}
+
 export interface ApiClient {
   readonly mode: ApiMode
   // 认证
@@ -277,6 +307,23 @@ export interface ApiClient {
   addProjectRule(projectId: string, input: CreateProjectRuleInput): Promise<ProjectApprovalRule>
   /** 删除项目审批规则（DELETE → 204） */
   removeProjectRule(projectId: string, ruleId: string): Promise<void>
+
+  // ---- 工作空间域（执行面一等实体；ABILITY 天花板依据，router.go:67-71） ----
+  /**
+   * 全部工作空间（GET /workspaces → {items}）。
+   * 服务端内置空间（ws-server）恒排最前，其余按创建时间升序；
+   * online / host 为服务层实时派生字段（不落库）。
+   */
+  listWorkspaces(): Promise<Workspace[]>
+  /** 新建工作空间（POST /workspaces → 201 WorkspaceView）；kind 创建后不可修改 */
+  createWorkspace(input: CreateWorkspaceInput): Promise<Workspace>
+  /**
+   * 更新工作空间（PATCH /workspaces/{wid} → 200 WorkspaceView）：只发送传入的字段。
+   * 不支持改 kind（改 kind = 提权，服务端直接 400）。
+   */
+  updateWorkspace(id: string, patch: UpdateWorkspaceInput): Promise<Workspace>
+  /** 删除工作空间（DELETE /workspaces/{wid} → 204）；仍被会话/项目引用时 409，不级联 */
+  deleteWorkspace(id: string): Promise<void>
   // 消息
   listMessages(sessionId: string, afterSeq?: number): Promise<Message[]>
   // Run
@@ -935,6 +982,27 @@ const mockWebhookStore: Webhook[] = [
   },
 ]
 
+/**
+ * 工作空间 DTO → UI：**唯一的字段映射入口**（store / 组件里严禁手写映射）。
+ *
+ * 映射要点（后端 snake_case 派生字段 vs UI 既有形态）：
+ *   - online / kind / name / id 直传（online 是服务层实时派生，不是库里字段）；
+ *   - builtin：`device_id === ''` 即服务端内置空间（恒在线、不可删除，store 的 removeWorkspace 依赖它）；
+ *   - limbCount：后端没有「肢体数量」概念，UI 侧固定 0（不虚构能力数）；
+ *   - lastSeenAt：后端无 last_seen_at，用 updated_at（毫秒）近似「最近活跃」。
+ */
+export function toUiWorkspace(w: WorkspaceDTO): Workspace {
+  return {
+    id: w.id,
+    name: w.name,
+    kind: w.kind as WorkspaceKind,
+    online: w.online,
+    limbCount: 0,
+    lastSeenAt: w.updated_at || undefined,
+    builtin: w.device_id === '',
+  }
+}
+
 export const mockApi: ApiClient = {
   mode: 'mock',
 
@@ -1115,6 +1183,41 @@ export const mockApi: ApiClient = {
   async removeProjectRule(projectId, ruleId) {
     const i = mockData.approvalRules.findIndex((r) => r.id === ruleId && r.projectId === projectId)
     if (i >= 0) mockData.approvalRules.splice(i, 1)
+  },
+
+  // ---- 工作空间域（mock：内存态，语义与 real 对齐） ----
+  async listWorkspaces() {
+    return clone(mockData.workspaces)
+  },
+  async createWorkspace(input) {
+    const seq = mockData.workspaces.filter((w) => !w.builtin).length + 1
+    const w: Workspace = {
+      id: `ws-mock-${Date.now()}`,
+      name: input.name.trim() || `新接入设备 ${seq}`,
+      kind: input.kind,
+      // mock 无真实设备 Hub：新建即演示为在线
+      online: true,
+      limbCount: 0,
+      lastSeenAt: Date.now(),
+      protocol: 'v1',
+    }
+    mockData.workspaces.push(w)
+    return clone(w)
+  },
+  async updateWorkspace(id, patch) {
+    const found = mockData.workspaces.find((w) => w.id === id)
+    if (!found) throw new ApiError('工作空间不存在', 'workspace.not_found', 404)
+    // kind 不参与更新（改 kind = 提权，real 侧服务端同样 400）
+    if (patch.name !== undefined) found.name = patch.name
+    return clone(found)
+  },
+  async deleteWorkspace(id) {
+    const idx = mockData.workspaces.findIndex((w) => w.id === id)
+    const found = mockData.workspaces[idx]
+    if (!found) throw new ApiError('工作空间不存在', 'workspace.not_found', 404)
+    // 内置服务端空间不可删除（服务端 repo_workspace.go:115 同样拒绝）
+    if (found.builtin) throw new ApiError('服务端内置空间不可删除', 'workspace.in_use', 409)
+    mockData.workspaces.splice(idx, 1)
   },
 
   async listMessages(sessionId) {
@@ -1790,6 +1893,40 @@ export const realApi: ApiClient = {
   },
   async deleteProject(id) {
     await request<void>(API_PATHS.project(id), { method: 'DELETE', headers: authHeaders() })
+  },
+  // ---- 工作空间域（real：服务端为准，router.go:67-71） ----
+  async listWorkspaces() {
+    // 后端 handler 用 map[string]any{"items": items} 包裹（workspace_handler.go:48）
+    const res = await request<{ items: WorkspaceDTO[] }>(API_PATHS.workspaces, { headers: authHeaders() })
+    return (res.items ?? []).map(toUiWorkspace)
+  },
+  async createWorkspace(input) {
+    const body: Record<string, unknown> = { name: input.name, kind: input.kind }
+    if (input.deviceId) body.device_id = input.deviceId
+    if (input.rootPath) body.root_path = input.rootPath
+    const w = await request<WorkspaceDTO>(API_PATHS.workspaces, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify(body),
+    })
+    return toUiWorkspace(w)
+  },
+  async updateWorkspace(id, patch) {
+    // 只发送传入字段（真 PATCH 语义）；**绝不发送 kind**（服务端仅接受与原值相同，不同即 400）
+    const body: Record<string, unknown> = {}
+    if (patch.name !== undefined) body.name = patch.name
+    if (patch.deviceId !== undefined) body.device_id = patch.deviceId
+    if (patch.rootPath !== undefined) body.root_path = patch.rootPath
+    const w = await request<WorkspaceDTO>(API_PATHS.workspace(id), {
+      method: 'PATCH',
+      headers: authHeaders(),
+      body: JSON.stringify(body),
+    })
+    return toUiWorkspace(w)
+  },
+  async deleteWorkspace(id) {
+    // 仍被会话/项目引用时服务端返回 409（不级联），错误交由调用方提示
+    await request<void>(API_PATHS.workspace(id), { method: 'DELETE', headers: authHeaders() })
   },
   async listProjectRules(projectId) {
     const res = await request<{ items: ApiProjectApprovalRule[] }>(API_PATHS.projectRules(projectId), {

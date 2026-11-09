@@ -12,6 +12,7 @@ import { PromptModal, type PromptField } from '../components/PromptModal'
 import { ProjectModal } from '../features/projects/ProjectModal'
 import { WorkspaceSwitcher } from '../components/WorkspaceSwitcher'
 import { hostStatus, hostOfWorkspace } from '../lib/workspaceHost'
+import { canCreateProject } from '../lib/mobileCapabilities'
 
 interface MenuItem {
   label: string
@@ -192,13 +193,18 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
               <span className="text-[12px] font-medium">项目</span>
               <span className="text-[10px] font-mono text-inkfaint">({wsProjects.length})</span>
             </div>
-            <button
-              className="w-5 h-5 rounded hover:bg-panel2 flex items-center justify-center text-inkfaint hover:text-accent transition-colors"
-              title="新建项目"
-              onClick={newProject}
-            >
-              <Plus size={13} />
-            </button>
+            {/* 新建项目入口：移动端壳声明 createProject=false 时不渲染（§4.3 能力声明）。
+                未注入声明（桌面端 / 浏览器）时为 true，渲染与改动前完全一致。
+                注意：这不是安全边界，服务端仍会独立校验（协议 §5.3）。 */}
+            {canCreateProject() && (
+              <button
+                className="w-5 h-5 rounded hover:bg-panel2 flex items-center justify-center text-inkfaint hover:text-accent transition-colors"
+                title="新建项目"
+                onClick={newProject}
+              >
+                <Plus size={13} />
+              </button>
+            )}
           </div>
 
           <div className="space-y-0.5 mt-0.5">

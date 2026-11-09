@@ -1,8 +1,9 @@
 import { useState } from 'react'
-import { ShieldAlert, Check, CheckCheck, X, Database } from 'lucide-react'
+import { ShieldAlert, Check, CheckCheck, X, Database, Smartphone } from 'lucide-react'
 import { useChat } from '../../stores/chatStore'
 import { Badge, Button, inputCls } from '../../components/ui'
 import { DATA_SCOPE_HINT, DATA_SCOPE_LABEL } from '../../lib/dataScopes'
+import { canDecideApproval } from '../../lib/mobileCapabilities'
 
 export function ApprovalBar() {
   const { approval, respond } = useChat()
@@ -10,6 +11,11 @@ export function ApprovalBar() {
   const [reason, setReason] = useState('')
 
   if (!approval) return null
+
+  // 移动端壳能力声明（§4.7.1 审批只读）：false → 卡片照常展示，但不提供 允许/拒绝 按钮。
+  // 未注入声明（桌面端 / 浏览器）时该值为 true，渲染路径与改动前完全一致。
+  // 注意：这不是安全边界，服务端仍会独立校验（协议 §5.3）。
+  const canDecide = canDecideApproval()
 
   const isData = approval.kind === 'data'
   const riskTone = approval.risk === 'danger' ? 'red' : approval.risk === 'command' ? 'yellow' : 'blue'
@@ -61,7 +67,16 @@ export function ApprovalBar() {
         </div>
       )}
 
-      {denying ? (
+      {!canDecide ? (
+        /* 移动端壳：审批只读（§4.7.1）。卡片保留展示让用户知道有待处理审批，
+           但明确告知去电脑端确认，而不是留一个点不动的空壳。 */
+        <div className="mt-3 pt-2.5 border-t border-edge/60 flex items-start gap-2 text-[12px] text-inkdim leading-relaxed">
+          <Smartphone size={13} className="text-warn shrink-0 mt-0.5" />
+          <span>
+            移动端为大模型操作的<b className="font-medium text-ink">只读审批</b>：此审批需在电脑端确认后才能继续执行。
+          </span>
+        </div>
+      ) : denying ? (
         <div className="mt-3 space-y-2 border-t border-edge/60 pt-2.5">
           <input
             className={inputCls}

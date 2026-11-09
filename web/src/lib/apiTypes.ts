@@ -137,6 +137,61 @@ export interface ProjectApprovalRule {
   created_at: number;
 }
 
+/* ============ 工作空间域（执行面一等实体 / 能力天花板依据） ============ */
+
+/**
+ * 工作空间类型：与后端 `model.WorkspaceKind`（internal/model/workspace.go:10-19）
+ * 以及 UI 的 `types.ts#WorkspaceKind` 逐字一致，**不额外引入 cli / tablet**。
+ */
+export type WorkspaceKindDTO = 'server' | 'desktop' | 'mobile' | 'browser';
+
+/**
+ * 工作空间 DTO：字段严格对齐后端实际 JSON。
+ * 来源：`model.Workspace`（internal/model/workspace.go:39-47）
+ *     + `service.WorkspaceView` 的两个派生字段（internal/service/workspace_service.go:19-23）。
+ * 派生字段（online / host）只在 service 层组装、**从不落库**：
+ *   - online：device_id 为空（服务端内置空间）恒 true；否则取设备 Hub 实时在线判定；
+ *   - host：设备空间为 `device:<deviceID>`，服务端内置空间为 `server`。
+ * created_at / updated_at 为毫秒时间戳（store.NowMillis）。
+ */
+export interface WorkspaceDTO {
+  id: string;
+  name: string;
+  kind: WorkspaceKindDTO;
+  /** 空串 = 服务端内置空间；非空 = 归属一台已配对设备 */
+  device_id: string;
+  /** 宿主侧根目录；服务端内置空间为空串 */
+  root_path: string;
+  online: boolean;
+  host: string;
+  created_at: number;
+  updated_at: number;
+}
+
+/** GET /api/v1/workspaces 响应体（handler 用 map[string]any{"items": items} 包裹） */
+export interface WorkspaceListResponseDTO {
+  items: WorkspaceDTO[];
+}
+
+/** POST /api/v1/workspaces 请求体（internal/api/workspace_handler.go:26-33 createWorkspaceReq） */
+export interface CreateWorkspaceDTO {
+  name: string;
+  kind: WorkspaceKindDTO;
+  device_id?: string;
+  root_path?: string;
+}
+
+/**
+ * PATCH /api/v1/workspaces/{wid} 请求体：全部字段可选，缺省 = 不改（真 PATCH 语义）。
+ * 🚨 故意**不提供 kind**：kind 是能力天花板依据，改 kind = 提权，
+ * 服务端仅接受与原值相同的 kind，不同即 400（docs/工作空间模型与三端能力收口协议.md §3）。
+ */
+export interface UpdateWorkspaceDTO {
+  name?: string;
+  device_id?: string;
+  root_path?: string;
+}
+
 export interface Message {
   id: string;
   seq: number;
@@ -344,6 +399,9 @@ export const API_PATHS = {
   // 项目域（阶段七）：项目 + 项目审批规则
   projects: '/api/v1/projects',
   project: (pid: string) => `/api/v1/projects/${pid}`,
+  // 工作空间域（执行面一等实体；router.go:67-71，必须登录鉴权）
+  workspaces: '/api/v1/workspaces',
+  workspace: (wid: string) => `/api/v1/workspaces/${wid}`,
   projectRules: (pid: string) => `/api/v1/projects/${pid}/approval-rules`,
   projectRule: (pid: string, rid: string) => `/api/v1/projects/${pid}/approval-rules/${rid}`,
   sessionArchive: (sid: string) => `/api/v1/sessions/${sid}/archive`,
