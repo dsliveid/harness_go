@@ -408,6 +408,9 @@ func run() error {
 		SOPFunc: sopBodies,
 		// C-7：高风险审批是否仅限执行端设备确认（默认 false = 只审计不阻断）
 		StrictApprovalDevice: cfg.Devices.StrictApprovalDevice,
+		// 能力天花板过滤工具注入：toolRunner 同时实现 agent.ToolCatalog（Risk），
+		// 与引擎侧用的风险源完全一致，避免两处判定漂移（协议 §4.1）。
+		Catalog: toolRunner,
 	})
 	if n, rErr := runSvc.RecoverInterrupted(ctx); rErr == nil && n > 0 {
 		logger.Warn("已将未完成 Run 置为 interrupted（不做断点续跑）", "count", n)
@@ -562,7 +565,6 @@ func run() error {
 	// 把审计端口注入引擎（nil 时不记日志，行为与之前完全一致）
 	runSvc.SetTraceSink(service.NewTraceSink(logWriterPipe))
 
-
 	// ⑩'' C-2：设备域（配对 / 列表 / 吊销）。配置来自 config.Devices 段。
 	// C-6：deviceLeases 已在引擎构造前建立（⑦''），这里注入到用例层。
 	deviceSvc := service.NewDeviceService(service.DeviceServiceOptions{
@@ -671,6 +673,7 @@ func run() error {
 		Webhooks:    webhookSvc,
 		OpenAI:      openaiSvc,
 		Projects:    service.NewProjectService(mainStore),
+		Workspaces:  service.NewWorkspaceService(mainStore, deviceHub),
 		SOP:         sopSvc,
 		FSRoots:     fsRoots,
 		DeviceWS:    deviceWSHandler(deviceGateway),

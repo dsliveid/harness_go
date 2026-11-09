@@ -47,7 +47,7 @@ type Deps struct {
 	// <=0 时回落默认 10；显式关闭请配 0 以外的语义（引擎内 <=0 即视为默认值）。
 	StepNoticeEvery int
 	ToolTimeout     time.Duration
-	Now           func() int64
+	Now             func() int64
 	// AccessModeProvider 实时读取会话访问模式（可选）。
 	// 对齐桌面端语义：顶栏「变更前确认/完全访问」切换即时生效——对话进行中同样立即生效，
 	// 因此每次审批决策前重读一次；读取失败回落 RunRequest.AccessMode（Run 启动快照）。
@@ -147,6 +147,16 @@ type RunRequest struct {
 	// 引导用户消息推入该通道，引擎在**轮次边界**消费——当前流结束后模型即看到该引导。
 	// 消息已由 service 层落库，引擎只回灌上下文不重复落库；nil 表示本 Run 不支持引导。
 	GuidanceCh <-chan *model.Message
+	// DenyTools 仅对话模式（工作空间能力天花板，协议 §4.1）：为 true 时，
+	// command / danger 级工具的调用在 Gate.Evaluate **之前**被立即拒绝并落库，
+	// 不进入 waiting_approval、不阻塞 Gate.Await，Run 继续执行。
+	//
+	// 铁律：判定唯一入口在 service 层（按 session.workspace_id 所指 Workspace 的 kind），
+	// 引擎只消费结果，不做第二套判定（避免两处实现漂移）。
+	DenyTools bool
+	// DenyReason 仅对话模式下的拒绝文案（展示给模型，避免它反复重试）。
+	// 空串时由引擎取默认文案。
+	DenyReason string
 }
 
 // Execute 执行 Run，阻塞直到终态。
@@ -617,6 +627,31 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 		"tool_name":     tc.Name,
 		"risk":          string(risk),
 	})
+
+	// ===== 能力天花板短路（协议 §4.1 / §4.2）=====
+	//
+	// 移动端工作空间与纯对话会话（req.DenyTools=true）不允许执行命令级工具。
+	// 必须在 Gate.Evaluate **之前**短路拒绝，理由：
+	//   ① 若走审批路径，会滞留 waiting_approval，而 DefaultTimeout = 5min（超时才视为拒绝），
+	//      用户要白等 5 分钟才被告知"不行"；
+	//   ② 状态机会经历一次无意义的 waiting_approval 迁移，污染 runs.status 与下游重建逻辑；
+	//   ③ 这是能力边界而非人工决策，本就不该交给人来点。
+	// 拒绝粒度是**工具调用级**：Run 必须继续执行，用户可继续聊别的话题。
+	if req.DenyTools && (risk == model.RiskCommand || risk == model.RiskDanger) {
+		reason := req.DenyReason
+		if strings.TrimSpace(reason) == "" {
+			reason = "当前为移动端，仅支持对话功能"
+		}
+		// 落库为 denied（审计可查），并保留 risk 便于回溯。
+		_ = sdb.FinishToolEvent(ctx, eventID, model.ToolDenied, "", "", reason, localExec)
+		e.publish(req.RunID, events.TypeToolResult, map[string]any{
+			"tool_event_id": eventID,
+			"tool_name":     tc.Name,
+			"status":        string(model.ToolDenied),
+			"result":        reason,
+		})
+		return toolMessage(tc, reason), false
+	}
 
 	// 审批规则：Deps.Rules 非 nil 时由它统一提供「会话级 + 项目级」合并集，
 	// 否则退回会话库规则（旧行为）。合并策略在 service.ApprovalPolicy 中唯一实现，

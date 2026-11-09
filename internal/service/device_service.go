@@ -273,12 +273,57 @@ func (s *DeviceService) Pair(ctx context.Context, clientKey string, req PairRequ
 		return nil, err
 	}
 	s.limiter.reset(key)
+	// 自动为一个执行面客户端建工作空间（协议 §2.4.4）。
+	//
+	// 只对 desktop / mobile 建：这两种形态在 WorkspaceKind 中有等价取值；
+	// tablet / cli / browser 无对应语义，需要时手工创建。
+	//
+	// 幂等：按 device_id 先查后建。失败只记日志不阻断配对——配对是主链路，
+	// 工作空间缺失可用手工补建兜底，不能让用户卡在"配不上对"。
+	s.ensureWorkspaceForDevice(ctx, d)
 	return &PairResult{
 		DeviceID:        d.ID,
 		DeviceToken:     plain,
 		WSPath:          DeviceWSPath,
 		ProtocolVersion: d.ProtocolVersion,
 	}, nil
+}
+
+// ensureWorkspaceForDevice 配对后为设备创建对应工作空间（幂等，失败不阻断）。
+func (s *DeviceService) ensureWorkspaceForDevice(ctx context.Context, d *model.Device) {
+	if d == nil || s.main == nil {
+		return
+	}
+	var kind model.WorkspaceKind
+	switch d.Kind {
+	case model.DeviceKindMobile:
+		kind = model.WorkspaceKindMobile
+	case model.DeviceKindDesktop:
+		kind = model.WorkspaceKindDesktop
+	default:
+		// tablet / cli / browser：无对应 WorkspaceKind，不自动创建（协议 §2.4.4）。
+		return
+	}
+	// 幂等：已有则复用，绝不重复建。
+	if existing, err := s.main.Workspaces().GetByDeviceID(ctx, d.ID); err == nil && existing != nil {
+		return
+	}
+	now := nowMillis()
+	ws := &model.Workspace{
+		ID:        "ws-" + d.ID,
+		Name:      d.Name,
+		Kind:      kind,
+		DeviceID:  d.ID,
+		RootPath:  "",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	if err := s.main.Workspaces().Create(ctx, ws); err != nil {
+		// 并发配对可能撞主键：再查一次确认确实存在，否则仅记日志。
+		if _, getErr := s.main.Workspaces().GetByDeviceID(ctx, d.ID); getErr != nil {
+			logDeviceWarn("配对后自动创建工作空间失败", d.ID, err)
+		}
+	}
 }
 
 // ============ 设备列表与吊销 ============
