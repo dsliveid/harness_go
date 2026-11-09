@@ -14,13 +14,17 @@ var publicPaths = []string{
 	"/api/v1/devices/pair",
 	// 设备长连接：端侧无用户账号，由**设备令牌**在升级前独立鉴权（C-3）
 	"/api/v1/devices/ws",
+	// WebView ticket 兑换：WebView 首屏尚无任何 Cookie，凭 ticket 本身即凭据。
+	// ticket 为 32 字节随机值 + TTL 60s + **一次性消费**（已用/过期/不存在统一 401），
+	// 强度与配对码同级；兑换成功后写入 hg_sess 降级会话（scope=webview）。
+	"/api/v1/auth/webview-exchange",
 }
 
 // NewRouter 构建路由（标准库 ServeMux，Go 1.22+ 路径参数）。
 //
 // 中间件顺序（外 → 内）：Recover → TraceID → AccessLog → Auth → RateLimit → Handler
 func NewRouter(d Deps) http.Handler {
-	h := &handlers{d: d, web: newAssets(d.Log)}
+	h := &handlers{d: d, web: newAssets(d.Log), webviewTickets: newWebviewTicketStore()}
 	mux := http.NewServeMux()
 
 	// SPA 入口（同时承担 SSO 免登拦截）
@@ -42,6 +46,10 @@ func NewRouter(d Deps) http.Handler {
 	mux.HandleFunc("GET /api/v1/auth/me", h.me)
 	mux.HandleFunc("POST /api/v1/auth/logout", h.logout)
 	mux.HandleFunc("POST /api/v1/auth/password", h.changePassword)
+	// WebView 免登（协议 §6.2 / 移动端架构 §4.2）：
+	//   签发需用户会话；兑换免鉴权（凭 ticket 本身），理由见 publicPaths 注释。
+	mux.HandleFunc("POST /api/v1/auth/webview-ticket", h.issueWebviewTicket)
+	mux.HandleFunc("POST /api/v1/auth/webview-exchange", h.exchangeWebviewTicket)
 
 	// 会话
 	mux.HandleFunc("GET /api/v1/sessions", h.listSessions)
@@ -62,6 +70,13 @@ func NewRouter(d Deps) http.Handler {
 	mux.HandleFunc("GET /api/v1/projects/{pid}/approval-rules", h.listProjectRules)
 	mux.HandleFunc("POST /api/v1/projects/{pid}/approval-rules", h.addProjectRule)
 	mux.HandleFunc("DELETE /api/v1/projects/{pid}/approval-rules/{rid}", h.deleteProjectRule)
+	// 工作空间域（执行面一等实体：能力天花板依据；kind 创建后不可改）。
+	// 注意：必须登录鉴权（不进 publicPaths），与项目域同权限级别。
+	mux.HandleFunc("GET /api/v1/workspaces", h.listWorkspaces)
+	mux.HandleFunc("POST /api/v1/workspaces", h.createWorkspace)
+	mux.HandleFunc("GET /api/v1/workspaces/{wid}", h.getWorkspace)
+	mux.HandleFunc("PATCH /api/v1/workspaces/{wid}", h.updateWorkspace)
+	mux.HandleFunc("DELETE /api/v1/workspaces/{wid}", h.deleteWorkspace)
 	// P1：Webhook 事件订阅管理（需求 §4.4）
 	mux.HandleFunc("GET /api/v1/webhooks", h.listWebhooks)
 	mux.HandleFunc("POST /api/v1/webhooks", h.createWebhook)

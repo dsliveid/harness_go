@@ -194,6 +194,23 @@ func (s *Service) VerifyToken(ctx context.Context, plain string) (string, error)
 	return tk.UserID, nil
 }
 
+// TokenKind 返回令牌的 kind（如 webview / admin），用于能力降级判定。
+//
+// 与 VerifyToken 的分工：VerifyToken 负责「是不是合法令牌」，本方法负责
+// 「这个令牌享有哪种能力」。查不到时返回空串而非报错——调用方按「无特殊限制」处理，
+// 不因存储问题扩大拒绝面。
+func (s *Service) TokenKind(ctx context.Context, plain string) (string, error) {
+	plain = strings.TrimSpace(plain)
+	if plain == "" {
+		return "", nil
+	}
+	tk, err := s.main.Tokens().GetByHash(ctx, HashToken(plain))
+	if err != nil || tk == nil {
+		return "", nil
+	}
+	return tk.Kind, nil
+}
+
 // Logout 吊销当前令牌。
 func (s *Service) Logout(ctx context.Context, plain string) error {
 	tk, err := s.main.Tokens().GetByHash(ctx, HashToken(strings.TrimSpace(plain)))

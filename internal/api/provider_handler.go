@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 
+	"harness-go/internal/apperr"
 	"harness-go/internal/model"
 	"harness-go/internal/service"
 )
@@ -34,6 +35,19 @@ func (h *handlers) decideApproval(w http.ResponseWriter, r *http.Request) {
 	deviceID := strings.TrimSpace(req.DeviceID)
 	if deviceID == "" {
 		deviceID = strings.TrimSpace(r.URL.Query().Get("device_id"))
+	}
+	// 硬约束 ③（协议 §6.2）：WebView 兑换出的降级会话不得做审批决策。
+	//
+	// 理由：WebView 里没有生物识别、没有设备绑定上下文，让它在手机上点「允许」
+	// 等于把高危操作的最后一道人审搬到最不可信的界面上。移动端的产品定位是
+	// 「只感知审批状态，不参与决策」（协议 §8 三端职责矩阵）。
+	//
+	// 校验方式：直接看当前请求令牌的 kind。不走中间件注入，是为了不改
+	// TokenVerifier 签名（那会波及全部既有调用点），在唯一需要限制的入口校验更内聚。
+	if h.currentTokenKind(r) == tokenKindWebview {
+		writeError(w, r, apperr.New(apperr.CodeForbidden,
+			"WebView 会话不能审批，请在电脑端确认"))
+		return
 	}
 	err := h.d.Runs.DecideApprovalFromDevice(r.Context(),
 		r.PathValue("sid"), r.PathValue("rid"), r.PathValue("aid"),

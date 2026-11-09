@@ -52,6 +52,8 @@ type Deps struct {
 	OpenAI   *service.OpenAICompatService
 	// Projects 项目域（项目 CRUD + 默认控制权限 + 项目审批规则；nil 时返回 unavailable）
 	Projects *service.ProjectService
+	// Workspaces 工作空间域（执行面实体 CRUD + 在线/宿主派生字段；nil 时返回 unavailable）
+	Workspaces *service.WorkspaceService
 	// SOP 核心 SOP（agent-core 出厂内置 + 运行时覆盖；nil 时返回 unavailable）
 	SOP *service.SOPService
 	// FSRoots 允许浏览的目录根白名单（工作区宿主目录列举，L0 服务端宿主）：
@@ -69,6 +71,9 @@ type Deps struct {
 type handlers struct {
 	d   Deps
 	web *assets
+	// webviewTickets WebView 免登一次性 ticket 内存表（协议 §6.2）。
+	// 不落库：重启即失效可接受；无独立 GC 协程，签发时顺手清理过期项。
+	webviewTickets *webviewTicketStore
 }
 
 // ============ 会话 ============
