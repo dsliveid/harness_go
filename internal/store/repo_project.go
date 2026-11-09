@@ -20,18 +20,27 @@ type ProjectRepo struct{ s *MainStore }
 func (s *MainStore) Projects() *ProjectRepo { return &ProjectRepo{s: s} }
 
 // projectColumns 项目列清单（与 scanProject 顺序严格一致）。
-const projectColumns = `id, name, path, default_access_mode, pinned, created_at, updated_at, deleted_at`
+// 0009 追加 workspace_id：位置紧随 path 之后（scanProject 实参保持一致）。
+const projectColumns = `id, name, path, workspace_id, default_access_mode, pinned, created_at, updated_at, deleted_at`
 
 func scanProject(sc interface{ Scan(...any) error }) (model.Project, error) {
 	var (
 		p       model.Project
 		pinned  int64
 		deleted sql.NullInt64
+		// workspace_id 由 0009 以可空列加入（回填后为 ws-server），用 NullString 兜底。
+		workspaceID sql.NullString
 	)
-	err := sc.Scan(&p.ID, &p.Name, &p.Path, &p.DefaultAccessMode, &pinned,
+	err := sc.Scan(&p.ID, &p.Name, &p.Path, &workspaceID, &p.DefaultAccessMode, &pinned,
 		&p.CreatedAt, &p.UpdatedAt, &deleted)
 	if err != nil {
 		return model.Project{}, err
+	}
+	p.WorkspaceID = workspaceID.String
+	if p.WorkspaceID == "" {
+		// 未指定空间的旧调用路径一律落户服务端内置空间（与 0009 回填口径一致，
+		// 避免出现 workspace_id 为空串的"无归属项目"）。
+		p.WorkspaceID = BuiltinWorkspaceServerID
 	}
 	p.Pinned = pinned != 0
 	if deleted.Valid {
@@ -59,9 +68,9 @@ func (r *ProjectRepo) Create(ctx context.Context, p *model.Project) error {
 		pinned = 1
 	}
 	_, err := r.s.conn().ExecContext(ctx,
-		`INSERT INTO projects(id, name, path, default_access_mode, pinned, created_at, updated_at, deleted_at)
-		 VALUES(?,?,?,?,?,?,?,NULL)`,
-		p.ID, p.Name, p.Path, p.DefaultAccessMode, pinned, p.CreatedAt, p.UpdatedAt)
+		`INSERT INTO projects(id, name, path, workspace_id, default_access_mode, pinned, created_at, updated_at, deleted_at)
+		 VALUES(?,?,?,?,?,?,?,?,NULL)`,
+		p.ID, p.Name, p.Path, p.WorkspaceID, p.DefaultAccessMode, pinned, p.CreatedAt, p.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("store: 创建项目失败: %w", err)
 	}

@@ -107,10 +107,14 @@ type Session struct {
 	Title         string `json:"title"`
 	WorkspacePath string `json:"workspace_path"`
 	// ProjectID 会话归属项目（空串 = 纯对话，不隶属任何项目）。
-	ProjectID  string `json:"project_id,omitempty"`
-	AccessMode string `json:"access_mode"`
-	ModelRef      string `json:"model_ref"`
-	UserID        string `json:"user_id"`
+	ProjectID string `json:"project_id,omitempty"`
+	// WorkspaceID 会话归属工作空间（执行面）。
+	// 空 = 纯对话，无执行面；与 WorkspacePath（磁盘路径）互相独立：
+	// WorkspaceID 决定「能力天花板」（能否执行命令/写文件），WorkspacePath 只是该空间的落盘目录。
+	WorkspaceID string `json:"workspace_id,omitempty"`
+	AccessMode  string `json:"access_mode"`
+	ModelRef    string `json:"model_ref"`
+	UserID      string `json:"user_id"`
 	// Source 会话来源：ui（默认）/ openai（OpenAI 兼容端点的隐藏会话，P1）。
 	Source        string    `json:"source,omitempty"`
 	MessageCount  int64     `json:"message_count"`
