@@ -174,6 +174,84 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+  /api/v1/auth/webview-ticket:
+    post:
+      tags: [auth]
+      summary: 签发一次性 WebView 免登票据
+      description: |
+        **需要用户会话**（不在 internal/api/router.go:10-21 的 publicPaths 内）。
+
+        背景：移动端壳的凭据在 Keychain，WebView 的 Cookie jar 是独立的。不做交换，用户每次进 WebView
+        都要重登；而直接把 `device_token` 注入页面又违反红线 R3/R9。故引入「一次性短时 ticket」：
+        原生（已登录）签发 ticket → 以 URL fragment 传给 WebView 页面 → 页面调 exchange 兑换 `hg_sess`
+        降级会话（internal/api/webview_ticket_handler.go:14-27）。
+
+        三条硬约束：
+        1. **一次性消费**：重放必须 401；
+        2. **绝不写日志**：ticket 明文不得出现在任何日志输出中（服务端只记「已签发」与长度）；
+        3. **权限降级**：兑换出的会话带 `webview` 标记（token kind=webview），高危审批决策被拒。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                device_id:
+                  type: string
+                  description: 可选；仅用于日志与审计溯源，不参与 ticket 兑换校验
+                ttl_s:
+                  type: integer
+                  description: |
+                    可选有效期（秒）。缺省、0 或负值取默认 60s。
+                    ⚠️ 客户端**只能请求更短**：请求值 > 60s 时服务端仍返回 60s（不报错）；
+                    代码里另有 300s 硬上限 `webviewTicketMaxTTL`，但在当前实现下不可达
+                    （webview_ticket_handler.go:155-165）。
+      responses:
+        "200":
+          description: 签发成功（ticket 明文仅此一次返回）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WebviewTicket" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "500":
+          description: 票据生成失败（crypto/rand 系统级异常，`error.code=internal`）
+  /api/v1/auth/webview-exchange:
+    post:
+      tags: [auth]
+      summary: 凭 ticket 兑换降级会话 Cookie（免鉴权）
+      description: |
+        **免鉴权**：在 internal/api/router.go:17-20 的 publicPaths 内——WebView 首屏尚无任何 Cookie，
+        ticket 本身即凭据（32 字节随机值 + 默认 TTL 60s + 一次性消费，强度与端侧配对码同级）。
+
+        成功时**不返回令牌**，而是写 `hg_sess` Cookie（Path=/，HttpOnly，SameSite=Lax，
+        MaxAge=SessionTTL），该会话 token kind=`webview`——降级语义：可读会话、看消息、会话内发消息，
+        **禁止审批决策**（decideApproval 处校验并拒绝）。
+
+        失败不区分「不存在 / 已过期 / 已使用」，统一 401 `unauthorized`（防探测）。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/WebviewExchangeReq" }
+      responses:
+        "200":
+          description: 兑换成功（凭据通过 Set-Cookie 下发，响应体无令牌）
+          headers:
+            Set-Cookie:
+              description: 降级会话 Cookie：`hg_sess=<token>; Path=/; HttpOnly; SameSite=Lax`
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/WebviewExchangeResp" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
   /api/v1/sessions:
     get:
       tags: [sessions]
@@ -362,6 +440,104 @@ paths:
         "204": { description: 已删除 }
         "404":
           $ref: "#/components/responses/NotFound"
+  # ============ 工作空间域（执行面一等实体：能力天花板依据；kind 创建后不可改） ============
+  # 路由来源：internal/api/router.go:75-79；handler：internal/api/workspace_handler.go
+  # 未装配工作空间域时统一 503 unavailable（与 Projects/Webhooks 等可选子系统约定一致）。
+  /api/v1/workspaces:
+    get:
+      tags: [workspaces]
+      summary: 工作空间列表（服务端内置空间排最前，其余按创建时间升序）
+      description: |
+        返回体固定为 `{"items":[...]}` 包裹，**不是分页结构**（无 limit/offset）。
+        online / host 为 service 层运行时派生字段，从不落库。
+      responses:
+        "200":
+          description: 工作空间列表（items）
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Workspace" }
+        "503":
+          $ref: "#/components/responses/Unavailable"
+    post:
+      tags: [workspaces]
+      summary: 新建工作空间（name 缺省取 kind；同一设备只允许一个工作空间）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateWorkspaceReq" }
+      responses:
+        "201":
+          description: 已创建
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Workspace" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+  /api/v1/workspaces/{wid}:
+    parameters:
+      - $ref: "#/components/parameters/WorkspaceID"
+    get:
+      tags: [workspaces]
+      summary: 工作空间详情
+      responses:
+        "200":
+          description: 工作空间
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Workspace" }
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+    patch:
+      tags: [workspaces]
+      summary: 更新工作空间（真 PATCH：缺省字段保留原值）
+      description: |
+        name / device_id / root_path 全部可选，缺省 = 不改；服务端用 *string 承接以区分
+        「未传」与「传空串」。
+        🚨 kind 不可修改：传入与原值相同的 kind 幂等通过，**与原值不同立即 400**
+        （kind 是能力天花板依据，改 kind 等于提权）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UpdateWorkspaceReq" }
+      responses:
+        "200":
+          description: 更新后的工作空间
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Workspace" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+    delete:
+      tags: [workspaces]
+      summary: 删除工作空间（仍被会话/项目引用或内置服务端空间时 409，不级联）
+      responses:
+        "204": { description: 已删除 }
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/Unavailable"
   /api/v1/sessions/{sid}/messages:
     parameters:
       - $ref: "#/components/parameters/SessionID"
@@ -1240,15 +1416,30 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
   /api/v1/providers/{pid}/models:
-    get:
+    post:
       tags: [providers]
       summary: 获取上游真实模型清单（依次尝试 {base}/models、{base}/v1/models、{base}/api/tags）
       description: |
         兼容 OpenAI `{"data":[{"id":...}]}` 与 Ollama `{"models":[{"name":...}]}` 两种响应形状。
         Base URL 会自动剥离误填的 `/chat/completions`、`/messages`、`/responses` 后缀。
         **失败时直接返回错误（不回退任何本地兜底清单）**，让前端展示真实原因。
+
+        方法为 **POST**（与 `router.go` 注册及前端 `api.ts` 调用一致）：因为需要携带草稿覆盖参数，
+        请求体复用 `providerTestReq`（`provider_handler.go:140-145`）。空 body 合法（读库内已保存配置），
+        同时为兼容旧 GET 调用/命令行调试保留了 query 传参（`?base_url=&api_key=`）。
       parameters:
         - { name: pid, in: path, required: true, schema: { type: string } }
+        - { name: base_url, in: query, required: false, schema: { type: string }, description: "兼容旧调用：草稿 Base URL（请求体同名字段优先）" }
+        - { name: api_key, in: query, required: false, schema: { type: string }, description: "兼容旧调用：草稿密钥（仅本次使用，不落库）" }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                base_url: { type: string, description: "可选：草稿里的 Base URL（未保存时以此为准）" }
+                api_key: { type: string, description: "可选：草稿里刚输入未保存的密钥（仅本次使用，不落库）" }
       responses:
         "200":
           description: 上游模型清单
@@ -1922,6 +2113,13 @@ components:
       in: path
       required: true
       schema: { type: string }
+    WorkspaceID:
+      name: wid
+      in: path
+      required: true
+      description: 工作空间 ID（服务端内置空间恒为 `ws-server`；其余形如 `ws-<随机串>`）
+      schema: { type: string }
+      example: ws-server
     Limit:
       name: limit
       in: query
@@ -1989,6 +2187,89 @@ components:
       properties:
         name: { type: string }
         path: { type: string }
+    # ============ 工作空间域 DTO（服务端为契约源头：字段以 Go struct 的 json tag 为准） ============
+    Workspace:
+      type: object
+      description: |
+        工作空间视图 = `model.Workspace`（internal/model/workspace.go:39-47）
+        + `service.WorkspaceView` 的两个运行时派生字段（internal/service/workspace_service.go:19-23）。
+        kind 是能力天花板依据，创建后不可修改（改 kind 等于提权）。
+      required: [id, name, kind, device_id, root_path, online, host, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          description: 工作空间 ID；服务端内置空间恒为 `ws-server`
+          example: ws-server
+        name:
+          type: string
+          description: 展示名；创建时缺省取 kind
+        kind:
+          type: string
+          enum: [server, desktop, mobile, browser]
+          description: |
+            工作空间类型（internal/model/workspace.go:10-19）。server 为唯一无需设备即可执行的空间；
+            mobile 仅对话 + 图片识别。取值与前端 `WorkspaceKindDTO` 逐字一致，不引入 cli / tablet。
+        device_id:
+          type: string
+          description: 归属设备 ID；空串 = 服务端内置空间（恒在线），非空必须对应一台已配对设备
+        root_path:
+          type: string
+          description: 宿主侧根目录；服务端内置空间为空串（磁盘路径在会话的 workspace_path 上）
+        online:
+          type: boolean
+          description: 派生字段，不落库。device_id 为空恒 true；否则取设备 Hub 实时在线判定（Hub 未启用按离线）
+        host:
+          type: string
+          description: 派生字段，不落库。设备空间为 `device:<device_id>`，服务端内置空间为 `server`
+          example: device:dev-abc123
+        created_at:
+          type: integer
+          format: int64
+          description: Unix 毫秒
+        updated_at:
+          type: integer
+          format: int64
+          description: Unix 毫秒
+    CreateWorkspaceReq:
+      type: object
+      description: |
+        POST /api/v1/workspaces 请求体（internal/api/workspace_handler.go:26-33 createWorkspaceReq）。
+        name 为空时服务端以 kind 作为名称；同一台设备只允许存在一个工作空间（重复建 409）。
+      required: [kind]
+      properties:
+        name:
+          type: string
+          description: 展示名；空串 = 以 kind 作为名称
+        kind:
+          type: string
+          enum: [server, desktop, mobile, browser]
+          description: 必填；非法取值 400（绝不静默降级），创建后不可修改
+        device_id:
+          type: string
+          description: 可选；非空必须对应一台已存在设备（否则 400 device.not_found）
+        root_path:
+          type: string
+          description: 可选；宿主侧根目录，服务端内置空间留空串
+    UpdateWorkspaceReq:
+      type: object
+      description: |
+        PATCH /api/v1/workspaces/{wid} 请求体（internal/api/workspace_handler.go:96-101 updateWorkspaceReq）。
+        全部字段可选，缺省 = 不改（服务端用 *string 承接，区分「未传」与「传空串」）。
+        🚨 kind 不可修改：与原值相同幂等通过，不同立即 400。
+      properties:
+        name:
+          type: string
+          description: 新名称；传空串即置为空名（不做 kind 兜底）
+        kind:
+          type: string
+          enum: [server, desktop, mobile, browser]
+          description: 仅用于校验：必须与原值一致（幂等 PATCH），不同即 400（改 kind 等于提权）
+        device_id:
+          type: string
+          description: 新归属设备；空串 = 改为服务端内置空间语义；非空必须对应已存在设备
+        root_path:
+          type: string
+          description: 新根目录；传空串即清空
     # ============ 阶段 E：外部插件与工具市场 DTO ============
     MCPServerView:
       type: object
@@ -2071,6 +2352,39 @@ components:
         tool_names: { type: array, items: { type: string } }
         state: { type: string }
         last_error: { type: string }
+    # ============ WebView 免登票据（internal/api/webview_ticket_handler.go） ============
+    WebviewTicket:
+      type: object
+      description: |
+        POST /api/v1/auth/webview-ticket 响应体（webview_ticket_handler.go:174-177）。
+        ticket 明文**仅此一次返回**，服务端不落库、不写日志；重启即全部失效是可接受语义。
+      required: [ticket, expires_at]
+      properties:
+        ticket:
+          type: string
+          description: 32 字节随机值的 base64url（无填充）编码，可直接放进 URL fragment
+        expires_at:
+          type: integer
+          format: int64
+          description: 过期时间，Unix 毫秒
+    WebviewExchangeReq:
+      type: object
+      description: POST /api/v1/auth/webview-exchange 请求体（webview_ticket_handler.go:180-182）。
+      required: [ticket]
+      properties:
+        ticket:
+          type: string
+          description: 由 webview-ticket 签发的票据明文；空串按无效处理（直接 401）
+    WebviewExchangeResp:
+      type: object
+      description: |
+        POST /api/v1/auth/webview-exchange 响应体（webview_ticket_handler.go:224）。
+        **不含任何令牌字段**：会话凭据只通过 `Set-Cookie: hg_sess=...` 下发。
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+          description: 恒为 true（失败走统一错误体）
     ErrorBody:
       type: object
       required: [error]

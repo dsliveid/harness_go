@@ -384,6 +384,41 @@ export interface RunEvent<T = Record<string, unknown>> {
   payload: T;
 }
 
+/* ============ WebView 免登票据（internal/api/webview_ticket_handler.go） ============ */
+
+/**
+ * 签发 ticket 的入参（POST /api/v1/auth/webview-ticket，需用户会话）。
+ * 两个字段均可选；`ttl_s` 只能请求更短（请求 > 60s 服务端仍给 60s）。
+ */
+export interface WebviewTicketRequest {
+  /** 仅用于日志与审计溯源，不参与兑换校验 */
+  device_id?: string;
+  /** 可选有效期（秒）；缺省/≤0 = 默认 60s */
+  ttl_s?: number;
+}
+
+/** 签发响应：ticket 明文**仅此一次返回**，服务端不落库、不写日志。 */
+export interface WebviewTicketResponse {
+  /** 32 字节随机值的 base64url（无填充）编码，可直接放进 URL fragment */
+  ticket: string;
+  /** 过期时间，Unix 毫秒 */
+  expires_at: number;
+}
+
+/** 兑换入参（POST /api/v1/auth/webview-exchange，免鉴权）。 */
+export interface WebviewExchangeRequest {
+  /** 由 webview-ticket 签发的票据明文；空串按无效处理（直接 401） */
+  ticket: string;
+}
+
+/**
+ * 兑换响应：**不含任何令牌字段**——会话凭据只通过 `Set-Cookie: hg_sess=...` 下发，
+ * 且该会话 token kind=`webview`（可读会话、会话内发消息，禁止审批决策）。
+ */
+export interface WebviewExchangeResponse {
+  ok: boolean;
+}
+
 /* ============ 路径常量（与 openapi.yaml 的 paths 一一对应） ============ */
 
 export const API_PATHS = {
@@ -394,6 +429,10 @@ export const API_PATHS = {
   authMe: '/api/v1/auth/me',
   authLogout: '/api/v1/auth/logout',
   authPassword: '/api/v1/auth/password',
+  /** 签发一次性 WebView 免登 ticket（需用户会话） */
+  authWebviewTicket: '/api/v1/auth/webview-ticket',
+  /** 凭 ticket 兑换降级 hg_sess 会话（免鉴权，publicPaths） */
+  authWebviewExchange: '/api/v1/auth/webview-exchange',
   sessions: '/api/v1/sessions',
   session: (sid: string) => `/api/v1/sessions/${sid}`,
   // 项目域（阶段七）：项目 + 项目审批规则
@@ -504,6 +543,8 @@ export const PUBLIC_PATHS = [
   API_PATHS.authSSO,
   // 端侧配对：凭码即凭据（一次性 + TTL 120s + 失败限流）
   API_PATHS.devicePair,
+  // WebView ticket 兑换：WebView 首屏尚无 Cookie，凭 ticket 本身即凭据（一次性 + 默认 TTL 60s）
+  API_PATHS.authWebviewExchange,
 ] as const;
 
 /* ============ B-3 / B-4 新增 DTO（与 openapi.yaml schemas 对应） ============ */
