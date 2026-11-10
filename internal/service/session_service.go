@@ -39,10 +39,18 @@ type CreateSessionInput struct {
 	ModelRef      string
 	WorkspacePath string
 	ProjectID     string
-	AccessMode    string
+	// WorkspaceID 会话所属执行面（协议 §3.3）：空 = 纯对话（不允许工具）。
+	// 能力天花板由它所指 Workspace 的 kind 决定，是权限判定的唯一依据。
+	WorkspaceID string
+	AccessMode  string
 }
 
 // Create 新建会话（**只写主库，不建会话库文件**；首次发消息时才建）。
+//
+// 归属裁决（协议 §3.3 / §5）：
+//   - WorkspaceID 非空 → 校验 Workspace 存在，否则 400（不留悬空引用）；
+//   - ProjectID 非空且 WorkspaceID 为空 → 从项目的 workspace_id 继承（缺省归属）；
+//   - 两者都空 → 纯对话，能力天花板为「仅对话」（由 run_service.conversationOnly 判定）。
 //
 // AccessMode 裁决链（顺序即优先级）：
 //  1. 显式传入的 in.AccessMode 合法（confirm|full）→ 直接采用；非空但非法 → 400 拒绝；
@@ -70,12 +78,32 @@ func (s *SessionService) Create(ctx context.Context, in CreateSessionInput) (*mo
 		// 项目里若存了非法值（历史脏数据），一律回落空串走 confirm 兜底，绝不放大权限。
 	}
 
+	// 执行面归属：显式 workspace_id 优先，其次从项目继承。
+	//
+	// 为什么必须校验存在性：能力判定靠 workspace.kind，悬空外键会让判定
+	// 走 fail-closed 分支（按仅对话），用户会莫名其妙失去工具能力却查不到原因。
+	wsID := strings.TrimSpace(in.WorkspaceID)
+	if wsID != "" {
+		if _, err := s.main.Workspaces().Get(ctx, wsID); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				return nil, invalidArg("工作空间不存在")
+			}
+			return nil, err
+		}
+	} else if pid := strings.TrimSpace(in.ProjectID); pid != "" {
+		// 项目已在上方校验过存在性（AccessMode 分支），此处可安全读取。
+		if p, err := s.main.Projects().Get(ctx, pid); err == nil {
+			wsID = strings.TrimSpace(p.WorkspaceID)
+		}
+	}
+
 	sess := &model.Session{
 		ID:            newID(),
 		Title:         in.Title,
 		ModelRef:      in.ModelRef,
 		WorkspacePath: in.WorkspacePath,
 		ProjectID:     strings.TrimSpace(in.ProjectID),
+		WorkspaceID:   wsID,
 		AccessMode:    mode,
 	}
 	if sess.Title == "" {

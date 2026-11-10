@@ -84,6 +84,9 @@ type createSessionReq struct {
 	WorkspacePath string `json:"workspace_path"`
 	// ProjectID 归属项目；非空且未显式传 access_mode 时，服务端按项目默认控制权限快照继承。
 	ProjectID string `json:"project_id"`
+	// WorkspaceID 会话所属执行面（协议 §3.3）：空 = 纯对话（不允许工具）。
+	// 留空且 ProjectID 非空时，从项目的 workspace_id 继承。
+	WorkspaceID string `json:"workspace_id"`
 	// AccessMode 可选显式覆盖（confirm|full）；留空 = 走项目默认权限继承。
 	AccessMode string `json:"access_mode"`
 }
@@ -105,11 +108,24 @@ func (h *handlers) createSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, err)
 		return
 	}
+	// 能力天花板前置约束（协议 §4.1）：移动端 WebView 会话不得创建带执行面的会话。
+	//
+	// 用令牌 kind 判定，不用请求体自报（自报可伪造）。webview 会话能做的只有对话：
+	// 强制清空 project_id / workspace_path，并锁 access_mode=confirm，双保险防提权。
+	//
+	// 注：这是「端侧自律 + 服务端兜底」的组合。真正不可绕过的是 run_service.conversationOnly
+	// ——即便有人绕过此处建了 mobile 空间的会话，能力判定仍会按 kind=mobile 拒绝工具。
+	if h.currentTokenKind(r) == tokenKindWebview {
+		req.ProjectID = ""
+		req.WorkspacePath = ""
+		req.AccessMode = "confirm"
+	}
 	sess, err := h.d.Sessions.Create(r.Context(), service.CreateSessionInput{
 		Title:         req.Title,
 		ModelRef:      req.ModelRef,
 		WorkspacePath: req.WorkspacePath,
 		ProjectID:     req.ProjectID,
+		WorkspaceID:   req.WorkspaceID,
 		AccessMode:    req.AccessMode,
 	})
 	if err != nil {
