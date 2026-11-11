@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from 'react'
-import { Check, ChevronDown, Plus, Wifi, WifiOff } from 'lucide-react'
+import { Check, ChevronDown, Link2, Wifi, WifiOff } from 'lucide-react'
 import { useSessions, wsOfProject, wsOfSession } from '../stores/sessionStore'
 import { useUI } from '../stores/uiStore'
-import { Button, cn } from './ui'
-import type { WorkspaceKind } from '../types'
+import { cn } from './ui'
+import type { Workspace, WorkspaceKind } from '../types'
 
 const KIND_LABEL: Record<WorkspaceKind, string> = {
   server: '服务端',
@@ -33,15 +33,12 @@ function fmtAgo(t?: number) {
 export function WorkspaceSwitcher() {
   const {
     workspaces, activeWorkspaceId, projects, sessions,
-    setWorkspace, connectWorkspace,
+    setWorkspace,
   } = useSessions()
   const { toast } = useUI()
   const [open, setOpen] = useState(false)
   const [pos, setPos] = useState<{ top: number; left: number; width: number } | null>(null)
-  const [newName, setNewName] = useState('')
-  const [newKind, setNewKind] = useState<WorkspaceKind>('desktop')
   const wrapRef = useRef<HTMLDivElement>(null)
-  const nameRef = useRef<HTMLInputElement>(null)
 
   const active = workspaces.find((w) => w.id === activeWorkspaceId)
 
@@ -78,26 +75,14 @@ export function WorkspaceSwitcher() {
     setOpen(true)
   }
 
-  const onPick = (id: string, online: boolean) => {
-    setWorkspace(id)
-    const ws = workspaces.find((w) => w.id === id)
-    toast(online ? 'success' : 'info', online
-      ? `已切换到「${ws?.name ?? id}」`
-      : `已切换到「${ws?.name ?? id}」· 该工作空间离线，仅可查看历史对话`)
-    setOpen(false)
-  }
-
-  const onConnect = () => {
-    // 以 DOM 值为准兜底，避免受控 state 未同步（CDP/输入法）时丢输入
-    const name = (nameRef.current?.value ?? newName).trim()
-    if (!name) {
-      toast('error', '请填写该客户端工作空间的名称')
-      return
+  const onPick = (w: Workspace) => {
+    setWorkspace(w.id)
+    // 提示与能力策略严格对齐：零工具空间「可以对话、只是没有工具」，不是只读历史。
+    if (w.toolPolicy === 'none') {
+      toast('info', `已切换到「${w.name}」· ${w.policyReason ?? '该空间没有可用设备，可对话但无法调用工具'}`)
+    } else {
+      toast('success', `已切换到「${w.name}」`)
     }
-    connectWorkspace(name, newKind)
-    toast('success', `「${name}」已接入并切换为当前工作空间`)
-    setNewName('')
-    if (nameRef.current) nameRef.current.value = ''
     setOpen(false)
   }
 
@@ -137,7 +122,7 @@ export function WorkspaceSwitcher() {
           style={{ top: pos.top, left: pos.left, width: pos.width }}
         >
           <div className="px-2.5 pb-1.5 pt-0.5 text-[10.5px] font-medium text-inkfaint uppercase tracking-wider">
-            已接入工作空间 ({workspaces.length})
+            工作空间 ({workspaces.length})
           </div>
 
           <div className="max-h-[300px] overflow-y-auto px-1">
@@ -148,7 +133,7 @@ export function WorkspaceSwitcher() {
               return (
                 <button
                   key={w.id}
-                  onClick={() => onPick(w.id, w.online)}
+                  onClick={() => onPick(w)}
                   className={cn(
                     'w-full text-left px-2 py-1.5 rounded-lg transition-colors',
                     isActive ? 'bg-accent-soft' : 'hover:bg-panel2',
@@ -179,63 +164,95 @@ export function WorkspaceSwitcher() {
                   <div className="flex items-center gap-1.5 mt-0.5 pl-3 text-[10.5px] text-inkfaint">
                     <span className="font-mono">{KIND_LABEL[w.kind]}</span>
                     <span className="opacity-40">·</span>
-                    {w.online ? (
-                      <span className="text-ok/90 inline-flex items-center gap-0.5">
-                        <Wifi size={9} />在线
-                      </span>
-                    ) : (
-                      <span className="inline-flex items-center gap-0.5">
-                        <WifiOff size={9} />离线 · {fmtAgo(w.lastSeenAt)}
-                      </span>
-                    )}
+                    <StatusText w={w} />
                     <span className="opacity-40">·</span>
                     <span>
                       {pCount} 项目 / {sCount} 对话
                     </span>
                   </div>
+                  {/* 设备绑定情况：哪个设备绑定的，一眼可见（内置空间不重复展示） */}
+                  {!w.builtin && (
+                    <div className="flex items-center gap-1 mt-0.5 pl-3 text-[10px] text-inkfaint">
+                      <Link2 size={8} className="shrink-0 opacity-70" />
+                      {w.deviceId ? (
+                        <>
+                          <span>绑定：</span>
+                          <span className="text-inkdim">{w.deviceName || w.deviceId}</span>
+                          {w.deviceKind && <span className="font-mono opacity-60">· {w.deviceKind}</span>}
+                        </>
+                      ) : (
+                        <span>未绑定设备</span>
+                      )}
+                    </div>
+                  )}
+                  {/* 无工具能力时给出原因：用户能明白「能聊但调不了工具」，而不是困惑按钮失效 */}
+                  {w.toolPolicy !== 'full' && (
+                    <div className="mt-0.5 pl-3 text-[10px] text-warn/90 leading-relaxed">
+                      {w.policyReason ?? (w.toolPolicy === 'readonly' ? '仅支持只读操作与对话' : '仅可对话，无法调用工具')}
+                    </div>
+                  )}
                 </button>
               )
             })}
           </div>
 
-          <div className="mt-1.5 pt-2 px-2.5 border-t border-edge/70 space-y-1.5">
+          <div className="mt-1.5 pt-2 px-2.5 border-t border-edge/70">
             <div className="text-[10.5px] text-inkfaint leading-relaxed">
-              客户端主动接入：桌面端 / 移动端启动后在此接入，可自定义该工作空间名称。
-            </div>
-            <div className="flex items-center gap-1.5">
-              <select
-                value={newKind}
-                onChange={(e) => setNewKind(e.target.value as WorkspaceKind)}
-                className="h-7 shrink-0 rounded-md bg-panel2 text-[11px] text-inkdim px-1 outline-none cursor-pointer appearance-none hover:bg-panel3 transition-colors focus:ring-1 focus:ring-accent/40"
-                title="接入客户端类型"
-              >
-                {KIND_OPTIONS.map((o) => (
-                  <option key={o.value} value={o.value} className="bg-panel text-ink">
-                    {o.label}
-                  </option>
-                ))}
-              </select>
-              <input
-                ref={nameRef}
-                value={newName}
-                onChange={(e) => setNewName(e.target.value)}
-                onKeyDown={(e) => { if (e.key === 'Enter') onConnect() }}
-                placeholder="客户端工作空间名称"
-                className="flex-1 min-w-0 h-7 px-2 rounded-md bg-panel2 text-[11.5px] text-ink placeholder:text-inkfaint outline-none focus:ring-1 focus:ring-accent/40"
-              />
-              <Button
-                variant="primary"
-                size="sm"
-                className="h-7 px-2 shrink-0 gap-1 text-[11px]"
-                onClick={onConnect}
-              >
-                <Plus size={12} />
-                接入
-              </Button>
+              工作空间与设备严格一对一：配对设备后服务端自动创建其空间。
+              设备绑定/解绑请到「设置 → 高级 → 工作空间」。
             </div>
           </div>
         </div>
       )}
     </div>
+  )
+}
+
+/**
+ * 单行状态文案：把「在线 / 离线 / 设备已删除 / 设备已解绑 / 未绑定设备」三种语义分开。
+ *
+ * 🚨 关键：离线（可恢复）与已删除/已解绑（需重新绑定）绝不能用同一句「离线」，
+ * 否则用户会一直等一台永远不会回来的设备。
+ */
+function StatusText({ w }: { w: Workspace }) {
+  if (w.builtin) {
+    return (
+      <span className="text-ok/90 inline-flex items-center gap-0.5">
+        <Wifi size={9} />在线
+      </span>
+    )
+  }
+  if (w.deviceMissing) {
+    return (
+      <span className="text-danger/90 inline-flex items-center gap-0.5">
+        <WifiOff size={9} />设备已删除
+      </span>
+    )
+  }
+  if (w.deviceRevoked) {
+    return (
+      <span className="text-danger/90 inline-flex items-center gap-0.5">
+        <WifiOff size={9} />设备已解绑
+      </span>
+    )
+  }
+  if (!w.bound) {
+    return (
+      <span className="inline-flex items-center gap-0.5">
+        <WifiOff size={9} />未绑定设备
+      </span>
+    )
+  }
+  if (!w.online) {
+    return (
+      <span className="inline-flex items-center gap-0.5">
+        <WifiOff size={9} />离线 · {fmtAgo(w.lastSeenAt)}
+      </span>
+    )
+  }
+  return (
+    <span className="text-ok/90 inline-flex items-center gap-0.5">
+      <Wifi size={9} />{w.deviceName ? `${w.deviceName} 在线` : '在线'}
+    </span>
   )
 }

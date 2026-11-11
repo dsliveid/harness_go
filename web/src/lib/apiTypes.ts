@@ -96,6 +96,11 @@ export interface Session {
   user_id: string;
   /** 归属项目 ID（空串 = 纯对话，不隶属任何项目） */
   project_id?: string;
+  /**
+   * 归属工作空间（执行面）ID：空 = 纯对话（无执行宿主）。
+   * 与 workspace_path（磁盘目录）互相独立：workspace_id 决定能力天花板，path 只是落盘目录。
+   */
+  workspace_id?: string;
   message_count: number;
   last_message_at?: number;
   total_tokens: number;
@@ -148,10 +153,11 @@ export type WorkspaceKindDTO = 'server' | 'desktop' | 'mobile' | 'browser';
 /**
  * 工作空间 DTO：字段严格对齐后端实际 JSON。
  * 来源：`model.Workspace`（internal/model/workspace.go:39-47）
- *     + `service.WorkspaceView` 的两个派生字段（internal/service/workspace_service.go:19-23）。
- * 派生字段（online / host）只在 service 层组装、**从不落库**：
- *   - online：device_id 为空（服务端内置空间）恒 true；否则取设备 Hub 实时在线判定；
- *   - host：设备空间为 `device:<deviceID>`，服务端内置空间为 `server`。
+ *     + `service.WorkspaceView` 的派生字段（internal/service/workspace_service.go）。
+ * 派生字段只在 service 层组装、**从不落库**：
+ *   - online：内置服务端空间恒 true；否则取设备 Hub 实时在线判定；
+ *   - host：设备空间为 `device:<deviceID>`，服务端内置空间为 `server`；
+ *   - tool_policy：工具能力**权威裁决**（full|readonly|none），前端不得自行推导。
  * created_at / updated_at 为毫秒时间戳（store.NowMillis）。
  */
 export interface WorkspaceDTO {
@@ -164,9 +170,33 @@ export interface WorkspaceDTO {
   root_path: string;
   online: boolean;
   host: string;
+  /** 是否绑定了设备（内置服务端空间恒 true，它是自洽的执行宿主） */
+  bound: boolean;
+  /** 归属设备名/形态/状态（未绑定或设备已删除时为空串） */
+  device_name?: string;
+  device_kind?: string;
+  device_status?: string;
+  /** 绑定的设备记录已不存在（需重新绑定；与「离线」严格区分） */
+  device_missing: boolean;
+  /** 设备已解绑（不可恢复，需重新配对） */
+  device_revoked: boolean;
+  /** 设备最近活跃时间（毫秒） */
+  last_seen_at?: number;
+  /**
+   * 工具能力策略（服务端权威值）：full 全工具 / readonly 仅只读 / none 零工具。
+   * 🚨 前端**不得**自行按 online/kind 推导 —— 判定只在 service 层实现一处。
+   */
+  tool_policy: ToolPolicyDTO;
+  /** 策略降级原因（人类可读，可直接展示） */
+  policy_reason?: string;
+  /** 是否可发起对话：恒 true（无设备也可对话，只是没有工具能力） */
+  can_chat: boolean;
   created_at: number;
   updated_at: number;
 }
+
+/** 工具能力策略（与 internal/agent.ToolPolicy 逐字一致） */
+export type ToolPolicyDTO = 'full' | 'readonly' | 'none';
 
 /** GET /api/v1/workspaces 响应体（handler 用 map[string]any{"items": items} 包裹） */
 export interface WorkspaceListResponseDTO {

@@ -13,7 +13,7 @@
  *   - 错误统一为 `ApiError`（携带 code / status / trace_id，trace_id 与后端日志一致）。
  */
 
-import type { AccessMode, Approval, ApprovalRule, FileDiff, Message, Project, ProjectApprovalRule, Run, RunStatus, Session, ToolCall, Risk, ToolStatus, Workspace, WorkspaceKind } from '../types'
+import type { AccessMode, Approval, ApprovalRule, FileDiff, Message, Project, ProjectApprovalRule, Run, RunStatus, Session, ToolCall, Risk, ToolPolicy, ToolStatus, Workspace, WorkspaceKind } from '../types'
 import { SseClient, type SseState as SseStateName, type SseStateInfo } from './sse'
 import { extractFileDiff, extractResultContent } from './toolDiff'
 import {
@@ -201,6 +201,11 @@ export interface CreateSessionInput {
   modelRef?: string
   workspacePath?: string
   /**
+   * 归属工作空间（执行面）ID。决定会话的能力天花板（能否执行命令/写文件）。
+   * 留空 = 纯对话；服务端会从 projectId 继承，未继承到则为空。
+   */
+  workspaceId?: string
+  /**
    * 归属项目（服务端 sessions.project_id）。**仅**用于告诉服务端「这个会话属于哪个项目」；
    * 该会话的初始控制权限由服务端按项目的 default_access_mode 裁决并快照。
    */
@@ -326,8 +331,16 @@ export interface ApiClient {
    * 不支持改 kind（改 kind = 提权，服务端直接 400）。
    */
   updateWorkspace(id: string, patch: UpdateWorkspaceInput): Promise<Workspace>
-  /** 删除工作空间（DELETE /workspaces/{wid} → 204）；仍被会话/项目引用时 409，不级联 */
-  deleteWorkspace(id: string): Promise<void>
+  /**
+   * 删除工作空间（DELETE /workspaces/{wid} → 204）。
+   *
+   * migrateRefs：
+   *   - false/缺省 = 严格模式：仍被会话/项目引用时 409，需先迁移引用；
+   *   - true        = 确认移除语义（Web 管理端使用）：服务端在同一主库事务内把该空间的
+   *     会话/项目一并软删、清项目审批规则、物理删除空间行，刷新后不会再出现。
+   *     🚨 不是「迁到内置 ws-server」—— 那会把 readonly/离线会话提权到 full（违反 D8）。
+   */
+  deleteWorkspace(id: string, opts?: { migrateRefs?: boolean }): Promise<void>
   // 消息
   listMessages(sessionId: string, afterSeq?: number): Promise<Message[]>
   // Run
@@ -650,6 +663,8 @@ export function toUiSession(s: ApiSession): Session {
     id: s.id,
     title: s.title,
     projectId: s.project_id || undefined,
+    // 执行面归属：服务端权威字段，前端不再靠 workspace_path 反查猜测。
+    workspaceId: s.workspace_id || undefined,
     workspacePath: s.workspace_path || undefined,
     accessMode: toAccessMode(s.access_mode),
     modelRef: s.model_ref,
@@ -812,9 +827,11 @@ function parseArgsOrEmpty(raw: string): Record<string, unknown> {
  *
  * 映射要点（后端 snake_case 派生字段 vs UI 既有形态）：
  *   - online / kind / name / id 直传（online 是服务层实时派生，不是库里字段）；
- *   - builtin：`device_id === ''` 即服务端内置空间（恒在线、不可删除，store 的 removeWorkspace 依赖它）；
+ *   - builtin：**按 id === 'ws-server' 判定**，不再用 `device_id === ''`。
+ *     旧口径把「手工建的无设备空间」也当成内置空间 → 恒在线可执行（D1 已修正）。
+ *   - toolPolicy：**直传服务端权威值**，前端绝不按 online/kind 自己推导；
  *   - limbCount：后端没有「肢体数量」概念，UI 侧固定 0（不虚构能力数）；
- *   - lastSeenAt：后端无 last_seen_at，用 updated_at（毫秒）近似「最近活跃」。
+ *   - lastSeenAt：优先用设备真实 last_seen_at，缺失时退化到 updated_at 近似。
  */
 export function toUiWorkspace(w: WorkspaceDTO): Workspace {
   return {
@@ -823,8 +840,17 @@ export function toUiWorkspace(w: WorkspaceDTO): Workspace {
     kind: w.kind as WorkspaceKind,
     online: w.online,
     limbCount: 0,
-    lastSeenAt: w.updated_at || undefined,
-    builtin: w.device_id === '',
+    lastSeenAt: w.last_seen_at ?? (w.updated_at || undefined),
+    builtin: w.id === 'ws-server',
+    deviceId: w.device_id || undefined,
+    deviceName: w.device_name || undefined,
+    deviceKind: w.device_kind || undefined,
+    bound: w.bound,
+    deviceMissing: w.device_missing,
+    deviceRevoked: w.device_revoked,
+    // 服务端未下发（旧后端）时退化为 none：宁可少给能力，也不能凭空放行工具。
+    toolPolicy: (w.tool_policy as ToolPolicy) ?? 'none',
+    policyReason: w.policy_reason || undefined,
   }
 }
 
@@ -1049,6 +1075,8 @@ export const realApi: ApiClient = {
       workspace_path: input.workspacePath,
     }
     if (input.projectId) body.project_id = input.projectId
+    // workspace_id 决定能力天花板：必须显式发送，否则会话落入「纯对话」失去执行面归属。
+    if (input.workspaceId) body.workspace_id = input.workspaceId
     if (input.accessMode) body.access_mode = input.accessMode
     return toUiSession(
       await request<ApiSession>(API_PATHS.sessions, { method: 'POST', headers: authHeaders(), body: JSON.stringify(body) }),
@@ -1171,9 +1199,11 @@ export const realApi: ApiClient = {
     })
     return toUiWorkspace(w)
   },
-  async deleteWorkspace(id) {
-    // 仍被会话/项目引用时服务端返回 409（不级联），错误交由调用方提示
-    await request<void>(API_PATHS.workspace(id), { method: 'DELETE', headers: authHeaders() })
+  async deleteWorkspace(id, opts) {
+    // migrateRefs=true：服务端事务内把该空间的会话/项目迁回内置 ws-server 后物理删除。
+    // 不带该参数则维持严格模式（有引用即 409），错误交由调用方提示。
+    const q = opts?.migrateRefs ? '?migrate_refs=true' : ''
+    await request<void>(`${API_PATHS.workspace(id)}${q}`, { method: 'DELETE', headers: authHeaders() })
   },
   async listProjectRules(projectId) {
     const res = await request<{ items: ApiProjectApprovalRule[] }>(API_PATHS.projectRules(projectId), {

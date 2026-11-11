@@ -25,15 +25,23 @@ export function Composer() {
   const fileRef = useRef<HTMLInputElement>(null)
   const [atts, setAtts] = useState<PendingAtt[]>([])
 
-  // 离线工作空间只读：可查看历史，不支持发起对话
+  // 工作空间能力提示：离线/未绑定/已删除空间**仍可对话**，只是没有工具能力。
+  //
+  // 🚨 与旧逻辑的关键差异：以前这里用 `!online` 直接禁用输入，
+  // 等于把「可以聊天但调不了工具」的需求错做成「完全不能聊」。
+  // 现在只提示、不阻断——服务端 ToolPolicy 才是能力的唯一权威。
   const activeWs = workspaces.find((w) => w.id === activeWorkspaceId)
-  const offline = Boolean(activeWs && !activeWs.online)
+  const policy = activeWs?.toolPolicy ?? 'full'
+  const policyHint =
+    policy === 'full'
+      ? null
+      : (activeWs?.policyReason
+        ?? (policy === 'readonly' ? '当前空间仅支持只读操作与对话' : '当前空间没有可用设备，可对话但无法调用工具'))
 
   const total = tokensIn + tokensOut
   const cacheRate = tokensIn > 0 ? Math.round((cachedTokens / tokensIn) * 1000) / 10 : 0
 
   const submit = () => {
-    if (offline) return
     const t = draft.trim()
     if (!t) return
     send(t)
@@ -107,15 +115,7 @@ export function Composer() {
         </div>
       )}
 
-      {/* 离线工作空间：仅可查看历史对话，禁止发起新对话 */}
-      {offline && (
-        <div className="flex items-start gap-1.5 rounded-xl border border-warn/30 bg-warn/10 px-3 py-2 text-[11.5px] text-warn leading-relaxed">
-          <WifiOff size={13} className="shrink-0 mt-0.5" />
-          <span>
-            「{activeWs?.name}」当前离线，仅可查看历史对话记录，暂不支持发起对话。
-          </span>
-        </div>
-      )}
+      {/* 能力提示统一放在输入卡片内（见下方 policyHint），此处不再重复横幅 */}
 
       {/* 主输入卡片：清晰线框，无阴影 */}
       <div
@@ -153,14 +153,18 @@ export function Composer() {
           </div>
         )}
 
+        {/* 能力提示条：零工具/只读空间仍可正常输入发送，只是工具会被服务端拒绝 */}
+        {policyHint && (
+          <div className="mx-2.5 mt-2 px-2.5 py-1.5 rounded-lg bg-warn/10 border border-warn/25 text-[11px] leading-relaxed text-warn">
+            {policyHint}
+          </div>
+        )}
+
         <textarea
           ref={ref}
-          disabled={offline}
-          className="w-full min-h-[50px] max-h-[160px] px-3.5 pt-3 pb-2 bg-transparent outline-none focus:outline-none focus:ring-0 resize-none text-[14px] leading-relaxed text-ink placeholder:text-inkfaint border-none disabled:cursor-not-allowed disabled:opacity-60"
+          className="w-full min-h-[50px] max-h-[160px] px-3.5 pt-3 pb-2 bg-transparent outline-none focus:outline-none focus:ring-0 resize-none text-[14px] leading-relaxed text-ink placeholder:text-inkfaint border-none"
           placeholder={
-            offline
-              ? '该工作空间离线，仅可查看历史对话'
-              : streaming ? '运行中：输入指令将自动加入待执行队列…' : '输入指令，Enter 发送 / Shift+Enter 换行'
+            streaming ? '运行中：输入指令将自动加入待执行队列…' : '输入指令，Enter 发送 / Shift+Enter 换行'
           }
           value={draft}
           onChange={(e) => { setDraft(e.target.value); grow() }}
@@ -175,9 +179,9 @@ export function Composer() {
             <button
               type="button"
               onClick={() => fileRef.current?.click()}
-              disabled={offline}
+              disabled={false}
               className="w-8 h-8 shrink-0 rounded-lg inline-flex items-center justify-center text-inkdim hover:text-accent hover:bg-panel2 transition-colors disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-inkdim"
-              title={offline ? '工作空间离线，无法添加附件' : '添加图片或文件附件'}
+              title="添加图片或文件附件"
               aria-label="添加附件"
             >
               <Paperclip size={15} />
@@ -209,9 +213,9 @@ export function Composer() {
                 <span>停止</span>
               </Button>
             ) : (
-              <Button size="sm" variant="primary" onClick={submit} disabled={offline} className="gap-1.5 px-3.5">
+              <Button size="sm" variant="primary" onClick={submit} className="gap-1.5 px-3.5">
                 <Send size={12} />
-                <span>{offline ? '离线' : '发送'}</span>
+                <span>发送</span>
               </Button>
             )}
           </div>

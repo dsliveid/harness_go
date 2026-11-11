@@ -8,6 +8,7 @@
     "dev:real": "vite --mode real",
     "build": "tsc -b && vite build",
     "verify:dist": "node scripts/verify-dist.mjs",
+    "verify:fab": "node scripts/verify-fabdrag.mjs",
     "build:check": "tsc -b && vite build && node scripts/verify-dist.mjs",
     "preview": "vite preview --port 5611 --strictPort"
   },

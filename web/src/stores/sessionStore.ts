@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import type { AccessMode, ApprovalRule, DataScope, DataScopeGrant, DataScopeMode, PlanMode, Project, ProjectLink, Session, Workspace, WorkspaceKind } from '../types'
 import { api } from '../lib/api'
+import type { CreateWorkspaceInput } from '../lib/api'
 import { useUI } from './uiStore'
 import { useSettings } from './settingsStore'
 import {
@@ -10,12 +11,18 @@ import {
 } from './sessionScope'
 
 /**
- * 内置服务端空间 id（服务端本身就是永远在线的「大脑」空间，不可移除）。
- * 历史上一度由演示数据模块导出，现在它是前端纯约定常量，就近定义。
+ * 内置服务端空间 id。
+ *
+ * 🚨 必须与服务端 `store.BuiltinWorkspaceServerID = "ws-server"` **逐字一致**。
+ * 历史缺陷（2026-11）：前端曾用 'ws-srv'，与服务端差一个字符，
+ * 导致归属判定、在线状态、内置空间识别全部对不上（会话总被归到「纯对话」）。
  */
-const DEFAULT_WORKSPACE_ID = 'ws-srv'
+const DEFAULT_WORKSPACE_ID = 'ws-server'
 
-/** 内置服务端空间：唯一预置的工作空间（真实概念，非演示数据） */
+/** 旧前端常量（'ws-srv'）：仅用于 localStorage 脏数据迁移，不得再作为 id 使用 */
+const LEGACY_WORKSPACE_ID = 'ws-srv'
+
+/** 内置服务端空间：服务端 0009 迁移已落库，这里只是后端未装配时的兜底占位 */
 const BUILTIN_WORKSPACE: Workspace = {
   id: DEFAULT_WORKSPACE_ID,
   name: '服务端工作空间',
@@ -23,6 +30,9 @@ const BUILTIN_WORKSPACE: Workspace = {
   online: true,
   limbCount: 1,
   builtin: true,
+  // 服务端内置空间自身就是执行宿主：恒在线、全工具能力。
+  bound: true,
+  toolPolicy: 'full',
 }
 
 /** 项目所属工作空间（缺省视为内置服务端空间） */
@@ -96,10 +106,40 @@ interface SessionState {
   unarchive: (id: string) => void
   setAccessMode: (id: string, mode: AccessMode) => void
   setModel: (id: string, modelRef: string) => void
-  // ---- 工作空间（服务端内置空间 + 客户端接入空间） ----
+  // ---- 工作空间（服务端为准：执行面实体 + 设备联动） ----
+  /** 从服务端拉取全部工作空间（唯一数据源；失败时保留上次已知状态） */
+  loadWorkspaces: () => Promise<void>
   setWorkspace: (id: string) => void
-  connectWorkspace: (name: string, kind?: WorkspaceKind) => string
-  removeWorkspace: (id: string) => boolean
+  /** 在服务端新建工作空间（设备绑定/kind 一致性/唯一性全部由服务端校验） */
+  createWorkspace: (input: CreateWorkspaceInput) => Promise<Workspace>
+  /**
+   * 移除工作空间（级联删除）。
+   *
+   * 🚨 必须真的调服务端 DELETE（`migrate_refs=true`）：旧实现只改本地 zustand +
+   * localStorage，服务端仍有该空间，刷新时 `loadWorkspaces()` 又拉回来 ——
+   * 这正是用户报告的「移除后刷新界面又出现了」。
+   *
+   * 服务端语义：单事务内把该空间的会话/项目一并软删、清规则、物理删空间行。
+   * 成功后本地同步移除这些会话与项目，最后重拉列表以服务端为准校正。
+   *
+   * 失败（409/网络）抛错给调用方 toast，界面绝不做「假成功」的乐观移除。
+   */
+  removeWorkspace: (id: string) => Promise<boolean>
+  /**
+   * 绑定设备到未绑定的工作空间（一对一：设备必须未被任何空间占用）。
+   *
+   * 成功后重拉服务端列表：deviceName / online / toolPolicy 都是服务端派生字段，
+   * 前端拼不出来（拼出来就是第二套判定，必然漂移）。
+   */
+  bindWorkspaceDevice: (wsId: string, deviceId: string) => Promise<void>
+  /**
+   * 解绑工作空间的设备归属（`device_id` 置空）。
+   *
+   * 🚨 服务端对解绑**不校验设备存在性**：设备被吊销/物理删除后仍必须能解绑，
+   * 否则该空间既删不掉（已绑定）又解不开（设备不存在）→ 永久僵尸空间。
+   * 因此前端对「设备已解绑/已删除」的空间也必须显示解绑按钮。
+   */
+  unbindWorkspaceDevice: (wsId: string) => Promise<void>
   // ---- 项目操作（对齐桌面端） ----
   createProject: (name: string, path: string) => string
   renameProject: (id: string, name: string) => void
@@ -136,14 +176,35 @@ interface SessionState {
 // 且刷新后回退旧值（实为服务端从未存过）。必须从空列表起步，由服务端填充。
 const initialProjects: Project[] = loadPersistedProjects() ?? []
 
-/** 工作空间：内置服务端空间恒存在，其余来自本地持久化（客户端接入是纯前端概念） */
+/** 工作空间：首屏用本地持久化占位，随后由 loadWorkspaces() 以服务端为准覆盖 */
 // loadPersistedWorkspaces() 已做脏数据自愈（逐项校验形状），此处拿到的必然是合法 Workspace[]，
 // 不会再出现 undefined 元素撑爆首屏渲染（2026-11 登录后黑屏事故）。
-const persistedWorkspaces: Workspace[] = loadPersistedWorkspaces()
+//
+// 🚨 in-flight 迁移：把历史 localStorage 里的 'ws-srv' 全部改写为 'ws-server'。
+// 若不迁移，用户本地残留的旧空间记录会与当前会话归属对不上，表现为
+// 「刚聊过的对话刷新后掉进纯对话」（因为 ws-srv 在服务端根本不存在）。
+const persistedWorkspaces: Workspace[] = migrateLegacyWorkspaces(loadPersistedWorkspaces())
 const initialWorkspaces: Workspace[] = persistedWorkspaces.some((w) => w.id === DEFAULT_WORKSPACE_ID)
   ? persistedWorkspaces
-  : [BUILTIN_WORKSPACE, ...persistedWorkspaces]
-const initialActiveWs = loadPersistedActiveWorkspace() ?? DEFAULT_WORKSPACE_ID
+  : [BUILTIN_WORKSPACE, ...persistedWorkspaces.filter((w) => w.id !== DEFAULT_WORKSPACE_ID)]
+const persistedActiveWs = loadPersistedActiveWorkspace()
+const initialActiveWs = persistedActiveWs === LEGACY_WORKSPACE_ID
+  ? DEFAULT_WORKSPACE_ID
+  : (persistedActiveWs ?? DEFAULT_WORKSPACE_ID)
+
+/**
+ * 把本地持久化里的旧内置空间 id 迁移到服务端口径。
+ *
+ * 只改 id 与 builtin/toolPolicy 这类「确定已知」的字段，其余字段原样保留：
+ * 该空间最终会被 loadWorkspaces() 用服务端真实数据整体替换，这里只为过渡期不崩。
+ */
+function migrateLegacyWorkspaces(list: Workspace[]): Workspace[] {
+  return list.map((w) =>
+    w.id === LEGACY_WORKSPACE_ID
+      ? { ...w, id: DEFAULT_WORKSPACE_ID, name: '服务端工作空间', kind: 'server', builtin: true, bound: true, online: true, toolPolicy: 'full' }
+      : w,
+  )
+}
 
 export const useSessions = create<SessionState>((set, get) => ({
   workspaces: initialWorkspaces,
@@ -160,6 +221,8 @@ export const useSessions = create<SessionState>((set, get) => ({
 
   // 登录后从主库拉取会话列表：空列表自动建一条，避免右侧空屏
   load: async () => {
+    // 先拉工作空间：会话归属判定（wsOfSession）依赖它，晚拉会让首屏闪一次「纯对话」。
+    await get().loadWorkspaces()
     try {
       const list = await api.listSessions({ limit: 100 })
       if (list.length === 0) {
@@ -205,6 +268,31 @@ export const useSessions = create<SessionState>((set, get) => ({
   },
 
   // ---- 工作空间 ----
+  /**
+   * 从服务端拉取全部工作空间（**唯一数据源**）。
+   *
+   * 为什么必须服务端为准：工作空间 = 执行面，其在线状态、绑定设备、工具能力策略
+   * 都是运行时事实，前端不可能靠 localStorage 假装出来。
+   * 历史缺陷（2026-11）：这里曾只读 localStorage + 一个硬编码内置空间，
+   * 于是下拉列表永远是「静态数据」，且与设备完全脱节。
+   */
+  loadWorkspaces: async () => {
+    try {
+      const list = await api.listWorkspaces()
+      const st = get()
+      // 内置服务端空间必须存在（服务端 0009 迁移已插入 ws-server，理论上必在；
+      // 若后端未装配工作空间域返回空列表，则保留本地内置项兜底，绝不让下拉列表空掉）。
+      const next = list.length > 0 ? list : st.workspaces
+      const activeId = next.some((w) => w.id === st.activeWorkspaceId)
+        ? st.activeWorkspaceId
+        : (next[0]?.id ?? DEFAULT_WORKSPACE_ID)
+      set({ workspaces: next, activeWorkspaceId: activeId })
+      persistScope(get())
+    } catch {
+      // 拉取失败不改列表：保留上次已知的可用状态，避免下拉列表瞬间清空
+      // （不清空比清空安全：清空会让当前会话失去归属，界面闪「纯对话」）。
+    }
+  },
   setWorkspace: (id) => {
     const st = get()
     if (id === st.activeWorkspaceId) return
@@ -222,50 +310,88 @@ export const useSessions = create<SessionState>((set, get) => ({
     // 该空间还没有任何会话时自动建一条，避免右侧空屏
     if (inWs.length === 0) get().create()
   },
-  connectWorkspace: (name, kind = 'desktop') => {
-    const seq = get().workspaces.filter((w) => !w.builtin).length + 1
-    const id = `ws-${Date.now()}`
-    const ws: Workspace = {
-      id,
-      name: name.trim() || `新接入设备 ${seq}`,
-      kind,
-      online: true,
-      limbCount: 1,
-      lastSeenAt: Date.now(),
-      protocol: 'v1',
-      clientId: `${kind}-${String(seq).padStart(2, '0')}`,
-    }
-    set((st) => ({ workspaces: [...st.workspaces, ws] }))
+  /**
+   * 在服务端新建工作空间并切换到它。
+   *
+   * 🚨 与旧的 `connectWorkspace` 的根本区别：这里**真的调服务端**，
+   * 且设备绑定必须在服务端完成（一对一 + kind 一致性 + 设备存在性全部由服务端校验）。
+   * 旧实现在前端凭空造一条 `online: true` 记录、无设备参与，导致「接入设备」纯属幻觉。
+   *
+   * 失败时原样抛出，由调用方 toast 服务端返回的 message（不吞错、不伪造成功）。
+   */
+  createWorkspace: async (input) => {
+    const created = await api.createWorkspace(input)
+    set((st) => ({
+      workspaces: st.workspaces.some((w) => w.id === created.id)
+        ? st.workspaces.map((w) => (w.id === created.id ? created : w))
+        : [...st.workspaces, created],
+    }))
     persistScope(get())
-    get().setWorkspace(id)
-    return id
+    get().setWorkspace(created.id)
+    return created
   },
-  removeWorkspace: (id) => {
+  /**
+   * 绑定设备到未绑定的工作空间。
+   *
+   * 服务端已保证：设备存在性、kind 一致性、一对一唯一性。前端不做二次判定，
+   * 只在失败时把服务端 message 原样抛给调用方（绝不吞错）。
+   */
+  bindWorkspaceDevice: async (wsId, deviceId) => {
+    await api.updateWorkspace(wsId, { deviceId })
+    // 重拉：deviceName/online/toolPolicy 是服务端派生字段，必须由服务端算。
+    await get().loadWorkspaces()
+  },
+  /**
+   * 解绑工作空间的设备归属。
+   *
+   * 传 `deviceId: ''` 即解绑：服务端 Update 在置空时**跳过**设备存在性/在线/吊销校验，
+   * 这是「设备已吊销后仍可解绑」的死锁逃生通道（见 workspace_service.go 铁律三）。
+   */
+  unbindWorkspaceDevice: async (wsId) => {
+    await api.updateWorkspace(wsId, { deviceId: '' })
+    await get().loadWorkspaces()
+  },
+  removeWorkspace: async (id) => {
     const st = get()
     const ws = st.workspaces.find((w) => w.id === id)
     // 内置服务端空间不可移除
     if (!ws || ws.builtin) return false
-    const goneProjectIds = st.projects.filter((p) => wsOfProject(p) === id).map((p) => p.id)
-    const keptProjects = st.projects.filter((p) => wsOfProject(p) !== id)
-    const keptSessions = st.sessions.filter((s) => wsOfSession(s, st.projects) !== id)
-    const fallbackWs = st.activeWorkspaceId === id ? DEFAULT_WORKSPACE_ID : st.activeWorkspaceId
+    // ① 先落服务端（真删 + 级联）：失败就原样抛出，界面不产生「假成功」。
+    //    不先改本地状态的原因：旧实现只改本地 → 刷新被 loadWorkspaces 拉回来（用户报告的 bug）。
+    await api.deleteWorkspace(id, { migrateRefs: true })
+    // ② 服务端已级联删除成功，本地同步移除该空间及其会话/项目。
+    //    语义必须与服务端一致：服务端把会话与项目一并删了，本地就不能留着
+    //    （否则界面上还挂着一批"幽灵"会话，点进去必 404）。
+    const cur = get()
+    const goneProjectIds = cur.projects.filter((p) => wsOfProject(p) === id).map((p) => p.id)
+    const keptProjects = cur.projects.filter((p) => wsOfProject(p) !== id)
+    const keptSessions = cur.sessions.filter((s) => wsOfSession(s, cur.projects) !== id)
+    const fallbackWs = cur.activeWorkspaceId === id ? DEFAULT_WORKSPACE_ID : cur.activeWorkspaceId
     const fallbackSessions = keptSessions.filter(
       (s) => !s.archivedAt && wsOfSession(s, keptProjects) === fallbackWs,
     )
-    const needCreate = st.activeWorkspaceId === id && fallbackSessions.length === 0
+    const needCreate = cur.activeWorkspaceId === id && fallbackSessions.length === 0
+    const aliveWsIds = cur.workspaces.filter((w) => w.id !== id).map((w) => w.id)
     set({
-      workspaces: st.workspaces.filter((w) => w.id !== id),
+      // 空间、其会话、其项目全部消失（与服务端级联删除一一对应）。
+      workspaces: cur.workspaces.filter((w) => w.id !== id),
       projects: keptProjects,
       sessions: keptSessions,
-      projectLinks: st.projectLinks.filter((l) => !goneProjectIds.includes(l.projectId)),
-      approvalRules: st.approvalRules.filter((r) => !goneProjectIds.includes(r.projectId)),
-      dataGrants: st.dataGrants.filter((g) => !goneProjectIds.includes(g.projectId)),
+      // 附属配置也要一并清掉，否则会残留指向已删项目/会话的悬空记录。
+      projectLinks: cur.projectLinks.filter((l) => !goneProjectIds.includes(l.projectId)),
+      approvalRules: cur.approvalRules.filter((r) => !goneProjectIds.includes(r.projectId)),
+      dataGrants: cur.dataGrants.filter((g) => !goneProjectIds.includes(g.projectId)),
       activeWorkspaceId: fallbackWs,
-      currentId: fallbackSessions[0]?.id ?? st.currentId,
+      currentId: fallbackSessions.some((s) => s.id === cur.currentId)
+        ? cur.currentId
+        : (fallbackSessions[0]?.id ?? cur.currentId),
     })
-    // 空间移除后清理悬空的归属记录（否则残留 projectId/workspaceId 会反复误导分组）
-    pruneScopeOverrides(keptProjects.map((p) => p.id), st.workspaces.filter((w) => w.id !== id).map((w) => w.id))
+    // 清理悬空归属：指向已删空间/项目的 override 必须清掉，否则分组会指向幽灵实体。
+    pruneScopeOverrides(keptProjects.map((p) => p.id), aliveWsIds)
     persistScope(get())
+    // ③ 以服务端为准校正一次列表：确保 UI 与 DB 同源（刷新前后一致）。
+    //    失败时 loadWorkspaces 内部保留当前状态，不会把列表清空。
+    await get().loadWorkspaces()
     if (needCreate) get().create()
     return true
   },

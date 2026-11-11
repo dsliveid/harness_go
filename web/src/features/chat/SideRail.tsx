@@ -155,6 +155,9 @@ export function SideRail() {
   return (
     <div
       ref={railRef}
+      // 供「宿主设置浮标」（layout/HostSettingsFab.tsx）测量包围盒做竖向避让：
+      // 两者同为贴右边缘的浮动件，浮标吸附到右侧时必须让开这条胶囊栏。
+      data-harness-side-rail=""
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { Check, Clock, Copy, Globe, KeyRound, Monitor, Server, Smartphone, Terminal, Trash2, Wifi, WifiOff } from 'lucide-react'
 import { useDevices } from '../../stores/deviceStore'
 import { useUI } from '../../stores/uiStore'
-import { Badge, Button, Empty, cn, inputCls } from '../../components/ui'
+import { Badge, Button, Empty, Modal, cn, inputCls } from '../../components/ui'
 import type { DeviceDTO, DeviceKind } from '../../lib/apiTypes'
 
 const KIND_META: Record<DeviceKind, { label: string; icon: ReactNode }> = {
@@ -136,24 +136,20 @@ function PairCodeCard() {
 function DeviceCard({ d }: { d: DeviceDTO }) {
   const { revoke, heartbeatSec, offlineAfterSec } = useDevices()
   const { toast } = useUI()
-  const [confirming, setConfirming] = useState(false)
+  const [confirmOpen, setConfirmOpen] = useState(false)
   const [openCaps, setOpenCaps] = useState(false)
   const [busy, setBusy] = useState(false)
   const meta = KIND_META[d.kind] ?? { label: d.kind, icon: <Server size={13} className="text-inkdim shrink-0" /> }
   const revoked = d.status === 'revoked'
   const caps = d.capabilities ?? []
 
+  // 一次点击即弹出确认对话框：确认后才真正调用 DELETE /devices/{did}。
+  // 旧实现是「点一次变文案、再点一次才执行」，用户容易误以为第一次点击没生效。
   const onRevoke = async () => {
-    if (!confirming) {
-      setConfirming(true)
-      toast('info', `再次点击「确认解绑」以解除「${d.name}」的绑定`)
-      window.setTimeout(() => setConfirming(false), 8000)
-      return
-    }
+    setConfirmOpen(false)
     setBusy(true)
     const ok = await revoke(d.id)
     setBusy(false)
-    setConfirming(false)
     toast(
       ok ? 'success' : 'error',
       ok
@@ -192,9 +188,9 @@ function DeviceCard({ d }: { d: DeviceDTO }) {
               {openCaps ? '收起能力' : '能力'}
             </Button>
           )}
-          <Button variant="danger" onClick={onRevoke} disabled={revoked || busy}>
+          <Button variant="danger" onClick={() => setConfirmOpen(true)} disabled={revoked || busy}>
             <Trash2 size={12} className="mr-1" />
-            {revoked ? '已解绑' : confirming ? '确认解绑' : '解除绑定'}
+            {revoked ? '已解绑' : busy ? '解绑中…' : '解除绑定'}
           </Button>
         </div>
       </div>
@@ -217,6 +213,37 @@ function DeviceCard({ d }: { d: DeviceDTO }) {
         {' · '}
         心跳间隔 {heartbeatSec}s / 超 {offlineAfterSec}s 无帧判离线
       </div>
+
+      <Modal
+        open={confirmOpen}
+        onClose={() => setConfirmOpen(false)}
+        title="解除设备绑定"
+        width="max-w-md"
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setConfirmOpen(false)}>取消</Button>
+            <Button variant="danger" onClick={() => void onRevoke()}>
+              <Trash2 size={12} className="mr-1" />
+              确认解绑
+            </Button>
+          </>
+        }
+      >
+        <div className="p-4 space-y-2 text-[12.5px] leading-relaxed text-inkdim">
+          <div>
+            确认解除「<span className="text-ink font-medium">{d.name || d.id}</span>」的绑定？
+          </div>
+          <div className="text-inkfaint">
+            · 该设备令牌立即失效，长连接断开，端侧将回到配对引导；
+          </div>
+          <div className="text-inkfaint">
+            · 后续所有工具调用回到服务端本地执行（不报错，只是失去端侧能力）；
+          </div>
+          <div className="text-inkfaint">
+            · 如需重新接入，请重新生成配对码。
+          </div>
+        </div>
+      </Modal>
     </div>
   )
 }

@@ -14,7 +14,7 @@ export interface Workspace {
   /** 工作空间显示名：内置空间固定为服务端，客户端接入时可自定义 */
   name: string
   kind: WorkspaceKind
-  /** 在线状态：离线空间仅可查看历史对话，不支持发起对话 */
+  /** 在线状态：离线空间仍可对话，但**没有工具能力**（服务端权威判定见 toolPolicy） */
   online: boolean
   /** 绑定的肢体数量（可执行工具的端） */
   limbCount: number
@@ -26,7 +26,31 @@ export interface Workspace {
   builtin?: boolean
   /** 接入该空间时客户端上报的标识，如 desk-01 / phone-01 */
   clientId?: string
+  /** 归属设备 ID（空 = 未绑定设备；服务端内置空间也为空但 bound=true） */
+  deviceId?: string
+  /** 归属设备名（未绑定 / 设备已删除时为空） */
+  deviceName?: string
+  /** 归属设备形态（desktop|mobile|tablet|cli|browser） */
+  deviceKind?: string
+  /** 是否绑定了可用宿主（内置服务端空间恒 true） */
+  bound?: boolean
+  /** 绑定的设备记录已不存在：需重新绑定（与「离线」严格区分，不可恢复） */
+  deviceMissing?: boolean
+  /** 设备已解绑：需重新配对（不可恢复） */
+  deviceRevoked?: boolean
+  /**
+   * 工具能力策略（服务端权威值，**前端不得自行推导**）：
+   *   - full     全部工具
+   *   - readonly 仅只读工具（对话 + 读文件）
+   *   - none     零工具（未绑定 / 离线 / 已删除 / 已解绑）
+   */
+  toolPolicy: ToolPolicy
+  /** 策略降级原因（服务端给出的人类可读文案，可直接展示） */
+  policyReason?: string
 }
+
+/** 工具能力策略（与 internal/agent.ToolPolicy 逐字一致） */
+export type ToolPolicy = 'full' | 'readonly' | 'none'
 
 // ============ 会话 / 项目 / 消息 ============
 export type PlanMode = 'standard' | 'always_plan' | 'always_proceed'
