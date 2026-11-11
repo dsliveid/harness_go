@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"harness-go/internal/model"
 )
@@ -436,6 +437,28 @@ func (r *TokenRepo) Revoke(ctx context.Context, id string, at int64) error {
 		return fmt.Errorf("store: 吊销令牌失败: %w", err)
 	}
 	return ensureAffected(res, "令牌 "+id)
+}
+
+// RevokeByUser 吊销某账号名下全部未吊销令牌，返回吊销条数。
+//
+// 用途：离线重置口令后强制该账号重新登录——旧会话令牌若不吊销，
+// 攻击者只要已经拿到 Cookie 就能继续用旧令牌访问，重置口令形同虚设。
+// 幂等：已全部吊销时返回 0 且不报错（与 Revoke 的单条 not-found 语义刻意不同）。
+func (r *TokenRepo) RevokeByUser(ctx context.Context, userID string, at int64) (int64, error) {
+	if strings.TrimSpace(userID) == "" {
+		// 空 user_id 的令牌（历史引导令牌）不属于任何账号，不在此处误伤。
+		return 0, nil
+	}
+	res, err := r.s.conn().ExecContext(ctx,
+		`UPDATE api_tokens SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL`, at, userID)
+	if err != nil {
+		return 0, fmt.Errorf("store: 按账号吊销令牌失败: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("store: 读取影响行数失败: %w", err)
+	}
+	return n, nil
 }
 
 // ============ 配置 ============

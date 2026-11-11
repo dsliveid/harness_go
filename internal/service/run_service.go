@@ -61,8 +61,14 @@ type RunServiceOptions struct {
 	StrictApprovalDevice bool
 	// Catalog 工具风险目录（能力天花板过滤用）：nil 时无法得知工具风险级，
 	// filterTools 将**保守地保留全部工具**（不能凭空判定谁危险），
-	// 此时仅依赖引擎侧 DenyTools 兜底短路，安全性不降级。
+	// 此时仅依赖引擎侧 ToolPolicy 兜底短路，安全性不降级。
 	Catalog agent.ToolCatalog
+	// Hub 设备在线判定（能力天花板用）：nil 时所有设备空间一律视为离线（失败即关闭）。
+	//
+	// 为什么必须注入：设备空间的能力天花板取决于「归属设备此刻是否在线」——
+	// 这是运行时事实，只在设备域 Hub 里。nil Hub 绝不等于「全部在线」，
+	// 而是「无法确认在線」→ 按离线处理（fail-closed），宁可降级为零工具。
+	Hub HubOnline
 }
 
 // RunService Run 用例：创建（异步执行）/ 停止 / 查询 / 启动恢复。
@@ -87,6 +93,8 @@ type RunService struct {
 	strictApproval bool
 	// catalog 工具风险目录（能力天花板过滤用）；nil 时 filterTools 保留全部工具。
 	catalog agent.ToolCatalog
+	// hub 设备在线判定；nil 时设备空间一律按离线处理（fail-closed）。
+	hub HubOnline
 
 	mu      sync.Mutex
 	cancels map[string]context.CancelFunc
@@ -113,6 +121,7 @@ func NewRunService(opts RunServiceOptions) *RunService {
 		memory:         opts.Memory,
 		strictApproval: opts.StrictApprovalDevice,
 		catalog:        opts.Catalog,
+		hub:            opts.Hub,
 		cancels:        make(map[string]context.CancelFunc),
 	}
 }
@@ -128,6 +137,20 @@ func (s *RunService) SetTraceSink(sink agent.TraceSink) {
 	s.engine.SetTraceSink(sink)
 }
 
+// SetHub 后置注入设备在线判定（启动装配期调用一次）。
+//
+// 为什么必须后置注入：设备域 Hub 的构造依赖 logger / 网关配置，晚于 RunService 装配；
+// 若强行走构造注入就要重排 main.go 的装配顺序，牵连更大。
+//
+// 🚨 未注入（nil）时所有设备空间一律按离线处理（fail-closed → 零工具），
+// 这是安全的降级方向；绝不会因为「不知道设备在不在线」就放行工具。
+func (s *RunService) SetHub(hub HubOnline) {
+	if s == nil {
+		return
+	}
+	s.hub = hub
+}
+
 // currentTools 返回本轮应注入的工具定义（动态优先）。
 func (s *RunService) currentTools() []prompt.ToolRef {
 	if s.toolRefs != nil {
@@ -136,62 +159,142 @@ func (s *RunService) currentTools() []prompt.ToolRef {
 	return s.tools
 }
 
-// conversationOnly 判定该会话是否「仅对话」——即工作空间能力天花板不允许执行工具。
+// executionDeviceID 解析本次 Run 的**执行面归属设备**（D7 执行面归属铁律）。
+//
+// 语义：工具必须落在「会话绑定工作空间所归属的那台设备」上，而不是任意在线设备，
+// 更不是服务端本地。返回空串表示「服务端内置空间」，允许本地执行。
+//
+// 为什么必须逐层透传而不是让派发器自己挑：`Dispatcher.candidates` 在未指定
+// DeviceID 时会退化为「全部在线设备按 ID 排序取首个」——会话绑的是手机 A，
+// 写文件却可能落到桌面端 B 上。这是错误执行而非功能缺失。
+func (s *RunService) executionDeviceID(ctx context.Context, sess *model.Session) string {
+	if s == nil || s.main == nil || sess == nil {
+		return ""
+	}
+	wsID := strings.TrimSpace(sess.WorkspaceID)
+	if wsID == "" {
+		return ""
+	}
+	ws, err := s.main.Workspaces().Get(ctx, wsID)
+	if err != nil {
+		return ""
+	}
+	// 内置服务端空间：执行面就是服务端本地。
+	if ws.ID == store.BuiltinWorkspaceServerID {
+		return ""
+	}
+	return strings.TrimSpace(ws.DeviceID)
+}
+
+// resolveToolPolicy 判定该会话的**工具能力策略**——工作空间能力天花板的唯一裁决入口。
 //
 // 【唯一入口铁律】工作空间能力判定**只在本函数实现**，其他任何位置（引擎、API 层、
 // 前端）都不得重复实现第二套规则，否则两处漂移会直接变成越权漏洞。
 // 依据：docs/工作空间模型与三端能力收口协议.md §4.1。
 //
 // 规则（fail-closed：查不到一律从严）：
-//   - session.WorkspaceID 为空 → 纯对话，不允许工具；
-//   - workspace.Kind == mobile → 仅对话（移动端不执行任何命令/写文件）；
-//   - workspace.Kind 为 server/desktop/browser → 允许全部工具；
-//   - workspace 查不到（悬空外键/已删除）→ 按仅对话处理，绝不放宽。
+//   - session.WorkspaceID 为空 → none（纯对话，无执行宿主）；
+//   - workspace 查不到（悬空外键/已删除）→ none；
+//   - workspace 是内置服务端空间（ws-server）→ full（服务端自身恒在线，D8）；
+//   - workspace.DeviceID 为空（非内置）→ none（未绑定设备，D1）；
+//   - 归属设备已删除 / 已解绑（revoked）→ none（D4：空间保留但无宿主）；
+//   - 归属设备不在线 → none（D3：**绝不降级到服务端本地执行**）；
+//   - workspace.Kind == mobile → readonly（移动端可对话+图片识别，禁写禁命令）；
+//   - kind 为 server/desktop/browser 且设备在线 → full。
 //
 // 第二个返回值为拒绝文案，用于 Engine 短路时展示给模型。
-func (s *RunService) conversationOnly(ctx context.Context, sess *model.Session) (bool, string) {
+func (s *RunService) resolveToolPolicy(ctx context.Context, sess *model.Session) (agent.ToolPolicy, string) {
 	if sess == nil {
-		return true, "当前会话未绑定执行空间，仅支持对话"
+		return agent.ToolPolicyReadonly, policyReasonNoWorkspace
 	}
 	wsID := strings.TrimSpace(sess.WorkspaceID)
 	if wsID == "" {
-		return true, "当前会话未绑定执行空间，仅支持对话"
+		// 纯对话会话（无 workspace_id）：协议 §3.3 的「无执行面」。
+		//
+		// 给 readonly 而非 none 的理由：只读工具（read_file / echo / 检索）不需要
+		// 执行宿主参与，纯对话里读代码上下文是正常刚需；而 write / command 必须
+		// 有设备或服务端空间承接，无归属时一律拒绝。
+		// 这与旧 DenyTools（只拦 command+danger）的差别在于：**write 现在也被拦下**，
+		// 补上了「纯对话能偷偷改文件」的漏洞。
+		return agent.ToolPolicyReadonly, policyReasonNoWorkspace
 	}
 	if s.main == nil {
-		return true, "当前会话未绑定执行空间，仅支持对话"
+		return agent.ToolPolicyReadonly, policyReasonNoWorkspace
 	}
 	ws, err := s.main.Workspaces().Get(ctx, wsID)
 	if err != nil {
 		// 悬空引用：宁可拒绝也不放宽（fail-closed）。
-		return true, "当前会话的执行空间不可用，仅支持对话"
+		return agent.ToolPolicyNone, policyReasonUnbound
 	}
 	if !ws.Kind.Valid() {
-		return true, "当前会话的执行空间不可用，仅支持对话"
+		return agent.ToolPolicyNone, policyReasonUnbound
+	}
+	// 内置服务端空间：恒在线（它就是服务端自身），不参与设备在线判定。
+	if ws.ID == store.BuiltinWorkspaceServerID {
+		if ws.Kind == model.WorkspaceKindMobile {
+			return agent.ToolPolicyReadonly, policyReasonMobile
+		}
+		return agent.ToolPolicyFull, ""
+	}
+	// 非内置空间必须有可用设备宿主，否则任何工具都只能落到服务端本地执行（D8 明令禁止）。
+	if strings.TrimSpace(ws.DeviceID) == "" {
+		return agent.ToolPolicyNone, policyReasonUnbound
+	}
+	dev, err := s.main.Devices().Get(ctx, ws.DeviceID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return agent.ToolPolicyNone, policyReasonDeviceMissing
+		}
+		return agent.ToolPolicyNone, policyReasonUnbound
+	}
+	if dev.RevokedAt != nil {
+		return agent.ToolPolicyNone, policyReasonDeviceRevoked
+	}
+	if s.hub == nil || !s.hub.Online(ws.DeviceID) {
+		return agent.ToolPolicyNone, policyReasonOffline
 	}
 	if ws.Kind == model.WorkspaceKindMobile {
-		return true, "当前为移动端，仅支持对话功能"
+		return agent.ToolPolicyReadonly, policyReasonMobile
 	}
-	return false, ""
+	return agent.ToolPolicyFull, ""
 }
 
 // filterTools 按能力天花板过滤工具注入列表（协议 §4.1）。
 //
-// 为什么在注入阶段就过滤：让模型**根本看不到**命令级工具的 schema，
-// 比"事后拒绝"更省 token、更少无效轮次；引擎侧的 DenyTools 短路是兜底
+// 为什么在注入阶段就过滤：让模型**根本看不到**被禁工具的 schema，
+// 比"事后拒绝"更省 token、更少无效轮次；引擎侧的 ToolPolicy 短路是兜底
 // （防止历史上下文或已被删除的工具名仍被模型尝试调用）。
 //
 // 保守原则：catalog 为 nil（无法得知风险级）时**不过滤**，宁可依赖引擎兜底，
 // 也不凭工具名猜测风险——猜错会把安全工具的注入也砍掉，损害正常对话。
-func (s *RunService) filterTools(refs []prompt.ToolRef, denyTools bool) []prompt.ToolRef {
-	if !denyTools || s.catalog == nil || len(refs) == 0 {
+//
+// 🚨 policy == none 时不依赖 catalog：那是「全部剔除」的绝对语义，
+// 连风险级都不需要知道，因此即使 catalog 为 nil 也必须全量清空
+// （否则「零工具」契约在未装配 catalog 的部署下会静默失效）。
+func (s *RunService) filterTools(refs []prompt.ToolRef, policy agent.ToolPolicy) []prompt.ToolRef {
+	if len(refs) == 0 {
+		return refs
+	}
+	// none：全部剔除，与 catalog 是否装配无关。
+	if policy == agent.ToolPolicyNone {
+		return nil
+	}
+	if policy == agent.ToolPolicyFull && s.catalog == nil {
+		return refs
+	}
+	if s.catalog == nil {
 		return refs
 	}
 	out := make([]prompt.ToolRef, 0, len(refs))
 	for _, ref := range refs {
-		if risk, ok := s.catalog.Risk(ref.Name); ok {
-			if risk == model.RiskCommand || risk == model.RiskDanger {
-				continue
-			}
+		risk, ok := s.catalog.Risk(ref.Name)
+		if !ok {
+			// 风险级未知：保守保留（catalog 未覆盖 ≠ 危险）。
+			out = append(out, ref)
+			continue
+		}
+		if !policy.Allows(risk) {
+			continue
 		}
 		out = append(out, ref)
 	}
@@ -346,8 +449,8 @@ func (s *RunService) CreateRunWithSystem(ctx context.Context, sessionID, userInp
 	// 工作区事实按会话注入：绑定/未绑定如实分叉，杜绝「未绑定却说自己在工作区内」的幻觉。
 	system = ComposeSystemBase(system, sess.WorkspacePath, s.workDir)
 	// 能力天花板（协议 §4.1）：唯一入口在此，引擎只消费结果。
-	// 仅对话会话不注入命令级工具（让模型根本看不到），且引擎侧做兜底短路拒绝。
-	denyTools, denyReason := s.conversationOnly(ctx, sess)
+	// 零工具策略下不注入任何工具（让模型根本看不到），且引擎侧做兜底短路拒绝。
+	toolPolicy, policyReason := s.resolveToolPolicy(ctx, sess)
 	req := agent.RunRequest{
 		RunID:           run.ID,
 		SessionID:       sessionID,
@@ -357,14 +460,17 @@ func (s *RunService) CreateRunWithSystem(ctx context.Context, sessionID, userInp
 		SystemBase:      system,
 		SOP:             s.currentSOP(sess.WorkspacePath),
 		ProjectSummary:  "",
-		Tools:           s.filterTools(s.currentTools(), denyTools),
+		Tools:           s.filterTools(s.currentTools(), toolPolicy),
 		ActiveTools:     s.selectTools(ctx, userInput),
 		MemoryCore:      memCore,
 		MemoryTail:      memTail,
 		LeaseHolder:     deviceID, // C-6：空串 = 服务端本地执行面
 		RequesterDevice: deviceID, // C-7：审批跨端仲裁的发起端来源
-		DenyTools:       denyTools,
-		DenyReason:      denyReason,
+		ToolPolicy:      toolPolicy,
+		PolicyReason:    policyReason,
+		// 执行面归属（D7）：工具必须在**会话绑定的设备**上执行，绝不落到服务端本地。
+		// 空串 = 服务端内置空间（ws-server），允许本地执行。
+		ExecutionDeviceID: s.executionDeviceID(ctx, sess),
 	}
 	// 运行中引导通道（§4.2）：随 Run 注册/注销，Guidance 端点推送、引擎轮次边界消费
 	guidanceCh := make(chan *model.Message, 16)

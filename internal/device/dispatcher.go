@@ -353,6 +353,14 @@ func (d *Dispatcher) sendToCandidates(ctx context.Context, task *pendingTask, re
 }
 
 // candidates 计算候选设备列表（稳定顺序：指定设备优先，其次按 ID 排序的在线设备）。
+//
+// 🚨 指定设备严格化（D7 执行面归属铁律）：显式传了 DeviceID 就**只认这台**，
+// 离线时返回空集（→ 派发失败 → 上层明确报错），绝不回退到其他在线设备。
+//
+// 注意本函数自身一直是严格的；真正的归属断裂在**上游**：tools.DeviceRunner
+// 构造 DeviceTask 时未填 DeviceID，导致这里 req.DeviceID 恒为空 → 走下面的
+// `hub.IDs()` 分支（全部在线设备按 ID 排序取首个）。已在 device_runner.go
+// 的 runOnDevice 里修好，本函数的严格语义是那条链路成立的前提。
 func (d *Dispatcher) candidates(ctx context.Context, req TaskRequest) []string {
 	if d.hub == nil {
 		return nil
@@ -361,6 +369,9 @@ func (d *Dispatcher) candidates(ctx context.Context, req TaskRequest) []string {
 		if d.hub.Online(id) {
 			return []string{id}
 		}
+		// 指定设备离线：**不**回退到其他设备，返回空集让派发明确失败。
+		d.log.Debug("指定执行设备不在线，拒绝回退其他设备",
+			"task_id", req.TaskID, "device_id", id)
 		return nil
 	}
 	if d.pick != nil {

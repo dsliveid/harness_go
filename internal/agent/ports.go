@@ -138,6 +138,12 @@ type ToolRunRequest struct {
 	ToolName    string
 	ArgsJSON    string
 	AccessMode  string // readonly | confirm | full（工具可据此自行收紧行为）
+	// DeviceID 执行面归属设备（D7 执行面归属铁律）：非空时工具**必须**在该设备上执行。
+	//
+	// 空串 = 服务端本地执行面（ws-server 内置空间，或端侧未接入的部署）。
+	// tools.DeviceRunner 会把它原样写入 DeviceTask.DeviceID，交给派发器严格路由：
+	// 指定设备离线时**明确报错**，绝不回退到其他在线设备、也不降级本地执行。
+	DeviceID string
 }
 
 // ToolRunResult 工具执行结果。

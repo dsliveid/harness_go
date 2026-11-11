@@ -109,11 +109,25 @@ func wantsDevice(spec toolapi.Spec) bool {
 }
 
 // tryDevice 尝试端侧执行；ok=false 表示应**静默降级**本地执行（不向用户报错）。
+//
+// 🚨 执行面归属铁律（D7，2026-11 定案）：req.DeviceID 非空时**绝不静默降级**。
+// 该设备离线/不可用必须返回明确的失败结果，原因有三：
+//   ① 会话绑定的是手机 A，用户预期命令在手机 A 上跑。静默降级到服务端本地
+//      等于「在错误的机器上执行」——用户完全无感，属最危险的失真；
+//   ② 端侧写文件会有真实的磁盘副作用，落到服务端 = 污染服务端工作区；
+//   ③ 失败即关闭（fail-closed）优于「看起来成功了」。
+//
+// 仅在 req.DeviceID 为空（服务端内置空间 / 未接入端侧的部署）时才保留旧的静默降级，
+// 因为那时「本地执行」本就是正确的执行面。
 func (r *Runner) tryDevice(ctx context.Context, spec toolapi.Spec, req agent.ToolRunRequest) (
 	agent.ToolRunResult, bool,
 ) {
 	if r.devices == nil || !wantsDevice(spec) {
 		return agent.ToolRunResult{}, false
+	}
+	// 绑定了具体设备：执行面已确定，任何不可用都必须显式失败（不回退、不降级）。
+	if deviceID := strings.TrimSpace(req.DeviceID); deviceID != "" {
+		return r.runOnDevice(ctx, spec, req, deviceID)
 	}
 	// 无在线设备 → 立即降级，不发起派发（不变量 5：绝不让用户等 TTL）
 	if r.devices.Online() <= 0 {
@@ -147,6 +161,51 @@ func (r *Runner) tryDevice(ctx context.Context, spec toolapi.Spec, req agent.Too
 		return agent.ToolRunResult{}, false
 	}
 
+	return deviceTaskResult(res)
+}
+
+// runOnDevice 在**指定设备**上执行工具，不可用即显式失败（D7 执行面归属铁律）。
+//
+// 与上面的「自动挑选」路径的关键差异：这里永不返回 ok=false，
+// 因为返回 false 会让调用方降级到服务端本地执行，那是错误执行面。
+func (r *Runner) runOnDevice(ctx context.Context, spec toolapi.Spec, req agent.ToolRunRequest, deviceID string) (
+	agent.ToolRunResult, bool,
+) {
+	res, err := r.devices.Execute(ctx, DeviceTask{
+		TaskID:      req.ToolEventID,
+		RunID:       req.RunID,
+		ToolEventID: req.ToolEventID,
+		ToolName:    req.ToolName,
+		Args:        json.RawMessage(req.ArgsJSON),
+		// 显式指定：派发器只认这台设备，离线即失败，绝不回退其他在线设备。
+		DeviceID: deviceID,
+	})
+	switch {
+	case errors.Is(err, ErrDeviceTaskInFlight):
+		return failure(model.ToolError, "任务已在设备 "+deviceID+" 上执行中，未重复派发"), true
+	case ctx.Err() != nil:
+		return failureForCtx(ctx), true
+	case err != nil || res.Degraded:
+		// 🚨 不降级：这是执行面归属的硬边界，必须让模型与用户都看到失败。
+		reason := orDefault(res.Error, "设备不可用")
+		if err != nil && strings.TrimSpace(res.Error) == "" {
+			reason = err.Error()
+		}
+		// 显式构造而不用 failure()：后者固定标 Executor=server + trusted，
+		// 会让审计误以为「服务端真的执行了」，掩盖执行面归属失败这一事实。
+		return agent.ToolRunResult{
+			Status:      model.ToolError,
+			Error:       "工作空间绑定的设备 " + deviceID + " 当前不可用（" + reason + "），未在服务端本地执行",
+			Executor:    model.ExecutorDevice,
+			DeviceID:    deviceID,
+			SourceTrust: model.TrustUntrusted,
+		}, true
+	}
+	return deviceTaskResult(res)
+}
+
+// deviceTaskResult 把端侧成功结果包装为引擎可消费的工具结果。
+func deviceTaskResult(res DeviceTaskResult) (agent.ToolRunResult, bool) {
 	// 端侧真实执行过：结果原样落地，**不重跑**（超时亦不降级，避免重复副作用）
 	status := res.Status
 	if status == "" {

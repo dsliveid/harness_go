@@ -147,16 +147,70 @@ type RunRequest struct {
 	// 引导用户消息推入该通道，引擎在**轮次边界**消费——当前流结束后模型即看到该引导。
 	// 消息已由 service 层落库，引擎只回灌上下文不重复落库；nil 表示本 Run 不支持引导。
 	GuidanceCh <-chan *model.Message
-	// DenyTools 仅对话模式（工作空间能力天花板，协议 §4.1）：为 true 时，
-	// command / danger 级工具的调用在 Gate.Evaluate **之前**被立即拒绝并落库，
-	// 不进入 waiting_approval、不阻塞 Gate.Await，Run 继续执行。
+	// ToolPolicy 工具能力策略（工作空间能力天花板，协议 §4.1）：三态，由 service 层唯一裁决。
 	//
-	// 铁律：判定唯一入口在 service 层（按 session.workspace_id 所指 Workspace 的 kind），
+	// 被拒工具在 Gate.Evaluate **之前**立即拒绝并落库，不进入 waiting_approval、
+	// 不阻塞 Gate.Await，Run 继续执行（拒绝粒度是工具调用级）。
+	//
+	// 铁律：判定唯一入口在 service 层（按 session.workspace_id 所指 Workspace 的运行时状态），
 	// 引擎只消费结果，不做第二套判定（避免两处实现漂移）。
-	DenyTools bool
-	// DenyReason 仅对话模式下的拒绝文案（展示给模型，避免它反复重试）。
-	// 空串时由引擎取默认文案。
-	DenyReason string
+	ToolPolicy ToolPolicy
+	// PolicyReason 策略拒绝文案（展示给模型，避免它反复重试）。空串时由引擎取默认文案。
+	PolicyReason string
+	// ExecutionDeviceID 执行面归属设备（D7 执行面归属铁律）：工具**必须**在这台设备上执行。
+	//
+	// 空串 = 服务端内置空间（ws-server），允许本地执行。
+	// 非空 = 会话绑定的工作空间所归属的设备，引擎逐层透传至 DeviceTask.DeviceID。
+	//
+	// 🚨 为什么必须显式传递：派发器在未指定设备时会退化为「全部在线设备按 ID 排序取首个」，
+	// 导致会话绑手机 A、工具却在桌面端 B 上执行（错误执行，非功能缺失）。
+	ExecutionDeviceID string
+}
+
+// ToolPolicy 工具能力策略（工作空间能力天花板的三态表达）。
+//
+// 为什么必须是三态而不是布尔：能力边界客观上有三种，用布尔会逼迫其中一档被错误合并。
+// 历史教训：旧的 `DenyTools bool` 只拦 command + danger 两级，`write` 级（write_file /
+// edit_file）被静默放行——移动端「禁止文件写入」的契约形同虚设。
+//
+// 三态的语义边界（互不重叠）：
+//   - full     ：允许全部工具（在线设备空间 / 服务端内置空间，仍受 kind 与审批链约束）；
+//   - readonly ：仅允许 readonly 级（移动端：仅对话 + 图片识别，禁写禁命令）；
+//   - none     ：拒绝**全部**工具（未绑定设备 / 设备离线 / 设备已删除或已解绑）。
+//
+// 🚨 none 不是「少给点能力」，而是安全边界：这些空间没有可用的执行宿主，
+// 任何工具调用都只能落到服务端本地执行，等于把用户的设备操作偷偷跑在服务端上（见 D8）。
+type ToolPolicy string
+
+const (
+	// ToolPolicyFull 允许全部工具（受 kind 与审批链约束）。
+	ToolPolicyFull ToolPolicy = "full"
+	// ToolPolicyReadonly 仅允许 readonly 级工具（移动端）。
+	ToolPolicyReadonly ToolPolicy = "readonly"
+	// ToolPolicyNone 拒绝全部工具（无可用执行宿主）。
+	ToolPolicyNone ToolPolicy = "none"
+)
+
+// Allows 判断该策略下 risk 级工具是否可执行。
+//
+// 零值（空串）按 full 处理：保证未接入工作空间判定的既有调用点（含测试）零回归。
+func (p ToolPolicy) Allows(risk model.Risk) bool {
+	switch p {
+	case ToolPolicyNone:
+		return false
+	case ToolPolicyReadonly:
+		return risk == model.RiskReadonly
+	default:
+		return true
+	}
+}
+
+// defaultPolicyReason 策略拒绝时的兜底文案（模型可见，必须说清「为什么」与「怎么办」）。
+func defaultPolicyReason(p ToolPolicy) string {
+	if p == ToolPolicyReadonly {
+		return "当前工作空间仅支持只读操作与对话，禁止执行命令或写入文件"
+	}
+	return "当前工作空间未连接可用的执行设备，无法调用工具"
 }
 
 // Execute 执行 Run，阻塞直到终态。
@@ -630,17 +684,21 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 
 	// ===== 能力天花板短路（协议 §4.1 / §4.2）=====
 	//
-	// 移动端工作空间与纯对话会话（req.DenyTools=true）不允许执行命令级工具。
-	// 必须在 Gate.Evaluate **之前**短路拒绝，理由：
+	// 必须按 ToolPolicy 三态裁决，且必须在 Gate.Evaluate **之前**短路拒绝，理由：
 	//   ① 若走审批路径，会滞留 waiting_approval，而 DefaultTimeout = 5min（超时才视为拒绝），
 	//      用户要白等 5 分钟才被告知"不行"；
 	//   ② 状态机会经历一次无意义的 waiting_approval 迁移，污染 runs.status 与下游重建逻辑；
 	//   ③ 这是能力边界而非人工决策，本就不该交给人来点。
 	// 拒绝粒度是**工具调用级**：Run 必须继续执行，用户可继续聊别的话题。
-	if req.DenyTools && (risk == model.RiskCommand || risk == model.RiskDanger) {
-		reason := req.DenyReason
+	//
+	// 🚨 历史缺陷（勿回退）：此处曾用 `DenyTools bool` 只拦 command + danger，
+	// 导致 write 级（write_file / edit_file）被静默放行 —— 移动端「禁止文件写入」
+	// 与无设备空间「零工具」两条契约同时失效。改三态后由 Allows() 统一裁决，
+	// 新增风险级只需改一处。
+	if !req.ToolPolicy.Allows(risk) {
+		reason := req.PolicyReason
 		if strings.TrimSpace(reason) == "" {
-			reason = "当前为移动端，仅支持对话功能"
+			reason = defaultPolicyReason(req.ToolPolicy)
 		}
 		// 落库为 denied（审计可查），并保留 risk 便于回溯。
 		_ = sdb.FinishToolEvent(ctx, eventID, model.ToolDenied, "", "", reason, localExec)
@@ -776,6 +834,8 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 		ToolName:    tc.Name,
 		ArgsJSON:    string(tc.Arguments),
 		AccessMode:  string(effMode),
+		// 执行面归属（D7）：显式指定设备，禁止派发器自行挑选其他在线设备。
+		DeviceID: req.ExecutionDeviceID,
 	})
 	if runErr != nil {
 		errText := runErr.Error()

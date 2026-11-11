@@ -502,12 +502,29 @@ paths:
           $ref: "#/components/responses/Unavailable"
     patch:
       tags: [workspaces]
-      summary: 更新工作空间（真 PATCH：缺省字段保留原值）
+      summary: 更新工作空间（绑定/解绑设备、改名、改根目录）
       description: |
         name / device_id / root_path 全部可选，缺省 = 不改；服务端用 *string 承接以区分
         「未传」与「传空串」。
+
+        **device_id 的三种语义（本端点同时承担绑定与解绑）**：
+
+        | 传入值 | 语义 | 校验 |
+        | --- | --- | --- |
+        | 不传 | 不改归属 | — |
+        | `""`（空串） | **解绑** | 🚨 **不校验设备存在性/在线/吊销** |
+        | 设备 ID | **绑定** | 设备存在 + kind 匹配 + 该设备未被其他空间占用 |
+
+        🚨 解绑为何不校验设备：设备被吊销或物理删除后，空间仍指向那台设备。若解绑也要求
+        设备存在，该空间将「因已绑定而不能删」且「因设备不存在而不能解绑」，成为永久僵尸。
+        解绑是唯一逃生通道，必须无条件放行。
+
         🚨 kind 不可修改：传入与原值相同的 kind 幂等通过，**与原值不同立即 400**
         （kind 是能力天花板依据，改 kind 等于提权）。
+
+        🚨 内置服务端空间 `ws-server` 的 device_id 是**只读锚点**：任何改变它的请求
+        （绑定或解绑）都返回 400。它的执行面恒为服务端本地，一旦绑上设备，
+        `executionDeviceID` 会把工具派发到该设备，内置空间语义立即崩塌。
       requestBody:
         required: true
         content:
@@ -529,7 +546,35 @@ paths:
           $ref: "#/components/responses/Unavailable"
     delete:
       tags: [workspaces]
-      summary: 删除工作空间（仍被会话/项目引用或内置服务端空间时 409，不级联）
+      summary: 删除工作空间（migrate_refs=true 时迁移引用后物理删除）
+      description: |
+        两种语义，由 `migrate_refs` 决定：
+
+        - **缺省 / false（严格模式）**：仍被会话/项目引用，或目标是内置服务端空间
+          `ws-server` 时返回 409，不做级联；
+        - **true（确认移除语义，Web 管理端使用）**：服务端在**同一主库事务**内把归属该空间的
+          `sessions` 与 `projects` 一并软删、清掉这些项目的 `project_approval_rules`，
+          最后**物理删除**工作空间行，返回 204。此后 `GET /workspaces` 不再返回该空间
+          （**刷新不会再出现**），其会话/项目也不再出现在列表里。事务提交后服务端还会
+          清理 `sessions/<sid>` 物理目录（失败留孤儿，由启动清理兜底）。
+
+        🚨 为什么不能「把引用迁到内置 ws-server」：后者的能力天花板是 `full`（可写文件 +
+        执行命令），而原空间可能是 `mobile`（readonly）或设备离线（none）。迁过去会把这些
+        会话的写与命令静默改到服务端执行，属**提权**，违反 D8「设备操作不得降级到服务端本地」。
+        级联删除从根上消除了这条路径。
+
+        🚨 **仍绑定设备（`device_id != ''`）的工作空间在两种模式下都返回 409**，
+        错误码 `conflict`，文案「该工作空间仍绑定设备，请先解绑归属后再删除」。
+        `migrate_refs=true` **不能**绕过它 —— 迁移引用解决不了「空间还挂着某台机器」，
+        必须由用户先显式解绑（`PATCH {"device_id":""}`）。该校验同时存在于严格删除与
+        级联删除两条路径（后者在事务内校验，避免 TOCTOU）。
+
+        内置 `ws-server` 在两种模式下都 409（它是历史回填兜底，删掉会让既有引用悬空）。
+      parameters:
+        - name: migrate_refs
+          in: query
+          description: 是否在删除前把引用迁回内置服务端空间（缺省 false = 有引用即 409）
+          schema: { type: boolean, default: false }
       responses:
         "204": { description: 已删除 }
         "404":
@@ -2343,10 +2388,18 @@ components:
     Workspace:
       type: object
       description: |
-        工作空间视图 = `model.Workspace`（internal/model/workspace.go:39-47）
-        + `service.WorkspaceView` 的两个运行时派生字段（internal/service/workspace_service.go:19-23）。
+        工作空间视图 = `model.Workspace`（internal/model/workspace.go）
+        + `service.WorkspaceView` 的运行时派生字段（internal/service/workspace_service.go）。
         kind 是能力天花板依据，创建后不可修改（改 kind 等于提权）。
-      required: [id, name, kind, device_id, root_path, online, host, created_at, updated_at]
+
+        **设备联动与能力三态（v2 契约）**：
+        - 工作空间与设备严格一对一（同一设备只能有一个空间）；
+        - `tool_policy` 是工具能力的**权威裁决**，前端不得按 online/kind 自行推导；
+        - 无可用宿主（未绑定 / 离线 / 设备已删除 / 已解绑）时 `tool_policy=none`，
+          但 `can_chat` 恒为 true——**可以对话，只是无法调用工具**；
+        - 设备空间的所有工具都在**该设备**上执行，设备不可用时明确报错，
+          绝不静默降级到服务端本地执行（执行面归属铁律）。
+      required: [id, name, kind, device_id, root_path, online, host, bound, device_missing, device_revoked, tool_policy, can_chat, created_at, updated_at]
       properties:
         id:
           type: string
@@ -2361,19 +2414,63 @@ components:
           description: |
             工作空间类型（internal/model/workspace.go:10-19）。server 为唯一无需设备即可执行的空间；
             mobile 仅对话 + 图片识别。取值与前端 `WorkspaceKindDTO` 逐字一致，不引入 cli / tablet。
+            绑定或切换设备时服务端校验 kind 与设备形态一致，不一致返回 400（防能力天花板错位/提权）。
         device_id:
           type: string
-          description: 归属设备 ID；空串 = 服务端内置空间（恒在线），非空必须对应一台已配对设备
+          description: 归属设备 ID；空串 = 服务端内置空间或未绑定设备的空间（后者 bound=false）
         root_path:
           type: string
           description: 宿主侧根目录；服务端内置空间为空串（磁盘路径在会话的 workspace_path 上）
         online:
           type: boolean
-          description: 派生字段，不落库。device_id 为空恒 true；否则取设备 Hub 实时在线判定（Hub 未启用按离线）
+          description: |
+            派生字段，不落库。内置服务端空间（id=ws-server）恒 true；
+            否则取设备 Hub 实时在线判定（Hub 未启用一律按离线 = fail-closed）。
         host:
           type: string
-          description: 派生字段，不落库。设备空间为 `device:<device_id>`，服务端内置空间为 `server`
+          description: 派生字段，不落库。设备空间为 `device:<device_id>`，服务端内置空间或未绑定空间为 `server`
           example: device:dev-abc123
+        bound:
+          type: boolean
+          description: 是否有可用执行宿主。内置服务端空间恒 true；未绑定设备 / 设备已删除 / 已解绑时为 false
+        device_name:
+          type: string
+          description: 归属设备名快照（未绑定或设备已删除时缺省）
+        device_kind:
+          type: string
+          enum: [desktop, tablet, mobile, cli, browser]
+          description: 归属设备形态快照
+        device_status:
+          type: string
+          enum: [online, offline, revoked]
+          description: 归属设备状态快照（设备域 devices.status）
+        device_missing:
+          type: boolean
+          description: |
+            绑定关系仍在但设备记录已不存在（已物理删除）。**与「离线」严格区分**：
+            离线可恢复，已删除必须重新绑定。
+        device_revoked:
+          type: boolean
+          description: 设备已解绑（devices.revoked_at 置位，不可恢复，需重新配对）
+        last_seen_at:
+          type: integer
+          format: int64
+          description: 设备最近活跃时间（Unix 毫秒）；未绑定或缺省表示未知
+        tool_policy:
+          type: string
+          enum: [full, readonly, none]
+          description: |
+            **工具能力权威裁决**（internal/agent.ToolPolicy），前端不得自行推导：
+            - full     全部工具（在线设备空间 / 内置服务端空间，仍受 kind 与审批链约束）；
+            - readonly 仅 readonly 级工具（移动端、纯对话会话）；
+            - none     零工具（未绑定 / 离线 / 已删除 / 已解绑）。
+            引擎在审批评估**之前**短路拒绝越界工具，Run 继续执行（拒绝粒度是工具调用级）。
+        policy_reason:
+          type: string
+          description: 策略降级的人类可读原因（可直接展示给用户）
+        can_chat:
+          type: boolean
+          description: 是否可发起对话。**恒为 true**——无可用宿主也允许对话，只是没有工具能力
         created_at:
           type: integer
           format: int64

@@ -25,6 +25,14 @@ type readOnlyCatalog struct{}
 
 func (readOnlyCatalog) Risk(string) (model.Risk, bool) { return model.RiskReadonly, true }
 
+// writeCatalog 写级风险：用于锁死「none 策略必须拦下 write」这条防倒退契约。
+//
+// 旧 DenyTools 布尔只拦 command+danger，write 级被静默放行——移动端「禁止文件写入」
+// 与无设备空间「零工具」两条契约同时失效。本桩存在的唯一目的就是守住这个边界。
+type writeCatalog struct{}
+
+func (writeCatalog) Risk(string) (model.Risk, bool) { return model.RiskWrite, true }
+
 // approvalRequestPayload 从事件流里取第一条 approval_request 的 payload。
 func approvalRequestPayload(t *testing.T, bus *events.Bus) map[string]any {
 	t.Helper()

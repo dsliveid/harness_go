@@ -143,6 +143,8 @@ func newTestServerWithDevices(t *testing.T) (*httptest.Server, string, *service.
 		Devices:     deviceSvc,
 		DeviceWS:    deviceGW,
 		Projects:    service.NewProjectService(mainStore),
+		// 工作空间域：删除语义（migrate_refs）与「移除后刷新复活」回归依赖它装配。
+		Workspaces: service.NewWorkspaceService(mainStore, deviceHub),
 		// 核心 SOP：出厂内置 + 运行时覆盖（dataDir 即 t.TempDir，天然隔离）。
 		SOP: service.NewSOPService(dir, 800),
 		Bus: bus,

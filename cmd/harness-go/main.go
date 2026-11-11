@@ -79,6 +79,17 @@ const defaultSystemBase = `你是 harness-go 的编码助手。
 3. 回答简洁，先给结论再给细节。`
 
 func main() {
+	// 离线救命通道：reset-password 子命令必须在 run() 之前分流。
+	//
+	// 理由：run() 会启动 HTTP 服务、拉起 store/agent 全套依赖；而「忘记口令」的场景
+	// 恰恰可能发生在服务无法正常启动时（配置错、端口冲突），此时仍必须能重置口令。
+	if isResetPasswordCmd(os.Args[1:]) {
+		if err := runResetPassword(os.Args[2:], os.Stdout, os.Stderr); err != nil {
+			fmt.Fprintf(os.Stderr, "harness-go reset-password: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "harness-go: %v\n", err)
 		os.Exit(1)
@@ -665,6 +676,10 @@ func run() error {
 		},
 	})
 	var deviceGateway *device.Gateway
+	// 能力天花板需要「设备此刻是否在线」这一运行时事实：注入 Hub 后，
+	// 离线/未绑定/已删除的设备空间才会被判定为 tool_policy=none（D3/D4）。
+	// 注入前若已有 Run 在跑，那些 Run 会因 hub==nil 按离线处理（fail-closed，安全方向）。
+	runSvc.SetHub(deviceHub)
 	if cfg.Devices.Enabled {
 		deviceHub.Start(ctx)
 		// 吊销设备时断开其长连接（后置注入，打破构造期循环依赖）
@@ -738,7 +753,7 @@ func run() error {
 		Webhooks:    webhookSvc,
 		OpenAI:      openaiSvc,
 		Projects:    service.NewProjectService(mainStore),
-		Workspaces:  service.NewWorkspaceService(mainStore, deviceHub),
+		Workspaces:  service.NewWorkspaceService(mainStore, deviceHub).WithSessionStore(sessionStore),
 		SOP:         sopSvc,
 		FSRoots:     fsRoots,
 		DeviceWS:    deviceWSHandler(deviceGateway),

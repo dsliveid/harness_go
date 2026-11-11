@@ -2,6 +2,8 @@ package api
 
 import (
 	"net/http"
+	"strconv"
+	"strings"
 
 	"harness-go/internal/apperr"
 	"harness-go/internal/service"
@@ -126,15 +128,20 @@ func (h *handlers) updateWorkspace(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, v)
 }
 
-// deleteWorkspace 删除工作空间（仍被会话/项目引用时 409，不级联）。
+// deleteWorkspace 删除工作空间。
 //
-//	DELETE /api/v1/workspaces/{wid}
+//	DELETE /api/v1/workspaces/{wid}[?migrate_refs=true]
+//
+// migrate_refs 缺省（false）= 严格模式：仍被会话/项目引用时 409，不级联。
+// migrate_refs=true = 一次性落地删除：服务端在事务内把这些会话/项目迁回内置
+// ws-server（回落服务端本地执行）后物理删除空间行，接口返回 204 且不再复活。
 func (h *handlers) deleteWorkspace(w http.ResponseWriter, r *http.Request) {
 	if h.d.Workspaces == nil {
 		writeError(w, r, workspacesUnavailableErr())
 		return
 	}
-	if err := h.d.Workspaces.Delete(r.Context(), r.PathValue("wid")); err != nil {
+	migrateRefs, _ := strconv.ParseBool(strings.TrimSpace(r.URL.Query().Get("migrate_refs")))
+	if err := h.d.Workspaces.Delete(r.Context(), r.PathValue("wid"), migrateRefs); err != nil {
 		writeError(w, r, err)
 		return
 	}
