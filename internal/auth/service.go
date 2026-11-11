@@ -151,6 +151,39 @@ func (s *Service) ChangePassword(ctx context.Context, userID, oldPassword, newPa
 	return s.main.Users().UpdatePassword(ctx, userID, hash)
 }
 
+// ResetPassword 离线重置口令（**不校验旧口令**，仅供服务端本地救命通道使用）。
+//
+// 与 ChangePassword 的分工必须严格区分：
+//   - ChangePassword 是「已登录用户自助改密」，旧口令是必需的，走 HTTP 端点；
+//   - ResetPassword 是「忘记口令的运维兜底」，只在进程本地通过 CLI 调用，
+//     **绝不暴露任何 HTTP 路由**（否则等于给攻击者一个免旧口令的改密接口）。
+//
+// 重置后强制吊销该账号全部现存令牌：口令已被重置的场景通常伴随「疑似泄露/交接」，
+// 旧会话若继续有效，重置就失去意义。返回吊销条数供调用方打印。
+func (s *Service) ResetPassword(ctx context.Context, username, newPassword string) (revoked int64, err error) {
+	username = strings.TrimSpace(username)
+	if username == "" {
+		return 0, errors.New("auth: 用户名不能为空")
+	}
+	// 与 ChangePassword 同口径的最小强度门槛（8 字符）。
+	// 刻意不引入更复杂的强度检查：离线兜底场景下挡住用户的代价大于收益。
+	if len([]rune(newPassword)) < 8 {
+		return 0, apperr.New(apperr.CodeAuthPasswordPolicy, "新口令至少 8 个字符")
+	}
+	u, err := s.main.Users().GetByUsername(ctx, username)
+	if err != nil {
+		return 0, fmt.Errorf("auth: 账号 %q 不存在: %w", username, err)
+	}
+	hash, err := HashPassword(newPassword, s.params)
+	if err != nil {
+		return 0, err
+	}
+	if err := s.main.Users().UpdatePassword(ctx, u.ID, hash); err != nil {
+		return 0, err
+	}
+	return s.main.Tokens().RevokeByUser(ctx, u.ID, s.now().UnixMilli())
+}
+
 // IssueToken 签发令牌，返回明文（仅此一次）与记录。
 func (s *Service) IssueToken(ctx context.Context, userID, kind, scope string) (string, *model.Token, error) {
 	plain := "hgt_" + randomHex(24)

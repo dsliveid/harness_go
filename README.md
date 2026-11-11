@@ -68,6 +68,13 @@ chmod +x ./harness-go ./start.sh && ./start.sh
 **首次登录**：首启自动创建管理员并生成随机口令写入 `data/initial_password`
 （第一行用户名、第二行口令，权限 0600，仅生成一次）。登录后请立即在「设置 → 账户」改口令。
 
+**忘记口令**：用内置子命令离线重置（无需旧口令、无需重启服务；会吊销该账号所有现存会话）：
+
+```powershell
+./harness-go reset-password -user admin -data ./data              # 随机生成并打印新口令
+./harness-go reset-password -user admin -data ./data -password "至少8位的新口令"
+```
+
 ### 3.2 源码开发
 
 ```powershell
