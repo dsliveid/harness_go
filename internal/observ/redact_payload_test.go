@@ -44,6 +44,18 @@ func TestRedactPayloadFiveCredentialKinds(t *testing.T) {
 			in:       `aws AKIAIOSFODNN7EXAMPLE done`,
 			mustGone: []string{"AKIAIOSFODNN7EXAMPLE"},
 		},
+		{
+			// 本项目自有令牌：用户把服务端签发的 hgt_/hgd_ 粘进对话时也必须脱敏，
+			// 否则「这个 token 为什么 401」这类提问会把有效凭据写进日志库。
+			name:     "本项目用户令牌 hgt_",
+			in:       `帮我看看 hgt_0123456789abcdef0123456789abcdef0123456789abcdef 为什么 401`,
+			mustGone: []string{"hgt_0123456789abcdef0123456789abcdef0123456789abcdef"},
+		},
+		{
+			name:     "本项目设备令牌 hgd_",
+			in:       `{"device_token":"hgd_0123456789abcdef0123456789abcdef"}`,
+			mustGone: []string{"hgd_0123456789abcdef0123456789abcdef"},
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

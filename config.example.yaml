@@ -57,6 +57,7 @@ data:
   #   data/snapshots/blobs/            全局 CAS（文件快照，跨会话去重）
   #   data/app.log                     日志（GET /api/v1/logs 尾行读它）
   #   data/initial_password            首启随机口令（0600，仅生成一次）
+  #   data/initial_token               首启 API 令牌（0600，直接可用于 curl -H @file）
   dir: "./data"
 
 # ---------------------------------------------------------------------------

@@ -461,6 +461,29 @@ func (r *TokenRepo) RevokeByUser(ctx context.Context, userID string, at int64) (
 	return n, nil
 }
 
+// RevokeByKind 吊销某类型下全部未吊销令牌，返回吊销条数。
+//
+// 用途：rotate-api-token 子命令一次性作废全部 api 令牌（不动 web_session / sso），
+// 避免「首启令牌曾被打印进日志」这类历史泄漏点继续有效——只吊销单条不够，
+// 因为调用方拿不到旧令牌的 id（明文在日志里，hash 在库内，无法反查）。
+// 幂等：无匹配时返回 0 且不报错。
+func (r *TokenRepo) RevokeByKind(ctx context.Context, kind string, at int64) (int64, error) {
+	if strings.TrimSpace(kind) == "" {
+		// 空 kind 会命中全部令牌，属于高危误伤，直接拒绝。
+		return 0, fmt.Errorf("store: 按类型吊销令牌时 kind 不能为空")
+	}
+	res, err := r.s.conn().ExecContext(ctx,
+		`UPDATE api_tokens SET revoked_at=? WHERE kind=? AND revoked_at IS NULL`, at, kind)
+	if err != nil {
+		return 0, fmt.Errorf("store: 按类型吊销令牌失败: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("store: 读取影响行数失败: %w", err)
+	}
+	return n, nil
+}
+
 // ============ 配置 ============
 
 // SettingsRepo 主库键值配置仓储（含 tools.tiers 的全局层）。

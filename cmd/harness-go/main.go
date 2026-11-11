@@ -90,6 +90,14 @@ func main() {
 		}
 		return
 	}
+	// 离线轮转 API 令牌：同理必须在 run() 之前分流（服务起不来时也要能换令牌）。
+	if isRotateAPITokenCmd(os.Args[1:]) {
+		if err := runRotateAPIToken(os.Args[2:], os.Stdout, os.Stderr); err != nil {
+			fmt.Fprintf(os.Stderr, "harness-go rotate-api-token: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "harness-go: %v\n", err)
 		os.Exit(1)
@@ -421,7 +429,23 @@ func run() error {
 	if plain, created, tErr := authSvc.EnsureBootstrapToken(ctx); tErr != nil {
 		return tErr
 	} else if created {
-		logger.Warn("已生成初始 API 令牌（仅显示一次，请妥善保存）", "token", plain)
+		// ⚠️ 铁律：令牌明文**绝不进 logger**。
+		//
+		// 历史事故：这里曾写成 logger.Warn(..., "token", plain)，而 logger 是
+		// io.MultiWriter(os.Stdout, data/app.log) —— 令牌明文直接落进 app.log，
+		// 且 GET /api/v1/logs（admin scope）能在界面上原样回读，轮转后还有 app.log.1..N 多份。
+		// 「仅显示一次」的语义在日志文件面前完全不成立。
+		//
+		// 与口令完全同口径处理：只写 0600 文件，日志里只出现文件路径。
+		tokenFile, wErr := persistBootstrapToken(dataDir, plain)
+		if wErr != nil {
+			// 写入失败绝不能退化成打印明文兜底（那等于恢复了本 bug）。
+			logger.Error("写入初始 API 令牌文件失败：本次令牌将对调用方不可见，请用 rotate-api-token 重新签发",
+				"err", wErr, "token_file", tokenFile)
+		} else {
+			logger.Warn("已生成初始 API 令牌，明文写入 data/initial_token（权限 0600），日志中不再出现",
+				"token_file", tokenFile)
+		}
 	}
 
 	// ⑩ 用例层

@@ -284,6 +284,31 @@ func (s *Service) EnsureBootstrapToken(ctx context.Context) (plain string, creat
 	return plain, true, nil
 }
 
+// RotateBootstrapToken 作废全部 api 令牌并签发一个新的引导令牌。
+//
+// 为什么按 kind 整体吊销而不是逐条：历史泄漏点（明文被打印进 app.log）的调用方
+// 只有明文、库内只有 hash，**无法反查令牌 id**，所以只能按类型整体吊销。
+// 刻意不动 web_session / sso：那会把用户从浏览器和客户端全部踢下线，
+// 而本命令要解决的是「API 令牌泄漏」，不应扩大副作用面。
+//
+// 返回值 revoked 为本次作废的旧 api 令牌条数（无旧令牌时为 0，非错误）。
+func (s *Service) RotateBootstrapToken(ctx context.Context) (plain string, revoked int64, err error) {
+	revoked, err = s.main.Tokens().RevokeByKind(ctx, model.TokenKindAPI, s.now().UnixMilli())
+	if err != nil {
+		return "", 0, err
+	}
+	// 复用 EnsureBootstrapToken：此刻 api 类已全部吊销，CountByKind 归零 → 必然新建一条。
+	// 这样「令牌怎么造、绑给谁、什么 scope」只有一处定义，不会随新命令悄悄漂移。
+	plain, _, err = s.EnsureBootstrapToken(ctx)
+	if err != nil {
+		return "", revoked, err
+	}
+	if plain == "" {
+		return "", revoked, errors.New("auth: 轮转后未签发新令牌")
+	}
+	return plain, revoked, nil
+}
+
 // HashToken 令牌哈希（sha256 hex）。库内永不存明文。
 func HashToken(plain string) string {
 	sum := sha256.Sum256([]byte(plain))

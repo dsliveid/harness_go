@@ -45,6 +45,17 @@ var redactRules = []redactRule{
 		re:    regexp.MustCompile(`sk-[A-Za-z0-9_-]{16,}`),
 		repl:  "***",
 	},
+	// 本项目自有令牌（用户 hgt_ / 设备 hgd_ / 设备注册 hgd_ 同族）。
+	//
+	// 为什么必须单独一条：上面 sk- 规则只覆盖 OpenAI/Anthropic 风格密钥，而本项目的
+	// 令牌前缀是 hgt_/hgd_。用户完全可能把「本服务端签给自己的令牌」粘进对话或工具参数
+	// （"帮我看下这个 token 为什么 401"），此时 logvault 落库若不脱敏 = 明文长期留档。
+	{
+		name:  "harness_token",
+		hints: []string{"hgt_", "hgd_"},
+		re:    regexp.MustCompile(`hg[td]_[A-Za-z0-9]{16,}`),
+		repl:  "***",
+	},
 	// Authorization: Bearer <token>
 	{
 		name:  "bearer",
