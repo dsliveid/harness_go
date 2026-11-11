@@ -1,4 +1,4 @@
-package device
+﻿package device
 
 import (
 	"context"
@@ -73,7 +73,7 @@ func TestGatewayFullChainPairDispatchDegradeReconnect(t *testing.T) {
 	if issuer.TTL() != 120*time.Second {
 		t.Fatalf("配对码 TTL 铁律 120s，得到 %s", issuer.TTL())
 	}
-	code, err := issuer.Issue(context.Background(), "桌面端", model.DeviceKindDesktop)
+	code, err := issuer.Issue(context.Background(), "桌面端", model.DeviceKindDesktop, "")
 	if err != nil {
 		t.Fatalf("签发配对码失败: %v", err)
 	}

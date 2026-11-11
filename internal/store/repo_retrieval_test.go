@@ -1,4 +1,4 @@
-package store
+﻿package store
 
 import (
 	"context"
@@ -41,8 +41,8 @@ func TestRetrievalMigration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v != 9 {
-		t.Fatalf("主库 schema 版本期望 9，得到 %d", v)
+	if v != 11 {
+		t.Fatalf("主库 schema 版本期望 11，得到 %d", v)
 	}
 }
 

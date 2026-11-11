@@ -1,4 +1,4 @@
-package device
+﻿package device
 
 import (
 	"context"
@@ -92,7 +92,7 @@ func TestPairCodeTTL120s(t *testing.T) {
 	base := time.Date(2026, 11, 1, 10, 0, 0, 0, time.UTC)
 	issuer.SetClock(fixedClock(base))
 
-	pc, err := issuer.Issue(context.Background(), "我的桌面端", model.DeviceKindDesktop)
+	pc, err := issuer.Issue(context.Background(), "我的桌面端", model.DeviceKindDesktop, "")
 	if err != nil {
 		t.Fatalf("生成配对码失败: %v", err)
 	}
@@ -108,6 +108,57 @@ func TestPairCodeTTL120s(t *testing.T) {
 	}
 }
 
+// TestPairCodeCarriesOwnerUser 配对码必须记住授权者，且兑换能原样取回。
+//
+// 这是「配对后免二次登录」的身份来源：签发时 handler 传入已登录账号的 UserID，
+// 兑换成功即据此签发用户会话。若此链路断掉，端侧只能回落到手动登录。
+func TestPairCodeCarriesOwnerUser(t *testing.T) {
+	issuer := NewPairCodeIssuer(newFakePairCodeStore(), 120*time.Second)
+	issuer.SetClock(fixedClock(time.Date(2026, 11, 1, 10, 0, 0, 0, time.UTC)))
+
+	pc, err := issuer.Issue(context.Background(), "我的手机", model.DeviceKindMobile, " usr_owner_9 ")
+	if err != nil {
+		t.Fatalf("生成配对码失败: %v", err)
+	}
+	// 首尾空白必须归一，否则后续按 user_id 取账号会查不到。
+	if pc.UserID != "usr_owner_9" {
+		t.Fatalf("配对码应记录归一化后的授权用户，得到 %q", pc.UserID)
+	}
+
+	redeemed, err := issuer.Redeem(context.Background(), pc.Code)
+	if err != nil {
+		t.Fatalf("兑换配对码失败: %v", err)
+	}
+	if redeemed.UserID != "usr_owner_9" {
+		t.Fatalf("兑换结果应原样返回授权用户，得到 %q", redeemed.UserID)
+	}
+}
+
+// TestPairCodeWithoutOwnerUser 不携带授权者（历史码 / 未登录签发）必须合法且兑换成功。
+//
+// 语义是「配对照常成功，只是不下发用户会话」，绝不能因此让配对失败 ——
+// 否则老配对码、以及未装配 Auth 的部署都会被这条新能力拖死。
+func TestPairCodeWithoutOwnerUser(t *testing.T) {
+	issuer := NewPairCodeIssuer(newFakePairCodeStore(), 120*time.Second)
+	issuer.SetClock(fixedClock(time.Date(2026, 11, 1, 10, 0, 0, 0, time.UTC)))
+
+	pc, err := issuer.Issue(context.Background(), "", model.DeviceKindMobile, "   ")
+	if err != nil {
+		t.Fatalf("无授权者时应能正常签发: %v", err)
+	}
+	if pc.UserID != "" {
+		t.Fatalf("纯空白授权者应归一为空串，得到 %q", pc.UserID)
+	}
+
+	redeemed, err := issuer.Redeem(context.Background(), pc.Code)
+	if err != nil {
+		t.Fatalf("无授权者的配对码也必须能兑换: %v", err)
+	}
+	if redeemed.UserID != "" {
+		t.Fatalf("无授权者兑换后仍应为空串，得到 %q", redeemed.UserID)
+	}
+}
+
 // TestPairCodeExpiredRejected 过期后兑换失败，且与"不存在"同错误（防枚举）。
 func TestPairCodeExpiredRejected(t *testing.T) {
 	store := newFakePairCodeStore()
@@ -117,7 +168,7 @@ func TestPairCodeExpiredRejected(t *testing.T) {
 	clock := &movableClock{cur: now}
 	issuer.SetClock(clock.Now)
 
-	pc, err := issuer.Issue(context.Background(), "", model.DeviceKindMobile)
+	pc, err := issuer.Issue(context.Background(), "", model.DeviceKindMobile, "")
 	if err != nil {
 		t.Fatalf("生成配对码失败: %v", err)
 	}
@@ -128,7 +179,7 @@ func TestPairCodeExpiredRejected(t *testing.T) {
 	}
 
 	// 新码跨过 120s → 拒绝
-	pc2, err := issuer.Issue(context.Background(), "", model.DeviceKindMobile)
+	pc2, err := issuer.Issue(context.Background(), "", model.DeviceKindMobile, "")
 	if err != nil {
 		t.Fatalf("生成配对码失败: %v", err)
 	}
@@ -143,7 +194,7 @@ func TestPairCodeSingleUse(t *testing.T) {
 	store := newFakePairCodeStore()
 	issuer := NewPairCodeIssuer(store, 120*time.Second)
 
-	pc, err := issuer.Issue(context.Background(), "", model.DeviceKindCLI)
+	pc, err := issuer.Issue(context.Background(), "", model.DeviceKindCLI, "")
 	if err != nil {
 		t.Fatalf("生成配对码失败: %v", err)
 	}
@@ -160,7 +211,7 @@ func TestPairCodeConcurrentRedeemOnlyOnce(t *testing.T) {
 	store := newFakePairCodeStore()
 	issuer := NewPairCodeIssuer(store, 120*time.Second)
 
-	pc, err := issuer.Issue(context.Background(), "", model.DeviceKindDesktop)
+	pc, err := issuer.Issue(context.Background(), "", model.DeviceKindDesktop, "")
 	if err != nil {
 		t.Fatalf("生成配对码失败: %v", err)
 	}
@@ -196,7 +247,7 @@ func TestPairCodeAntiEnumeration(t *testing.T) {
 	issuer.SetClock(clock.Now)
 
 	// 已消费
-	used, err := issuer.Issue(context.Background(), "", model.DeviceKindDesktop)
+	used, err := issuer.Issue(context.Background(), "", model.DeviceKindDesktop, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +255,7 @@ func TestPairCodeAntiEnumeration(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 已过期
-	expired, err := issuer.Issue(context.Background(), "", model.DeviceKindDesktop)
+	expired, err := issuer.Issue(context.Background(), "", model.DeviceKindDesktop, "")
 	if err != nil {
 		t.Fatal(err)
 	}

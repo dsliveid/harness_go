@@ -21,8 +21,23 @@ type DeviceRepo struct{ s *MainStore }
 // Devices 返回设备仓储。
 func (s *MainStore) Devices() *DeviceRepo { return &DeviceRepo{s: s} }
 
+// deviceCols 设备的列清单（SELECT / INSERT 共用，**唯一真源**）。
+//
+// 🔴 改动铁律（违反即静默数据错位，且现有测试不一定抓得到）：
+//   deviceCols / Create 的占位符与参数顺序 / scanDevice 的 Scan 目标，
+//   三者必须**成组同步**修改，且新列一律追加在**末尾**。
+//
+// 为什么追加在末尾而不是按语义就近插入：扫描的对应关系靠位置而非列名，
+// 中间插列会让它之后的所有字段整体错位一格 —— 而错位不会报错，
+// 只会让 Name 变成 Kind、Platform 变成 Status 之类的荒诞结果。
+// 当前已有 `DeviceService.Get` 的调用方（设备上线的 OnOnline 回调取 name/kind
+// 做 SSE 广播）依赖这些字段正确，错位会导致设备状态推送显示错误的设备信息。
+//
+// 防回归：repo_device_test.go 的 TestDeviceRepoTracksOwnerUserID 会写入
+// 互相可区分的字段值再逐字段核对，专门守这条线。
 const deviceCols = `id, name, kind, platform, status, capabilities_hash, protocol_version,
-	app_version, load_json, token_hash, paired_at, last_seen_at, revoked_at, created_at, updated_at`
+	app_version, load_json, token_hash, paired_at, last_seen_at, revoked_at, created_at, updated_at,
+	user_id`
 
 // Create 新增设备（配对成功后写入；token_hash 必须是 sha256 摘要）。
 func (r *DeviceRepo) Create(ctx context.Context, d *model.Device) error {
@@ -44,10 +59,10 @@ func (r *DeviceRepo) Create(ctx context.Context, d *model.Device) error {
 	}
 	d.CreatedAt, d.UpdatedAt = now, now
 	_, err := r.s.conn().ExecContext(ctx,
-		`INSERT INTO devices(`+deviceCols+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		`INSERT INTO devices(`+deviceCols+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		d.ID, d.Name, string(d.Kind), d.Platform, string(d.Status), d.CapabilitiesHash,
 		d.ProtocolVersion, d.AppVersion, rawOrNil(d.LoadJSON), d.TokenHash,
-		d.PairedAt, d.LastSeenAt, d.RevokedAt, d.CreatedAt, d.UpdatedAt)
+		d.PairedAt, d.LastSeenAt, d.RevokedAt, d.CreatedAt, d.UpdatedAt, d.UserID)
 	if err != nil {
 		return fmt.Errorf("store: 新增设备失败: %w", err)
 	}
@@ -78,8 +93,25 @@ func (r *DeviceRepo) GetByTokenHash(ctx context.Context, tokenHash string) (*mod
 	return &list[0], nil
 }
 
-// List 列出全部设备（含已吊销，按配对时间倒序）。
+// List 列出**未吊销**设备（按配对时间倒序）。
+//
+// 语义变更（解绑双向收敛）：此前本方法返回「全部含已吊销」，导致管理端
+// 「解除绑定」后设备仍以红标卡片留在列表里，用户以为解绑没生效。
+// 现在设备表是**绑定关系的真源**，被吊销即视为「已解除绑定」，默认不再出现在列表。
+//
+// 需要审计/运维查看历史吊销记录时用 ListAll（语义等价于旧 List）。
+//
+// 为什么用 WHERE 过滤而不是物理删除：revoked_at 是审计事实（谁在何时解约），
+// 且 ReplacedBy 换机链路与历史心跳复盘都依赖该行仍然存在。
 func (r *DeviceRepo) List(ctx context.Context) ([]model.Device, error) {
+	return r.query(ctx, `WHERE revoked_at IS NULL ORDER BY paired_at DESC`)
+}
+
+// ListAll 列出全部设备（**含已吊销**，按配对时间倒序）。
+//
+// 保留旧 List 的语义，仅供审计入口（include_revoked=true）与运维脚本使用。
+// 业务代码请优先用 List —— 「已吊销」在业务上等于「已解除绑定」。
+func (r *DeviceRepo) ListAll(ctx context.Context) ([]model.Device, error) {
 	return r.query(ctx, `ORDER BY paired_at DESC`)
 }
 
@@ -147,6 +179,46 @@ func (r *DeviceRepo) Revoke(ctx context.Context, id string, at int64) error {
 	return ensureAffected(res, "设备 "+id)
 }
 
+// RevokeByTokenHash 凭令牌摘要吊销设备，返回被吊销的 deviceID 与是否命中。
+//
+// 用途：端侧自我解约（POST /devices/unpair）。**只接受令牌摘要**，不接受 deviceID ——
+// 这是越权防护的关键：调用方手里只有自己的令牌，物理上无法指定别人的设备。
+//
+// 幂等语义：令牌不存在或已吊销时 returnedID="" / affected=false / err=nil。
+// 这与 Revoke（按 ID，未命中返回 ErrNotFound）刻意不同 —— 端侧解绑的目标状态是
+// 「这台设备不再绑定」，已经达成的事实不该报错，否则客户端会卡在「解绑失败」。
+//
+// 为什么用 UPDATE ... RETURNING 语义（这里是先取 id 再条件更新），而不是
+// 「先查后改」两步：两步之间可能被并发吊销，条件更新能保证只有真正
+// 从「未吊销 → 已吊销」跃迁的那一次拿到 affected=true，避免重复断开长连接/重复广播。
+func (r *DeviceRepo) RevokeByTokenHash(ctx context.Context, tokenHash string, at int64) (string, bool, error) {
+	if tokenHash == "" {
+		return "", false, nil
+	}
+	list, err := r.query(ctx, `WHERE token_hash=? AND revoked_at IS NULL`, tokenHash)
+	if err != nil {
+		return "", false, err
+	}
+	if len(list) == 0 {
+		// 令牌不存在，或设备早已吊销 —— 目标状态已达成，幂等成功。
+		return "", false, nil
+	}
+	id := list[0].ID
+	res, err := r.s.conn().ExecContext(ctx,
+		`UPDATE devices SET status=?, revoked_at=?, token_hash=?, updated_at=?
+		 WHERE id=? AND revoked_at IS NULL`,
+		string(model.DeviceRevoked), at, "revoked:"+id, at, id)
+	if err != nil {
+		return "", false, fmt.Errorf("store: 按令牌吊销设备失败: %w", err)
+	}
+	// 并发竞态：查询后、更新前被别的请求吊销了 → 受影响 0 行，仍按幂等成功处理
+	// （但 affected=false，调用方不会重复断开已断开的连接）。
+	if n, aerr := res.RowsAffected(); aerr == nil && n == 0 {
+		return "", false, nil
+	}
+	return id, true, nil
+}
+
 // Delete 物理删除设备（连带删除其能力项，同库事务）。
 func (r *DeviceRepo) Delete(ctx context.Context, id string) error {
 	return r.s.withTx(ctx, func(tx *sql.Tx) error {
@@ -159,6 +231,17 @@ func (r *DeviceRepo) Delete(ctx context.Context, id string) error {
 		}
 		return ensureAffected(res, "设备 "+id)
 	})
+}
+
+// ListByUser 列出归属指定账号的设备（按配对时间倒序）。
+//
+// 用途：多用户场景下按账号划分设备视图。一期单用户（EnsureBootstrapUser 保证
+// 只存在一个账号）时它与 List 结果相同，但语义明确 —— 调用方不必自己过滤。
+//
+// 注意 userID 为空串时**不做**全量兜底：空串代表「归属未知」，返回的只会是
+// 那些同样归属未知的历史设备，不会把别人的设备混进来。
+func (r *DeviceRepo) ListByUser(ctx context.Context, userID string) ([]model.Device, error) {
+	return r.query(ctx, `WHERE user_id=? ORDER BY paired_at DESC`, userID)
 }
 
 func (r *DeviceRepo) query(ctx context.Context, clause string, args ...any) ([]model.Device, error) {
@@ -188,7 +271,7 @@ func scanDevice(sc interface{ Scan(...any) error }) (model.Device, error) {
 	)
 	if err := sc.Scan(&d.ID, &d.Name, &kind, &d.Platform, &state, &d.CapabilitiesHash,
 		&d.ProtocolVersion, &d.AppVersion, &load, &d.TokenHash, &d.PairedAt,
-		&d.LastSeenAt, &d.RevokedAt, &d.CreatedAt, &d.UpdatedAt); err != nil {
+		&d.LastSeenAt, &d.RevokedAt, &d.CreatedAt, &d.UpdatedAt, &d.UserID); err != nil {
 		return d, fmt.Errorf("store: 解析设备失败: %w", err)
 	}
 	d.Kind = model.DeviceKind(kind)
@@ -220,9 +303,9 @@ func (r *PairCodeRepo) Create(ctx context.Context, pc *model.DevicePairCode) err
 		pc.CreatedAt = now
 	}
 	_, err := r.s.conn().ExecContext(ctx,
-		`INSERT INTO device_pair_codes(code, device_name, device_kind, expires_at, consumed_at, created_at)
-		 VALUES(?,?,?,?,?,?)`,
-		pc.Code, pc.DeviceName, string(pc.DeviceKind), pc.ExpiresAt, pc.ConsumedAt, pc.CreatedAt)
+		`INSERT INTO device_pair_codes(code, device_name, device_kind, expires_at, consumed_at, created_at, user_id)
+		 VALUES(?,?,?,?,?,?,?)`,
+		pc.Code, pc.DeviceName, string(pc.DeviceKind), pc.ExpiresAt, pc.ConsumedAt, pc.CreatedAt, pc.UserID)
 	if err != nil {
 		return fmt.Errorf("store: 生成配对码失败: %w", err)
 	}
@@ -236,9 +319,9 @@ func (r *PairCodeRepo) Get(ctx context.Context, code string) (*model.DevicePairC
 		kind string
 	)
 	err := r.s.conn().QueryRowContext(ctx,
-		`SELECT code, device_name, device_kind, expires_at, consumed_at, created_at
+		`SELECT code, device_name, device_kind, expires_at, consumed_at, created_at, user_id
 		   FROM device_pair_codes WHERE code=?`, code).
-		Scan(&pc.Code, &pc.DeviceName, &kind, &pc.ExpiresAt, &pc.ConsumedAt, &pc.CreatedAt)
+		Scan(&pc.Code, &pc.DeviceName, &kind, &pc.ExpiresAt, &pc.ConsumedAt, &pc.CreatedAt, &pc.UserID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}

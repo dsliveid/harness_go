@@ -73,7 +73,11 @@ func (p *PairCodeIssuer) TTL() time.Duration { return p.ttl }
 // Issue 生成一条 6 位配对码。
 //
 // deviceName / deviceKind 是**预置提示**：端侧配对时若未自带名称则沿用（kind 非法时回退 desktop）。
-func (p *PairCodeIssuer) Issue(ctx context.Context, deviceName string, kind model.DeviceKind) (*model.DevicePairCode, error) {
+//
+// userID 是**授权者**（生成配对码时的登录账号），落库后供兑换时一并签发用户会话。
+// 传空串合法且安全：等价于「本码不携带授权身份」，兑换照常成功但不下发用户会话。
+// 本包只做透传不校验——它是否为空由调用方（需鉴权的 handler）决定语义。
+func (p *PairCodeIssuer) Issue(ctx context.Context, deviceName string, kind model.DeviceKind, userID string) (*model.DevicePairCode, error) {
 	if !kind.Valid() {
 		kind = model.DeviceKindDesktop
 	}
@@ -92,6 +96,7 @@ func (p *PairCodeIssuer) Issue(ctx context.Context, deviceName string, kind mode
 			DeviceKind: kind,
 			ExpiresAt:  expires,
 			CreatedAt:  now.UnixMilli(),
+			UserID:     strings.TrimSpace(userID),
 		}
 		if err := p.store.Create(ctx, pc); err != nil {
 			// 主键冲突（极小概率）换一个码重试；也覆盖其他写入故障的最后兜底

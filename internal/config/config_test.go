@@ -13,7 +13,7 @@ func envMap(m map[string]string) func(string) string {
 
 func TestDefaultValues(t *testing.T) {
 	c := Default()
-	if c.Server.Addr != "127.0.0.1:5611" {
+	if c.Server.Addr != "0.0.0.0:5611" {
 		t.Fatalf("默认监听地址错误: %s", c.Server.Addr)
 	}
 	if c.Deployment.Mode != ModeLocal {

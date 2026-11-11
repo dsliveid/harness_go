@@ -1,4 +1,4 @@
-package store
+﻿package store
 
 import (
 	"context"
@@ -74,16 +74,16 @@ func TestMainDevicesMigration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 0009_workspaces.sql 落地后主库版本为 9。
-	if v != 9 {
-		t.Fatalf("主库 schema 版本期望 9，得到 %d", v)
+	// 0011_device_owner.sql 落地后主库版本为 11。
+	if v != 11 {
+		t.Fatalf("主库 schema 版本期望 11，得到 %d", v)
 	}
 	req, err := RequiredSchemaVersion("main")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if req != 9 {
-		t.Fatalf("RequiredSchemaVersion(main) 期望 9，得到 %d", req)
+	if req != 11 {
+		t.Fatalf("RequiredSchemaVersion(main) 期望 11，得到 %d", req)
 	}
 }
 
@@ -192,7 +192,6 @@ func TestDeviceRepoLifecycle(t *testing.T) {
 	if _, err := repo.Get(ctx, "dev-missing"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("不存在的设备应返回 ErrNotFound，得到 %v", err)
 	}
-
 	now := NowMillis()
 	if err := repo.MarkOnline(ctx, "dev-1", now); err != nil {
 		t.Fatalf("标记在线失败: %v", err)
@@ -263,6 +262,22 @@ func TestDeviceRepoLifecycle(t *testing.T) {
 	}
 	if err := repo.MarkOnline(ctx, "dev-1", now+62000); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("已吊销设备不得回到在线，得到 %v", err)
+	}
+
+	// 列表投影：吊销后默认 List 不再返回该设备（= 解除绑定），ListAll 仍可见（审计）
+	visible, err := repo.List(ctx)
+	if err != nil {
+		t.Fatalf("列出设备失败: %v", err)
+	}
+	if len(visible) != 1 || visible[0].ID != "dev-2" {
+		t.Fatalf("吊销后默认列表应只剩 dev-2（解绑即消失），得到 %+v", visible)
+	}
+	all, err := repo.ListAll(ctx)
+	if err != nil {
+		t.Fatalf("列出全部设备失败: %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("ListAll 应含已吊销设备（审计视角），期望 2 得到 %d", len(all))
 	}
 
 	// 物理删除（连带能力项）
@@ -602,12 +617,13 @@ func TestMigrationUpgradeFromV1(t *testing.T) {
 		t.Fatalf("主库增量迁移失败: %v", err)
 	}
 	// v1 库升级：0002_devices + 0003_retrieval + 0004_market + 0005_snapshots + 0006_webhooks
-	// + 0007_session_archive + 0008_projects + 0009_workspaces 共 8 个增量迁移。
-	if applied != 8 {
-		t.Fatalf("主库增量迁移应应用 8 个，得到 %d", applied)
+	// + 0007_session_archive + 0008_projects + 0009_workspaces + 0010_pair_code_user
+	// + 0011_device_owner 共 10 个增量迁移。
+	if applied != 10 {
+		t.Fatalf("主库增量迁移应应用 10 个，得到 %d", applied)
 	}
-	if v, _ := SchemaVersion(ctx, mdb); v != 9 {
-		t.Fatalf("主库升级后版本期望 9，得到 %d", v)
+	if v, _ := SchemaVersion(ctx, mdb); v != 11 {
+		t.Fatalf("主库升级后版本期望 11，得到 %d", v)
 	}
 	var title string
 	if err := mdb.QueryRowContext(ctx, `SELECT title FROM sessions WHERE id='old-s1'`).Scan(&title); err != nil {
@@ -669,4 +685,221 @@ func TestMigrationUpgradeFromV1(t *testing.T) {
 			decision, reqDevice, decDevice)
 	}
 	_ = sdb.Close()
+}
+
+// TestDeviceRepoTracksOwnerUserID 设备必须能存取归属账号，且列顺序不得错位。
+//
+// 这个用例同时守两条线：
+//
+//  1. **功能**：0011 迁移引入 devices.user_id 后，Create 写入 / Get 读回必须一致。
+//     这是「设备与账号持久绑定」的地基 —— 归属读不出来，/devices/session
+//     就永远只能返回 device.owner_unknown，7 天失效问题无从修复。
+//
+//  2. **防列错位（真正的动机）**：deviceCols 是 SELECT 与 INSERT 共用的字符串，
+//     扫描按**位置**对应。若有人日后在中间插列而不改 scanDevice，
+//     结果不会报错，只会让字段整体错位一格。
+//     现有用例抓不到这点：它们只写 id/name/kind/token_hash 少数几个字段，
+//     错位后仍可能"看起来正常"。
+//     对策是给**每一个参与扫描的字段**都填互相可区分的值再逐字段核对 ——
+//     一旦错位，相邻字段的值必然对不上，立刻失败。
+//
+// 为什么现在更要紧：设备上线时 OnOnline 回调会经 DeviceService.Get 取 name/kind
+// 做 SSE 广播，错位会让设备状态推送显示错误的设备信息（且不报任何错）。
+func TestDeviceRepoTracksOwnerUserID(t *testing.T) {
+	ctx := context.Background()
+	main, err := OpenMain(ctx, t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenMain 失败: %v", err)
+	}
+	defer main.Close()
+	repo := main.Devices()
+
+	const wantUser = "usr_owner_7"
+	lastSeen := int64(1_700_000_000_123)
+	revoked := int64(1_700_000_000_456)
+	d := &model.Device{
+		ID:               "dev-cols",
+		Name:             "我的工作机",
+		Kind:             model.DeviceKindMobile,
+		Platform:         "android",
+		Status:           model.DeviceRevoked,
+		CapabilitiesHash: "cap-hash-x",
+		ProtocolVersion:  3,
+		AppVersion:       "1.2.3",
+		LoadJSON:         json.RawMessage(`{"cpu":0.25}`),
+		TokenHash:        "hash-cols",
+		PairedAt:         1_700_000_000_000,
+		LastSeenAt:       &lastSeen,
+		RevokedAt:        &revoked,
+		UserID:           wantUser,
+	}
+	if err := repo.Create(ctx, d); err != nil {
+		t.Fatalf("创建设备失败: %v", err)
+	}
+
+	got, err := repo.Get(ctx, d.ID)
+	if err != nil {
+		t.Fatalf("读取设备失败: %v", err)
+	}
+
+	// 逐字段核对：任何一处错位都会在这里暴露成相邻字段的串味。
+	cases := []struct {
+		field string
+		got   any
+		want  any
+	}{
+		{"ID", got.ID, d.ID},
+		{"Name", got.Name, d.Name},
+		{"Kind", got.Kind, d.Kind},
+		{"Platform", got.Platform, d.Platform},
+		{"Status", got.Status, d.Status},
+		{"CapabilitiesHash", got.CapabilitiesHash, d.CapabilitiesHash},
+		{"ProtocolVersion", got.ProtocolVersion, d.ProtocolVersion},
+		{"AppVersion", got.AppVersion, d.AppVersion},
+		{"LoadJSON", string(got.LoadJSON), string(d.LoadJSON)},
+		{"TokenHash", got.TokenHash, d.TokenHash},
+		{"PairedAt", got.PairedAt, d.PairedAt},
+		{"UserID", got.UserID, d.UserID},
+	}
+	for _, c := range cases {
+		if c.got != c.want {
+			t.Fatalf("字段 %s 读取错位（列顺序可能被破坏）：得到 %v，期望 %v", c.field, c.got, c.want)
+		}
+	}
+	if got.LastSeenAt == nil || *got.LastSeenAt != lastSeen {
+		t.Fatalf("LastSeenAt 读取错位：得到 %v，期望 %d", got.LastSeenAt, lastSeen)
+	}
+	if got.RevokedAt == nil || *got.RevokedAt != revoked {
+		t.Fatalf("RevokedAt 读取错位：得到 %v，期望 %d", got.RevokedAt, revoked)
+	}
+
+	// 归属必须能被「按令牌反查」带回 —— WS 鉴权与 /devices/session 都走这条路径。
+	//
+	// 注意：这里必须用**未吊销**的独立设备。GetByTokenHash 带
+	// `AND revoked_at IS NULL` 条件（令牌即刻失效的保证），上面那台是 revoked 状态，
+	// 用它反查必然 not found —— 那是正确行为，不是 bug。
+	if err := repo.Create(ctx, &model.Device{
+		ID: "dev-live", Name: "在役设备", Kind: model.DeviceKindDesktop,
+		Platform: "windows", TokenHash: "hash-live", UserID: wantUser,
+	}); err != nil {
+		t.Fatalf("创建在役设备失败: %v", err)
+	}
+	byTok, err := repo.GetByTokenHash(ctx, "hash-live")
+	if err != nil {
+		t.Fatalf("按令牌反查失败: %v", err)
+	}
+	if byTok.UserID != wantUser {
+		t.Fatalf("按令牌反查应带回归属账号 %q，得到 %q", wantUser, byTok.UserID)
+	}
+	// 反向确认：已吊销设备的令牌必须查不到（这正是「吊销即刻失效」的落点）。
+	if _, err := repo.GetByTokenHash(ctx, d.TokenHash); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("已吊销设备的令牌应查不到，得到 %v", err)
+	}
+
+	// 归属未知（历史设备）也是合法状态，读回必须是空串而不是报错。
+	if err := repo.Create(ctx, &model.Device{
+		ID: "dev-legacy", Name: "老设备", Kind: model.DeviceKindDesktop,
+		Platform: "windows", TokenHash: "hash-legacy",
+	}); err != nil {
+		t.Fatalf("创建历史设备失败: %v", err)
+	}
+	legacy, err := repo.Get(ctx, "dev-legacy")
+	if err != nil {
+		t.Fatalf("读取历史设备失败: %v", err)
+	}
+	if legacy.UserID != "" {
+		t.Fatalf("未指定归属时应为空串（合法降级），得到 %q", legacy.UserID)
+	}
+
+	// 按账号列举：此时该账号名下有 dev-cols 与 dev-live 两台（dev-legacy 归属为空不算）。
+	list, err := repo.ListByUser(ctx, wantUser)
+	if err != nil {
+		t.Fatalf("按账号列设备失败: %v", err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("该账号名下应有 2 台设备，得到 %d：%+v", len(list), list)
+	}
+	for _, got := range list {
+		if got.UserID != wantUser {
+			t.Fatalf("按账号列举不应混入其它归属的设备：%+v", got)
+		}
+	}
+	// 反向：归属为空的设备（dev-legacy）不得出现在该账号的列举结果里。
+	for _, got := range list {
+		if got.ID == "dev-legacy" {
+			t.Fatal("归属未知的历史设备不应出现在按账号列举中")
+		}
+	}
+}
+
+// TestDeviceRepoRevokeByTokenHash 端侧自我解约的存储支撑：凭令牌吊销自己 + 幂等。
+//
+// 这条链路守的是「客户端取消绑定后服务端必须一并取消」—— 端侧只有 device_token，
+// 无法用 DELETE /devices/{did}（需用户令牌），故必须有按令牌吊销的能力。
+func TestDeviceRepoRevokeByTokenHash(t *testing.T) {
+	m, err := OpenMain(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatalf("OpenMain 失败: %v", err)
+	}
+	defer m.Close()
+	ctx := context.Background()
+	repo := m.Devices()
+	now := NowMillis()
+
+	if err := repo.Create(ctx, &model.Device{
+		ID: "dev-self", Name: "我的桌面端", Kind: model.DeviceKindDesktop,
+		Platform: "windows", TokenHash: "hash-self",
+	}); err != nil {
+		t.Fatalf("创建设备失败: %v", err)
+	}
+	// 再建一台「别人」的设备：验证按令牌吊销绝不会波及它。
+	if err := repo.Create(ctx, &model.Device{
+		ID: "dev-other", Name: "同事的机器", Kind: model.DeviceKindDesktop,
+		Platform: "macos", TokenHash: "hash-other",
+	}); err != nil {
+		t.Fatalf("创建第二台设备失败: %v", err)
+	}
+
+	// ① 命中：返回自己的 id，且立刻吊销
+	id, affected, err := repo.RevokeByTokenHash(ctx, "hash-self", now)
+	if err != nil {
+		t.Fatalf("按令牌吊销失败: %v", err)
+	}
+	if !affected || id != "dev-self" {
+		t.Fatalf("应吊销 dev-self 且 affected=true，得到 id=%q affected=%v", id, affected)
+	}
+	got, err := repo.Get(ctx, "dev-self")
+	if err != nil {
+		t.Fatalf("读取设备失败: %v", err)
+	}
+	if got.Status != model.DeviceRevoked || got.RevokedAt == nil {
+		t.Fatalf("吊销状态未写入: %+v", got)
+	}
+
+	// ② 越权隔离：别人的设备不受影响，令牌仍可反查
+	other, err := repo.GetByTokenHash(ctx, "hash-other")
+	if err != nil {
+		t.Fatalf("另一台设备不应被波及: %v", err)
+	}
+	if other.ID != "dev-other" {
+		t.Fatalf("按令牌吊销波及了别的设备: %+v", other)
+	}
+
+	// ③ 幂等：同一个令牌再吊销一次 → 不报错、affected=false（已达成目标状态）
+	id2, affected2, err := repo.RevokeByTokenHash(ctx, "hash-self", now+1000)
+	if err != nil {
+		t.Fatalf("重复按令牌吊销不应报错（幂等），得到 %v", err)
+	}
+	if affected2 || id2 != "" {
+		t.Fatalf("重复吊销应为 affected=false / id 空，得到 id=%q affected=%v", id2, affected2)
+	}
+
+	// ④ 令牌根本不存在（伪造/已清）→ 同样幂等成功
+	if _, affected3, err := repo.RevokeByTokenHash(ctx, "hash-never-existed", now+2000); err != nil || affected3 {
+		t.Fatalf("不存在的令牌应幂等成功，得到 affected=%v err=%v", affected3, err)
+	}
+	// ⑤ 空摘要保护：绝不生成 `WHERE token_hash=''` 这样的查询
+	if _, affected4, err := repo.RevokeByTokenHash(ctx, "", now+3000); err != nil || affected4 {
+		t.Fatalf("空令牌摘要应直接返回未命中，得到 affected=%v err=%v", affected4, err)
+	}
 }

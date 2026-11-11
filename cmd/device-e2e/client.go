@@ -210,11 +210,23 @@ type servicePairCode struct {
 }
 
 // pairResult 对应 service.PairResult（device_token 明文仅此一次）。
+//
+// 另含「配对后免二次登录」下发的用户会话三字段：UserToken/User/SessionTTLS。
+// 它们是**可选**的（历史配对码或签发失败时整体缺失），故用零值 + 显式判空处理，
+// 不能因为服务端没下发就让 e2e 失败。
 type pairResult struct {
 	DeviceID        string `json:"device_id"`
 	DeviceToken     string `json:"device_token"`
 	WSPath          string `json:"ws_path"`
 	ProtocolVersion int    `json:"protocol_version"`
+
+	UserToken   string `json:"user_token"`
+	SessionTTLS int    `json:"session_ttl_s"`
+	User        struct {
+		ID       string `json:"id"`
+		Username string `json:"username"`
+		Role     string `json:"role"`
+	} `json:"user"`
 }
 
 // pairDevice 凭码配对（免登录接口），端侧名固定为「脚本扮演」。
@@ -247,6 +259,46 @@ func pairDeviceNamed(ctx context.Context, cli *http.Client, baseURL, code, name 
 		return nil, fmt.Errorf("配对成功但响应里没有 device_token")
 	}
 	return &out, nil
+}
+
+// fetchMe 用给定令牌调 /api/v1/auth/me（用于验证配对下发的 user_token 真能用）。
+//
+// 刻意复用 doJSON：非 2xx 会转成 *apiError，调用方据此判断「令牌不可用」。
+// 红线：本函数**绝不**打印令牌明文，错误信息里只出现状态码与错误码。
+func fetchMe(ctx context.Context, cli *http.Client, baseURL, token string) (*meResult, error) {
+	var out meResult
+	if err := doJSON(ctx, cli, http.MethodGet, baseURL+"/api/v1/auth/me", token, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// renewDeviceSession 用设备令牌换取新的用户会话（设备与账号持久绑定的续期入口）。
+//
+// 实测要点：本端点**只认设备令牌**，不接受 Cookie。故这里显式把 device_token
+// 放进 Authorization: Bearer —— 若误传 user_token，服务端会返回 401。
+func renewDeviceSession(ctx context.Context, cli *http.Client, baseURL, deviceToken string) (*meResult, string, error) {
+	var out struct {
+		UserToken   string   `json:"user_token"`
+		SessionTTLS int      `json:"session_ttl_s"`
+		User        meResult `json:"user"`
+	}
+	if err := doJSON(ctx, cli, http.MethodPost, baseURL+"/api/v1/devices/session", deviceToken,
+		nil, &out); err != nil {
+		return nil, "", err
+	}
+	if strings.TrimSpace(out.UserToken) == "" {
+		return nil, "", fmt.Errorf("续期成功但响应里没有 user_token")
+	}
+	return &out.User, out.UserToken, nil
+}
+
+// meResult 对应 /auth/me 的响应（不包 user 字段，直接是 User 对象）。
+type meResult struct {
+	ID          string `json:"id"`
+	Username    string `json:"username"`
+	DisplayName string `json:"display_name"`
+	Role        string `json:"role"`
 }
 
 // wsURL 由 baseURL 推导 WS 端点（http→ws / https→wss），令牌经 query 传入。

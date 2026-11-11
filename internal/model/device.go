@@ -61,6 +61,21 @@ type Device struct {
 	CreatedAt        int64           `json:"created_at"`
 	UpdatedAt        int64           `json:"updated_at"`
 
+	// UserID 归属账号（= 配对时那张配对码的授权者，见 0011 迁移）。
+	//
+	// 这是「设备与账号持久绑定」的唯一事实来源：配对码会被消费，而这条记录不会消失，
+	// 故它是持久关系的落点。
+	//
+	// 语义边界（三条，违反任意一条都会出错）：
+	//   - 为空串 = **归属未知**（0011 迁移之前的历史设备）。合法状态，不参与鉴权，
+	//     只表示「不能为它签发用户会话」—— /devices/session 对它返回 device.owner_unknown，
+	//     要恢复只能重新配对，绝不猜测、绝不回填某个默认账号。
+	//   - **不参与鉴权**：鉴权仍只看 token_hash 与 revoked_at。归属回答的是
+	//     「这台机器属于谁」，而非「这个请求有没有权限」。
+	//   - **不是可变字段**：换账号的唯一途径是解绑后重新配对，不提供原地改写，
+	//     否则「绑定」语义形同虚设。
+	UserID string `json:"user_id,omitempty"`
+
 	// Capabilities 读路径按需填充（列表/详情用），不落 devices 表。
 	Capabilities []Capability `json:"capabilities,omitempty"`
 }
@@ -85,6 +100,14 @@ type DevicePairCode struct {
 	ExpiresAt  int64      `json:"expires_at"`
 	ConsumedAt *int64     `json:"consumed_at,omitempty"`
 	CreatedAt  int64      `json:"created_at"`
+
+	// UserID 签发该码的授权用户（= 生成配对码时的登录账号）。
+	//
+	// 为空串是**合法状态**（历史配对码 / 未登录签发），语义是「本码不携带授权身份」：
+	// 兑换照常成功，只是不下发用户会话，端侧回落登录页。绝不可用它做鉴权判定，
+	// 它只用于「配对成功后顺带签发谁的会话」，真正的授权强度仍由配对码本身的
+	// 一次性 + TTL 120s + 失败限流保证。
+	UserID string `json:"user_id,omitempty"`
 }
 
 // Usable 在 now 时刻是否仍可用于配对。

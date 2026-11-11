@@ -102,6 +102,15 @@ const (
 	CodeDeviceProtocolMismatch Code = "device.protocol_mismatch"
 	// CodeDeviceDisabled 设备域被配置关闭
 	CodeDeviceDisabled Code = "device.disabled"
+	// CodeDeviceOwnerUnknown 设备归属账号未知（0011 迁移之前配对的历史设备）。
+	//
+	// 语义：设备本身有效（令牌没过期、没被吊销），但服务端不知道它属于哪个账号，
+	// 因此**无法**为它签发用户会话。端侧正确处理是引导用户重新配对，
+	// 而不是让他去登录页输密码 —— 密码登进来的是"人"，而这里缺的是"机器属于谁"。
+	//
+	// 刻意与 CodeDeviceNotFound / CodeDeviceRevoked 区分：那两者要用户解绑重来，
+	// 这一条只需重新配对（设备令牌还在，但归属要重新授权）。
+	CodeDeviceOwnerUnknown Code = "device.owner_unknown"
 )
 
 // Error 统一错误类型。
@@ -216,7 +225,9 @@ func StatusFor(code Code) int {
 		CodeApprovalNotFound, CodeDeviceNotFound, CodeFSPathNotFound:
 		return http.StatusNotFound
 	case CodeConflict, CodeRunStateConflict, CodeApprovalAlreadyDecide,
-		CodeDeviceProtocolMismatch, CodeFSHostOffline, CodeFSHostUnsupported:
+		CodeDeviceProtocolMismatch, CodeFSHostOffline, CodeFSHostUnsupported,
+		// 归属未知是"状态需要修正"而非"没权限"：端侧要据此提示重新配对。
+		CodeDeviceOwnerUnknown:
 		return http.StatusConflict
 	case CodeRateLimited, CodeAuthRateLimited:
 		return http.StatusTooManyRequests

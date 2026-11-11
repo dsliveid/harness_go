@@ -14,6 +14,15 @@ var publicPaths = []string{
 	"/api/v1/devices/pair",
 	// 设备长连接：端侧无用户账号，由**设备令牌**在升级前独立鉴权（C-3）
 	"/api/v1/devices/ws",
+	// 设备自续会话：user_token 过期后，端侧只剩 device_token，而它通不过用户令牌
+	// 中间件。本端点故免全局鉴权，但**不是**免鉴权：handler 内只认
+	// `Authorization: Bearer <device_token>` 并自行校验（拒 Cookie，防用 WebView
+	// 的用户会话绕开设备身份）。详见 device_handler.go 的 deviceSession 注释。
+	"/api/v1/devices/session",
+	// 端侧自我解约：同上，端侧解绑时手里只有 device_token（user_token 可能已过期），
+	// 而 DELETE /devices/{did} 走用户令牌中间件 → 端侧结构上不可达。
+	// handler 内只认 Bearer 设备令牌，且目标由令牌反查（无法指定别人的设备）。
+	"/api/v1/devices/unpair",
 	// WebView ticket 兑换：WebView 首屏尚无任何 Cookie，凭 ticket 本身即凭据。
 	// ticket 为 32 字节随机值 + TTL 60s + **一次性消费**（已用/过期/不存在统一 401），
 	// 强度与配对码同级；兑换成功后写入 hg_sess 降级会话（scope=webview）。
@@ -176,6 +185,17 @@ func NewRouter(d Deps) http.Handler {
 	mux.HandleFunc("DELETE /api/v1/devices/{did}", h.revokeDevice)
 	// 设备长连接（C-3 WS 网关）：设备令牌在升级前独立鉴权，不走用户令牌中间件
 	mux.HandleFunc("GET /api/v1/devices/ws", h.deviceWS)
+	// 设备自续用户会话：凭 device_token 换新 user_token（设备与账号持久绑定的续期入口）。
+	// 免全局鉴权但 handler 内自鉴权，理由见 publicPaths 注释。
+	mux.HandleFunc("POST /api/v1/devices/session", h.deviceSession)
+	// 端侧自我解约：凭 device_token 吊销自己（免全局鉴权，handler 内自鉴权）。
+	// 与 DELETE /api/v1/devices/{did} 的分工：后者是管理端按 ID 吊销（需用户令牌），
+	// 本端点由端侧主动调用（只需设备令牌）→ 双向解绑的另一个方向。
+	mux.HandleFunc("POST /api/v1/devices/unpair", h.unpairDevice)
+	// 设备状态实时推送（SSE）：走用户令牌中间件（**不进** publicPaths）。
+	// 语义：首帧全量快照 + 增量上下线事件；不做 Last-Event-ID 续传
+	// （设备状态是「当前态」，重连重拿快照即可 —— 详见 device_events_handler.go 头注释）。
+	mux.HandleFunc("GET /api/v1/devices/events", h.deviceEvents)
 
 	// 工作区宿主目录列举（L0 服务端宿主；docs/工作区宿主与目录选择对接约定.md）
 	// —— 只读、只列目录；落在 /api/** 下由全局 Auth 中间件强制令牌。

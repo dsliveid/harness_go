@@ -11,10 +11,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -81,6 +83,42 @@ func main() {
 		fmt.Fprintf(os.Stderr, "harness-go: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// isLoopbackOnly 报告监听地址是否只绑定回环网卡（即局域网内其它设备无法访问）。
+//
+// 判定口径（与 net.Listen 的实际行为对齐）：
+//   - 空 host（`":5611"`）→ 绑定全部网卡，**不是**仅回环；
+//   - 0.0.0.0 / [::] / 具体网卡 IP → **不是**仅回环；
+//   - 127.0.0.1 / ::1 / localhost → 仅回环。
+//
+// 地址非法时保守返回 true（宁可多提示一次，也不让用户以为已经对外开放）。
+func isLoopbackOnly(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		// 允许只写端口（如 "5611"）：此时 net.Listen 等同 ":5611"，绑全部网卡。
+		// ⚠️ 必须先判空：net.LookupPort("tcp", "") 会返回 0, nil（视作合法服务名），
+		// 不加这层判断会把空地址误判成「已对外开放」——单测 TestIsLoopbackOnlyGarbage 守这条线。
+		if strings.TrimSpace(addr) != "" {
+			if _, pErr := net.LookupPort("tcp", addr); pErr == nil {
+				return false
+			}
+		}
+		return true
+	}
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return false // ":5611" 绑定所有网卡
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return true // 主机名：无法静态判定，保守按仅回环提示
+	}
+	return ip.IsLoopback()
 }
 
 func run() error {
@@ -591,13 +629,34 @@ func run() error {
 	// C-4：OnOffline 组合回调——先落库 offline，再让派发器**立即**收敛该设备的在途任务
 	// （离线立即降级，绝不等到 deadline）。dispatcher 在 hub 之后构造，故用闭包前置引用。
 	var deviceDispatcher *device.Dispatcher
+	// 设备状态广播总线（供 /api/v1/devices/events SSE 实时推送上下线）。
+	// 与 events.Bus 是**两套**总线：后者是 per-Run 序号流，设备状态是「当前态」。
+	deviceState := device.NewStateBus(device.StateBusOptions{})
 	deviceHub := device.NewHub(device.HubOptions{
 		Log:          logger,
 		OfflineAfter: time.Duration(cfg.Devices.OfflineAfterS) * time.Second,
-		OnOnline:     deviceSvc.MarkOnline,
-		OnHeartbeat:  deviceSvc.RecordHeartbeat,
+		OnOnline: func(octx context.Context, deviceID string) {
+			deviceSvc.MarkOnline(octx, deviceID)
+			// 广播上线：name/kind/user_id 从设备档案取（失败也不影响上线事实，
+			// 只少了展示字段 —— 绝不能让一次查询失败把上线事件吞掉）。
+			info := device.DeviceState{}
+			if d, err := deviceSvc.Get(octx, deviceID); err == nil && d != nil {
+				info.Name = d.Name
+				info.Kind = string(d.Kind)
+				// 归属账号：观察侧据此按账号划分设备视图。
+				// 为空（历史设备）时保持空串，由前端展示为"未绑定账号"。
+				info.UserID = d.UserID
+			}
+			deviceState.MarkOnline(deviceID, info)
+		},
+		OnHeartbeat: func(octx context.Context, deviceID string, at int64, load json.RawMessage, capsHash string, proto int) {
+			deviceSvc.RecordHeartbeat(octx, deviceID, at, load, capsHash, proto)
+			// 心跳只刷新 last_seen，**不广播**（否则每 15s 刷屏一次无意义事件）。
+			deviceState.Touch(deviceID)
+		},
 		OnOffline: func(octx context.Context, deviceID string) {
 			deviceSvc.MarkOffline(octx, deviceID)
+			deviceState.MarkOffline(deviceID)
 			if deviceDispatcher != nil {
 				if n := deviceDispatcher.FailDevice(deviceID, device.TaskErrorOffline); n > 0 {
 					logger.Warn("设备离线，在途端侧任务已降级", "device_id", deviceID, "tasks", n)
@@ -610,6 +669,12 @@ func run() error {
 		deviceHub.Start(ctx)
 		// 吊销设备时断开其长连接（后置注入，打破构造期循环依赖）
 		deviceSvc.SetDisconnector(deviceHub)
+		// 解绑双向收敛：吊销（管理端 DELETE 或端侧自我解约）后从观察面移除并广播
+		// device.revoked，让 Web 端列表**无需手动刷新**即消失。
+		// 不挂这个钩子的话，SSE 只能等下一次重连的快照才收敛。
+		deviceSvc.SetRevokedHook(func(hctx context.Context, deviceID string) {
+			deviceState.Remove(deviceID)
+		})
 		// C-6：租约管理器接入在线连接表 → 抢占时向旧端推送 lease.revoked
 		if deviceLeases != nil {
 			deviceLeases.SetHub(deviceHub)
@@ -677,6 +742,7 @@ func run() error {
 		SOP:         sopSvc,
 		FSRoots:     fsRoots,
 		DeviceWS:    deviceWSHandler(deviceGateway),
+		DeviceState: deviceState,
 		Bus:         bus,
 		Auth:        authSvc,
 		AuthConfig: api.AuthConfig{
@@ -698,6 +764,14 @@ func run() error {
 	}
 
 	// ⑫ 启动
+	// 监听口径（2026-11 起）：默认 0.0.0.0:5611（局域网开箱可访问，用户明确要求）。
+	// 检测到「仅回环绑定」时反而是用户显式收窄了范围（-addr 127.0.0.1:N 等），
+	// 此时打一条 Info 级说明——不是告警，只是让局域网访问需求者知道为什么别的设备连不上。
+	// （历史口径曾是默认仅回环 + Warn 提示如何开放；方向已随产品决策翻转。）
+	if isLoopbackOnly(cfg.Server.Addr) {
+		logger.Info("当前仅本机可访问（监听回环地址）；局域网/其它设备访问请用 -addr 0.0.0.0:5611 启动（或设置 HARNESS_SERVER_ADDR）",
+			"addr", cfg.Server.Addr)
+	}
 	errCh := make(chan error, 1)
 	go func() {
 		logger.Info("harness-go 已启动",

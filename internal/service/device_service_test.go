@@ -1,4 +1,4 @@
-package service
+﻿package service
 
 import (
 	"context"
@@ -10,6 +10,12 @@ import (
 	"harness-go/internal/model"
 	"harness-go/internal/store"
 )
+
+// testOwnerUserID 生成配对码时的授权用户（模拟已登录账号）。
+//
+// 引入它的原因：配对码必须记录授权者，配对成功后服务端据此一并签发用户会话，
+// 端侧才能免二次登录。测试里用固定值便于断言 PairResult.OwnerUserID 透传正确。
+const testOwnerUserID = "usr_owner_0001"
 
 // newDeviceTestService 建主库 + 设备用例（TTL 120s，与线上默认一致）。
 func newDeviceTestService(t *testing.T) (*DeviceService, *store.MainStore) {
@@ -37,7 +43,7 @@ func TestDevicePairHappyPath(t *testing.T) {
 	svc, _ := newDeviceTestService(t)
 	ctx := context.Background()
 
-	view, err := svc.IssuePairCode(ctx, "办公机", model.DeviceKindDesktop)
+	view, err := svc.IssuePairCode(ctx, testOwnerUserID, "办公机", model.DeviceKindDesktop)
 	if err != nil {
 		t.Fatalf("生成配对码失败: %v", err)
 	}
@@ -66,9 +72,13 @@ func TestDevicePairHappyPath(t *testing.T) {
 	if res.WSPath != DeviceWSPath || res.ProtocolVersion != model.DefaultDeviceProtocolVersion {
 		t.Fatalf("配对结果协议字段错误: %+v", res)
 	}
+	// 免二次登录的关键：授权用户必须从配对码透传到 PairResult（api 层据此签发会话）。
+	if res.OwnerUserID != testOwnerUserID {
+		t.Fatalf("PairResult 应透传配对码的授权用户 %q，得到 %q", testOwnerUserID, res.OwnerUserID)
+	}
 
 	// 列表：令牌摘要绝不出栈，能力项已落库
-	list, err := svc.List(ctx)
+	list, err := svc.List(ctx, false)
 	if err != nil {
 		t.Fatalf("设备列表失败: %v", err)
 	}
@@ -119,7 +129,7 @@ func TestDevicePairCodeSingleUse(t *testing.T) {
 	svc, _ := newDeviceTestService(t)
 	ctx := context.Background()
 
-	view, err := svc.IssuePairCode(ctx, "", model.DeviceKindMobile)
+	view, err := svc.IssuePairCode(ctx, testOwnerUserID, "", model.DeviceKindMobile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +154,7 @@ func TestDevicePairExpiredTTL(t *testing.T) {
 
 	now := time.Now()
 	svc.SetPairClock(func() time.Time { return now })
-	view, err := svc.IssuePairCode(ctx, "", model.DeviceKindCLI)
+	view, err := svc.IssuePairCode(ctx, testOwnerUserID, "", model.DeviceKindCLI)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,7 +192,7 @@ func TestDeviceDisabled(t *testing.T) {
 	}
 	defer main.Close()
 	svc := NewDeviceService(DeviceServiceOptions{Main: main, Enabled: false})
-	if _, err := svc.IssuePairCode(context.Background(), "", ""); !isCode(err, apperr.CodeDeviceDisabled) {
+	if _, err := svc.IssuePairCode(context.Background(), "", "", ""); !isCode(err, apperr.CodeDeviceDisabled) {
 		t.Fatalf("关闭时应返回 device.disabled，得到 %v", err)
 	}
 	if _, err := svc.Pair(context.Background(), "x", PairRequest{Code: "000003"}); !isCode(err, apperr.CodeDeviceDisabled) {
@@ -204,6 +214,161 @@ func TestDeviceConfigDefaults(t *testing.T) {
 	}
 	if svc.TaskTTL() != 600*time.Second {
 		t.Fatalf("默认任务超时应为 600s，得到 %s", svc.TaskTTL())
+	}
+}
+
+// TestDeviceRevokeSelf 端侧自我解约：只认令牌、只吊销自己、幂等、触发吊销钩子。
+//
+// 守的是「客户端取消绑定后服务端必须一并取消」这条链路：
+// 端侧手里只有 device_token，无法用 DELETE /devices/{did}（需用户令牌）。
+func TestDeviceRevokeSelf(t *testing.T) {
+	svc, main := newDeviceTestService(t)
+	ctx := context.Background()
+
+	// 配对两台设备（各自持有独立令牌）
+	pairOne := func(name string) *PairResult {
+		view, err := svc.IssuePairCode(ctx, testOwnerUserID, name, model.DeviceKindDesktop)
+		if err != nil {
+			t.Fatalf("签发配对码失败: %v", err)
+		}
+		res, err := svc.Pair(ctx, "client-"+name, PairRequest{Code: view.Code, Name: name})
+		if err != nil {
+			t.Fatalf("配对失败: %v", err)
+		}
+		return res
+	}
+	self := pairOne("我的桌面端")
+	other := pairOne("同事的机器")
+
+	// 吊销钩子：模拟 cmd 装配里的 deviceState.Remove（观察面广播）
+	var hooked []string
+	svc.SetRevokedHook(func(_ context.Context, id string) { hooked = append(hooked, id) })
+	// 断连能力：吊销后必须主动断开长连接
+	var closed []string
+	svc.SetDisconnector(stubDisconnector{on: func(id, reason string) {
+		closed = append(closed, id+"/"+reason)
+	}})
+
+	// ① 空令牌 → 401（调用方编程错误，不是"已解绑"）
+	if err := svc.RevokeSelf(ctx, "  "); !isCode(err, apperr.CodeUnauthorized) {
+		t.Fatalf("空令牌应返回 unauthorized，得到 %v", err)
+	}
+
+	// ② 正常路径：吊销自己
+	if err := svc.RevokeSelf(ctx, self.DeviceToken); err != nil {
+		t.Fatalf("自我解约失败: %v", err)
+	}
+	d, err := main.Devices().Get(ctx, self.DeviceID)
+	if err != nil {
+		t.Fatalf("读取自己失败: %v", err)
+	}
+	if d.Status != model.DeviceRevoked {
+		t.Fatalf("自我解约后状态应为 revoked，得到 %s", d.Status)
+	}
+	// 钩子与断连都必须被触发（否则管理端 SSE 不收敛、僵尸连接不断开）
+	if len(hooked) != 1 || hooked[0] != self.DeviceID {
+		t.Fatalf("吊销钩子应收到自己的 device_id，得到 %v", hooked)
+	}
+	if len(closed) != 1 || closed[0] != self.DeviceID+"/device.revoked" {
+		t.Fatalf("应断开自己的长连接，得到 %v", closed)
+	}
+
+	// ③ 越权隔离：别人的设备毫发无损，令牌仍然有效
+	if err := svc.RevokeSelf(ctx, other.DeviceToken); err != nil {
+		t.Fatalf("第二台自我解约失败: %v", err)
+	}
+	od, err := main.Devices().Get(ctx, other.DeviceID)
+	if err != nil || od.Status != model.DeviceRevoked {
+		t.Fatalf("第二台设备应被正常吊销: %+v err=%v", od, err)
+	}
+
+	// ④ 幂等：同一令牌再来一次 → 不报错，且不再重复触发钩子/断连
+	before := len(hooked)
+	if err := svc.RevokeSelf(ctx, self.DeviceToken); err != nil {
+		t.Fatalf("重复自我解约应幂等成功（不报错），得到 %v", err)
+	}
+	if len(hooked) != before {
+		t.Fatalf("重复解约不应重复触发吊销钩子，钩子数 %d → %d", before, len(hooked))
+	}
+
+	// ⑤ 伪造令牌 → 幂等成功（不泄露"该令牌是否存在"）
+	if err := svc.RevokeSelf(ctx, "hgd_forged_token_value"); err != nil {
+		t.Fatalf("伪造令牌应幂等成功（防枚举），得到 %v", err)
+	}
+
+	// ⑥ 列表投影：两台都已解绑 → 默认列表为空；审计视角仍能看到 2 条
+	visible, err := svc.List(ctx, false)
+	if err != nil {
+		t.Fatalf("列出设备失败: %v", err)
+	}
+	if len(visible) != 0 {
+		t.Fatalf("全部解绑后默认列表应为空（解绑即消失），得到 %d 条", len(visible))
+	}
+	all, err := svc.List(ctx, true)
+	if err != nil {
+		t.Fatalf("列出全部设备失败: %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("审计视角应含 2 条已吊销设备，得到 %d 条", len(all))
+	}
+	for _, d := range all {
+		if d.TokenHash != "" {
+			t.Fatal("审计视角同样绝不允许回传令牌摘要")
+		}
+	}
+}
+
+// TestDeviceRevokeNotifiesHook 管理端吊销（按 ID）同样必须触发观察面钩子。
+//
+// 否则 Web 端点了「解除绑定」后，SSE 收不到 device.revoked，列表只能等
+// 用户手动点刷新才消失 —— 那正是用户报告的「取消绑定后设备没消失」。
+func TestDeviceRevokeNotifiesHook(t *testing.T) {
+	svc, _ := newDeviceTestService(t)
+	ctx := context.Background()
+
+	view, err := svc.IssuePairCode(ctx, testOwnerUserID, "待解绑设备", model.DeviceKindDesktop)
+	if err != nil {
+		t.Fatalf("签发配对码失败: %v", err)
+	}
+	res, err := svc.Pair(ctx, "client-x", PairRequest{Code: view.Code})
+	if err != nil {
+		t.Fatalf("配对失败: %v", err)
+	}
+
+	var hooked []string
+	svc.SetRevokedHook(func(_ context.Context, id string) { hooked = append(hooked, id) })
+
+	if err := svc.Revoke(ctx, res.DeviceID); err != nil {
+		t.Fatalf("吊销失败: %v", err)
+	}
+	if len(hooked) != 1 || hooked[0] != res.DeviceID {
+		t.Fatalf("管理端吊销也必须触发吊销钩子（供 SSE 广播），得到 %v", hooked)
+	}
+
+	// 未装配钩子时不得 panic（设备域关闭 / 单测环境）
+	svc2, _ := newDeviceTestService(t)
+	svc2.SetRevokedHook(nil)
+	view2, err := svc2.IssuePairCode(ctx, testOwnerUserID, "无钩子设备", model.DeviceKindDesktop)
+	if err != nil {
+		t.Fatalf("签发配对码失败: %v", err)
+	}
+	res2, err := svc2.Pair(ctx, "client-y", PairRequest{Code: view2.Code})
+	if err != nil {
+		t.Fatalf("配对失败: %v", err)
+	}
+	if err := svc2.Revoke(ctx, res2.DeviceID); err != nil {
+		t.Fatalf("未装配钩子时吊销不应失败: %v", err)
+	}
+}
+
+// stubDisconnector 记录断连调用的测试替身。
+type stubDisconnector struct {
+	on func(deviceID, reason string)
+}
+
+func (s stubDisconnector) CloseDevice(deviceID, reason string) {
+	if s.on != nil {
+		s.on(deviceID, reason)
 	}
 }
 

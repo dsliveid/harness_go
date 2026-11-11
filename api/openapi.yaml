@@ -1104,6 +1104,16 @@ paths:
         配对码不存在 / 已消费 / 已过期 / 格式非法，**一律**返回 401 `device.pair_code_invalid`
         （防枚举，不区分具体原因）。同一来源失败 6 次/分钟 → 429 `rate_limited`。
         device_token 明文仅在此响应中出现一次，服务端只存 sha256。
+
+        **配对后免二次登录**：配对码由已登录账号签发（`/devices/pair-codes` 需用户令牌），
+        其授权者随码落库。故本端点在配对成功时会**额外**下发一份用户会话：
+        `user_token` / `user` / `session_ttl_s` 三字段**同生共死**（要么全有、要么全无）。
+        端侧拿到后直接进入已登录态，无需再走 `/auth/login`。
+
+        三字段缺失是**合法降级**，不是错误：历史配对码（未记录授权者）、服务端未装配
+        Auth、或签发失败时都会省略它们，此时**配对本身仍然成功**，端侧回落登录页。
+        之所以不因签发失败而回滚配对：配对码已被一次性消费，回滚等于强迫用户重新配对，
+        代价远大于多登录一次。
       requestBody:
         required: true
         content:
@@ -1132,6 +1142,56 @@ paths:
               schema: { $ref: "#/components/schemas/PairResult" }
         "401":
           description: 配对码无效（不存在/已消费/已过期均同码）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorBody" }
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "503":
+          $ref: "#/components/responses/DeviceUnavailable"
+  /api/v1/devices/session:
+    post:
+      tags: [devices]
+      summary: 凭设备令牌续签用户会话（设备与账号持久绑定的续期入口）
+      description: |
+        `user_token` 会过期（`auth.session_ttl_h`，默认 168h = 7 天）。过期后端侧只剩
+        `device_token`，而设备令牌**通不过** `/api/**` 的用户令牌中间件 —— 若无本端点，
+        「配对即免登录」只能撑 7 天，之后用户被迫重新输密码，而设备其实还在。
+
+        设备在配对时已记录归属账号（`devices.user_id`），故服务端能回答「该给谁续会话」。
+
+        **鉴权（三条铁律）**：
+        1. 本端点免全局鉴权（端侧没有用户令牌），但**不是**免鉴权：handler 内只认
+           `Authorization: Bearer <device_token>` 并自行校验。
+        2. **明确拒绝 Cookie 通道**：不接受 `hg_sess`，否则 WebView 的用户会话就能
+           换取"刷会话"，绕开设备身份、也让吊销设备失效。
+        3. 设备被吊销 / 令牌无效 → 401（不区分原因，防枚举）。
+
+        **安全权衡（已知并已接受）**：本端点把 `device_token` 从"只能连 WS 执行面"
+        提升为"可换业务会话"。之所以可接受：持有 device_token 本就等同于在宿主上获得
+        执行权（可收 `task.dispatch` 执行 `fs.*` / `exec`），相对而言换取业务会话不是质变；
+        且吊销设备即刻失效。缓解措施：签发的会话恒为 `kind=web_session` + `scope=write`
+        （不授 admin），高危操作仍由审批闸门二次把关。
+
+        **归属未知的存量设备**（0011 迁移之前配对，`user_id` 为空）返回 409
+        `device.owner_unknown`：设备本身有效，但服务端不知道它属于谁，无法签发会话。
+        端侧应引导重新配对，而不是让用户去登录页 —— 密码登进来的是"人"，
+        而这里缺的是"机器属于谁"。
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: 续签成功（三字段同生共死，与配对响应形态一致）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SessionGrant" }
+        "401":
+          description: 设备令牌无效 / 已吊销 / 缺失（含误用 user_token 调用）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorBody" }
+        "409":
+          description: 设备归属账号未知（`device.owner_unknown`），需重新配对
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorBody" }
@@ -1214,7 +1274,21 @@ paths:
   /api/v1/devices:
     get:
       tags: [devices]
-      summary: 设备列表（含离线/已吊销与能力项；**不回传令牌摘要**）
+      summary: 设备列表（默认只含**未吊销**；不回传令牌摘要）
+      description: |
+        默认只返回**仍处于绑定关系**的设备（`revoked_at IS NULL`）。
+
+        **解绑语义变更（双向收敛）**：此前本端点返回全部设备（含已吊销），导致管理端
+        「解除绑定」后设备仍以红标卡片留在列表里，用户以为解绑没生效。现在吊销即从
+        列表消失 —— 绑定关系的真源是 `devices.revoked_at`，列表只是它的投影。
+
+        审计/运维需要看历史吊销记录时传 `include_revoked=true`。
+      parameters:
+        - name: include_revoked
+          in: query
+          required: false
+          description: 为 true 时包含已吊销设备（审计用）。非法值按 false 处理，不报 400。
+          schema: { type: boolean, default: false }
       responses:
         "200":
           description: 设备列表
@@ -1223,11 +1297,44 @@ paths:
               schema: { $ref: "#/components/schemas/DeviceList" }
         "503":
           $ref: "#/components/responses/DeviceUnavailable"
+  /api/v1/devices/unpair:
+    post:
+      tags: [devices]
+      summary: 端侧自我解约（凭 device_token 吊销自己，**免用户令牌**）
+      description: |
+        **双向解绑的客户端方向**：端侧「解除本机绑定」时调用，把服务端的设备记录一并吊销。
+
+        # 为什么必须是独立端点
+        `DELETE /api/v1/devices/{did}` 走全局用户令牌中间件，而端侧解绑时手里只有
+        `device_token`（user_token 可能已过期）→ 端侧解绑**结构上不可达**，
+        只能清本地凭据、服务端记录原封不动（这就是「客户端取消绑定后服务端没取消」的根因）。
+
+        # 鉴权
+        只认 `Authorization: Bearer <device_token>`，**明确拒绝 Cookie**（防用 WebView
+        的用户会话"替别人解绑"）。请求体为空：目标设备由令牌哈希反查，
+        **不接受任何 deviceID**，物理上无法删别人的设备。
+
+        # 幂等
+        令牌无效 / 设备不存在 / 已吊销 → 一律 **204**（目标状态「本机不再绑定」已达成）。
+        这与 `DELETE /devices/{did}` 的 404 刻意区分：端侧解绑不该因为"已经解绑了"而失败。
+        仅令牌缺失/格式非法 → 401。
+      security:
+        - bearerAuth: []
+      responses:
+        "204":
+          description: 已解绑（或本就未绑定）
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          $ref: "#/components/responses/DeviceUnavailable"
   /api/v1/devices/{did}:
     delete:
       tags: [devices]
       summary: 吊销设备（令牌立即失效并断开长连接）
-      description: 已吊销或不存在均返回 404 `device.not_found`（幂等语义外的不可重复成功）。
+      description: |
+        管理端按 ID 吊销，**需用户令牌**。吊销后该设备即从 `GET /api/v1/devices` 的
+        默认列表消失（= 解除绑定），并广播 SSE `device.revoked`。
+        已吊销或不存在均返回 404 `device.not_found`（幂等语义外的不可重复成功）。
       parameters:
         - { name: did, in: path, required: true, schema: { type: string } }
       responses:
@@ -1259,6 +1366,51 @@ paths:
           description: 已升级为 WebSocket（`task.dispatch` / `task.progress` / `task.result` / `lease.revoked`）
         "401":
           description: 设备令牌无效或已吊销
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorBody" }
+        "503":
+          $ref: "#/components/responses/DeviceUnavailable"
+  /api/v1/devices/events:
+    get:
+      tags: [devices]
+      summary: 设备状态实时推送（SSE；**需用户令牌**）
+      description: |
+        把设备的上下线变化实时推给观察侧（Web 前端），用于展示「当前哪些设备在线」。
+
+        **与 `/sessions/{sid}/runs/{rid}/events` 是两套不同语义的流，勿混用**：
+        - 后者是 per-Run 事件流（含 seq，支持 `Last-Event-ID` 续传）；
+        - 本端点是设备状态**当前态**，**不支持续传** —— 重连即重拿全量快照。
+
+        帧格式：
+        ```
+        event: snapshot
+        data: {"type":"snapshot","all":[{"device_id","name","kind","online","last_seen_at"}],"at":<ms>}
+
+        event: device.online
+        data: {"type":"device.online","device":{...},"at":<ms>}
+
+        event: device.offline
+        data: {"type":"device.offline","device":{...},"at":<ms>}
+        ```
+        首帧固定为 `snapshot`（全量，按 `device_id` 排序），随后仅推**状态跃迁**。
+
+        语义铁律：
+        - 心跳**不推送**（每 15s 一次会让观察侧被无意义事件刷屏），只刷新 `last_seen_at`；
+        - 同一设备重复上线/重复离线**不重复推送**（幂等），避免端侧重连造成事件风暴；
+        - 同设备新连接接管旧连接 → 先 `offline` 再 `online`（不制造「一直在线」的假象）；
+        - 慢消费者被服务端主动断开（缓冲满），浏览器重连后重拿快照即可；
+        - 响应中**绝不含任何令牌字段**（红线 R3）。
+      responses:
+        "200":
+          description: SSE 流（`text/event-stream`；每 15s 一条 `: ping` 注释保活）
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: 见上方的 snapshot / device.online / device.offline 帧格式
+        "401":
+          description: 缺少或无效的用户令牌
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorBody" }
@@ -2688,6 +2840,37 @@ components:
           description: 明文仅此一次返回（前缀 hgd_），服务端只存 sha256
         ws_path: { type: string, description: 端侧长连接路径（出站 WS） }
         protocol_version: { type: integer, description: 设备协议版本，支持 N / N-1 }
+        user_token:
+          type: string
+          description: |
+            用户会话令牌（前缀 hgt_），与 device_token 是**两套独立凭据**：
+            device_token 证明「这台机器获准接入」，user_token 证明「操作者是谁」。
+            明文仅此一次返回，服务端只存 sha256。
+
+            可选：仅当配对码携带授权用户且签发成功时下发，与 user / session_ttl_s
+            同生共死。缺失即表示端侧需回落到 `/auth/login` 手动登录。
+        user:
+          $ref: "#/components/schemas/User"
+        session_ttl_s:
+          type: integer
+          description: user_token 有效期（秒），供端侧决定何时提示重新登录
+    SessionGrant:
+      type: object
+      description: |
+        用户会话签发结果（配对成功 / 设备自续会话共用同一形态）。
+
+        三字段**同生共死**：`user_token` 是唯一必要条件，`user` / `session_ttl_s`
+        用于展示与过期提示，服务端总是同时下发。
+      required: [user_token]
+      properties:
+        user_token:
+          type: string
+          description: 用户会话令牌（前缀 hgt_）。明文仅此一次返回，服务端只存 sha256。
+        user:
+          $ref: "#/components/schemas/User"
+        session_ttl_s:
+          type: integer
+          description: 会话有效期（秒）
     Device:
       type: object
       properties:

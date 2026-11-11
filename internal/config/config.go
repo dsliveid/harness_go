@@ -39,7 +39,7 @@ const (
 
 // ServerConfig HTTP 服务参数。
 type ServerConfig struct {
-	Addr          string `yaml:"addr"`            // 默认 127.0.0.1:5611
+	Addr          string `yaml:"addr"`            // 默认 0.0.0.0:5611（局域网可访问；仅本机请写 127.0.0.1:5611）
 	ReadTimeoutS  int    `yaml:"read_timeout_s"`  // 秒
 	WriteTimeoutS int    `yaml:"write_timeout_s"` // 秒（SSE 需为 0 或足够大）
 }
@@ -283,10 +283,16 @@ type Config struct {
 	ConfigFile string `yaml:"-"`
 }
 
-// Default 返回内置默认值（local 形态、本机监听）。
+// Default 返回内置默认值（local 形态）。
+//
+// 监听口径（2026-11 调整，用户明确要求）：默认 **0.0.0.0:5611**，局域网开箱可访问。
+// 历史口径曾是 127.0.0.1:5611（仅本机，保守安全姿态），但用户实测反馈「服务端只支持
+// 本地访问，用 IP 打不开」并明确要求默认开放，故翻转。若需收回仅本机访问，
+// 用 -addr 127.0.0.1:5611 / config.yaml server.addr / HARNESS_SERVER_ADDR 任一覆盖。
+// 无 TLS 明文暴露的风险由「部署在可信内网」这一产品定位承接（docs 部署口径）。
 func Default() Config {
 	return Config{
-		Server:     ServerConfig{Addr: "127.0.0.1:5611", ReadTimeoutS: 30, WriteTimeoutS: 0},
+		Server:     ServerConfig{Addr: "0.0.0.0:5611", ReadTimeoutS: 30, WriteTimeoutS: 0},
 		Deployment: DeploymentConfig{Mode: ModeLocal},
 		Data:       DataConfig{Dir: "./data"},
 		Auth: AuthConfig{

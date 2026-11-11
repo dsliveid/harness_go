@@ -723,3 +723,81 @@ func TestPluginLayering(t *testing.T) {
 	}
 	t.Logf("分层合规：扫描 %d 个文件，零越界", scanned)
 }
+
+// webviewTicketSrcPath / authStoreSrcPath / apiClientSrcPath：WebView 免登链路的三个前端落点。
+//
+// 为什么用 Go 断言 TS 源码：`harness_go/web` 未安装 vitest，也没有 test 脚本，
+// 本任务明令禁止新增 npm 依赖，因此「前端契约被人删掉」只能靠仓库级的源码断言守住。
+const (
+	webviewTicketSrcPath = "../../web/src/lib/webviewTicket.ts"
+	authStoreSrcPath     = "../../web/src/stores/authStore.ts"
+	apiClientSrcPath     = "../../web/src/lib/api.ts"
+)
+
+// readWebSrc 读取前端源码原文，失败即 Fatal（文件被改名/删除本身就是漂移）。
+func readWebSrc(t *testing.T, path string) string {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("读取 %s 失败: %v（前端契约文件缺失或被改名）", path, err)
+	}
+	return string(raw)
+}
+
+// TestWebExchangesWebviewTicket 守门「契约两边都有、但没人真调」的漂移复发。
+//
+// 事故背景（P0）：移动端 `prepareAuth` 会签出一次性 ticket 并拼进入口 URL 的 fragment，
+// 服务端 `/api/v1/auth/webview-exchange` 也早已齐备，`apiTypes.ts` 里连路径常量与 DTO 都有，
+// **但 web/src 全仓没有任何调用点、也没有一处读 `location.hash` 的 ticket**。
+// 结果：ticket 被签出后无人消费 → `/auth/me` 无 hg_sess → 首屏渲染登录表单 = 移动端「两轮登录」。
+//
+// 本测试把那条断链的三个必要条件钉死（三边缺一即失败）：
+//  1. `lib/webviewTicket.ts` 存在并导出解析/抹除/组合三个纯函数；
+//  2. `stores/authStore.ts` 的 boot 里**同时**出现 `takeTicketFromLocation` 与 `exchangeWebviewTicket`
+//     —— 只断言契约文件存在是不够的，必须证明启动路径真的接了线；
+//  3. `lib/api.ts` 里出现 `API_PATHS.authWebviewExchange` —— 证明 realApi 真的发出了兑换请求。
+func TestWebExchangesWebviewTicket(t *testing.T) {
+	// ① 纯函数模块：三个导出缺一不可（`export function xxx` 精确匹配，避免注释误命中）
+	ticketSrc := readWebSrc(t, webviewTicketSrcPath)
+	for _, fn := range []string{
+		"export function readTicketFromHash",
+		"export function stripTicketFromFragment",
+		"export function takeTicketFromLocation",
+	} {
+		if !strings.Contains(ticketSrc, fn) {
+			t.Errorf("%s 缺少 %q —— fragment 里的 ticket 将再次无人消费（移动端两轮登录的直接成因）",
+				webviewTicketSrcPath, fn)
+		}
+	}
+
+	// ② boot 必须真的调用：读 ticket + 发兑换，二者同时出现才算接线完成
+	authSrc := readWebSrc(t, authStoreSrcPath)
+	start := strings.Index(authSrc, "boot: async () => {")
+	if start < 0 {
+		t.Fatalf("%s 中未找到 `boot: async () => {`（boot 实现已改名或被删，守门点失效）", authStoreSrcPath)
+	}
+	// 截取 boot 函数体：到下一个顶层 `  },\n` 结束（boot 之后的兄弟方法以 2 空格缩进声明）
+	bootBody := authSrc[start:]
+	if end := strings.Index(bootBody[1:], "\n  },\n"); end > 0 {
+		bootBody = bootBody[:end+1]
+	}
+	// 防止「截取失效 → bootBody 变成整个文件 → 断言退化为形式主义」：
+	// 若截取成功，bootBody 一定不含紧邻的兄弟方法声明，也必然短于全文。
+	if strings.Contains(bootBody, "ssoLogin: async") || len(bootBody) >= len(authSrc) {
+		t.Fatalf("%s 的 boot() 函数体截取失败（守门断言会退化为全文匹配，形同虚设）", authStoreSrcPath)
+	}
+	for _, call := range []string{"takeTicketFromLocation", "exchangeWebviewTicket"} {
+		if !strings.Contains(bootBody, call) {
+			t.Errorf("%s 的 boot() 内未调用 %q —— 契约文件存在但启动路径没接线，"+
+				"移动端 WebView 免登会静默失效（首屏回落 Web 登录表单）", authStoreSrcPath, call)
+		}
+	}
+
+	// ③ api.ts 必须真的打兑换端点
+	apiSrc := readWebSrc(t, apiClientSrcPath)
+	if !strings.Contains(apiSrc, "API_PATHS.authWebviewExchange") {
+		t.Errorf("%s 中未找到 API_PATHS.authWebviewExchange —— realApi 未实现兑换请求", apiClientSrcPath)
+	}
+
+	t.Logf("WebView ticket 兑换链路三边齐备：webviewTicket.ts（3 个纯函数）/ authStore.boot（取票+兑换）/ api.ts（authWebviewExchange）")
+}

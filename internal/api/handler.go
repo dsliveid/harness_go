@@ -11,6 +11,7 @@ import (
 
 	"harness-go/internal/apperr"
 	"harness-go/internal/auth"
+	"harness-go/internal/device"
 	"harness-go/internal/events"
 	"harness-go/internal/logvault"
 	"harness-go/internal/service"
@@ -61,7 +62,10 @@ type Deps struct {
 	// （失败即关闭，绝不放行全盘）。docs/工作区宿主与目录选择对接约定.md §4
 	FSRoots []string
 	// DeviceWS 设备长连接网关（阶段 C-3；nil 时 /devices/ws 返回 503 device.disabled）
-	DeviceWS    http.Handler
+	DeviceWS http.Handler
+	// DeviceState 设备状态广播总线（nil 时 /devices/events 返回 503 device.disabled）。
+	// 由 cmd 装配：把 Hub 的 OnOnline/OnOffline 与 StateBus.MarkOnline/MarkOffline 组合。
+	DeviceState *device.StateBus
 	Bus         *events.Bus
 	Auth        *auth.Service
 	AuthConfig  AuthConfig

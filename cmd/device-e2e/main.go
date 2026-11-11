@@ -253,6 +253,78 @@ func (r *runner) runAll(ctx context.Context, cli *http.Client, baseURL, user, pa
 	r.pass("配对", fmt.Sprintf("device_id=%s token=%s ws_path=%s protocol_version=%d",
 		paired.DeviceID, maskToken(paired.DeviceToken), paired.WSPath, paired.ProtocolVersion))
 
+	// ---------- ②b 免二次登录：配对下发用户会话必须真能用 ----------
+	//
+	// 这是本轮新增契约的端到端证明：配对码由已登录账号签发 → 服务端一并下发 user_token
+	// → 端侧无需再登录即可访问需鉴权的接口。
+	// 判据刻意用「拿它调 /auth/me 并核对身份」，而不是只看字段非空：
+	// 字段非空但令牌不可用（例如 kind 写错被中间件拒）是最典型的假绿。
+	fmt.Println("\n[2b] 配对后免二次登录（核对 user_token 可用性）")
+	if !strings.HasPrefix(paired.UserToken, "hgt_") {
+		r.fail("免登录", fmt.Sprintf("配对响应应含 hgt_ 前缀的 user_token，实际 %q", maskToken(paired.UserToken)))
+		return
+	}
+	if paired.User.ID == "" || paired.SessionTTLS <= 0 {
+		r.fail("免登录", fmt.Sprintf("user_token 必须与 user / session_ttl_s 同生共死，实际 user_id=%q ttl=%d",
+			paired.User.ID, paired.SessionTTLS))
+		return
+	}
+	me, err := fetchMe(ctx, cli, baseURL, paired.UserToken)
+	if err != nil {
+		r.fail("免登录", explainHTTP(err))
+		return
+	}
+	if me.ID != paired.User.ID {
+		r.fail("免登录", fmt.Sprintf("user_token 身份与配对响应不一致：me=%q pair=%q", me.ID, paired.User.ID))
+		return
+	}
+	// 反向边界：device_token 绝不能访问用户接口（双令牌模型不可被合并）。
+	if _, err := fetchMe(ctx, cli, baseURL, paired.DeviceToken); err == nil {
+		r.fail("免登录", "device_token 不应能访问 /auth/me（双令牌边界被破坏）")
+		return
+	}
+	r.pass("免登录", fmt.Sprintf("配对即登录成功 user=%s(%s) ttl_s=%d token=%s",
+		me.Username, me.ID, paired.SessionTTLS, maskToken(paired.UserToken)))
+
+	// ---------- ②c 设备令牌自续会话（设备与账号持久绑定的证明） ----------
+	//
+	// 为什么必须验这一段：user_token 7 天过期后，端侧只剩 device_token。
+	// 若设备令牌换不到新会话，「绑定即免登录」就只撑 7 天，之后用户被迫重登。
+	// 判据同样用「拿新会话调 /auth/me 并核对身份」，而不是只看字段非空。
+	fmt.Println("\n[2c] 设备令牌自续会话（设备与账号持久绑定）")
+	renewedUser, renewedToken, err := renewDeviceSession(ctx, cli, baseURL, paired.DeviceToken)
+	if err != nil {
+		r.fail("自续会话", explainHTTP(err))
+		return
+	}
+	if renewedUser.ID != paired.User.ID {
+		r.fail("自续会话", fmt.Sprintf("续出的身份必须是设备归属账号：得到 %s，期望 %s",
+			renewedUser.ID, paired.User.ID))
+		return
+	}
+	// 新会话必须真能用，且与配对下发的那张**不是同一张**（否则等于没续）。
+	if renewedToken == paired.UserToken {
+		r.fail("自续会话", "续出的 user_token 与配对下发的是同一个值（说明没有真正签发新会话）")
+		return
+	}
+	renewedMe, err := fetchMe(ctx, cli, baseURL, renewedToken)
+	if err != nil {
+		r.fail("自续会话", explainHTTP(err))
+		return
+	}
+	if renewedMe.ID != paired.User.ID {
+		r.fail("自续会话", fmt.Sprintf("新会话身份不一致：me=%s expected=%s",
+			renewedMe.ID, paired.User.ID))
+		return
+	}
+	// 反向边界：用 **user_token** 调本端点必须 401（只有设备令牌可换）。
+	if _, _, err := renewDeviceSession(ctx, cli, baseURL, renewedToken); err == nil {
+		r.fail("自续会话", "user_token 不应能调用 /devices/session（只有设备令牌可以）")
+		return
+	}
+	r.pass("自续会话", fmt.Sprintf("凭设备令牌换到新会话 user=%s token=%s（与配对下发者不同）",
+		renewedMe.Username, maskToken(renewedToken)))
+
 	// ---------- 分支：真实 Runner 二进制模式 ----------
 	// 必须在这里就分叉：下面 [3] 会用**同一 device_id** 再建一条脚本自己的 WS 连接，
 	// 而 Hub.Register 对同 device_id 是「替换」语义 —— 两条连接会互相顶掉，
