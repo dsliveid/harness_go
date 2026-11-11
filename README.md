@@ -96,9 +96,10 @@ go build -trimpath -ldflags "-s -w" -o bin/harness-go.exe ./cmd/harness-go
 
 > ⚠️ `web/dist/.gitkeep` 必须入库：`//go:embed all:dist` 在编译期要求目录存在。
 > 未构建前端时二进制仍可启动，`/` 返回「前端未构建」提示页。
-> 也提供了 `run.cmd` / `run.sh`（支持 `--dev` / `--port` / `--data` / `--config` / `--open` /
-> `--no-build` / `--rebuild` / `--dry-run` / `--no-health` / `--no-web-rebuild` 等参数，
-> 详见第四章；注意 `--web` 已迁移到前端脚本，传它会直接报错退出）。
+> 也提供了 `run.cmd` / `run.sh`（支持 `--run`（默认单二进制） / `--dev` / `--port` / `--data` /
+> `--config` / `--open` / `--no-build` / `--rebuild` / `--dry-run` / `--no-health` /
+> `--no-web-rebuild` 等参数，详见第四章；注意 `--web` 已迁移到前端脚本，传它会直接报错退出）。
+> 默认 `run` 模式启动前会**重建前端并重编二进制**，确保页面为当前源码最新产物。
 
 ---
 
@@ -128,7 +129,7 @@ go build -trimpath -ldflags "-s -w" -o bin/harness-go.exe ./cmd/harness-go
 
 | 脚本 | 参数 |
 | --- | --- |
-| `run.sh` | `--dev`（go run 模式）· `--port` · `--data` · `--config` · `--open` · `--no-build` · `--rebuild` · `--dry-run` · `--no-health` · `--no-web-rebuild` |
+| `run.sh` | `--run`（单二进制模式，默认）· `--dev`（go run 模式）· `--port` · `--data` · `--config` · `--open` · `--no-build` · `--rebuild` · `--dry-run` · `--no-health` · `--no-web-rebuild`（跳过启动前强制重建前端） |
 | `web/run.sh` | `--port` · `--real`（默认即真实，显式写法保留）· `--backend <url>` · `--open` · `--install` · `--dry-run` |
 | `demo/run.sh` | `--port` · `--build` · `--preview`（零依赖 `serve.cjs` 托管 `demo/dist`）· `--open` · `--install` · `--dry-run` |
 | `build.sh` | `--web`（先构建前端）· `--skip-web`（复用已有产物，只编译后端）· `--debug` |
@@ -164,8 +165,9 @@ go build -trimpath -ldflags "-s -w" -o bin/harness-go.exe ./cmd/harness-go
 - 后端端口必须与 `web/vite.config.ts` 的 proxy 默认 target 一致（5611），否则用
   `.\web\run.cmd --backend http://127.0.0.1:9000` 显式对齐。
 - 想看早期纯前端原型（与后端无关）另开终端跑 `.\demo\run.cmd`（5610）。
-- 只跑 `./run.sh`（单二进制或 `--dev`）时，脚本仅在「前端源码比 `web/dist` 新」时
-  **重建一次**，属于冷更新；`--no-web-rebuild` 可跳过。
+- 只跑 `./run.sh`（单二进制或 `--dev`）时，脚本会在启动前**无条件重建一次**前端产物
+  （保证启动那一刻的页面就是当前源码的最新构建），属于冷更新；随后 `run` 模式还会
+  重编二进制以把新产物内嵌进去。`--no-web-rebuild` 可跳过重建（复用旧 `web/dist`）。
 
 ---
 

@@ -92,17 +92,45 @@ harness_bin_path() {
 }
 
 # ---------------------------------------------------------------------------
-# 前端产物新鲜度：web/src 等是否比 web/dist/index.html 新
+# 前端产物完整性校验：web/dist/index.html 引用的 assets/* 是否都真实存在
 #
-# 痛点：web/dist 通过 //go:embed 在**编译期**打进二进制，Go 侧完全不感知它的变化。
-#       后端脚本（go run / 已编译二进制）不会因为前端源码改动而生效：
-#       页面仍是上一次 npm run build 的产物，用户会误以为「前端没变化 / 代码没生效」。
+# 为什么需要它：构建失败有两种截然不同的后果，必须区别对待。
+#   ① 失败于 tsc -b（类型检查阶段）：vite 尚未写出任何文件，dist 仍是**上一次的
+#      完整产物** → 可安全复用；
+#   ② 失败于 vite build 中途：index.html 可能已被覆写、新 chunk 未写全 → dist
+#      **半损坏**，此时若仍内嵌进二进制，页面必然白屏，且现象极难排查。
+# 本函数用于区分这两种情况：返回 0 表示「dist 完整可用」。
+#
+# 实现：解析 index.html 里的 assets/xxx 引用，逐个 stat；一个都不能缺。
+#   只用 grep（System32 无同名工具），与 web/build.sh 的 prune 逻辑口径一致。
+# ---------------------------------------------------------------------------
+dist_intact() {
+  local html="web/dist/index.html"
+  [ -f "$html" ] || return 1
+  local refs
+  refs="$(grep -o 'assets/[A-Za-z0-9._/-]*' "$html" 2>/dev/null | sort -u)"
+  [ -n "$refs" ] || return 1          # 入口里一个 assets 引用都没有 → 视为异常
+  local r
+  for r in $refs; do
+    [ -f "web/dist/$r" ] || return 1
+  done
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# 前端产物新鲜度：以下白名单内的文件是否「比 web/dist/index.html 新」
 #
 # 实现约束（踩过的坑）：**禁止使用外部 find / sort / head**。
 #   build.cmd / run.cmd 曾把 %SystemRoot%\System32 前置到 PATH，而 Windows 自带同名工具：
 #     System32\find.exe 是「字符串查找」而非 GNU find → `-newer` 参数报错被吞、结果恒为空；
 #     System32\sort.exe 同样不支持 -u。混用会让新鲜度判断静默失效。
 #   故这里只用 bash 内建比较（[ a -nt b ]）与 glob，跨 Git Bash / MSYS 行为一致。
+#
+# ⚠️ 配置权限说明（2026-11）：
+#   run.sh 已改为「启动时无条件重建前端」，正常路径不再依赖本判定；
+#   本函数现在只服务于两类场景：① build.sh / package.sh 的按需构建；
+#   ② run.sh --no-web-rebuild 时的兜底告警。因此白名单必须尽量收全，
+#   一旦新增加固前述 5 类盲区，请在此同步补充，否则这两条路径会静默给出旧 UI。
 # ---------------------------------------------------------------------------
 web_stale() {
   [ -f web/dist/index.html ] || return 0   # 无产物 → 视为需要构建
@@ -111,9 +139,22 @@ web_stale() {
   prev_nullglob="$(shopt -p nullglob 2>/dev/null || true)"
   prev_globstar="$(shopt -p globstar 2>/dev/null || true)"
   shopt -s nullglob globstar 2>/dev/null || true
-  for f in web/src/**/*.ts web/src/**/*.tsx web/src/**/*.css web/src/**/*.json \
-           web/index.html web/vite.config.ts web/tailwind.config.js \
-           web/postcss.config.js web/package.json web/tsconfig.json; do
+  # ① 源码：不再只认 ts/tsx/css/json，把 vite 可直接处理的全部扩展名纳入，
+  #    否则「把 svg/jsx 当组件或资源改一行」会被判定为新鲜，静默用旧 UI。
+  # ② web/public/**：vite 原样拷贝进 dist 的静态资源（图标/robots/favicon 等）。
+  # ③ 构建配置与依赖锁：package-lock.json 变了（升级依赖）同样必须重建。
+  # ④ build.sh 自身：构建脚本逻辑变更（如新增 prune 步骤）也算产物需更新。
+  for f in web/src/**/*.ts web/src/**/*.tsx web/src/**/*.js web/src/**/*.jsx \
+           web/src/**/*.mjs web/src/**/*.cjs web/src/**/*.css web/src/**/*.scss \
+           web/src/**/*.sass web/src/**/*.less web/src/**/*.json web/src/**/*.svg \
+           web/src/**/*.html \
+           web/public/** \
+           web/index.html web/vite.config.ts web/vite.config.js \
+           web/tailwind.config.js web/tailwind.config.ts \
+           web/postcss.config.js web/postcss.config.cjs \
+           web/package.json web/package-lock.json \
+           web/tsconfig.json web/tsconfig.node.json web/tsconfig.app.json \
+           web/build.sh web/build.cmd; do
     if [ "$f" -nt web/dist/index.html ]; then hit="$f"; break; fi
   done
   eval "${prev_nullglob:-shopt -u nullglob}" 2>/dev/null || true

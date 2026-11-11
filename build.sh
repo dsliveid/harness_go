@@ -11,6 +11,12 @@
 #
 # 产物：bin/harness-go[.exe]（前端 web/dist 在编译期被 //go:embed 内嵌）
 #
+# ⚠️ 与 run.sh 的分工（重要）：
+#   run.sh  每次启动都**无条件重建前端**（保证启动时刻页面＝源码最新），再重编二进制；
+#   build.sh 默认**按需**构建前端（仅 dist 缺失或源码比产物新时才重建），
+#            因为它是 package.sh 的中间步骤，多平台打包时不该反复跑同一份 npm build。
+#   想让 build.sh 也强制重建：加 --web。
+#
 # 与 package.sh 的分工（两者不重复，是"日常"与"发版"的关系）：
 #   build.sh    本机平台 ×1，秒级，产出 bin/，供 run.sh 启动与本地调试
 #   package.sh  多平台交叉编译 → dist/ 分发包目录 + zip/tar.gz + SHA256SUMS（+可选 NSIS）
@@ -43,7 +49,7 @@ for arg in "$@"; do
     --skip-web) SKIP_WEB=1 ;;
     --debug)    DEBUG=1 ;;
     -h|--help)
-      sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
