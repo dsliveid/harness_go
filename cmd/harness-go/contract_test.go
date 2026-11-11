@@ -265,6 +265,134 @@ func readRouterRoutes(t *testing.T) []muxRoute {
 	return out
 }
 
+// ============ 可测纯函数：三方比对判定核心（S1 负向用例的落点） ============
+//
+// 抽成纯函数的原因：原先比对逻辑全部内联在 TestContractRouterNoDrift 内，
+// 想验证「判定真有约束力」只能去改生产源码（router.go / openapi.yaml），
+// 而生产源码是只读基准，不能被负向用例污染。
+// 现在正向用例与负向用例共用**同一份**判定实现：正向用真实文件，负向喂构造样本。
+// 若有人把判定改成「恒返回无差异」，正向用例未必立刻变红，但负向用例必定变红。
+//
+// 约定：所有 diff 函数「空切片 = 无漂移」，非空即以升序返回差异项，调用方负责报错。
+
+// sortedKeys 把字符串集合转成升序切片（diff 结果稳定，便于断言与日志比对）。
+func sortedKeys(set map[string]struct{}) []string {
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// diffStrings 返回 a 中不属于 b 的元素（去重升序）。
+// 「属于」按值精确比较，不做前缀/通配模糊匹配——模糊匹配会让新增路径静默滑过。
+func diffStrings(a, b []string) []string {
+	bSet := make(map[string]struct{}, len(b))
+	for _, p := range b {
+		bSet[p] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(a))
+	for _, p := range a {
+		if _, ok := bSet[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+	}
+	return sortedKeys(seen)
+}
+
+// buildRouterMethodIndex 把 router 注册项按路径聚合成「方法集合」。
+// 只看路径会漏掉方法维度漂移（历史实测：同一路径 router=POST、openapi=GET → 线上 405）。
+func buildRouterMethodIndex(routes []muxRoute) map[string]map[string]struct{} {
+	out := make(map[string]map[string]struct{}, len(routes))
+	for _, r := range routes {
+		if out[r.Path] == nil {
+			out[r.Path] = map[string]struct{}{}
+		}
+		out[r.Path][r.Method] = struct{}{}
+	}
+	return out
+}
+
+// diffRouterAgainstOpenAPI 返回「router.go 已注册、但 openapi.yaml 未登记」的路径。
+//
+// 这是三方校验里最关键的一条边：router.go 是端点真实存在的唯一证据。
+// 若新增端点只在 router 落地、契约两侧都没写，前端照契约写代码就是 404，
+// 而旧测试会一直绿——本函数存在就是为了让这种情况必然报错。
+func diffRouterAgainstOpenAPI(routerRoutes []muxRoute, openapiPaths []string) []string {
+	routerPaths := make([]string, 0, len(routerRoutes))
+	for _, r := range routerRoutes {
+		routerPaths = append(routerPaths, r.Path)
+	}
+	return diffStrings(routerPaths, openapiPaths)
+}
+
+// diffOpenAPIAgainstRouter 返回「openapi.yaml 声明、但 router.go 未注册」的路径
+// （nonAPIRoutes 白名单内的静态/SPA/探活路径除外）。
+//
+// 非空即幽灵端点：契约里挂着早已删除的端点，前端照契约调用会 404。
+func diffOpenAPIAgainstRouter(openapiPaths []string, routerRoutes []muxRoute, whitelist map[string]string) []string {
+	routerPaths := make([]string, 0, len(routerRoutes))
+	for _, r := range routerRoutes {
+		routerPaths = append(routerPaths, r.Path)
+	}
+	routerSet := make(map[string]struct{}, len(routerPaths))
+	for _, p := range routerPaths {
+		routerSet[p] = struct{}{}
+	}
+	missing := make([]string, 0, 4)
+	for _, p := range openapiPaths {
+		if _, ok := routerSet[p]; ok {
+			continue
+		}
+		if _, whitelisted := whitelist[p]; whitelisted {
+			continue
+		}
+		missing = append(missing, p)
+	}
+	return diffStrings(missing, nil) // 复用去重 + 升序
+}
+
+// diffMethodDrifts 返回方法维度漂移（router 某路径注册了某方法、openapi 同路径未声明）。
+// known 是显式台账：登记后豁免，但台账条目一旦修好必须在 TestContractRouterNoDrift 里被清理。
+func diffMethodDrifts(routerRoutes []muxRoute, openapiRoutes map[string]map[string]struct{},
+	known map[string]string) []string {
+
+	idx := buildRouterMethodIndex(routerRoutes)
+	out := make([]string, 0, 4)
+	for path, methods := range idx {
+		declared, ok := openapiRoutes[path]
+		if !ok {
+			// 路径整体未登记已由 diffRouterAgainstOpenAPI 报出，这里不重复报，避免噪音。
+			continue
+		}
+		for m := range methods {
+			if _, ok := declared[m]; ok {
+				continue
+			}
+			if _, isKnown := known[path]; isKnown {
+				continue
+			}
+			out = append(out, fmt.Sprintf("%s %s（router 注册但 openapi 未声明该方法）", m, path))
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// diffOpenAPIAgainstAPITypes 返回「openapi.yaml 有、apiTypes.ts 的 API_PATHS 缺失」的路径。
+// 改契约必须两侧同步：漏改前端会导致前端拿不到路径常量。
+func diffOpenAPIAgainstAPITypes(openapiPaths, tsPaths []string) []string {
+	return diffStrings(openapiPaths, tsPaths)
+}
+
+// diffAPITypesAgainstOpenAPI 返回「apiTypes.ts 有、openapi.yaml 缺失」的路径。
+// 非空即前端自造端点：后端 404，且契约自检形同虚设。
+func diffAPITypesAgainstOpenAPI(tsPaths, openapiPaths []string) []string {
+	return diffStrings(tsPaths, openapiPaths)
+}
+
 // TestParseMuxRoutesSelfCheck 是解析器自身的单元测试。
 //
 // 必要性：router.go 当前恰好没有注释掉的注册行，也没有变量拼接路径，
@@ -324,44 +452,20 @@ func TestContractRouterNoDrift(t *testing.T) {
 	openapi := readOpenAPIPaths(t)
 	openapiRoutes := readOpenAPIRoutes(t)
 
+	// 判定全部委托给纯函数（与 TestContractDiffPureFunctions 的负向用例共用同一份实现，
+	// 避免「正向走一套、负向测另一套」的自欺欺人）。
+	missingInOpenAPI := diffRouterAgainstOpenAPI(routes, openapi)
+	missingInRouter := diffOpenAPIAgainstRouter(openapi, routes, nonAPIRoutes)
+	methodDrifts := diffMethodDrifts(routes, openapiRoutes, knownMethodDrifts)
+
+	routerMethods := buildRouterMethodIndex(routes)
 	routeSet := make(map[string]struct{}, len(routes))
-	routerMethods := make(map[string]map[string]struct{}, len(routes))
 	for _, r := range routes {
 		routeSet[r.Path] = struct{}{}
-		if routerMethods[r.Path] == nil {
-			routerMethods[r.Path] = map[string]struct{}{}
-		}
-		routerMethods[r.Path][r.Method] = struct{}{}
 	}
 	openapiSet := make(map[string]struct{}, len(openapi))
 	for _, p := range openapi {
 		openapiSet[p] = struct{}{}
-	}
-
-	var missingInOpenAPI, missingInRouter, methodDrifts []string
-	for _, r := range routes {
-		if _, ok := openapiSet[r.Path]; !ok {
-			missingInOpenAPI = append(missingInOpenAPI, r.Path)
-			continue
-		}
-		// 方法维度：router 该路径的方法必须在 openapi 同一路径下声明。
-		for m := range routerMethods[r.Path] {
-			if _, ok := openapiRoutes[r.Path][m]; !ok {
-				key := m + " " + r.Path
-				if _, known := knownMethodDrifts[r.Path]; known {
-					continue
-				}
-				methodDrifts = append(methodDrifts, fmt.Sprintf("%s（router 注册但 openapi 未声明该方法）", key))
-			}
-		}
-	}
-	for _, p := range openapi {
-		if _, ok := routeSet[p]; !ok {
-			if _, whitelisted := nonAPIRoutes[p]; whitelisted {
-				continue
-			}
-			missingInRouter = append(missingInRouter, p)
-		}
 	}
 
 	// 白名单不得腐化：条目必须在 router 或 openapi 任一侧仍存在。
@@ -449,26 +553,10 @@ func TestContractPathsNoDrift(t *testing.T) {
 	openapi := readOpenAPIPaths(t)
 	ts := readAPITypesPaths(t)
 
-	openapiSet := make(map[string]struct{}, len(openapi))
-	for _, p := range openapi {
-		openapiSet[p] = struct{}{}
-	}
-	tsSet := make(map[string]struct{}, len(ts))
-	for _, p := range ts {
-		tsSet[p] = struct{}{}
-	}
+	// 判定委托给纯函数（与 TestContractDiffPureFunctions 的负向用例共用同一份实现）。
+	missingInTS := diffOpenAPIAgainstAPITypes(openapi, ts)
+	missingInYAML := diffAPITypesAgainstOpenAPI(ts, openapi)
 
-	var missingInTS, missingInYAML []string
-	for _, p := range openapi {
-		if _, ok := tsSet[p]; !ok {
-			missingInTS = append(missingInTS, p)
-		}
-	}
-	for _, p := range ts {
-		if _, ok := openapiSet[p]; !ok {
-			missingInYAML = append(missingInYAML, p)
-		}
-	}
 	if len(missingInTS) > 0 {
 		t.Fatalf("openapi.yaml 有但 apiTypes.ts 缺失: %v（改契约必须两侧同步）", missingInTS)
 	}
@@ -476,6 +564,119 @@ func TestContractPathsNoDrift(t *testing.T) {
 		t.Fatalf("apiTypes.ts 有但 openapi.yaml 缺失: %v（前端不得自造端点）", missingInYAML)
 	}
 	t.Logf("契约一致：%d 条 path", len(openapi))
+}
+
+// ============ S1：契约负向用例（证明校验真有约束力） ============
+//
+// 正向用例只能证明「当前三方恰好一致」，无法证明「不一致时会变红」——
+// 若有人把比对改成恒返回空（或把断言放宽成 len>0 才报），正向用例依旧全绿。
+// 下面四个用例喂构造样本，逐个钉死「必须报出差异」。
+
+// TestContractDiffRouterAgainstOpenAPIRejectsUnregistered 是 S1 最核心的负向用例：
+// router.go 注册了、openapi.yaml 没登记 → **必须**报出该路径。
+//
+// 两段式：
+//  1. 纯构造样本：断言返回值精确等于缺失项（钉死语义，不依赖仓库真实状态）；
+//  2. 真实基线 + 注入假路由：证明「往今天这份 router 集合里掺一条漏登记的路由」也会被抓到。
+//     这里只断言「包含」，因为断言精确等于会把「将来真实基线确有一条待修漂移」误判成本测试失败。
+func TestContractDiffRouterAgainstOpenAPIRejectsUnregistered(t *testing.T) {
+	// ① 纯构造样本
+	router := []muxRoute{
+		{Method: "GET", Path: "/api/v1/sessions"},
+		{Method: "GET", Path: "/api/v1/__drift_probe"},
+	}
+	openapi := []string{"/api/v1/sessions"}
+	got := diffRouterAgainstOpenAPI(router, openapi)
+	want := []string{"/api/v1/__drift_probe"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("router 注册但 openapi 未登记必须报出\n got=%v\nwant=%v", got, want)
+	}
+
+	// ② 真实基线 + 假路由
+	real := readRouterRoutes(t)
+	if drift := diffRouterAgainstOpenAPI(real, readOpenAPIPaths(t)); len(drift) != 0 {
+		t.Fatalf("前置不成立：真实基线本身已有漂移 %v，负向用例无法定位假路由", drift)
+	}
+	probe := muxRoute{Method: "GET", Path: "/api/v1/__drift_probe"}
+	injected := append(append([]muxRoute{}, real...), probe)
+	got = diffRouterAgainstOpenAPI(injected, readOpenAPIPaths(t))
+	found := false
+	for _, p := range got {
+		if p == probe.Path {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("往真实 router 集合注入 %s 后未被报出（got=%v）——契约校验形同虚设", probe, got)
+	}
+
+	// ③ 一致时不得报差异（防「恒返回非空」的反向腐化）
+	if got := diffRouterAgainstOpenAPI(router[:1], openapi); len(got) != 0 {
+		t.Fatalf("router 与 openapi 完全一致时不得报差异，实际 %v", got)
+	}
+}
+
+// TestContractDiffOpenAPIAgainstRouterRejectsGhost 覆盖反向边：
+// openapi 声明了但 router 未注册（幽灵端点）必须报出，且 nonAPIRoutes 白名单内的不算漂移。
+func TestContractDiffOpenAPIAgainstRouterRejectsGhost(t *testing.T) {
+	router := []muxRoute{{Method: "GET", Path: "/api/v1/sessions"}}
+	whitelist := map[string]string{"/healthz": "探活端点，非 API 契约"}
+	openapi := []string{"/api/v1/sessions", "/api/v1/ghost", "/healthz"}
+
+	got := diffOpenAPIAgainstRouter(openapi, router, whitelist)
+	want := []string{"/api/v1/ghost"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("幽灵端点必须报出、白名单必须放过\n got=%v\nwant=%v", got, want)
+	}
+
+	// 白名单不是「万能放过」：非白名单路径一律报
+	if got := diffOpenAPIAgainstRouter([]string{"/api/v1/ghost2"}, router, whitelist); len(got) != 1 {
+		t.Fatalf("非白名单的幽灵端点必须报出，实际 %v", got)
+	}
+}
+
+// TestContractDiffMethodDriftsRejectsMethodMismatch 覆盖方法维度：
+// 同一路径 router=POST、openapi 只声明 GET → 必须报 POST 漂移；登记台账后豁免。
+func TestContractDiffMethodDriftsRejectsMethodMismatch(t *testing.T) {
+	router := []muxRoute{{Method: "POST", Path: "/api/v1/providers/{pid}/models"}}
+	openapiRoutes := map[string]map[string]struct{}{
+		"/api/v1/providers/{pid}/models": {"GET": {}},
+	}
+
+	got := diffMethodDrifts(router, openapiRoutes, map[string]string{})
+	if len(got) != 1 || !strings.Contains(got[0], "POST /api/v1/providers/{pid}/models") {
+		t.Fatalf("方法漂移必须报出，实际 %v", got)
+	}
+
+	// 登记到显式台账后豁免（台账本身另有「修好必须删条目」的腐化检测）
+	known := map[string]string{"/api/v1/providers/{pid}/models": "历史遗留，本轮不改契约"}
+	if got := diffMethodDrifts(router, openapiRoutes, known); len(got) != 0 {
+		t.Fatalf("台账登记项不得再报漂移，实际 %v", got)
+	}
+
+	// 方法一致时不得误报
+	same := map[string]map[string]struct{}{"/api/v1/providers/{pid}/models": {"POST": {}}}
+	if got := diffMethodDrifts(router, same, map[string]string{}); len(got) != 0 {
+		t.Fatalf("方法一致时不得报漂移，实际 %v", got)
+	}
+}
+
+// TestContractDiffOpenAPIAgainstAPITypesRejectsDrift 覆盖 openapi ↔ apiTypes 双向：
+// openapi 有而 apiTypes 没有必须报出；apiTypes 有而 openapi 没有同样必须报出。
+func TestContractDiffOpenAPIAgainstAPITypesRejectsDrift(t *testing.T) {
+	openapi := []string{"/api/v1/sessions", "/api/v1/auth/login"}
+	ts := []string{"/api/v1/auth/login", "/api/v1/frontend-only"}
+
+	if got := diffOpenAPIAgainstAPITypes(openapi, ts); fmt.Sprint(got) != fmt.Sprint([]string{"/api/v1/sessions"}) {
+		t.Fatalf("openapi 有但 apiTypes 缺失必须报出，实际 %v", got)
+	}
+	if got := diffAPITypesAgainstOpenAPI(ts, openapi); fmt.Sprint(got) != fmt.Sprint([]string{"/api/v1/frontend-only"}) {
+		t.Fatalf("apiTypes 有但 openapi 缺失必须报出，实际 %v", got)
+	}
+	// 两侧一致时双向都不得报差异
+	if a, b := diffOpenAPIAgainstAPITypes(openapi, openapi), diffAPITypesAgainstOpenAPI(openapi, openapi); len(a) != 0 || len(b) != 0 {
+		t.Fatalf("两侧一致时不得报差异，实际 %v / %v", a, b)
+	}
 }
 
 // TestPluginLayering 校验插件与契约层的分层依赖（depguard 兜底）。

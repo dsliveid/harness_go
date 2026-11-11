@@ -44,6 +44,37 @@ func (h *handlers) decideApproval(w http.ResponseWriter, r *http.Request) {
 	//
 	// 校验方式：直接看当前请求令牌的 kind。不走中间件注入，是为了不改
 	// TokenVerifier 签名（那会波及全部既有调用点），在唯一需要限制的入口校验更内聚。
+	//
+	// ============ 【有意取舍】这条校验是 fail-open 的，为什么可以接受 ============
+	//
+	// 现象：currentTokenKind 在「token 为空 / Auth 未装配 / TokenKind 查库报错」时一律返回空串，
+	// 空串 != tokenKindWebview → 本校验放行。也就是说**存储抖动时 WebView 会话可以走完审批决策**。
+	// 这不是漏写，是刻意的 fail-open：
+	//
+	// ① 为什么选 fail-open 而非 fail-closed：
+	//   - 若改成「查不到 kind 就 403」，那么 DB 抖动 / 连接池耗尽 / TokenVerifier 未装配的**任何**抖动，
+	//     都会让**桌面端与浏览器的正常用户**也无法审批。审批是 Run 的阻塞点（Gate.Await 卡在等待），
+	//     一次抖动会把所有进行中的 Run 全部挂到超时（超时一律按 Deny 落库，见 Gate.Await），
+	//     把「短暂存储故障」放大成「大批任务被误拒」，这是比越权更常见、更痛的故障。
+	//   - 而 fail-open 的最坏后果被另一条边兜住：WebView 降级会话即便走到这里，也仍然受
+	//     DecideApprovalFromDevice 的跨端仲裁（strict_approval_device=true 时 danger 风险审批
+	//     只能由发起执行端设备确认）与 Gate 的待决项校验约束。真正的高危闸门不在本函数。
+	//
+	// ② 这个取舍在什么信任边界下才安全（三条前提，缺一条就得改成 fail-closed）：
+	//   - 前提 a：服务端与存储同属一个信任域。TokenKind 查的是本机主库，其抖动是**基础设施故障**，
+	//     不是攻击者可控的输入；外部攻击者无法诱导它返回 error。
+	//   - 前提 b：WebView 降级是**纵深防御的一层，不是唯一一层**。strict_approval_device=true 时
+	//     Gate.CheckDevice 仍会按 RequiredDeviceID 拒绝非执行端设备；因此即便本层 fail-open 漏过，
+	//     高危审批依然被设备绑定挡住。若哪天 Gate 侧的设备仲裁被移除或默认关闭且无人开启 strict，
+	//     本层就会变成**唯一**防线，必须立刻改为 fail-closed。
+	//   - 前提 c：降级标记由服务端令牌签发时写入（tokenKindWebview 只在兑换 ticket 时落到令牌上），
+	//     不来自请求体/请求头等客户端可控字段。一旦有人改成读 body/query 里的 kind，攻击者直接伪造绕过。
+	//
+	// ③ 什么时候会真正变成风险：① TokenKind 的错误来源变成攻击者可诱导的（例如改成远程校验、
+	// 或错误信息可被外部触发）；② strict_approval_device 长期保持默认 false（只审计不阻断）
+	// 且部署在多用户/公网场景——此时 WebView 会话的越权审批将无人兜底；
+	// ③ currentTokenKind 被改成「忽略 error 但返回部分结果」这类更宽松的形态。
+	// 改动本节任一条，都必须把本函数从 fail-open 切换为 fail-closed（并在 Gate 侧保留审计日志）。
 	if h.currentTokenKind(r) == tokenKindWebview {
 		writeError(w, r, apperr.New(apperr.CodeForbidden,
 			"WebView 会话不能审批，请在电脑端确认"))
