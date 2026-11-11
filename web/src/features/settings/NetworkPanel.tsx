@@ -3,7 +3,6 @@ import { useUI } from '../../stores/uiStore'
 import { useSettings } from '../../stores/settingsStore'
 import { Switch, inputCls } from '../../components/ui'
 import { cn } from '../../components/ui'
-import { RealModeNotice } from '../../components/RealModeNotice'
 
 // 网络代理：统一正向代理开关 + 地址 + 连接测试（对齐桌面端「网络代理」）
 export function NetworkPanel() {
@@ -37,11 +36,19 @@ export function NetworkPanel() {
 
   return (
     <div className="flex flex-col gap-4">
-      <RealModeNotice text="代理「连接测试」是本地原型模拟（随机延迟 + 随机成功/失败），并未真正发起探测请求；代理配置本身会写入服务端设置。" />
       <div>
         <div className="text-[13px] font-medium">网络代理设置</div>
         <div className="text-[12px] text-inkdim mt-1 leading-relaxed max-w-[560px]">
           统一配置客户端网络正向代理。开启后，网页抓取工具、终端命令环境与厂商模型请求将统一经由此代理访问，解决境外网站与模型 API 受阻的问题。
+        </div>
+        {/*
+          诚实边界（勿删）：下方「测试连接」按钮走的是 handleTest 里的
+          setTimeout + Math.random() 本地模拟，并未真正发起探测请求。
+          不写明的话用户会把「连接正常（延迟 137ms）」当成服务端实测结果 ——
+          这正是它必须显示提示、而不是静默降级的原因。
+        */}
+        <div className="text-[11px] text-warn mt-1 leading-relaxed max-w-[560px]">
+          ⚠️ 「测试连接」为本地模拟（随机延迟 + 随机成功/失败），并未真正发起探测请求；代理配置本身会写入服务端设置。
         </div>
       </div>
 

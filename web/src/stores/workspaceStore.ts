@@ -4,13 +4,8 @@ import type {
   CommandRun, Message,
 } from '../types'
 import type { Snapshot as SnapshotAnchor } from '../lib/apiTypes'
-import { api, apiMode } from '../lib/api'
+import { api } from '../lib/api'
 import { deriveWorkspace } from '../lib/workspaceDerive'
-import {
-  commands as mockCommands, plans as mockPlans,
-  snapshots as mockSnapshots, subagents as mockSubagents,
-  todos as mockTodos,
-} from '../mock/data'
 
 /**
  * 把服务端「锚点级」快照（一个锚点可含多路径，`paths[]`）展开为 UI「单文件级」快照行。
@@ -57,12 +52,11 @@ interface WorkspaceState {
   snapshotsLoading: boolean
   /** 快照加载错误（原样透传后端 message，绝不吞） */
   snapshotsError: string | null
-  /** 拉取指定会话的真实快照锚点；mock 模式保持本地演示数据不请求 */
+  /** 拉取指定会话的真实快照锚点 */
   loadSnapshots: (sessionId: string) => Promise<void>
   /**
    * 由真实工具调用实时派生运行态四类数据（todos / plans / subagents / commands）。
    * 由 chatStore 在消息落地后调用（SSE 增量与历史回灌共用同一入口）。
-   * mock 模式为空操作——演示数据仍由 mock/data 提供，不被真实通道覆盖。
    */
   syncFromMessages: (messages: Message[]) => void
   /** 停止正在执行的命令（进程组终止） */
@@ -75,19 +69,16 @@ interface WorkspaceState {
 }
 
 export const useWorkspace = create<WorkspaceState>((set) => ({
-  // real 模式初始为空态：绝不先闪一屏演示数据再被真实数据覆盖（冒充真实）。
-  // mock 模式才用 mock/data 的演示行。
-  plans: apiMode === 'mock' ? mockPlans : [],
-  todos: apiMode === 'mock' ? mockTodos : [],
-  snapshots: apiMode === 'mock' ? mockSnapshots : [],
-  subagents: apiMode === 'mock' ? mockSubagents : [],
-  commands: apiMode === 'mock' ? mockCommands : [],
+  // 一律空态起步：绝不先闪一屏演示数据再被真实数据覆盖（冒充真实）
+  plans: [],
+  todos: [],
+  snapshots: [],
+  subagents: [],
+  commands: [],
   snapshotsLoading: false,
   snapshotsError: null,
 
   syncFromMessages: (messages) => {
-    // mock 模式：演示数据由 mock/data 持有，真实派生通道不介入（不伪造「已接真」）
-    if (apiMode !== 'real') return
     const derived = deriveWorkspace(messages)
     set({
       todos: derived.todos,
@@ -98,8 +89,6 @@ export const useWorkspace = create<WorkspaceState>((set) => ({
   },
 
   loadSnapshots: async (sessionId) => {
-    // mock 模式：保留 mock/data 的演示行，不发请求（不伪造「已接真」）
-    if (apiMode !== 'real') return
     if (!sessionId) {
       set({ snapshots: [], snapshotsLoading: false, snapshotsError: null })
       return
@@ -109,7 +98,7 @@ export const useWorkspace = create<WorkspaceState>((set) => ({
       const anchors = await api.listSessionSnapshots(sessionId)
       set({ snapshots: toUiSnapshots(anchors), snapshotsLoading: false })
     } catch (e) {
-      // 错误原样透传：绝不 fallback 到 mock 冒充成功
+      // 错误原样透传：绝不 fallback 到演示数据冒充成功
       set({
         snapshots: [],
         snapshotsLoading: false,

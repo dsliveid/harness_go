@@ -2,7 +2,6 @@ import { useEffect, useState } from 'react'
 import { api } from '../../lib/api'
 import type { SOPCore } from '../../lib/apiTypes'
 import { Badge, Button } from '../../components/ui'
-import { RealModeNotice } from '../../components/RealModeNotice'
 import { cn } from '../../components/ui'
 import { ShieldCheck, RotateCcw, Copy, Check } from 'lucide-react'
 
@@ -114,7 +113,6 @@ export function SopPanel() {
 
   return (
     <div className="flex flex-col gap-4">
-      <RealModeNotice text="核心 SOP 已接入服务端：出厂内置内容内嵌于程序（只读），自定义内容保存在 data/sop/agent-core.md，保存后下一轮对话立即生效。" />
 
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">

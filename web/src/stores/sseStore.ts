@@ -1,5 +1,4 @@
 import { create } from 'zustand'
-import { apiMode } from '../lib/api'
 import type { SseState as ClientPhase, SseStateInfo } from '../lib/sse'
 
 // ============ SSE 客户端状态（**真实**上报容器） ============
@@ -9,8 +8,7 @@ import type { SseState as ClientPhase, SseStateInfo } from '../lib/sse'
 // ⚠️ 历史教训（务必保留这段注释）：
 //   本 store 曾经是纯硬编码假值容器（lastSeq:214 / totalSeq:218 / reconnects:2 /
 //   lastDrop 永为「43 分钟前缓冲已满」），并被 features/chat/SseStatus.tsx 常驻渲染在
-//   layout/TopBar.tsx 上 —— 也就是**每一个登录页顶部都在展示假的 SSE 连接状态**，
-//   且 RealModeNotice 机制对它无效（它是状态点不是面板）。
+//   layout/TopBar.tsx 上 —— 也就是**每一个登录页顶部都在展示假的 SSE 连接状态**。
 //
 //   现在改为「真实状态上报容器」：唯一写入方是 lib/sse.ts 的 SseClient.onState，
 //   经 lib/api.ts（real.startRun）→ stores/chatStore（转发）落到 applyReal()。
@@ -44,8 +42,6 @@ export interface SseState {
   retryIn: number | null
   /** 最近一次断开记录 */
   lastDrop: SseDrop | null
-  /** 是否正在演示断线重连（仅 mock 模式可用） */
-  demoRunning: boolean
 
   /** 开始/切换订阅目标（Run 启动时由 chatStore 调用） */
   attachRun: (runId: string) => void
@@ -57,9 +53,6 @@ export interface SseState {
   noteEvent: (seq: number) => void
   /** 真实状态机上报（唯一真实入口，由 lib/api.ts → chatStore 转发） */
   applyReal: (phase: ClientPhase, info?: SseStateInfo) => void
-  /** mock 模式演示断线重连（real 模式下为空操作） */
-  simulateDrop: () => void
-  resetDemo: () => void
 }
 
 /** 诚实空闲态：没有任何订阅时不展示任何虚构指标 */
@@ -70,7 +63,6 @@ const idleState = {
   reconnects: 0,
   retryIn: null,
   lastDrop: null,
-  demoRunning: false,
 }
 
 export const SSE_PHASE_META: Record<SsePhase, { label: string; tone: 'ok' | 'warn' | 'accent2' | 'err' | 'dim'; hint: string }> = {
@@ -103,8 +95,6 @@ export const useSse = create<SseState>((set, get) => ({
 
   applyReal: (phase, info = {}) => {
     const s = get()
-    // demo 进行中时不被真实状态覆盖（demo 仅 mock 模式可触发，且无真实订阅并发）
-    if (s.demoRunning && apiMode === 'mock') return
 
     const patch: Partial<SseState> = { phase }
 
@@ -131,22 +121,4 @@ export const useSse = create<SseState>((set, get) => ({
 
     set(patch)
   },
-
-  // 演示：仅 mock 模式可用（real 模式下真实状态由 SseClient 驱动，不得伪造）
-  simulateDrop: () => {
-    if (apiMode !== 'mock') return
-    const s = get()
-    if (s.demoRunning || s.phase === 'backoff') return
-    const reconnects = s.reconnects + 1
-    set({ demoRunning: true, phase: 'backoff', retryIn: 1200, runId: s.runId ?? 'demo-run', lastSeq: s.lastSeq || 0 })
-
-    window.setTimeout(() => {
-      set({ phase: 'resync', reconnects, lastDrop: { at: Date.now(), reason: '网络抖动 / EventSource 连接被重置（演示）', retryIn: 1200, attempts: reconnects } })
-      window.setTimeout(() => {
-        set((st) => ({ phase: 'open', retryIn: null, demoRunning: false, lastSeq: st.lastSeq + 3 }))
-      }, 1400)
-    }, 1200)
-  },
-
-  resetDemo: () => set({ ...idleState }),
 }))

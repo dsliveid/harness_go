@@ -1,10 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
 import { ChevronDown, ChevronRight } from 'lucide-react'
-import { logEntries as mockLogEntries, tokenStats } from '../../mock/settingsData'
 import { Badge, cn } from '../../components/ui'
-import { RealModeNotice } from '../../components/RealModeNotice'
-import type { LogEntry, TokenStatRow } from '../../types'
-import { api, apiMode } from '../../lib/api'
+import type { LogEntry } from '../../types'
+import { api } from '../../lib/api'
 import type { SnapshotMode, TokenStatApiRow } from '../../lib/apiTypes'
 
 const fmt = (n: number) => n >= 10_000 ? `${(n / 1000).toFixed(1)}k` : String(n)
@@ -39,27 +37,19 @@ function Chip({ active, onClick, children }: { active: boolean; onClick: () => v
 const searchCls = 'h-8 w-full sm:w-56 px-2.5 rounded-lg bg-panel2 border border-edge text-[12px] outline-none focus:border-accent'
 
 // ---------------- Token 统计 ----------------
-// ⚠️ 降级真相（勿再"美化"）：后端 GET /stats 返回的就是 MaintenanceStats（库/会话/未完成计数），
-// **不包含任何按模型聚合的 token 行**。因此本面板整体为前端演示数据，不能接线。
-// 这里刻意删除了旧的区间乘法系数表（today 0.12 / 7d 1 / 30d 2.9 / all 3.4）——
-// 用固定系数乘样例行伪造区间差异属于造假；现在时间范围切换只过滤「最近调用明细」，不改变任何聚合数值。
+// 数据源：GET /api/v1/stats/tokens（走 rollup_hourly 预聚合，不扫明细表，30 天量级通常 <20ms）。
+// 数字全部为服务端真实统计，前端不做任何换算；历史「前端演示数据」面板已随双模式下线一并删除。
 const RANGE_MS: Record<TimeRange, number | null> = { today: 24 * 3_600_000, '7d': 7 * 24 * 3_600_000, '30d': 30 * 24 * 3_600_000, all: null }
 
 export function TokenStatsPanel() {
-  const mock = apiMode === 'mock'
   const [range, setRange] = useState<TimeRange>('today')
   const [groupBy, setGroupBy] = useState<'model' | 'provider' | 'day'>('model')
-  // mock 模式专用：演示数据的模型下拉筛选（real 模式用 groupBy + 服务端聚合替代）
-  const [modelFilter, setModelFilter] = useState('all')
-  const [expanded, setExpanded] = useState<string | null>(null)
-  // real 模式：真实用量来自 /api/v1/stats/tokens（走 rollup_hourly 预聚合，不扫明细）
   const [apiRows, setApiRows] = useState<TokenStatApiRow[]>([])
   const [summary, setSummary] = useState<{ calls: number; prompt: number; completion: number; cached: number; hit: number } | null>(null)
   const [loading, setLoading] = useState(false)
   const [loadErr, setLoadErr] = useState('')
 
   useEffect(() => {
-    if (mock) return
     let alive = true
     const ms = RANGE_MS[range]
     const to = Date.now()
@@ -91,33 +81,16 @@ export function TokenStatsPanel() {
     return () => {
       alive = false
     }
-  }, [mock, range, groupBy])
+  }, [range, groupBy])
 
-  const rows = useMemo(() => {
-    if (!mock) return []
-    const ms = RANGE_MS[range]
-    return tokenStats
-      .filter((r: TokenStatRow) => modelFilter === 'all' || r.model === modelFilter)
-      .map((r: TokenStatRow) => {
-      const all = r.recent ?? []
-      const recent = ms ? all.filter((c) => Date.now() - c.time <= ms) : all
-      return { ...r, recent }
-    })
-  }, [mock, range, modelFilter])
-  const total = rows.reduce((a, r) => a + r.prompt + r.completion, 0)
-  const totalCached = rows.reduce((a, r) => a + r.cached, 0)
-
-  // real 模式渲染：直接按后端聚合结果展示，不做任何系数变换
-  if (!mock) {
-    return (
-      <div className="flex flex-col gap-4">
-        <RealModeNotice text="real 模式：本面板读取 GET /api/v1/stats/tokens（数据源为 rollup_hourly 预聚合，不扫明细表，30 天量级通常 <20ms）。数字全部为服务端真实统计，前端不做任何换算。" />
-        <div>
-          <div className="text-[13px] font-medium">Token 用量统计</div>
-          <div className="text-[12px] text-inkdim mt-0.5 leading-relaxed">
-            按模型 / 厂商 / 天聚合的调用次数与 token 用量。数据来自天分片审计库的小时级预聚合。
-          </div>
+  return (
+    <div className="flex flex-col gap-4">
+      <div>
+        <div className="text-[13px] font-medium">Token 用量统计</div>
+        <div className="text-[12px] text-inkdim mt-0.5 leading-relaxed">
+          按模型 / 厂商 / 天聚合的调用次数与 token 用量。数据来自天分片审计库的小时级预聚合。
         </div>
+      </div>
 
         <div className="flex items-center gap-2 flex-wrap">
           <span className="text-[12px] text-inkfaint shrink-0">范围</span>
@@ -180,130 +153,7 @@ export function TokenStatsPanel() {
             </div>
           ))}
         </div>
-      </div>
-    )
-  }
-
-  return (
-    <div className="flex flex-col gap-4">
-      <RealModeNotice text="本面板整体为前端演示数据：后端 /stats 不提供按模型 token 聚合（它返回的是维护计数）。演示数值固定不变，切换时间范围不会改变汇总/明细数字，仅过滤「最近调用明细」行；缓存命中率已移除（无真实分子分母可算）。" />
-      <div>
-        <div className="text-[13px] font-medium">Token 用量统计</div>
-        <div className="text-[12px] text-inkdim mt-0.5 leading-relaxed">
-          演示面板：真实后端尚未提供按模型聚合的用量接口，下列数字为样例数据，不代表服务端实际用量。点击行展开最近调用明细。
-        </div>
-      </div>
-
-      {/* 查询条件：时间范围 + 模型筛选 */}
-      <div className="flex items-center gap-2 flex-wrap">
-        <span className="text-[12px] text-inkfaint shrink-0">时间范围（仅过滤演示明细）</span>
-        <div className="flex items-center gap-1">
-          {TIME_RANGES.map((r) => (
-            <Chip key={r.key} active={range === r.key} onClick={() => setRange(r.key)}>{r.label}</Chip>
-          ))}
-        </div>
-        <span className="text-[12px] text-inkfaint shrink-0 sm:ml-2">模型</span>
-        <select className={`${searchCls} sm:w-40`} value={modelFilter} onChange={(e) => setModelFilter(e.target.value)}>
-          <option value="all">全部模型</option>
-          {tokenStats.map((r) => <option key={r.model} value={r.model}>{r.provider} / {r.model}</option>)}
-        </select>
-      </div>
-
-      {/* 汇总卡：缓存命中率卡片已删除——旧实现用 totalCached/(total+totalCached*3) 凭空凑比率，
-          没有任何真实分子分母可用，保留即造假。改为直接展示 cached 原始数值，不做比率运算。 */}
-      <div className="grid grid-cols-2 gap-2">
-        {[
-          { label: '区间用量（演示）', value: fmt(total) },
-          { label: '缓存命中（演示）', value: fmt(totalCached) },
-        ].map((c) => (
-          <div key={c.label} className="rounded-xl border border-edge bg-panel2/30 p-3">
-            <div className="text-[11px] text-inkfaint">{c.label}</div>
-            <div className="text-[16px] font-semibold mt-1">{c.value}</div>
-          </div>
-        ))}
-      </div>
-
-      {/* 明细表（行可展开） */}
-      <div className="rounded-xl border border-edge overflow-x-auto">
-        <table className="w-full text-[12px] min-w-[560px]">
-          <thead>
-            <tr className="text-inkfaint text-left border-b border-edge">
-              <th className="px-3 py-2 font-medium">模型</th>
-              <th className="px-3 py-2 font-medium">会话</th>
-              <th className="px-3 py-2 font-medium text-right">输入</th>
-              <th className="px-3 py-2 font-medium text-right">输出</th>
-              <th className="px-3 py-2 font-medium text-right">缓存</th>
-              <th className="px-3 py-2 font-medium text-right">校准系数</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.length === 0 && (
-              <tr><td colSpan={6} className="px-3 py-6 text-center text-inkfaint">该筛选条件下暂无数据</td></tr>
-            )}
-            {rows.map((r) => (
-              <TokenRow key={r.model} r={r} expanded={expanded === r.model} onToggle={() => setExpanded(expanded === r.model ? null : r.model)} />
-            ))}
-          </tbody>
-        </table>
-      </div>
-
-      <div className="rounded-lg border border-edge bg-panel2/40 px-2.5 py-2 text-[11px] text-inkfaint">
-        降级说明：本面板未接线。后端 <code className="font-mono text-[11px] bg-panel2 px-1 rounded">/stats</code> 只返回维护计数（会话数、未完成 Run、待审批等），无按模型 token 聚合，故上表全部为前端样例，切换时间范围不改变数值。
-      </div>
     </div>
-  )
-}
-
-function TokenRow({ r, expanded, onToggle }: { r: TokenStatRow & { recent: TokenStatRow['recent'] }; expanded: boolean; onToggle: () => void }) {
-  return (
-    <>
-      <tr
-        className="border-b border-edge/50 cursor-pointer hover:bg-panel2/40 transition-colors"
-        onClick={onToggle}
-        title={expanded ? '收起明细' : '展开最近调用明细'}
-      >
-        <td className="px-3 py-2">
-          <div className="font-mono flex items-center gap-1.5">
-            {expanded ? <ChevronDown size={12} className="text-inkfaint shrink-0" /> : <ChevronRight size={12} className="text-inkfaint shrink-0" />}
-            <span>{r.model}</span>
-          </div>
-          <div className="text-[11px] text-inkfaint">{r.provider}</div>
-        </td>
-        <td className="px-3 py-2">{r.sessions}</td>
-        <td className="px-3 py-2 text-right font-mono">{fmt(r.prompt)}</td>
-        <td className="px-3 py-2 text-right font-mono">{fmt(r.completion)}</td>
-        <td className="px-3 py-2 text-right font-mono text-inkdim">{fmt(r.cached)}</td>
-        <td className={cn('px-3 py-2 text-right font-mono', Math.abs(r.calibRatio - 1) <= 0.03 ? 'text-ok' : 'text-warn')}>
-          {r.calibRatio.toFixed(2)}
-        </td>
-      </tr>
-      {expanded && (
-        <tr className="border-b border-edge/50">
-          <td colSpan={6} className="bg-panel2/20 px-3 py-2.5">
-            <div className="text-[11px] text-inkfaint mb-1.5">最近调用明细（含缓存命中与首字延迟）</div>
-            {(r.recent ?? []).length === 0 ? (
-              <div className="text-[12px] text-inkfaint py-1">该时间范围内无调用记录</div>
-            ) : (
-              <div className="flex flex-col gap-1">
-                {(r.recent ?? []).map((c, i) => (
-                  <div key={i} className="flex items-center gap-3 text-[12px] rounded-lg bg-panel px-2.5 py-1.5 border border-edge/40">
-                    <span className="text-inkfaint font-mono shrink-0 w-[110px]">{fmtTime(c.time)}</span>
-                    <span className="font-mono shrink-0">↑ {fmt(c.prompt)}</span>
-                    <span className="font-mono shrink-0">↓ {fmt(c.completion)}</span>
-                    <span className="font-mono text-inkdim shrink-0">缓存 {fmt(c.cached)}</span>
-                    <span className="flex-1" />
-                    <span className={cn('font-mono shrink-0', c.latencyMs < 1000 ? 'text-ok' : 'text-warn')}>{(c.latencyMs / 1000).toFixed(2)}s</span>
-                  </div>
-                ))}
-              </div>
-            )}
-            <div className="text-[11px] text-inkfaint mt-1.5">
-              预估输入 {fmt(Math.round(r.prompt / r.calibRatio))} · 实际输入 {fmt(r.prompt)} · 偏差 {(Math.abs(1 - r.calibRatio) * 100).toFixed(1)}%
-            </div>
-          </td>
-        </tr>
-      )}
-    </>
   )
 }
 
@@ -365,11 +215,9 @@ function normalizeLevel(raw: string): LogEntry['level'] {
 }
 
 export function LogsPanel() {
-  // ⚠️ 降级真相（勿再"美化"）：real 模式下 level / 时间范围 / keyword 全部作为 **服务端 query 参数**
-  // 下发给 GET /api/v1/logs，前端不再对一次性 500 行做本地过滤（那会让第 500 行以外的日志永远搜不到）。
-  // mock 模式没有服务端，仍用本地演示数据 + 本地过滤，保证演示可用。
-  const mock = apiMode === 'mock'
-  const [logEntries, setLogEntries] = useState<LogEntry[]>(mock ? mockLogEntries : [])
+  // level / 时间范围 / keyword 全部作为 **服务端 query 参数** 下发给 GET /api/v1/logs，
+  // 前端不再对一次性 500 行做本地过滤（那会让第 500 行以外的日志永远搜不到）。
+  const [logEntries, setLogEntries] = useState<LogEntry[]>([])
   const [level, setLevel] = useState<LevelFilter>('all')
   const [range, setRange] = useState<TimeRange>('today')
   const [keyword, setKeyword] = useState('')
@@ -378,7 +226,7 @@ export function LogsPanel() {
   // 服务端返回的保留策略 / 抓取档位（真值来源，缺字段就显示"未知"，绝不硬编码天数）
   const [retentionDays, setRetentionDays] = useState<number | undefined>(undefined)
   const [earliestDay, setEarliestDay] = useState<string | undefined>(undefined)
-  const [snapshotMode, setSnapshotMode] = useState<string>(mock ? 'preview' : '')
+  const [snapshotMode, setSnapshotMode] = useState<string>('')
   const [total, setTotal] = useState<number | undefined>(undefined)
   const [hasMore, setHasMore] = useState(false)
   const [loading, setLoading] = useState(false)
@@ -393,10 +241,6 @@ export function LogsPanel() {
 
   // 首屏读取当前真实生效的级别（后端返回 LevelVar 的值，不是猜测值）
   useEffect(() => {
-    if (mock) {
-      setLogLevel('warn')
-      return
-    }
     let alive = true
     void api
       .getLogConfig()
@@ -409,7 +253,7 @@ export function LogsPanel() {
     return () => {
       alive = false
     }
-  }, [mock])
+  }, [])
 
   const applyLogLevel = (next: string) => {
     if (next === logLevel) return
@@ -421,9 +265,7 @@ export function LogsPanel() {
         setLogLevel(next)
         setLevelMsg({
           ok: true,
-          text: mock
-            ? `已设为 ${next.toUpperCase()}（mock 模式仅本地生效）`
-            : `已设为 ${next.toUpperCase()}：控制台与日志文件同步生效，无需重启`,
+          text: `已设为 ${next.toUpperCase()}：控制台与日志文件同步生效，无需重启`,
         })
       })
       .catch((e: unknown) => {
@@ -434,7 +276,6 @@ export function LogsPanel() {
 
   // 服务端过滤：任一条件变化就重新请求（含 300ms 去抖，避免逐字符打服务端）
   useEffect(() => {
-    if (mock) return
     let alive = true
     const timer = window.setTimeout(() => {
       setLoading(true)
@@ -485,7 +326,7 @@ export function LogsPanel() {
       alive = false
       window.clearTimeout(timer)
     }
-  }, [mock, level, range, keyword])
+  }, [level, range, keyword])
 
   const applySnapshotMode = (next: SnapshotMode) => {
     if (next === snapshotMode) return
@@ -501,9 +342,7 @@ export function LogsPanel() {
         setSnapshotMode(next)
         setPatchMsg({
           ok: true,
-          text: mock
-            ? `已切换为「${SNAPSHOT_MODES.find((m) => m.key === next)?.label}」（mock 模式仅本地生效，未写服务端）`
-            : `已切换为「${SNAPSHOT_MODES.find((m) => m.key === next)?.label}」，仅对之后的新调用生效`,
+          text: `已切换为「${SNAPSHOT_MODES.find((m) => m.key === next)?.label}」，仅对之后的新调用生效`,
         })
       })
       .catch((e: unknown) => {
@@ -512,24 +351,13 @@ export function LogsPanel() {
       .finally(() => setPatching(false))
   }
 
-  const list = useMemo(() => {
-    // real 模式：level / range / keyword 已由服务端过滤，直接返回服务端结果。
-    // （原「来源」筛选已移除：real 模式下 source 恒为 'server'，只有一个选项的控件属于误导性复杂度。）
-    if (!mock) return logEntries
-    const ms = TIME_RANGES.find((r) => r.key === range)?.ms ?? null
-    const kw = keyword.trim().toLowerCase()
-    return logEntries.filter((l) =>
-      (level === 'all' || l.level === level) &&
-      (!ms || !l.time || Date.now() - l.time <= ms) &&
-      (!kw || l.text.toLowerCase().includes(kw) || (l.detail ?? '').toLowerCase().includes(kw) || (l.traceId ?? '').includes(kw)),
-    )
-  }, [mock, level, range, keyword, logEntries])
+  // level / range / keyword 已由服务端过滤，直接返回服务端结果。
+  // （原「来源」筛选已移除：source 恒为 'server'，只有一个选项的控件属于误导性复杂度。）
+  const list = useMemo(() => logEntries, [logEntries])
 
   const retentionText = retentionDays != null && earliestDay
     ? `日志在线保留 ${retentionDays} 天（最早可查 ${earliestDay} ~ 今天），超期自动清理。`
-    : mock
-      ? '保留策略未知（mock 模式无服务端，天数以 real 模式后端返回为准）'
-      : '保留策略未知'
+    : '保留策略未知'
   const activeMode = SNAPSHOT_MODES.find((m) => m.key === snapshotMode)
 
   return (
@@ -540,9 +368,6 @@ export function LogsPanel() {
           运行日志与运行时事件，按级别 / 来源 / 时间范围 / 关键字组合过滤；点击行展开详情（traceId + 上下文说明）。
         </div>
       </div>
-
-      {/* 诚实降级提示：过滤是否真正生效取决于后端是否支持对应 query 参数 */}
-      <RealModeNotice text="real 模式下级别 / 时间范围 / 关键字（含 traceId）均已改为服务端 query 参数下发（GET /api/v1/logs?level=&from=&to=&keyword=&traceId=&offset=），不再对一次性 500 行做前端过滤。⚠️ 诚实边界：若后端尚未支持某个参数，它会忽略该参数并返回不过滤的结果，此时列表与「服务端命中数」仍按真实返回展示，不会前端二次伪造筛选效果。" />
 
       {/* 保留策略说明条：N 天与最早可查日全部来自后端响应，取不到就明说"未知" */}
       <div
@@ -661,12 +486,12 @@ export function LogsPanel() {
           <span className="text-[12px] text-inkfaint shrink-0">级别</span>
           <div className="flex items-center gap-1">
             {([
-              // real 模式下列表已按所选级别被服务端过滤，各档明细数会互相矛盾，
-              // 因此只在 mock（本地全量数据）下展示分档计数；real 下「全部」显示服务端 total。
-              { key: 'all', label: `全部 (${mock ? logEntries.length : (total ?? logEntries.length)})` },
-              { key: 'info', label: mock ? `信息 (${logEntries.filter((l) => l.level === 'info').length})` : '信息' },
-              { key: 'warn', label: mock ? `警告 (${logEntries.filter((l) => l.level === 'warn').length})` : '警告' },
-              { key: 'error', label: mock ? `错误 (${logEntries.filter((l) => l.level === 'error').length})` : '错误' },
+              // 列表已按所选级别被服务端过滤，各档明细数会互相矛盾，
+              // 因此只有「全部」显示服务端 total，其余档位只显示名称。
+              { key: 'all', label: `全部 (${total ?? logEntries.length})` },
+              { key: 'info', label: '信息' },
+              { key: 'warn', label: '警告' },
+              { key: 'error', label: '错误' },
             ] as Array<{ key: LevelFilter; label: string }>).map((f) => (
               <Chip key={f.key} active={level === f.key} onClick={() => setLevel(f.key)}>{f.label}</Chip>
             ))}
@@ -736,9 +561,7 @@ export function LogsPanel() {
       </div>
 
       <div className="text-[11px] text-inkfaint leading-relaxed">
-        {mock
-          ? `演示数据：共显示 ${list.length} 条 / ${logEntries.length} 条（mock 模式为前端本地过滤）`
-          : `本次返回 ${list.length} 条${total != null ? ` / 服务端命中 ${total} 条` : ''}${hasMore ? '（还有更多，已按 limit 截断）' : ''} · 过滤条件由服务端执行`}
+        {`本次返回 ${list.length} 条${total != null ? ` / 服务端命中 ${total} 条` : ''}${hasMore ? '（还有更多，已按 limit 截断）' : ''} · 过滤条件由服务端执行`}
         {' · '}
         {retentionText}
       </div>

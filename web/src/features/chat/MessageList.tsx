@@ -2,11 +2,10 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useChat } from '../../stores/chatStore'
 import { useSessions } from '../../stores/sessionStore'
 import { MarkdownLite } from '../../components/MarkdownLite'
-import { RealModeNotice } from '../../components/RealModeNotice'
 import { VirtualList } from '../../components/VirtualList'
 import { cn } from '../../components/ui'
 import { useUI } from '../../stores/uiStore'
-import { Check, Clock, Copy, GitBranch, GitCompare, RotateCcw, RotateCw, Trash2, Zap, Sparkles, MessageSquare, Terminal, FileCode2 } from 'lucide-react'
+import { Check, Clock, Copy, GitBranch, GitCompare, RotateCcw, RotateCw, Trash2, Zap, Sparkles } from 'lucide-react'
 import { ProcessDrawer, formatStepMs, formatStepTokens } from './ProcessDrawer'
 import { ReasoningCard } from './ReasoningCard'
 import type { Message } from '../../types'
@@ -49,8 +48,6 @@ export function MessageList() {
 
   return (
     <div className="flex-1 min-h-0 flex flex-col">
-      {/* real 模式下明示消息操作的真实服务端语义（见 chatStore 中各动作注释） */}
-      <RealModeNotice text="消息操作真实口径：撤回 / 重新应用 = 服务端消息级回滚（原消息置灰、可重放）；「删除对话」服务端无物理删除端点，仅置灰不再参与上下文；「分支」服务端只建空会话，前序历史仅本端可见；数据权限策略仅本地生效、刷新即失效。" />
       <MessageThread
         messages={messages}
         streaming={streaming}
@@ -74,7 +71,6 @@ export function MessageThread({
 }: MessageThreadProps) {
   const scrollerRef = useRef<HTMLDivElement>(null)
   const [nearBottom, setNearBottom] = useState(true)
-  const { setDraft } = useChat()
 
   // 切换数据源：重置贴底并跳到底部
   useEffect(() => {
@@ -107,12 +103,6 @@ export function MessageThread({
   const lastMsg = messages[messages.length - 1]
   const followKey = `${messages.length}:${lastMsg?.content.length ?? 0}:${streaming ? 1 : 0}`
 
-  const suggestions = [
-    { icon: <FileCode2 size={13} className="text-accent" />, text: '帮我查看工具注册表实现，增加同名冲突检测' },
-    { icon: <Terminal size={13} className="text-amber-400" />, text: '运行构建脚本并检查有哪些未通过的类型定义' },
-    { icon: <Sparkles size={13} className="text-accent2" />, text: '分析当前项目结构并梳理能力扩展路线图' },
-  ]
-
   if (messages.length === 0) {
     return (
       <div className="flex-1 flex flex-col items-center justify-center p-6 select-none fade-in">
@@ -120,35 +110,11 @@ export function MessageThread({
           <Sparkles size={22} />
         </div>
         <h3 className="text-[15px] font-semibold text-ink tracking-tight">开启一段新对话</h3>
-        <p className="text-[13px] text-inkfaint mt-1.5 max-w-[340px] text-center leading-relaxed">
-          {emptyHint ?? '随时下发指令、提问代码实现或让 Agent 协助执行自动化重构任务'}
-        </p>
-
-        {!emptyHint && (
-          <div className="mt-5 w-full max-w-[460px] space-y-2">
-            <div className="text-[11px] font-medium text-inkdim flex items-center gap-1.5 px-1">
-              <MessageSquare size={11} className="text-inkfaint" />
-              <span>常用指令示例（点击填入输入框）：</span>
-            </div>
-            {suggestions.map((s, idx) => (
-              <button
-                key={idx}
-                type="button"
-                onClick={() => setDraft(s.text)}
-                className="w-full text-left p-2.5 rounded-xl border border-edge bg-panel2/40 hover:bg-panel2/80 hover:border-edge2 transition-all flex items-center gap-2.5 group cursor-pointer active:scale-[0.99]"
-              >
-                <span className="p-1.5 rounded-lg bg-panel2 shrink-0 group-hover:scale-105 transition-transform">
-                  {s.icon}
-                </span>
-                <span className="text-[13px] text-inkdim group-hover:text-ink transition-colors flex-1 truncate font-medium">
-                  {s.text}
-                </span>
-                <span className="text-[11px] text-accent font-medium shrink-0">
-                  填入 ↵
-                </span>
-              </button>
-            ))}
-          </div>
+        {/* 仅浮窗等场景（传了 emptyHint）才显示补充说明；主对话空态保持极简，不放说明与常用指令 */}
+        {emptyHint && (
+          <p className="text-[13px] text-inkfaint mt-1.5 max-w-[340px] text-center leading-relaxed">
+            {emptyHint}
+          </p>
         )}
       </div>
     )

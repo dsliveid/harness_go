@@ -12,7 +12,7 @@
  * 结论：归属恢复必须靠 `workspace_path` 反查项目目录（零迁移、零 API 契约变更）。
  * 反查不到时**不伪造归属**：保持 projectId 为空，但 workspacePath 仍在（顶栏照实显示真实目录）。
  */
-import type { Project, Session } from '../types'
+import type { Project, Session, Workspace } from '../types'
 
 /**
  * 路径规范化：统一分隔符、去掉尾部斜杠、合并重复斜杠、去空白。
@@ -78,9 +78,9 @@ export function adoptServerSessions(list: Session[], projects: Project[]): Sessi
 /* ==================== 本地持久化（real 模式的项目/空间/归属） ==================== */
 
 /**
- * 为什么需要它：real 模式的项目（projects）与工作空间（workspaces）目前都是**纯前端概念**
- * （后端无 projects 表与接口，createProject/connectWorkspace 只改内存），刷新即回到
- * mock 初始列表 —— 用户自建的项目连同其下会话的归属一起蒸发，会话就"掉进纯对话"。
+ * 为什么需要它：项目（projects）与工作空间（workspaces）目前都是**纯前端概念**
+ * （createProject/connectWorkspace 只改内存），刷新即回到初始列表 —— 用户自建的项目
+ * 连同其下会话的归属一起蒸发，会话就"掉进纯对话"。
  * 在项目真正落库之前，至少把这几张表持久化到本地，保证刷新前后一致。
  */
 const LS_PROJECTS = 'harness.projects'
@@ -112,17 +112,50 @@ function writeJSON(key: string, value: unknown) {
 }
 
 export function loadPersistedProjects(): Project[] | null {
-  const v = readJSON<Project[]>(LS_PROJECTS)
-  return Array.isArray(v) ? v : null
+  const v = readJSON<unknown[]>(LS_PROJECTS)
+  if (!Array.isArray(v)) return null
+  // 与 loadPersistedWorkspaces 同口径加固：项目对象会被 Sidebar / TopBar / ProjectModal
+  // 直接读 `p.id` / `p.workspaceId` / `p.name`，脏数据同样会让首屏渲染抛错。
+  const clean = v.filter(isProjectShape)
+  return clean.length > 0 ? clean : null
+}
+
+/** 项目最小形状校验：只认 UI 渲染真正会读的字段。 */
+function isProjectShape(p: unknown): p is Project {
+  if (!p || typeof p !== 'object') return false
+  const o = p as Record<string, unknown>
+  return typeof o.id === 'string' && o.id !== '' && typeof o.name === 'string'
 }
 
 export function savePersistedProjects(projects: Project[]) {
   writeJSON(LS_PROJECTS, projects)
 }
 
-export function loadPersistedWorkspaces(): unknown[] | null {
+export function loadPersistedWorkspaces(): Workspace[] {
   const v = readJSON<unknown[]>(LS_WORKSPACES)
-  return Array.isArray(v) ? v : null
+  if (!Array.isArray(v)) return []
+  // 🚨 必须逐项校验形状，不能只判 Array.isArray（2026-11 黑屏事故根因）：
+  // 本函数的返回值会被 sessionStore 直接当作 Workspace[] 使用，并在
+  // WorkspaceSwitcher / Composer / Sidebar 等处读 `w.online`、`w.id`、`w.name`。
+  // 一旦 localStorage 里存过半截数据（旧版本字段变更、写一半被打断、手工改过），
+  // 就会出现 `undefined` 元素 → 首屏渲染时 `w.online` 抛
+  // `TypeError: Cannot read properties of undefined (reading 'online')`
+  // → React 整棵树卸载 → 登录后整页黑屏（白屏无任何提示）。
+  // 这里做「脏数据自愈」：形状不合法的项直接丢弃，宁可少一个空间也不要崩首页。
+  return v.filter(isWorkspaceShape)
+}
+
+/** 工作空间最小形状校验：只认 UI 渲染真正会读的字段。 */
+function isWorkspaceShape(w: unknown): w is Workspace {
+  if (!w || typeof w !== 'object') return false
+  const o = w as Record<string, unknown>
+  return (
+    typeof o.id === 'string' &&
+    o.id !== '' &&
+    typeof o.name === 'string' &&
+    typeof o.online === 'boolean' &&
+    typeof o.kind === 'string'
+  )
 }
 
 export function savePersistedWorkspaces(workspaces: unknown[]) {

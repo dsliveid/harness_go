@@ -2,8 +2,7 @@ import { useState } from 'react'
 import { Blocks, Wrench, Cpu, Sparkles, Boxes, Monitor, Smartphone, Wifi, WifiOff, Check } from 'lucide-react'
 import { usePlugins } from '../../stores/pluginStore'
 import { useUI } from '../../stores/uiStore'
-import { Badge, Modal, Tabs, cn } from '../../components/ui'
-import { RealModeNotice } from '../../components/RealModeNotice'
+import { Badge, Button, Modal, Tabs, cn } from '../../components/ui'
 import { ToolsPane, McpPane, SkillsPane, ExtensionsPane } from '../plugins/PluginsPage'
 import { clientPlatformLabel, osLabel } from '../../lib/platform'
 import type { DeviceNode } from '../../types'
@@ -59,6 +58,43 @@ export function MarketModal() {
   const client = devices.find((d) => d.id === currentClientId) ?? clients[0]
   const server = devices.find((d) => d.platform === 'server')
 
+  // 🚨 空态必须早退（2026-11 登录后黑屏事故根因）：
+  // 全新部署（尚未配对任何客户端）时 devices 里只有 server 节点，clients 为空数组，
+  // 于是 client === undefined。本组件下方多处直接读 `client.online` / `client.os` /
+  // `clientPlatformLabel(client)`，一旦数组为空就抛
+  // `TypeError: Cannot read properties of undefined (reading 'online')`
+  // —— 由于该弹窗所在的组件树与主界面共享根节点，异常会让 React 卸载整棵树，
+  // 表现为**登录后整页纯黑，无任何提示**。
+  // 这里显式渲染空态引导，绝不把「没有客户端」当成可继续渲染的合法值。
+  if (!client) {
+    return (
+      <Modal
+        open={pluginsOpen}
+        onClose={() => setPlugins(false)}
+        title={
+          <span className="flex items-center gap-2">
+            <Blocks size={15} className="text-accent" />
+            <span>插件市场</span>
+          </span>
+        }
+        width="max-w-xl"
+        height="h-auto"
+      >
+        <div className="flex flex-col items-center justify-center gap-2 px-6 py-12 text-center">
+          <Blocks size={26} className="text-inkfaint" />
+          <div className="text-[13px] font-medium text-ink">尚未接入任何客户端</div>
+          <div className="text-[12px] text-inkfaint leading-relaxed max-w-[360px]">
+            能力的安装与卸载只作用于客户端本机，因此需要先配对一台桌面端或移动端设备。
+            请到「设置 → 设备」用配对码接入后再回来浏览市场。
+          </div>
+          <Button size="sm" variant="outline" className="mt-1" onClick={() => setPlugins(false)}>
+            知道了
+          </Button>
+        </div>
+      </Modal>
+    )
+  }
+
   return (
     <Modal
       open={pluginsOpen}
@@ -74,7 +110,6 @@ export function MarketModal() {
       height="h-[min(780px,92dvh)] sm:h-[min(780px,86dvh)]"
     >
       <div className="flex flex-col h-full min-h-0">
-        <RealModeNotice text="插件市场仍是本地演示数据：市场包、签名校验与安装下发属阶段 E/F，尚未接入服务端。" />
         {/* 固定头：当前客户端 + 一级分类（不随列表滚动、不改变弹窗高度） */}
         <div className="shrink-0 border-b border-edge/60 bg-panel2/30 px-4 pt-2.5 pb-2">
           <div className="flex items-center gap-2 flex-wrap mb-1.5">

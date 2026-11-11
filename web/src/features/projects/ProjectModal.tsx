@@ -3,7 +3,6 @@ import { FileText, Shield, FolderGit2, ShieldAlert, Settings, Zap, Folder, Datab
 import type { DataScope, DataScopeMode, PlanMode, Project } from '../../types'
 import { Button, Modal, Tabs, cn, inputCls } from '../../components/ui'
 import { MarkdownLite } from '../../components/MarkdownLite'
-import { RealModeNotice } from '../../components/RealModeNotice'
 import { DirectoryPicker } from '../../components/DirectoryPicker'
 import { hostStatus } from '../../lib/workspaceHost'
 import { DATA_MODE_META, DATA_SCOPES } from '../../lib/dataScopes'
@@ -608,9 +607,6 @@ export function ProjectModal({ project, onClose }: { project: Project | null; on
         </div>
 
         <div className="flex-1 p-3 sm:p-4 min-w-0 min-h-0">
-          {(tab === 'approvals' || tab === 'data') && (
-            <RealModeNotice text="审批规则与数据权限是本地态（仅内存/本地设置）：后端没有项目维度的审批规则与数据授权端点，改动不会下发服务端，刷新后不回填。" />
-          )}
           {tab === 'constraints' && <ConstraintsPane value={constraints} onChange={setConstraints} />}
           {tab === 'policy' && <PolicyPane value={planMode} onChange={setPlanMode} />}
           {tab === 'links' && <LinksPane project={project} onOpenConstraints={() => setTab('constraints')} />}

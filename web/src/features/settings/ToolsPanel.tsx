@@ -1,14 +1,13 @@
 import { useEffect, useState } from 'react'
-import { toolList, toolInstallInfo } from '../../mock/settingsData'
+import { toolList, toolInstallInfo } from '../../lib/toolCatalog'
 import { toggleDisabled, useSettings } from '../../stores/settingsStore'
 import { usePlugins } from '../../stores/pluginStore'
 import { useUI } from '../../stores/uiStore'
 import { Badge, Button, Switch } from '../../components/ui'
-import { RealModeNotice } from '../../components/RealModeNotice'
 import type { DeviceNode, Risk, ToolGroup, ToolInstallMeta } from '../../types'
 import { cn } from '../../components/ui'
 import { supportsClient, unsupportedReason } from '../../lib/platform'
-import { api, apiMode } from '../../lib/api'
+import { api } from '../../lib/api'
 import type { ToolSnapshot, ToolTier } from '../../lib/apiTypes'
 import { ToolInjectionPanel } from './ToolInjectionPanel'
 
@@ -306,10 +305,8 @@ export function ToolsPanel({ client, query = '' }: { client: DeviceNode; query?:
 
   return (
     <div className="flex flex-col gap-4">
-      <RealModeNotice text="下方「服务端工具快照」区块来自 GET /tools 真实返回（总数 / 三档 tier / 注入成本 / warnings），tier 变更会 PATCH /tools/tiers 回写服务端。「本轮工具注入明细」来自 GET /tools/injection，展示本轮真正塞进 prompt 的内容与 token 预算（core 全量 / deferred 索引 / on_demand 零注入）。而内置工具卡片的「启用/禁用」开关仍是本地设置：后端只有 core / deferred / on_demand 三档 tier，不存在启停布尔，故该开关仅本地生效、不下发服务端；「可安装性 / 本端已安装」来自前端内置表。另：「网络与多模态」分组内的 generate_image / recognize_image 卡片为前端内置表占位条目，服务端 image 插件实际只提供 save_image（base64 落盘 + 魔数校验）与 read_image_meta（格式/尺寸/大小），无图像生成与像素识别能力，这两张卡不会出现在 GET /tools 快照中。" />
-      {/* real 模式才渲染真实快照区块；mock 模式保持纯演示数据，不臆造接口 */}
-      {apiMode === 'real' && <ServerToolSnapshot />}
-      {apiMode === 'real' && <ToolInjectionPanel />}
+      <ServerToolSnapshot />
+      <ToolInjectionPanel />
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">
           <div className="text-[13px] font-medium">系统内置工具</div>

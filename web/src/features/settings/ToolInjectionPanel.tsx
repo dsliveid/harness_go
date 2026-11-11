@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Layers, RefreshCw, ChevronDown, ChevronRight } from 'lucide-react'
-import { api, apiMode } from '../../lib/api'
+import { api } from '../../lib/api'
 import { useUI } from '../../stores/uiStore'
 import { Badge, Button, cn } from '../../components/ui'
 import type { ToolInjection, ToolSpecBrief } from '../../lib/apiTypes'
@@ -57,9 +57,7 @@ export function ToolInjectionPanel() {
       <div className="flex items-center gap-2 flex-wrap">
         <Layers size={13} className="text-inkdim shrink-0" />
         <span className="text-[12px] font-semibold">本轮工具注入明细</span>
-        <Badge tone={apiMode === 'real' ? 'blue' : 'gray'}>
-          {apiMode === 'real' ? 'GET /tools/injection' : 'mock'}
-        </Badge>
+        <Badge tone="blue">服务端实时</Badge>
         {loading && <span className="text-[11px] text-inkfaint">读取中…</span>}
         <Button variant="ghost" size="sm" className="ml-auto" onClick={() => void load()} disabled={loading}>
           <RefreshCw size={11} className={cn('mr-1', loading && 'animate-spin')} />

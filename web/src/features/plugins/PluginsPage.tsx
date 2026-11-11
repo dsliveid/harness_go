@@ -2,32 +2,14 @@
 import { Search, X, Download, Trash2, Sparkles, Cpu } from 'lucide-react'
 import { usePlugins } from '../../stores/pluginStore'
 import { useUI } from '../../stores/uiStore'
-import { apiMode } from '../../lib/api'
 import type { PackageViewDTO } from '../../lib/apiTypes'
 import { Badge, Button, Empty, Progress, StateBadge, Tabs, cn } from '../../components/ui'
 import type {
   DeviceNode, ExtensionItem, ExtensionKind, McpServer, PlatformSupport, RegistryItem, Risk,
 } from '../../types'
-import { toolInstallInfo, toolList } from '../../mock/settingsData'
+import { toolInstallInfo, toolList } from '../../lib/toolCatalog'
 import { supportsClient, unsupportedReason, clientPlatformLabel } from '../../lib/platform'
 import { ToolsPanel } from '../settings/ToolsPanel'
-import { RealModeNotice } from '../../components/RealModeNotice'
-
-/**
- * 能力面板降级提示（按 pane 分档，禁止一刀切）：
- * - PLUGIN_MOCK_NOTICE：仍全链演示数据的面板（工具 / 技能 / 拓展），保留原口径；
- * - MCP_MOCK_NOTICE：MCP Server 清单已接 `GET /api/v1/mcp/servers` 真实数据，
- *   仅「市场制品 / 拓展」为演示数据。
- */
-const PLUGIN_MOCK_NOTICE =
-  '本面板的「系统内置清单 / 市场制品 / 已安装状态」仍来自前端内置演示数据：服务端并无工具级清单与 registry 端点，此视图暂未接线。'
-
-/** 工具面板：服务端工具包已接线，其余仍演示 —— 必须分档说明，避免用户误判整页真假。 */
-const TOOLS_MOCK_NOTICE =
-  '「服务端已安装工具包」已接真实数据（GET /api/v1/packages）；「系统内置工具清单」「市场制品」「已安装（端节点）」「拓展」仍为前端演示数据（服务端无对应端点）。'
-
-const MCP_MOCK_NOTICE =
-  'MCP Server 清单已接服务端真实数据（GET /api/v1/mcp/servers，启停/重载/联通测试走真实端点）；「市场制品」页签与「拓展」页签仍为演示数据（服务端无 registry / 自演化端点）。'
 
 
 // ============ 能力面板（客户端自行安装）============
@@ -381,9 +363,8 @@ export function ToolsPane({ client }: { client: DeviceNode }) {
   const [q, setQ] = useState('')
   const kw = q.trim().toLowerCase()
   const match = (s: string) => !kw || s.toLowerCase().includes(kw)
-  const real = apiMode === 'real'
 
-  // real 模式进入面板即拉取真实工具包（GET /api/v1/packages；store 对 mock 模式空转）
+  // 进入面板即拉取真实工具包（GET /api/v1/packages）
   useEffect(() => {
     void loadRemoteCapabilities()
   }, [loadRemoteCapabilities])
@@ -399,7 +380,6 @@ export function ToolsPane({ client }: { client: DeviceNode }) {
 
   return (
     <div className="space-y-3">
-      <RealModeNotice text={TOOLS_MOCK_NOTICE} />
       <div className="flex items-center gap-2 flex-wrap">
         <div className="flex-1 min-w-[200px]"><SearchBar value={q} onChange={setQ} placeholder="搜索工具：名称 / 描述 / 版本" /></div>
         <SourceTabs view={view} onView={setView} counts={{ builtin: toolList.length, installed: installedCount, extended: extAll.length }} />
@@ -411,7 +391,7 @@ export function ToolsPane({ client }: { client: DeviceNode }) {
             系统内置工具随程序发布，各端可<span className="text-inkdim">自行安装</span>到本机执行。当前端（{client.name}）可安装 {installableOfClient} / {toolList.length} 个；
             移动端不支持 shell 执行类工具，Windows 与 Linux 分别判定（如 bash 脚本、Chromium 依赖）。
           </PageHint>
-          {real && <ServerPackagesPanel packages={packages} loading={remoteStatus === 'loading'} error={remoteError} />}
+          <ServerPackagesPanel packages={packages} loading={remoteStatus === 'loading'} error={remoteError} />
           <ToolsPanel client={client} query={kw} />
         </>
       )}
@@ -454,9 +434,8 @@ export function McpPane({ client }: { client: DeviceNode }) {
   const [q, setQ] = useState('')
   const kw = q.trim().toLowerCase()
   const match = (s: string) => !kw || s.toLowerCase().includes(kw)
-  const real = apiMode === 'real'
 
-  // real 模式进入面板即拉取真实 MCP Server / 工具包（store 内部对 mock 模式直接空转）
+  // 进入面板即拉取真实 MCP Server / 工具包
   useEffect(() => {
     void loadRemoteCapabilities()
   }, [loadRemoteCapabilities])
@@ -470,13 +449,12 @@ export function McpPane({ client }: { client: DeviceNode }) {
 
   return (
     <div className="space-y-3">
-      <RealModeNotice text={MCP_MOCK_NOTICE} />
-      {real && remoteStatus === 'error' && (
+      {remoteStatus === 'error' && (
         <div className="rounded-lg border border-err/40 bg-err/[0.06] px-2.5 py-1.5 text-[11px] text-err leading-relaxed">
           拉取服务端 MCP 清单失败：{remoteError ?? '未知原因'}（下方面板可能为空，不代表服务端没有配置）
         </div>
       )}
-      {real && remoteStatus === 'loading' && (
+      {remoteStatus === 'loading' && (
         <div className="text-[11px] text-inkfaint">正在拉取服务端 MCP Server 清单…</div>
       )}
       <div className="flex items-center gap-2 flex-wrap">
@@ -487,10 +465,7 @@ export function McpPane({ client }: { client: DeviceNode }) {
       {view === 'builtin' && (
         <>
           <PageHint>
-            {real
-              ? <>下表的 MCP Server 由服务端托管（配置 + 运行态合并自 GET /api/v1/mcp/servers）。启停 / 重载 / 联通测试均写回服务端真实状态；「安装到此端」属端侧本地托管（服务端无对应端点），当前不可用。</>
-              : <>系统内置 MCP Server 可自行安装到客户端本地进程运行（stdio/http），避免服务端往返与数据外泄；
-                stdio 类仅 PC 端（Windows / Linux）可安装，HTTP/SSE 类全端可用。</>}
+            <>下表的 MCP Server 由服务端托管（配置 + 运行态合并自 GET /api/v1/mcp/servers）。启停 / 重载 / 联通测试均写回服务端真实状态；「安装到此端」属端侧本地托管（服务端无对应端点），当前不可用。</>
           </PageHint>
           <div className="space-y-2">
             {builtinList.map((m) => (
@@ -499,18 +474,17 @@ export function McpPane({ client }: { client: DeviceNode }) {
                 m={m}
                 client={client}
                 action={
-                  real ? (
-                    <>
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        onClick={() => {
-                          const r = testMcp(m.id)
-                          toast(r.ok ? 'info' : 'warn', r.message)
-                        }}
-                      >
-                        联通测试
-                      </Button>
+                  <>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => {
+                        const r = testMcp(m.id)
+                        toast(r.ok ? 'info' : 'warn', r.message)
+                      }}
+                    >
+                      联通测试
+                    </Button>
                       <Button
                         size="sm"
                         variant="ghost"
@@ -533,14 +507,11 @@ export function McpPane({ client }: { client: DeviceNode }) {
                       </Button>
                       {/* 端侧本地安装无后端端点（服务端托管 Server 不能由 Web 端落地到某台设备），明确禁用 */}
                       <Button size="sm" variant="ghost" disabled title="端侧安装暂无服务端端点：MCP Server 由服务端托管运行">安装到此端</Button>
-                    </>
-                  ) : (
-                    <InstallAction itemKey={`${KEY_PREFIX.mcp}${m.name}`} platforms={m.platforms} client={client} />
-                  )
+                  </>
                 }
               />
             ))}
-            {builtinList.length === 0 && <Empty icon={<Cpu size={22} className="text-inkfaint" />} title={kw ? '没有匹配的内置 MCP' : real ? '服务端尚未配置 MCP Server' : '暂无内置 MCP Server'} />}
+            {builtinList.length === 0 && <Empty icon={<Cpu size={22} className="text-inkfaint" />} title={kw ? '没有匹配的内置 MCP' : '服务端尚未配置 MCP Server'} />}
           </div>
         </>
       )}
@@ -629,7 +600,6 @@ export function SkillsPane({ client }: { client: DeviceNode }) {
 
   return (
     <div className="space-y-3">
-      <RealModeNotice text={PLUGIN_MOCK_NOTICE} />
       <div className="flex items-center gap-2 flex-wrap">
         <div className="flex-1 min-w-[200px]"><SearchBar value={q} onChange={setQ} placeholder="搜索技能：名称 / 描述" /></div>
         <SourceTabs view={view} onView={setView} counts={{ builtin: builtinList.length, installed: installedCount, extended: extAll.length }} />
@@ -700,7 +670,6 @@ export function ExtensionsPane({ client }: { client: DeviceNode }) {
 
   return (
     <div className="space-y-3">
-      <RealModeNotice text={PLUGIN_MOCK_NOTICE} />
       <div className="flex items-center gap-2 flex-wrap">
         <div className="flex-1 min-w-[200px]"><SearchBar value={q} onChange={setQ} placeholder="搜索拓展：名称 / 描述" /></div>
         <Badge tone="cyan">草稿 {drafts.length}</Badge>

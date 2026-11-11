@@ -2,7 +2,6 @@ import { useState, useRef, useEffect } from 'react'
 import { ListTodo, CheckSquare, TerminalSquare, Layers, GripHorizontal } from 'lucide-react'
 import { useWorkspace } from '../../stores/workspaceStore'
 import { useUI } from '../../stores/uiStore'
-import { apiMode } from '../../lib/api'
 import { cn } from '../../components/ui'
 
 // 会话期间记忆拖动停留的 Y 轴高度
@@ -26,9 +25,8 @@ export function SideRail() {
   const runningAgents = subagents.filter((a) => a.status === 'running').length
 
   const hasItems = todos.length > 0 || Boolean(activePlan) || runningCmds > 0 || subagents.length > 0
-  // real 模式的计数全部来自 agent 真实工具调用（workspaceStore 派生），
-  // 徽标不再有任何演示成分；计划版本号后端不下发，故 real 模式不显示假 vN。
-  const showPlanVersion = apiMode !== 'real'
+  // 计数全部来自 agent 真实工具调用（workspaceStore 派生），徽标不含任何演示成分；
+  // 计划版本号后端不下发，故不展示 vN（旧版 mock 模式曾显示演示版本号，已下线）。
 
   const [top, setTop] = useState(savedRailTop)
   const [dragOffset, setDragOffset] = useState<{ x: number; y: number } | null>(null)
@@ -213,7 +211,7 @@ export function SideRail() {
             )}
           >
             <ListTodo size={11} className="shrink-0" />
-            <span>{showPlanVersion ? `v${activePlan.version} 方案` : '方案'}</span>
+            <span>方案</span>
           </span>
           <span className="flex items-center gap-1 font-mono font-medium text-ink">
             <span className="text-emerald-400 font-bold">{planDone}</span>

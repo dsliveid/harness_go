@@ -15,7 +15,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api } from '../../lib/api'
 import { Badge, cn } from '../../components/ui'
-import { RealModeNotice } from '../../components/RealModeNotice'
 import type { AuditLlmCallItem, AuditToolEventItem } from '../../lib/apiTypes'
 
 type RangeKey = '1h' | 'today' | '7d' | '30d'
@@ -195,8 +194,6 @@ export function LlmLogsPanel() {
           （<span className="font-mono">/api/v1/audit/llm-calls</span>），跨会话可查，与「日志查询」页签的 Agent 运维日志是两套数据源。
         </div>
       </div>
-
-      <RealModeNotice text="本面板读取 logvault 天库的结构化审计副本。⚠️ 两个诚实边界：① 当前为「预览」档时只保存脱敏摘要与校验值，**不保存报文正文**，详情里的「报文」页签会说明原因而非显示空白；② 审计端点要求 admin 权限（日志含他人会话内容），无权限时请求会被拒绝。" />
 
       {/* 保留策略 + 当前档位 */}
       <div

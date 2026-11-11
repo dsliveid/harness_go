@@ -3,11 +3,9 @@ import { useUI, type SidePanel } from '../../stores/uiStore'
 import { useWorkspace } from '../../stores/workspaceStore'
 import { useSessions } from '../../stores/sessionStore'
 import { useChat } from '../../stores/chatStore'
-import { apiMode } from '../../lib/api'
 import { Badge, Button, cn, Drawer, StateBadge } from '../../components/ui'
 import { DiffView } from '../../components/DiffView'
 import { CodeBlock } from '../../components/CodeBlock'
-import { RealModeNotice } from '../../components/RealModeNotice'
 import { MessageThread } from '../chat/MessageList'
 import { RollbackHistoryPanel } from '../chat/RollbackHistoryPanel'
 import { Check, Square, RotateCcw, X, ArrowLeft, Bot, FileText, CheckSquare, ListTodo, TerminalSquare, Layers, ShieldAlert, ChevronRight, ChevronDown, Download } from 'lucide-react'
@@ -98,16 +96,15 @@ export function SidePanel() {
 function TaskListPanel({ mode }: { mode: 'todo' | 'plan' }) {
   const { todos, toggleTodo, plans } = useWorkspace()
   const activePlan = plans.find((p) => p.active)
-  // real 模式下清单来自 agent 的 todo_write 工具调用（后端唯一真源），
+  // 清单来自 agent 的 todo_write 工具调用（后端唯一真源），
   // 本地勾选没有任何回写端点，下一次工具事件派生即被覆盖 → 只读展示，不做假交互。
-  const real = apiMode === 'real'
 
   if (mode === 'todo') {
     if (todos.length === 0) {
       return (
         <div className="py-6 text-center text-[12px] text-inkfaint">
           本轮对话暂无任务清单
-          {real && <div className="mt-1 text-[11px]">agent 调用 todo_write 写入清单后，此处会实时出现</div>}
+          <div className="mt-1 text-[11px]">agent 调用 todo_write 写入清单后，此处会实时出现</div>
         </div>
       )
     }
@@ -125,10 +122,9 @@ function TaskListPanel({ mode }: { mode: 'todo' | 'plan' }) {
               key={t.id}
               className={cn(
                 'w-full flex items-start gap-2 rounded-lg border border-edge px-2.5 py-2 text-left transition-colors',
-                real ? 'cursor-default' : 'hover:bg-panel2',
+                'w-full flex items-start gap-2 rounded-lg border border-edge px-2.5 py-2 text-left transition-colors cursor-default',
               )}
-              onClick={() => { if (!real) toggleTodo(t.id) }}
-              title={real ? '状态以 agent 的 todo_write 为准（服务端无单项回写端点）' : '点击切换完成状态'}
+              title="状态以 agent 的 todo_write 为准（服务端无单项回写端点）"
             >
               {t.status === 'done'
                 ? <Check size={13} className="mt-0.5 text-ok shrink-0" />
@@ -151,7 +147,7 @@ function TaskListPanel({ mode }: { mode: 'todo' | 'plan' }) {
     return (
       <div className="py-6 text-center text-[12px] text-inkfaint">
         当前没有进行中的方案
-        {real && <div className="mt-1 text-[11px]">agent 调用 plan_set 登记计划后，此处会实时出现</div>}
+        <div className="mt-1 text-[11px]">agent 调用 plan_set 登记计划后，此处会实时出现</div>
       </div>
     )
   }
@@ -160,9 +156,6 @@ function TaskListPanel({ mode }: { mode: 'todo' | 'plan' }) {
     <div>
       <div className="text-[12px] text-inkdim mb-1.5">
         方案 · {activePlan.title}
-        {apiMode !== 'real' && (
-          <span className="ml-1.5 font-mono text-[11px] text-inkfaint">v{activePlan.version}</span>
-        )}
         <span className="ml-2 font-mono text-[11px] text-ok">
           {activePlan.steps.filter((s) => s.status === 'done').length}/{activePlan.steps.length}
         </span>
@@ -251,13 +244,12 @@ function CommandsPanel() {
   const { commands, stopCommand } = useWorkspace()
   const toast = useUI((s) => s.toast)
   const running = commands.filter((c) => c.status === 'running')
-  const real = apiMode === 'real'
 
   if (running.length === 0) {
     return (
       <div className="py-6 text-center text-[12px] text-inkfaint">
         当前没有正在执行的命令行
-        {real && <div className="mt-1 text-[11px]">agent 调用 run_command 执行命令时会实时出现在这里</div>}
+        <div className="mt-1 text-[11px]">agent 调用 run_command 执行命令时会实时出现在这里</div>
       </div>
     )
   }
@@ -265,14 +257,14 @@ function CommandsPanel() {
   return (
     <div className="space-y-3">
       <div className="text-[12px] text-inkdim">
-        正在执行（{running.length}）{real ? ' · 实时输出来自 tool.progress 事件' : ' · 点击停止终止进程组'}
+        正在执行（{running.length}） · 实时输出来自 tool.progress 事件
       </div>
       <div className="space-y-1.5">
         {running.map((c) => (
           <CommandRow
             key={c.id}
             cmd={c}
-            canStop={!real}
+            canStop={false}
             onStop={() => { stopCommand(c.id); toast('info', `已停止命令行（PID ${c.pid}，终止进程组）`) }}
           />
         ))}
@@ -319,13 +311,12 @@ const formatElapsed = (ms: number) => {
 function SubagentsListPanel() {
   const { subagents } = useWorkspace()
   const { openRunsDetail } = useUI()
-  const real = apiMode === 'real'
 
   if (subagents.length === 0) {
     return (
       <div className="py-6 text-center text-[12px] text-inkfaint">
         本轮对话暂无子进程
-        {real && <div className="mt-1 text-[11px]">agent 调用 spawn_subagent 派生子代理后会实时出现在这里</div>}
+        <div className="mt-1 text-[11px]">agent 调用 spawn_subagent 派生子代理后会实时出现在这里</div>
       </div>
     )
   }
@@ -419,9 +410,8 @@ function toThreadMsgs(agent: Subagent): Message[] {
 function SubagentDetailHeader({ agent }: { agent: Subagent }) {
   const { stopSubagent, resumeSubagent } = useWorkspace()
   const toast = useUI((s) => s.toast)
-  // real 模式：后端没有子 Run 的 stop/resume 端点（只有父 Run 的 stop），
+  // 后端没有子 Run 的 stop/resume 端点（只有父 Run 的 stop），
   // 且 spawn_subagent 是阻塞等待子 Run 终态的工具调用 → 不提供会撒谎的按钮。
-  const real = apiMode === 'real'
 
   return (
     <div className="px-3 pt-3 pb-2 space-y-2 border-b border-edge shrink-0">
@@ -433,14 +423,9 @@ function SubagentDetailHeader({ agent }: { agent: Subagent }) {
         {agent.tokens > 0 && (
           <span className="font-mono text-[11px] text-inkfaint shrink-0">{agent.tokens} tok</span>
         )}
-        {!real && (agent.status === 'running'
-          ? <Button size="sm" variant="danger" onClick={() => { stopSubagent(agent.id); toast('info', `已停止子进程「${agent.name}」`) }}>停止</Button>
-          : (agent.status === 'interrupted' || agent.status === 'cancelled' || agent.status === 'failed') && (
-            <Button size="sm" variant="primary" onClick={() => { resumeSubagent(agent.id); toast('success', `已恢复子进程「${agent.name}」（新建 Run）`) }}>恢复</Button>
-          ))}
       </div>
       <div className="text-[11px] text-inkfaint border-l-2 border-edge pl-2.5">{agent.summary}</div>
-      {real && agent.status === 'running' && (
+      {agent.status === 'running' && (
         <div className="text-[11px] text-inkfaint">
           子代理由 spawn_subagent 工具阻塞执行，需中断请停止主对话（服务端未提供子 Run 单独停止端点）。
         </div>
@@ -490,10 +475,9 @@ function LocalSnapshotSection() {
     useWorkspace()
   const toast = useUI((s) => s.toast)
   const currentId = useSessions((s) => s.currentId)
-  const real = apiMode === 'real'
   const [openId, setOpenId] = useState<string | null>(null)
 
-  // real 模式下随当前会话切换拉取真实快照锚点；mock 模式保持演示数据不发请求
+  // 随当前会话切换拉取真实快照锚点
   useEffect(() => {
     void loadSnapshots(currentId ?? '')
   }, [currentId, loadSnapshots])
@@ -504,25 +488,20 @@ function LocalSnapshotSection() {
         <span className="text-[12px] font-semibold text-inkdim tracking-tight">工作区快照</span>
         <Badge tone="gray">{snapshots.length}</Badge>
       </div>
-      {real ? (
-        <RealModeNotice text="本区块在 real 模式下已接服务端真实数据：列表来自 GET /sessions/{sid}/snapshots（锚点级，含 paths[] 多路径，前端按单文件展开）。服务端快照只存前后哈希与该轮元数据，不含逐行 diff 文本，展开时的逐行 diff 一律取自真实工具结果 meta.data.diff（write_file / edit_file），取不到则明确显示空态，不用样例内容填充。⚠️ 诚实边界：后端锚点无 turnSeq / beforeHash / revertedAt 字段，故「轮次」显示为 0、「已回滚」标记不生效；「回滚 / 重新应用」按钮仍是本地演示（真实回滚请用上方「回滚历史 / 快照锚点」面板）。" />
-      ) : (
-        <RealModeNotice text="演示模式：下方快照为前端演示数据，非服务端返回。切换到 real 模式后将自动改读 GET /sessions/{sid}/snapshots。" />
-      )}
       <div className="rounded-lg border border-edge bg-panel2/50 p-2.5 text-[11px] text-inkfaint space-y-0.5">
         <div>· 快照不按轮次剪枝（随会话删除统一清理）；单文件 &gt; 64MB 时快照失败 → write_file / edit_file <span className="text-warn">直接拒绝写入</span>（不静默跳过）</div>
         <div>· 仅覆盖经内核写入的路径（write_file / edit_file）；run_command 等非 fs 插件造成的文件变更不在快照范围，不可回滚</div>
       </div>
 
-      {real && snapshotsLoading && (
+      {snapshotsLoading && (
         <div className="px-1 text-[12px] text-inkfaint">正在拉取快照锚点…</div>
       )}
-      {real && snapshotsError && (
+      {snapshotsError && (
         <div className="rounded-lg border border-danger/40 bg-danger/5 p-2.5 text-[12px] text-danger">
           快照加载失败：{snapshotsError}
         </div>
       )}
-      {real && !snapshotsLoading && !snapshotsError && snapshots.length === 0 && (
+      {!snapshotsLoading && !snapshotsError && snapshots.length === 0 && (
         <div className="rounded-lg border border-edge bg-panel2/60 p-2.5 text-[11.5px] text-inkfaint leading-relaxed">
           该会话暂无快照锚点：只有经内核 write_file / edit_file 写入过的文件才会产生快照。
         </div>
@@ -563,23 +542,15 @@ function LocalSnapshotSection() {
                 </div>
               )}
               <div className="flex flex-col gap-1.5">
-                {real ? (
-                  <>
-                    <Button size="sm" variant="outline" disabled>
-                      回滚到此快照
-                    </Button>
-                    <div className="text-[11px] text-inkfaint leading-relaxed">
-                      诚实边界：real 模式下该按钮已禁用。服务端回滚端点为
-                      <span className="font-mono"> POST /sessions/&#123;sid&#125;/rollback </span>
-                      （mode = tool / turn / message），不接受「快照锚点 id」作为目标，
-                      无法由此处发起真实回滚。请使用上方「回滚历史 / 快照锚点」面板按工具事件 / 轮次 / 消息回滚。
-                    </div>
-                  </>
-                ) : s.revertedAt ? (
-                  <Button size="sm" variant="outline" onClick={() => { reapplySnapshot(s.id); toast('success', '已重新应用（正序写回）') }}>重新应用</Button>
-                ) : (
-                  <Button size="sm" variant="primary" disabled={s.skipped} onClick={() => { revertSnapshot(s.id); toast('success', `已回滚到该快照（校验当前 hash 后写回）`) }}>回滚到此快照</Button>
-                )}
+                <Button size="sm" variant="outline" disabled>
+                  回滚到此快照
+                </Button>
+                <div className="text-[11px] text-inkfaint leading-relaxed">
+                  该按钮已禁用：服务端回滚端点为
+                  <span className="font-mono"> POST /sessions/&#123;sid&#125;/rollback </span>
+                  （mode = tool / turn / message），不接受「快照锚点 id」作为目标，
+                  无法由此处发起真实回滚。请使用上方「回滚历史 / 快照锚点」面板按工具事件 / 轮次 / 消息回滚。
+                </div>
               </div>
             </div>
           )}

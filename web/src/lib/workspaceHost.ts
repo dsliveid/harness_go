@@ -1,4 +1,4 @@
-import { ApiError, apiMode } from './api'
+import { ApiError } from './api'
 import { API_PATHS } from './apiTypes'
 import type { Workspace } from '../types'
 
@@ -87,17 +87,13 @@ export function hostStatus(ws: Workspace | undefined | null): HostStatus {
 
 const toHost = (h: HostID) => encodeURIComponent(h)
 
-/** hello 分隔符兜底：服务端总会回，这里仅防御 mock/dev 异常响应 */
+/** hello 分隔符兜底：服务端总会回，这里仅防御异常响应 */
 const guessSeparator = (p: string) => (p.includes('\\') ? '\\' : '/')
 
 /**
  * 列出 host 的根（盘符 / 白名单根）。
- * mock 模式下直接抛错，由调用方降级为「仅手填」。
  */
 export async function listHostRoots(host: HostID): Promise<DirListing> {
-  if (apiMode !== 'real') {
-    throw new ApiError('演示模式不支持目录列举', 'fs.host_unsupported', 409, '')
-  }
   const raw = await fetch(`${API_PATHS.fsRoots}?host=${toHost(host)}`, { credentials: 'include' })
   const body = await raw.json().catch(() => null)
   if (!raw.ok) {
@@ -120,9 +116,6 @@ export async function listHostRoots(host: HostID): Promise<DirListing> {
  */
 export async function listHostDirs(host: HostID, path: string): Promise<DirListing> {
   if (!path) return listHostRoots(host)
-  if (apiMode !== 'real') {
-    throw new ApiError('演示模式不支持目录列举', 'fs.host_unsupported', 409, '')
-  }
   const q = `host=${toHost(host)}&path=${encodeURIComponent(path)}`
   const raw = await fetch(`${API_PATHS.fsDirs}?${q}`, { credentials: 'include' })
   const body = await raw.json().catch(() => null)

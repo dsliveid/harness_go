@@ -2,9 +2,8 @@ import { useEffect, useState } from 'react'
 import { useUI } from '../../stores/uiStore'
 import { useChat } from '../../stores/chatStore'
 import { Button, Switch } from '../../components/ui'
-import { RealModeNotice } from '../../components/RealModeNotice'
 import { promptInstall, usePwa } from '../../lib/pwa'
-import { api, apiMode } from '../../lib/api'
+import { api } from '../../lib/api'
 import { DataBackupPanel } from './DataBackupPanel'
 
 /**
@@ -66,13 +65,12 @@ export function DataPanel() {
   const { pushDataApproval } = useChat()
   const pwa = usePwa()
 
-  // real 模式：容量/计数全部来自 GET /maintenance 真实返回；mock 模式不做请求（下方明示为演示）
+  // 容量/计数全部来自 GET /maintenance 真实返回
   const [maint, setMaint] = useState<MaintenanceView | null>(null)
   const [maintErr, setMaintErr] = useState<string | null>(null)
-  const [maintLoading, setMaintLoading] = useState(apiMode === 'real')
+  const [maintLoading, setMaintLoading] = useState(true)
 
   useEffect(() => {
-    if (apiMode !== 'real') return
     let alive = true
     api
       .getMaintenance()
@@ -93,54 +91,35 @@ export function DataPanel() {
     }
   }, [])
 
-  const real = apiMode === 'real'
-  // mock 模式也不放演示数字：容量类数据后端确实不提供（除 /maintenance 少数指标），
-  // 与其展示「看起来真实」的写死值，不如统一显示「—」并注明未接入。
+  // 后端不提供的能力（快照占用 / 消息总数）统一显示「—」并注明未接入，绝不展示"看起来真实"的写死值
   const notWired = '—'
-  const dbValue = real
-    ? maintLoading
-      ? '读取中…'
-      : maintErr
-        ? '读取失败'
-        : fmtBytes(maint?.dbSizeBytes)
-    : notWired
-  const dbHint = real
-    ? maintErr
-      ? 'GET /maintenance 失败'
-      : maint?.dbPageCount !== undefined
-        ? `${fmtCount(maint.dbPageCount)} 页 · freelist ${fmtCount(maint.dbFreelist)} · SQLite WAL`
-        : 'SQLite WAL'
-    : 'DEMO 模式未请求 /maintenance'
-  // 快照占用：后端完全无统计能力 → 任何模式恒为「—」，不保留任何假数字
+  const dbValue = maintLoading
+    ? '读取中…'
+    : maintErr
+      ? '读取失败'
+      : fmtBytes(maint?.dbSizeBytes)
+  const dbHint = maintErr
+    ? 'GET /maintenance 失败'
+    : maint?.dbPageCount !== undefined
+      ? `${fmtCount(maint.dbPageCount)} 页 · freelist ${fmtCount(maint.dbFreelist)} · SQLite WAL`
+      : 'SQLite WAL'
+  // 快照占用：后端完全无统计能力 → 恒为「—」，不保留任何假数字
   const snapValue = notWired
   const snapHint = '后端未提供快照占用统计'
   // 消息总数后端不提供 → 恒为「—」；仅 sessions 是真实值
-  const sessionValue = real
-    ? maintLoading
-      ? '读取中…'
-      : maintErr
-        ? '读取失败'
-        : `${fmtCount(maint?.sessions)} / —`
-    : notWired
-  const sessionHint = real
-    ? maint?.openSessionDbs !== undefined
-      ? `已打开 ${maint.openSessionDbs} 个会话库 · 消息总数后端未提供`
-      : '会话数真实 · 消息总数后端未提供'
-    : 'DEMO 模式未请求 /maintenance'
+  const sessionValue = maintLoading
+    ? '读取中…'
+    : maintErr
+      ? '读取失败'
+      : `${fmtCount(maint?.sessions)} / —`
+  const sessionHint = maint?.openSessionDbs !== undefined
+    ? `已打开 ${maint.openSessionDbs} 个会话库 · 消息总数后端未提供`
+    : '会话数真实 · 消息总数后端未提供'
 
   return (
     <div className="p-3 space-y-4">
-      <RealModeNotice
-        text={
-          real
-            ? maintErr
-              ? `GET /maintenance 读取失败（${maintErr}）：数据库体积与计数无法展示，下方以「读取失败」如实标注，不做假值兜底。`
-              : '数据库体积与会话数来自 GET /maintenance 真实返回（main_db.file_size_bytes / sessions）；消息总数与快照 blob 占用后端未提供，一律显示「—」，不做估算或填充。'
-            : '当前为 DEMO 模式：下方容量与计数均为占位「—」，本端未请求服务端（演示数据已按「不造假」口径移除）。切到 REAL 模式后，数据库体积与会话数会替换为 GET /maintenance 真实返回。'
-        }
-      />
       <div className="grid grid-cols-2 gap-3">
-        <Stat label="数据目录" value={real && maint?.dbFilePath ? maint.dbFilePath : 'data/'} hint="可整体拷贝迁移" />
+        <Stat label="数据目录" value={maint?.dbFilePath ? maint.dbFilePath : 'data/'} hint="可整体拷贝迁移" />
         <Stat label="数据库" value={dbValue} hint={dbHint} />
         <Stat label="快照 blob" value={snapValue} hint={snapHint} />
         <Stat label="会话 / 消息" value={sessionValue} hint={sessionHint} />
@@ -170,9 +149,7 @@ export function DataPanel() {
           variant="outline"
           onClick={() =>
             // 后端未提供 VACUUM 触发接口，因此不做「已回收 x MB」这种编造结果
-            real
-              ? toast('info', '服务端未提供 VACUUM 触发接口，本按钮暂不执行任何压缩操作')
-              : toast('info', 'DEMO 模式：不会真正执行 VACUUM（无对应后端接口）')
+            toast('info', '服务端未提供 VACUUM 触发接口，本按钮暂不执行任何压缩操作')
           }
         >压缩数据库（VACUUM）</Button>
         <Button
@@ -180,7 +157,7 @@ export function DataPanel() {
           title="导出会话数据受「项目设置 → 数据权限」控制，越界会触发审批"
           onClick={() => {
             setAdvanced(false)
-            const sessions = real ? maint?.sessions : undefined
+            const sessions = maint?.sessions
             pushDataApproval({
               scope: 'session_export',
               toolName: 'export_session',

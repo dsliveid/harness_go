@@ -1,22 +1,19 @@
 import { useEffect, useState } from 'react'
-import { Sparkles, Eye, EyeOff, LogIn, Sun, Moon, User, Lock, Zap } from 'lucide-react'
+import { Sparkles, Eye, EyeOff, LogIn, Sun, Moon, User, Lock } from 'lucide-react'
 import { Button, Switch, inputCls, cn } from '../../components/ui'
 import { useAuth } from '../../stores/authStore'
 import { useUI } from '../../stores/uiStore'
-import { apiMode } from '../../lib/api'
+import { HostSettingsFab } from '../../layout/HostSettingsFab'
 
 /**
  * 极简自托管登录界面：
  * - 紧凑居中单卡片设计，干净克制，去除冗余宣传与繁杂说明
  * - 纯粹 1px 精密线框，全站无多余阴影
  * - 顶部集成深浅主题无缝切换
- * - 提供便捷的一键填入演示账号快捷操作
  */
 export function LoginPage() {
-  const { login, loginDirect, ssoLogin, loading, error, clearError } = useAuth()
+  const { login, ssoLogin, loading, error, clearError } = useAuth()
   const { theme, toggleTheme } = useUI()
-  // 演示入口仅在 mock 模式出现（real 模式账号由服务端引导创建）
-  const isDemo = apiMode === 'mock'
 
   // SSO 兜底自愈：dev / 纯静态部署时服务端不拦截 GET /，由前端读 query 换取 Cookie，
   // 并立刻把凭据从地址栏抹掉（不留浏览器历史、不被 Referer 带出）
@@ -43,12 +40,6 @@ export function LoginPage() {
   const submit = async (e?: React.FormEvent) => {
     e?.preventDefault()
     await login(username, password, remember)
-  }
-
-  const fillDemo = () => {
-    clearError()
-    setUsername('admin')
-    setPassword('harness123')
   }
 
   return (
@@ -154,36 +145,6 @@ export function LoginPage() {
               <LogIn size={14} />
               <span>{loading ? '正在验证…' : '进入工作台'}</span>
             </Button>
-
-            {/* 演示直通 + 一键填入：仅 mock 演示模式（real 模式安静呈现，不显示任何说明文案） */}
-            {isDemo && (
-              <>
-                <Button
-                  type="button"
-                  variant="outline"
-                  className="w-full justify-center gap-1.5 h-9 text-[13px]"
-                  disabled={loading}
-                  title="演示模式：免输入账号密码，以内置账号直接进入工作台（仅 mock 数据模式可用）"
-                  onClick={() => { clearError(); void loginDirect() }}
-                >
-                  <Zap size={13} className="text-warn" />
-                  <span>直接登录（演示模式）</span>
-                </Button>
-
-                <div className="rounded-xl border border-edge bg-panel2/40 px-3 py-2 flex items-center justify-between text-[12px]">
-                  <span className="text-inkdim">
-                    演示账号：<code className="font-mono text-accent font-medium">admin</code>
-                  </span>
-                  <button
-                    type="button"
-                    className="text-accent hover:underline font-medium cursor-pointer"
-                    onClick={fillDemo}
-                  >
-                    一键填入
-                  </button>
-                </div>
-              </>
-            )}
           </div>
         </form>
       </main>
@@ -192,6 +153,10 @@ export function LoginPage() {
       <footer className="w-full text-center text-[11px] text-inkfaint py-2">
         <span>harness_go · 本地安全自托管</span>
       </footer>
+
+      {/* 契约三：客户端壳内的「返回宿主设置」浮标（登录页也保留出口）。
+          桌面壳会话失效撞登录墙时，用户可以从这里回基线页重新走登录表单。 */}
+      <HostSettingsFab />
     </div>
   )
 }

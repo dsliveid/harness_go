@@ -146,7 +146,7 @@ function DeviceCard({ d }: { d: DeviceDTO }) {
   const onRevoke = async () => {
     if (!confirming) {
       setConfirming(true)
-      toast('info', `再次点击「确认吊销」以吊销「${d.name}」`)
+      toast('info', `再次点击「确认解绑」以解除「${d.name}」的绑定`)
       window.setTimeout(() => setConfirming(false), 8000)
       return
     }
@@ -154,7 +154,12 @@ function DeviceCard({ d }: { d: DeviceDTO }) {
     const ok = await revoke(d.id)
     setBusy(false)
     setConfirming(false)
-    toast(ok ? 'success' : 'error', ok ? `已吊销「${d.name}」，令牌立即失效并断开长连接` : '吊销失败')
+    toast(
+      ok ? 'success' : 'error',
+      ok
+        ? `已解除「${d.name}」的绑定，令牌立即失效、长连接已断开，端侧将回到配对引导`
+        : '解除绑定失败',
+    )
   }
 
   return (
@@ -189,7 +194,7 @@ function DeviceCard({ d }: { d: DeviceDTO }) {
           )}
           <Button variant="danger" onClick={onRevoke} disabled={revoked || busy}>
             <Trash2 size={12} className="mr-1" />
-            {revoked ? '已吊销' : confirming ? '确认吊销' : '吊销'}
+            {revoked ? '已解绑' : confirming ? '确认解绑' : '解除绑定'}
           </Button>
         </div>
       </div>
@@ -236,8 +241,7 @@ export function DevicePanel() {
   const stats = useMemo(() => {
     const online = devices.filter((d) => d.status === 'online').length
     const offline = devices.filter((d) => d.status === 'offline').length
-    const revoked = devices.filter((d) => d.status === 'revoked').length
-    return { online, offline, revoked }
+    return { online, offline }
   }, [devices])
 
   return (
@@ -256,7 +260,6 @@ export function DevicePanel() {
           <span>已配对设备</span>
           <Badge tone="green">在线 {stats.online}</Badge>
           <Badge tone="gray">离线 {stats.offline}</Badge>
-          {stats.revoked > 0 && <Badge tone="red">吊销 {stats.revoked}</Badge>}
         </div>
         <Button variant="ghost" onClick={() => void loadDevices()} disabled={loading}>
           {loading ? '刷新中…' : '刷新'}
@@ -267,7 +270,7 @@ export function DevicePanel() {
         <Empty
           icon={<Monitor size={22} className="text-inkdim" />}
           title="暂无已配对设备"
-          hint="生成配对码后，在端侧输入即可接入；未接入时所有工具仍在服务端本地执行。"
+          hint="生成配对码后，在端侧输入即可接入；解除绑定后设备会立即从此列表消失。未接入时所有工具仍在服务端本地执行。"
         />
       ) : (
         <div className="space-y-2">

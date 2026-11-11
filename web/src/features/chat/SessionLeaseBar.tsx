@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useState } from 'react'
 import { RefreshCw, ShieldAlert, ShieldCheck, Smartphone } from 'lucide-react'
-import { api, apiMode } from '../../lib/api'
+import { api } from '../../lib/api'
 import { useSessions } from '../../stores/sessionStore'
 import { useUI } from '../../stores/uiStore'
-import { Badge, Button, cn } from '../../components/ui'
+import { Badge, cn } from '../../components/ui'
 import type { SessionLeaseDTO } from '../../lib/apiTypes'
 
 /** 租约带 TTL 与心跳，20s 静默轮询即可反映「谁在写」，无需 WS 推送。 */
@@ -26,6 +26,9 @@ function fmtClock(ms?: number): string {
  * 语义铁律（后端注释明写）：**无租约不是 404**——`active=true / epoch=0 / holder=''`
  * 表示「无跨端写者，服务端本地可写」。故此处不把空 holder 当异常，也不伪造写者。
  * 读取失败一律原样透传（行内红字 + toast），绝不兜底成假租约。
+ *
+ * 展示为单行紧凑布局以适配移动端：仅保留「写者身份 + 状态」；
+ * epoch / 心跳 / 到期等排障细节在 sm 及以上（≥640px）才显示，窄屏不换行不溢出。
  */
 export function SessionLeaseBar() {
   const currentId = useSessions((s) => s.currentId)
@@ -75,60 +78,61 @@ export function SessionLeaseBar() {
   const active = Boolean(lease?.active)
 
   return (
-    <div className="mx-3 mt-2 rounded-lg border border-edge bg-panel2/30 px-3 py-1.5 text-[11.5px] flex items-center gap-x-2.5 gap-y-1 flex-wrap">
-      <span className="inline-flex items-center gap-1 text-inkdim shrink-0">
-        {isDevice ? (
-          <Smartphone size={12} className="text-accent shrink-0" />
-        ) : active ? (
-          <ShieldCheck size={12} className="text-ok shrink-0" />
-        ) : (
-          <ShieldAlert size={12} className="text-warn shrink-0" />
-        )}
-        会话写者
-      </span>
+    <div className="mx-3 mt-2 rounded-lg border border-edge bg-panel2/30 px-2.5 py-1.5 text-[11px] flex items-center gap-2 min-w-0">
+      {isDevice ? (
+        <Smartphone size={12} className="text-accent shrink-0" />
+      ) : active ? (
+        <ShieldCheck size={12} className="text-ok shrink-0" />
+      ) : (
+        <ShieldAlert size={12} className="text-warn shrink-0" />
+      )}
 
       {error ? (
-        // 错误原样透传，不做美化或吞掉
-        <span className="text-err font-mono break-all">{error}</span>
+        // 错误原样透传，不做美化或吞掉（窄屏省略号截断，完整信息见 toast）
+        <span className="text-err font-mono truncate min-w-0 flex-1" title={error}>
+          {error}
+        </span>
       ) : !lease ? (
-        <span className="text-inkfaint">{loading ? '读取中…' : '暂无租约数据'}</span>
+        <span className="text-inkfaint truncate min-w-0 flex-1">
+          {loading ? '读取中…' : '暂无租约数据'}
+        </span>
       ) : (
         <>
-          <span className={cn('font-medium', active ? 'text-ink' : 'text-warn')}>
-            {isDevice ? `设备 ${lease.holder}` : '服务端本地执行面'}
+          <span
+            className={cn('font-medium truncate min-w-0', active ? 'text-ink' : 'text-warn')}
+            title={isDevice ? `设备 ${lease.holder}` : '服务端本地执行面'}
+          >
+            {isDevice ? `设备 ${lease.holder}` : '服务端本地'}
           </span>
-          <Badge tone={active ? (isDevice ? 'blue' : 'green') : 'yellow'}>
-            {active ? (isDevice ? 'device 写者' : 'server 写者') : '已过期 / 无写者'}
+
+          <Badge tone={active ? (isDevice ? 'blue' : 'green') : 'yellow'} className="shrink-0">
+            {active ? (isDevice ? 'device' : 'server') : '空闲'}
           </Badge>
-          <span className="text-inkfaint">
-            epoch <span className="font-mono text-inkdim">{lease.epoch}</span>
-          </span>
-          {lease.heartbeat_at ? (
-            <span className="text-inkfaint">
-              心跳 <span className="font-mono text-inkdim">{fmtClock(lease.heartbeat_at)}</span>
+
+          {/* 排障细节：窄屏隐藏，避免换行撑高顶栏 */}
+          {active && (lease.epoch > 0 || lease.heartbeat_at) && (
+            <span className="hidden sm:inline text-inkfaint truncate">
+              epoch <span className="font-mono text-inkdim">{lease.epoch}</span>
+              {lease.heartbeat_at ? (
+                <>
+                  {' · '}心跳 <span className="font-mono text-inkdim">{fmtClock(lease.heartbeat_at)}</span>
+                </>
+              ) : null}
             </span>
-          ) : null}
-          {lease.expires_at ? (
-            <span className="text-inkfaint">
-              到期 <span className="font-mono text-inkdim">{fmtClock(lease.expires_at)}</span>
-            </span>
-          ) : null}
-          {lease.epoch === 0 && !isDevice && (
-            <span className="text-inkfaint">（无跨端写者，服务端可写）</span>
           )}
         </>
       )}
 
-      <span className="ml-auto inline-flex items-center gap-1.5 shrink-0">
-        <span className="text-[10px] text-inkfaint font-mono">
-          {apiMode === 'real' ? 'GET /sessions/{sid}/lease' : 'mock'}
-        </span>
-        <Button variant="ghost" size="sm" onClick={() => void load()} disabled={loading}>
-          <RefreshCw size={11} className={cn('mr-1', loading && 'animate-spin')} />
-          {loading ? '刷新中' : '刷新'}
-        </Button>
-      </span>
+      <button
+        type="button"
+        onClick={() => void load()}
+        disabled={loading}
+        title={loading ? '正在刷新会话写者' : '刷新会话写者'}
+        aria-label="刷新会话写者"
+        className="ml-auto shrink-0 w-6 h-6 rounded-md inline-flex items-center justify-center text-inkfaint hover:text-accent hover:bg-panel2 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+      >
+        <RefreshCw size={11} className={cn(loading && 'animate-spin')} />
+      </button>
     </div>
   )
 }
-

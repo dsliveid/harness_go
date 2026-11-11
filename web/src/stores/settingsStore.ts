@@ -1,7 +1,6 @@
 import { create } from 'zustand'
 import type { ModelInfo, Provider } from '../types'
-import { defaultModels, providers as mockProviders } from '../mock/data'
-import { api, apiMode } from '../lib/api'
+import { api } from '../lib/api'
 import { DEFAULT_CONTEXT_LIMIT, registerProviderSource } from '../lib/context'
 import type { ProviderDTO, ProviderInput } from '../lib/apiTypes'
 import { useUI } from './uiStore'
@@ -28,13 +27,10 @@ export const PROVIDER_KEY_MASK = '••••••••'
 const DEFAULT_MODEL_KEY = 'agent.default_model'
 
 const initialSettings: AppSettings = {
-  // real 模式的厂商来自主库 providers 表（loadProviders 拉取）；mock 沿用 demo 样例
-  providers: apiMode === 'mock' ? mockProviders : [],
-  defaultProviderId: apiMode === 'mock' ? (mockProviders[0]?.id ?? '') : '',
-  capabilityModels:
-    apiMode === 'mock'
-      ? { ...defaultModels }
-      : { chat: '', vision: '', image: '', decision: '' },
+  // 厂商来自主库 providers 表（loadProviders 拉取），初始为空态绝不预置演示数据
+  providers: [],
+  defaultProviderId: '',
+  capabilityModels: { chat: '', vision: '', image: '', decision: '' },
   disabledTools: [],
   disabledSops: [],
   proxyEnabled: false,
@@ -71,13 +67,12 @@ function toProviderInput(p: Provider): ProviderInput {
 }
 
 /**
- * 把「草稿里的厂商配置」同步到服务端（仅 real 模式）。
+ * 把「草稿里的厂商配置」同步到服务端。
  *
  * 差异提交：新增 → create、字段变化 → update、被删 → delete；
  * 未变化的厂商不发请求（避免无谓写入与密钥覆盖）。返回是否有变更。
  */
 async function syncProvidersToServer(prev: Provider[], next: Provider[]): Promise<boolean> {
-  if (apiMode !== 'real') return false
   const prevMap = new Map(prev.map((p) => [p.id, p]))
   const nextIds = new Set(next.map((p) => p.id))
   let changed = false
@@ -134,7 +129,7 @@ interface SettingsState {
    * 「应用」语义（对齐桌面端 ModalActions）：提交草稿使其生效，但**不结束编辑**。
    *
    * 与 endEdit(true) 的差异：提交后立刻用最新设置重开草稿，弹窗保持打开，
-   * 用户可继续改下一项；real 模式会等服务端同步完成再重开草稿，
+   * 用户可继续改下一项；会等服务端同步完成再重开草稿，
    * 保证界面回到「已落库」的真值（厂商 id / 密钥掩码都以服务端为准）。
    */
   applyDraft: () => Promise<void>
@@ -143,7 +138,7 @@ interface SettingsState {
    * 若当前正在编辑草稿，则同步草稿避免出现「改了但没保存」的错觉）
    */
   setDisabledTools: (next: string[]) => void
-  /** 从服务端拉取厂商列表（real 模式；登录后调用） */
+  /** 从服务端拉取厂商列表（登录后调用） */
   loadProviders: () => Promise<void>
 }
 
@@ -159,7 +154,7 @@ export const useSettings = create<SettingsState>((set, get) => ({
     const { draft, settings } = get()
     if (!draft) return
     set(commit ? { settings: draft, draft: null } : { draft: null })
-    if (!commit || apiMode !== 'real') return
+    if (!commit) return
     // 默认对话模型落库（内存态刷新即丢）+ 厂商差异提交后再拉回服务端真值（密钥只回掩码）
     void syncDefaultModelToServer(draft.capabilityModels?.chat ?? '')
     void syncProvidersToServer(settings.providers, draft.providers).then((changed) => {
@@ -169,7 +164,6 @@ export const useSettings = create<SettingsState>((set, get) => ({
 
   // 登录后拉取厂商列表：服务端为唯一真源（has_api_key 只回布尔，不回明文）
   loadProviders: async () => {
-    if (apiMode !== 'real') return
     try {
       const list = (await api.listProviders()).map(toUiProvider)
       set((s) => ({
@@ -211,12 +205,7 @@ export const useSettings = create<SettingsState>((set, get) => ({
     const { draft, settings } = get()
     if (!draft) return
     set({ settings: draft })
-    if (apiMode !== 'real') {
-      // mock：直接用提交后的设置重开草稿
-      set({ draft: structuredClone(get().settings) })
-      return
-    }
-    // real：默认对话模型落库 + 差异提交厂商，再拉回服务端真值后重开草稿
+    // 默认对话模型落库 + 差异提交厂商，再拉回服务端真值后重开草稿
     void syncDefaultModelToServer(draft.capabilityModels?.chat ?? '')
     const changed = await syncProvidersToServer(settings.providers, draft.providers)
     if (changed) {
@@ -290,10 +279,10 @@ export function toggleDisabled(list: string[], id: string): string[] {
 }
 
 /**
- * 向 lib/context 注册真实厂商表读取器（消除 contextLimit 对 mock/data 的直引）。
+ * 向 lib/context 注册厂商表读取器（消除 contextLimit 对演示数据的直引）。
  *
  * 放在模块末尾：此刻 `useSettings` 已求值完成，回调只读 `settings.providers` 快照，
  * 既不形成 import 循环，也不会在 loop 初始化期被访问到 TDZ。
- * real 模式下该表来自 `GET /providers`（ProviderDTO），demo 模式为本地样例。
+ * 该表来自 `GET /providers`（ProviderDTO）。
  */
 registerProviderSource(() => useSettings.getState().settings.providers)

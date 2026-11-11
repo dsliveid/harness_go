@@ -1,8 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
-import { Activity, Zap } from 'lucide-react'
+import { Activity } from 'lucide-react'
 import { useSse, SSE_PHASE_META } from '../../stores/sseStore'
-import { apiMode } from '../../lib/api'
-import { Button, cn } from '../../components/ui'
+import { cn } from '../../components/ui'
 
 const dotCls: Record<string, string> = {
   ok: 'bg-ok',
@@ -17,11 +16,9 @@ const dotCls: Record<string, string> = {
  *
  * ⚠️ 该组件在 layout/TopBar.tsx 常驻渲染，历史上展示的是 sseStore 里的**硬编码假值**
  *    （游标 214/218、重连 2 次、断开原因永为「43 分钟前缓冲已满」），等于每个页面顶部
- *    都在展示假的连接状态，且 RealModeNotice 对它无效（它是状态点不是面板）。
+ *    都在展示假的连接状态。
  *    现已改为只消费真实状态机：唯一写入方是 lib/sse.ts SseClient → api.startRun → chatStore。
  *    无活跃订阅时如实显示「未订阅」，**不展示任何编造指标**。
- *
- * 「模拟断线重连」按钮仅在 mock 模式出现，用于演示状态机流转；real 模式下隐藏（不伪造状态）。
  */
 export function SseStatus() {
   const sse = useSse()
@@ -31,7 +28,6 @@ export function SseStatus() {
   const panelRef = useRef<HTMLDivElement>(null)
 
   const meta = SSE_PHASE_META[sse.phase]
-  const isMock = apiMode === 'mock'
   /** 有真实订阅（正在跑 Run 且事件流打开） */
   const active = sse.runId !== null && (sse.phase === 'open' || sse.phase === 'connecting' || sse.phase === 'backoff' || sse.phase === 'resync')
 
@@ -128,30 +124,6 @@ export function SseStatus() {
               {typeof sse.lastDrop.retryIn === 'number' && (
                 <div className="mt-1 font-mono">退避 {Math.round(sse.lastDrop.retryIn)}ms 后按 lastEventId 续传重连</div>
               )}
-            </div>
-          )}
-
-          {isMock ? (
-            <div className="mt-3 pt-2.5 border-t border-edge/40 flex items-center gap-2">
-              <Button
-                size="sm"
-                variant="outline"
-                className="gap-1.5"
-                disabled={sse.demoRunning || (sse.phase !== 'open' && sse.phase !== 'idle')}
-                onClick={() => sse.simulateDrop()}
-                title="演示断线 → 指数退避 → 重连 → 按游标补同步的全过程（仅 mock 模式）"
-              >
-                <Zap size={12} className="text-warn" />
-                <span>{sse.demoRunning ? '断线重连演示中…' : '模拟断线重连（演示）'}</span>
-              </Button>
-              <span className="text-[10px] text-inkfaint leading-relaxed">
-                回到前台会立即重连（visibilitychange）
-              </span>
-            </div>
-          ) : (
-            <div className="mt-3 pt-2.5 border-t border-edge/40 text-[10px] text-inkfaint leading-relaxed">
-              real 模式：显示的是 EventSource 真实状态机（连接 / 退避 / 补同步），断线由
-              `lib/sse.ts` 自动按 lastEventId 续传，无演示按钮。
             </div>
           )}
 

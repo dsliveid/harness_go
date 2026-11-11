@@ -1,11 +1,6 @@
 import { create } from 'zustand'
 import type { AccessMode, ApprovalRule, DataScope, DataScopeGrant, DataScopeMode, PlanMode, Project, ProjectLink, Session, Workspace, WorkspaceKind } from '../types'
-import {
-  approvalRules as mockApprovalRules, dataGrants as mockDataGrants, projects as mockProjects,
-  projectLinks as mockProjectLinks, sessions as mockSessions, workspaces as mockWorkspaces,
-  DEFAULT_WORKSPACE_ID,
-} from '../mock/data'
-import { api, apiMode } from '../lib/api'
+import { api } from '../lib/api'
 import { useUI } from './uiStore'
 import { useSettings } from './settingsStore'
 import {
@@ -14,6 +9,22 @@ import {
   savePersistedProjects, savePersistedWorkspaces, setScopeOverride,
 } from './sessionScope'
 
+/**
+ * 内置服务端空间 id（服务端本身就是永远在线的「大脑」空间，不可移除）。
+ * 历史上一度由演示数据模块导出，现在它是前端纯约定常量，就近定义。
+ */
+const DEFAULT_WORKSPACE_ID = 'ws-srv'
+
+/** 内置服务端空间：唯一预置的工作空间（真实概念，非演示数据） */
+const BUILTIN_WORKSPACE: Workspace = {
+  id: DEFAULT_WORKSPACE_ID,
+  name: '服务端工作空间',
+  kind: 'server',
+  online: true,
+  limbCount: 1,
+  builtin: true,
+}
+
 /** 项目所属工作空间（缺省视为内置服务端空间） */
 export const wsOfProject = (p: Project) => p.workspaceId ?? DEFAULT_WORKSPACE_ID
 
@@ -21,7 +32,7 @@ export const wsOfProject = (p: Project) => p.workspaceId ?? DEFAULT_WORKSPACE_ID
  * 新会话的初始模型（不存在「默认模型」这个模糊选项，落到具体模型或空）：
  *  ① 同一作用域内最近的会话：项目对话看同项目最新一条，纯对话看上一条纯对话；
  *  ② 设置 → 能力模型槽位 chat（全局默认对话模型，需仍在启用厂商列表内）；
- *  ③ 兜底：mock 用演示模型；real 为空串 = 未选择（发送时会提示先选模型）。
+ *  ③ 兜底为空串 = 未选择（发送时会提示先选模型）。
  */
 function inheritModelRef(sessions: Session[], projectId?: string): string {
   const scope = sessions.filter((s) => (projectId ? s.projectId === projectId : !s.projectId))
@@ -35,7 +46,7 @@ function inheritModelRef(sessions: Session[], projectId?: string): string {
     const p = providers.find((x) => x.id === pid)
     if (p?.enabled && p.models.some((m) => m.id === mid)) return chatSlot
   }
-  return apiMode === 'mock' ? 'deepseek/deepseek-chat' : ''
+  return ''
 }
 
 /** 会话所属工作空间：优先自身 workspaceId，其次按项目推导，纯对话缺省内置空间 */
@@ -55,11 +66,10 @@ function syncUsage(sessionId: string) {
 }
 
 /**
- * 把「项目 / 工作空间 / 当前空间」写入本地持久化（real 模式；mock 模式是演示数据不必落盘）。
+ * 把「项目 / 工作空间 / 当前空间」写入本地持久化。
  * 三者都是纯前端实体，不在服务端落库，只能靠本地存储保证刷新前后一致。
  */
 function persistScope(st: { projects: Project[]; workspaces: Workspace[]; activeWorkspaceId: string }) {
-  if (apiMode !== 'real') return
   savePersistedProjects(st.projects)
   savePersistedWorkspaces(st.workspaces)
   savePersistedActiveWorkspace(st.activeWorkspaceId)
@@ -118,32 +128,38 @@ interface SessionState {
   dataScopeOf: (projectId: string, scope: DataScope) => DataScopeMode
 }
 
-// 项目：real 模式下**服务端 projects 表是权威源**（由 loadProjects() 拉取）；
+// 项目：**服务端 projects 表是权威源**（由 loadProjects() 拉取）；
 // 本地持久化只用于首屏秒开与水合前占位，且**只保留前端独有字段**（workspaceId/constraints/planMode）。
 //
-// 🚨 踩坑记录（2026-11）：这里曾用 `?? mockProjects` 兜底，导致 real 模式首屏注入 p1/p2/p3
-// 这三条演示项目。它们服务端根本不存在，用户对其切换权限 → PATCH 404 → 前端误报「保存失败」
-// 且刷新后回退旧值（实为服务端从未存过）。real 模式必须从空列表起步，由服务端填充。
-const initialProjects = apiMode === 'mock' ? mockProjects : (loadPersistedProjects() ?? [])
-const initialWorkspaces = apiMode === 'mock'
-  ? mockWorkspaces
-  : ((loadPersistedWorkspaces() as Workspace[] | null) ?? mockWorkspaces)
-const initialActiveWs = apiMode === 'mock' ? DEFAULT_WORKSPACE_ID : (loadPersistedActiveWorkspace() ?? DEFAULT_WORKSPACE_ID)
+// 🚨 踩坑记录（2026-11）：这里曾用演示项目兜底，导致首屏注入 p1/p2/p3 三条假项目。
+// 它们服务端根本不存在，用户对其切换权限 → PATCH 404 → 前端误报「保存失败」
+// 且刷新后回退旧值（实为服务端从未存过）。必须从空列表起步，由服务端填充。
+const initialProjects: Project[] = loadPersistedProjects() ?? []
+
+/** 工作空间：内置服务端空间恒存在，其余来自本地持久化（客户端接入是纯前端概念） */
+// loadPersistedWorkspaces() 已做脏数据自愈（逐项校验形状），此处拿到的必然是合法 Workspace[]，
+// 不会再出现 undefined 元素撑爆首屏渲染（2026-11 登录后黑屏事故）。
+const persistedWorkspaces: Workspace[] = loadPersistedWorkspaces()
+const initialWorkspaces: Workspace[] = persistedWorkspaces.some((w) => w.id === DEFAULT_WORKSPACE_ID)
+  ? persistedWorkspaces
+  : [BUILTIN_WORKSPACE, ...persistedWorkspaces]
+const initialActiveWs = loadPersistedActiveWorkspace() ?? DEFAULT_WORKSPACE_ID
 
 export const useSessions = create<SessionState>((set, get) => ({
   workspaces: initialWorkspaces,
   activeWorkspaceId: initialActiveWs,
-  // real 模式会话列表来自主库（load() 拉取）；mock 模式沿用 demo 样例
-  sessions: apiMode === 'mock' ? mockSessions : [],
+  // 会话列表来自主库（load() 拉取），初始为空态
+  sessions: [],
   projects: initialProjects,
-  projectLinks: mockProjectLinks,
-  approvalRules: mockApprovalRules,
-  dataGrants: mockDataGrants,
-  currentId: apiMode === 'mock' ? 's1' : '',
+  // 项目级数据（关联项目 / 审批规则 / 数据权限）同样从空态起步：
+  // 服务端无「列全部规则」端点，规则由 loadProjects 之后按需回填，绝不预置演示行。
+  projectLinks: [],
+  approvalRules: [],
+  dataGrants: [],
+  currentId: '',
 
   // 登录后从主库拉取会话列表：空列表自动建一条，避免右侧空屏
   load: async () => {
-    if (apiMode === 'mock') return
     try {
       const list = await api.listSessions({ limit: 100 })
       if (list.length === 0) {
@@ -178,7 +194,7 @@ export const useSessions = create<SessionState>((set, get) => ({
   select: (id) => {
     if (id !== get().currentId) syncUsage(id)
     set({ currentId: id })
-    if (apiMode === 'real' && id) {
+    if (id) {
       // 切换会话即拉取该会话消息快照（以 DB 为准）
       void import('./chatStore').then((m) => {
         // 先清掉上一会话残留的进行中态，再按目标会话的真实情况重建
@@ -276,49 +292,45 @@ export const useSessions = create<SessionState>((set, get) => ({
     // 归属同步落服务端（sessions.project_id，阶段七起服务端已有一等项目实体），
     // 本地 override 仍保留：用于承接前端独有的 workspaceId 分组。
     if (projectId || s.workspaceId) setScopeOverride(id, { projectId, workspaceId: s.workspaceId })
-    if (apiMode === 'real') {
-      // 先乐观插入（同步返回 id 供调用方 select），再以服务端返回的会话替换本地壳。
-      // **只传 projectId，不传 accessMode**：默认控制权限由服务端按项目设置快照继承。
-      void api
-        .createSession({
-          title: s.title,
-          modelRef: s.modelRef,
-          workspacePath: s.workspacePath,
-          projectId,
-        })
-        .then((created) => {
-          set((st) => ({
-            sessions: st.sessions.map((x) =>
-              // 服务端已回传 projectId；workspaceId 仍是前端概念，保留本地值兜底。
-              x.id === id ? { ...created, projectId: created.projectId ?? x.projectId, workspaceId: x.workspaceId } : x,
-            ),
-            currentId: st.currentId === id ? created.id : st.currentId,
-          }))
-          // 本地壳 id → 服务端真实 id：账本与归属记录都要迁徙，否则切回来/刷新后丢失
-          if (projectId || s.workspaceId) {
-            setScopeOverride(created.id, { projectId, workspaceId: s.workspaceId })
-            clearScopeOverride(id)
+    // 先乐观插入（同步返回 id 供调用方 select），再以服务端返回的会话替换本地壳。
+    // **只传 projectId，不传 accessMode**：默认控制权限由服务端按项目设置快照继承。
+    void api
+      .createSession({
+        title: s.title,
+        modelRef: s.modelRef,
+        workspacePath: s.workspacePath,
+        projectId,
+      })
+      .then((created) => {
+        set((st) => ({
+          sessions: st.sessions.map((x) =>
+            // 服务端已回传 projectId；workspaceId 仍是前端概念，保留本地值兜底。
+            x.id === id ? { ...created, projectId: created.projectId ?? x.projectId, workspaceId: x.workspaceId } : x,
+          ),
+          currentId: st.currentId === id ? created.id : st.currentId,
+        }))
+        // 本地壳 id → 服务端真实 id：账本与归属记录都要迁徙，否则切回来/刷新后丢失
+        if (projectId || s.workspaceId) {
+          setScopeOverride(created.id, { projectId, workspaceId: s.workspaceId })
+          clearScopeOverride(id)
+        }
+        void import('./chatStore').then((m) => m.useChat.getState().migrateUsage(id, created.id))
+      })
+      .catch(() => {
+        set((st) => {
+          const rest = st.sessions.filter((x) => x.id !== id)
+          return {
+            sessions: rest,
+            currentId: st.currentId === id ? (rest[0]?.id ?? '') : st.currentId,
           }
-          void import('./chatStore').then((m) => m.useChat.getState().migrateUsage(id, created.id))
         })
-        .catch(() => {
-          set((st) => {
-            const rest = st.sessions.filter((x) => x.id !== id)
-            return {
-              sessions: rest,
-              currentId: st.currentId === id ? (rest[0]?.id ?? '') : st.currentId,
-            }
-          })
-          useUI.getState().toast('error', '创建会话失败，请检查服务状态')
-        })
-    }
+        useUI.getState().toast('error', '创建会话失败，请检查服务状态')
+      })
     return id
   },
   rename: (id, title) => {
     set((s) => ({ sessions: s.sessions.map((x) => (x.id === id ? { ...x, title } : x)) }))
-    if (apiMode === 'real') {
-      void api.renameSession(id, title).catch(() => useUI.getState().toast('error', '重命名失败'))
-    }
+    void api.renameSession(id, title).catch(() => useUI.getState().toast('error', '重命名失败'))
   },
   remove: (id) => {
     set((s) => {
@@ -330,9 +342,7 @@ export const useSessions = create<SessionState>((set, get) => ({
     })
     // 删的是当前会话 → token 水位跟着切到新的当前会话
     if (get().currentId !== id) syncUsage(get().currentId)
-    if (apiMode === 'real') {
-      void api.deleteSession(id).catch(() => useUI.getState().toast('error', '删除会话失败'))
-    }
+    void api.deleteSession(id).catch(() => useUI.getState().toast('error', '删除会话失败'))
   },
   archive: (id) => {
     set((s) => ({
@@ -340,30 +350,22 @@ export const useSessions = create<SessionState>((set, get) => ({
       currentId: s.currentId === id ? (s.sessions.find((x) => x.id !== id && !x.archivedAt)?.id ?? s.currentId) : s.currentId,
     }))
     if (get().currentId !== id) syncUsage(get().currentId)
-    if (apiMode === 'real') {
-      // 归档落库：刷新/重启后归档中心仍完整（失败仅提示，本地状态已更新）
-      void api.archiveSession(id).catch(() => useUI.getState().toast('error', '归档会话失败'))
-    }
+    // 归档落库：刷新/重启后归档中心仍完整（失败仅提示，本地状态已更新）
+    void api.archiveSession(id).catch(() => useUI.getState().toast('error', '归档会话失败'))
   },
   unarchive: (id) => {
     set((s) => ({ sessions: s.sessions.map((x) => (x.id === id ? { ...x, archivedAt: undefined } : x)) }))
-    if (apiMode === 'real') {
-      void api.unarchiveSession(id).catch(() => useUI.getState().toast('error', '取消归档失败'))
-    }
+    void api.unarchiveSession(id).catch(() => useUI.getState().toast('error', '取消归档失败'))
   },
   setAccessMode: (id, accessMode) => {
     set((s) => ({ sessions: s.sessions.map((x) => (x.id === id ? { ...x, accessMode } : x)) }))
-    if (apiMode === 'real') {
-      // 访问模式落库：引擎每次审批实时重读，运行中切换立即生效（对齐桌面端语义）
-      void api.setSessionAccessMode(id, accessMode).catch(() => useUI.getState().toast('error', '保存访问模式失败'))
-    }
+    // 访问模式落库：引擎每次审批实时重读，运行中切换立即生效（对齐桌面端语义）
+    void api.setSessionAccessMode(id, accessMode).catch(() => useUI.getState().toast('error', '保存访问模式失败'))
   },
   setModel: (id, modelRef) => {
     set((s) => ({ sessions: s.sessions.map((x) => (x.id === id ? { ...x, modelRef } : x)) }))
-    if (apiMode === 'real') {
-      // 会话级模型落库：重载 / 换端后仍生效（失败不影响本地选择）
-      void api.setSessionModel(id, modelRef).catch(() => useUI.getState().toast('error', '保存模型选择失败'))
-    }
+    // 会话级模型落库：重载 / 换端后仍生效（失败不影响本地选择）
+    void api.setSessionModel(id, modelRef).catch(() => useUI.getState().toast('error', '保存模型选择失败'))
   },
 
   createProject: (name, path) => {
@@ -378,23 +380,21 @@ export const useSessions = create<SessionState>((set, get) => ({
     }
     set((s) => ({ projects: [...s.projects, p] }))
     persistScope(get())
-    if (apiMode === 'real') {
-      // 项目是服务端一等实体：创建必须落库，否则后续 PATCH 权限/规则会 404。
-      // 以服务端生成的 id 替换本地临时 id，避免本地 id 与服务端不一致导致后续调用全失败。
-      void api
-        .createProject({ name: p.name, path: p.path, defaultAccessMode: p.defaultAccessMode })
-        .then((created) =>
-          set((s) => ({
-            projects: s.projects.map((x) => (x.id === id ? { ...created, workspaceId: x.workspaceId } : x)),
-            sessions: s.sessions.map((x) => (x.projectId === id ? { ...x, projectId: created.id } : x)),
-          })),
-        )
-        .then(() => persistScope(get()))
-        .catch(() => {
-          set((s) => ({ projects: s.projects.filter((x) => x.id !== id) }))
-          useUI.getState().toast('error', '项目创建失败，请检查服务状态')
-        })
-    }
+    // 项目是服务端一等实体：创建必须落库，否则后续 PATCH 权限/规则会 404。
+    // 以服务端生成的 id 替换本地临时 id，避免本地 id 与服务端不一致导致后续调用全失败。
+    void api
+      .createProject({ name: p.name, path: p.path, defaultAccessMode: p.defaultAccessMode })
+      .then((created) =>
+        set((s) => ({
+          projects: s.projects.map((x) => (x.id === id ? { ...created, workspaceId: x.workspaceId } : x)),
+          sessions: s.sessions.map((x) => (x.projectId === id ? { ...x, projectId: created.id } : x)),
+        })),
+      )
+      .then(() => persistScope(get()))
+      .catch(() => {
+        set((s) => ({ projects: s.projects.filter((x) => x.id !== id) }))
+        useUI.getState().toast('error', '项目创建失败，请检查服务状态')
+      })
     return id
   },
   renameProject: (id, name) => {
@@ -429,7 +429,6 @@ export const useSessions = create<SessionState>((set, get) => ({
   // 服务端不认识前端的 workspaceId/constraints/planMode，必须与本地既有值按 id 合并保留，
   // 否则一次刷新就会把用户的空间分组与项目约束全部抹掉。
   loadProjects: async () => {
-    if (apiMode === 'mock') return
     try {
       const list = await api.listProjects()
       set((st) => {
@@ -461,10 +460,6 @@ export const useSessions = create<SessionState>((set, get) => ({
       set((s) => ({ projects: s.projects.map((p) => (p.id === id ? { ...p, defaultAccessMode: mode } : p)) }))
       persistScope(get())
     }
-    if (apiMode !== 'real') {
-      apply()
-      return Promise.resolve()
-    }
     return api
       .updateProject(id, { defaultAccessMode: mode })
       .then(apply)
@@ -484,32 +479,30 @@ export const useSessions = create<SessionState>((set, get) => ({
     set((s) => ({ projectLinks: s.projectLinks.map((l) => (l.id === id ? { ...l, path: path.trim(), description } : l)) })),
   deleteProjectLink: (id) => set((s) => ({ projectLinks: s.projectLinks.filter((l) => l.id !== id) })),
 
-  // ---- 审批规则（项目级；real 模式以服务端为权威源） ----
+  // ---- 审批规则（项目级；服务端为权威源） ----
   addApprovalRule: (projectId, toolName, pattern) => {
     const id = `ar-${Date.now()}`
     const rule: ApprovalRule = { id, projectId, toolName, pattern, createdAt: Date.now() }
     set((s) => ({ approvalRules: [...s.approvalRules, rule] }))
-    if (apiMode === 'real') {
-      // 乐观插入后以服务端回包纠偏（幂等：重复添加服务端返回既有规则）。
-      void api
-        .addProjectRule(projectId, { toolName, pattern })
-        .then((saved) =>
-          set((s) => ({
-            approvalRules: s.approvalRules.map((r) => (r.id === id ? saved : r)),
-          })),
-        )
-        .catch(() => {
-          // 失败即回滚乐观项，避免前端显示「规则已生效」而引擎实际不认
-          set((s) => ({ approvalRules: s.approvalRules.filter((r) => r.id !== id) }))
-          useUI.getState().toast('error', '审批规则保存失败')
-        })
-    }
+    // 乐观插入后以服务端回包纠偏（幂等：重复添加服务端返回既有规则）。
+    void api
+      .addProjectRule(projectId, { toolName, pattern })
+      .then((saved) =>
+        set((s) => ({
+          approvalRules: s.approvalRules.map((r) => (r.id === id ? saved : r)),
+        })),
+      )
+      .catch(() => {
+        // 失败即回滚乐观项，避免前端显示「规则已生效」而引擎实际不认
+        set((s) => ({ approvalRules: s.approvalRules.filter((r) => r.id !== id) }))
+        useUI.getState().toast('error', '审批规则保存失败')
+      })
   },
   removeApprovalRule: (id) => {
     const prev = get().approvalRules
     const victim = prev.find((r) => r.id === id)
     set((s) => ({ approvalRules: s.approvalRules.filter((r) => r.id !== id) }))
-    if (apiMode === 'real' && victim) {
+    if (victim) {
       void api.removeProjectRule(victim.projectId, id).catch(() => {
         // 回滚：删除失败时恢复原条目，避免前端与引擎规则集不一致
         set(() => ({ approvalRules: prev }))

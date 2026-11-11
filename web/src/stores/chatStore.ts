@@ -2,9 +2,7 @@
 import type {
   Approval, DataScope, Message, Run, ToolCall,
 } from '../types'
-import { longSessionMessages, messages as mockMessages } from '../mock/data'
-import { startMockRun, type Decision, type MockRunHandle, type StreamEvent } from '../mock/stream'
-import { api, apiMode, type RunHandle } from '../lib/api'
+import { api, type Decision, type RunHandle, type StreamEvent } from '../lib/api'
 import type { ActiveRunDTO } from '../lib/apiTypes'
 import type { SseState as SseStateName, SseStateInfo } from '../lib/sse'
 import { DATA_SCOPE_LABEL } from '../lib/dataScopes'
@@ -15,11 +13,8 @@ import { useWorkspace } from './workspaceStore'
 
 // 模块级流式缓冲：delta 累积后按 50ms 批量提交，避免逐 token setState
 //
-// handle 只承载 real 通道（订阅/停止/重连）；mock 的句柄单独放 mockHandle。
-// 两者此前混成一个联合类型，导致 mock 缺 reconnect、real 缺 resume 时编译器无法定位，
-// 只能在调用点写死分支——职责混在一个变量里是这两类缺陷反复出现的根源。
+// handle 只承载唯一的真实通道（订阅 / 停止 / 重连）；服务端是 Run 的唯一执行方。
 let handle: RunHandle | null = null
-let mockHandle: MockRunHandle | null = null
 // startRun 的 POST 在途时点了「停止」：拿到句柄后立即补一次 stop，避免服务端 Run 空跑
 let cancelPending = false
 let pendingText = ''
@@ -66,10 +61,6 @@ export interface SessionUsage {
  */
 const usageBySession: Record<string, SessionUsage> = {}
 
-// mock 演示态：demo 会话 s1 自带一份用量水位（切到其他会话时仍从 0 起算）
-const MOCK_USAGE: SessionUsage = { tokensIn: 18420, tokensOut: 1280, cachedTokens: 15980 }
-if (apiMode === 'mock') usageBySession.s1 = { ...MOCK_USAGE }
-
 /** 把一次 Run 的用量累加进该会话账本，并返回累加后的最新值。 */
 function accumulateUsage(sessionId: string, delta: SessionUsage): SessionUsage {
   const prev = usageBySession[sessionId] ?? { tokensIn: 0, tokensOut: 0, cachedTokens: 0 }
@@ -89,7 +80,7 @@ function usageOf(sessionId: string): SessionUsage {
 
 /**
  * SSE 真实状态上报转发（lib/api.ts → 顶栏 SseStatus）。
- * 单独抽成函数而非内联，是为了 mock/real 两个分支共用同一套转发与终态清理逻辑。
+ * 单独抽成函数而非内联，是为了让开始 / 恢复两条订阅路径共用同一套转发与终态清理逻辑。
  */
 function applySseState(state: SseStateName, info: SseStateInfo) {
   useSse.getState().applyReal(state, info)
@@ -287,7 +278,6 @@ export const useChat = create<ChatState>((set, get) => {
     currentRunId = null
     currentRunSessionId = null
     handle = null
-    mockHandle = null
     // 订阅结束：如实回到空闲态（顶栏不再残留「已连接」假象）
     useSse.getState().detachRun()
     // 排队输入继续依次执行（失败与成功同语义：不因一次结束阻塞后续）
@@ -511,15 +501,7 @@ export const useChat = create<ChatState>((set, get) => {
 
     const onStreamEvent = makeStreamEventHandler(sessionId)
 
-    if (apiMode === 'mock') {
-      mockHandle = startMockRun({ sessionId, runId, input, onEvent: onStreamEvent })
-      // mock 无真实 EventSource：如实上报「演示态」（顶栏同时有 🟡 DEMO 角标提示为演示数据）
-      useSse.getState().attachRun(runId)
-      useSse.getState().applyReal('open', { reason: 'mock-stream' })
-      return
-    }
-
-    // real 模式：Run 在服务端执行（本地 runId 仅用于消息壳，真实 id 以服务端返回为准）
+    // Run 在服务端执行（本地 runId 仅用于消息壳，真实 id 以服务端返回为准）
     cancelPending = false
     // 订阅开始：顶栏如实进入「连接中」，此后由 SseClient 状态机接管
     useSse.getState().attachRun(runId)
@@ -564,16 +546,16 @@ export const useChat = create<ChatState>((set, get) => {
   }
 
   return {
-    // real 模式消息来自 DB（登录后/reloadMessages 拉取）；mock 模式保留 demo 样例
-    messages: apiMode === 'mock' ? [...mockMessages, ...longSessionMessages] : [],
+    // 消息一律来自 DB（登录后 / reloadMessages 拉取），绝不预置演示数据
+    messages: [],
     runStatus: 'completed',
     approval: null,
     queued: [],
     streaming: false,
     reasoning: '',
-    tokensIn: apiMode === 'mock' ? 18420 : 0,
-    tokensOut: apiMode === 'mock' ? 1280 : 0,
-    cachedTokens: apiMode === 'mock' ? 15980 : 0,
+    tokensIn: 0,
+    tokensOut: 0,
+    cachedTokens: 0,
     lastError: null,
     draft: '',
 
@@ -583,7 +565,7 @@ export const useChat = create<ChatState>((set, get) => {
 
     // 以 DB 为准重拉消息快照：断线重连（resync）后覆盖本地流式态
     reloadMessages: async (sessionId) => {
-      if (apiMode === 'mock') return
+      if (!sessionId) return
       try {
         const list = await api.listMessages(sessionId)
         set((s) => ({
@@ -612,7 +594,7 @@ export const useChat = create<ChatState>((set, get) => {
      * 再补发历史 delta 会把正文重复追加一遍（脏数据级缺陷）。
      */
     resumeRun: async (sessionId) => {
-      if (apiMode === 'mock' || !sessionId) return
+      if (!sessionId) return
       // 仅当本地正在跟踪的**就是该会话**的 Run 时才跳过；跟踪别的会话不影响本会话恢复
       if (get().streaming && currentRunId && useSessions.getState().currentId === sessionId
         && currentRunSessionId === sessionId) return
@@ -625,7 +607,6 @@ export const useChat = create<ChatState>((set, get) => {
         currentRunId = null
         currentRunSessionId = null
         handle = null
-        mockHandle = null
         useSse.getState().detachRun()
       }
       let active: ActiveRunDTO | null = null
@@ -738,15 +719,13 @@ export const useChat = create<ChatState>((set, get) => {
     },
 
     stop: () => {
-      if (!handle && !mockHandle) {
-        // POST 仍在途（real 模式）：先记账，拿到句柄后立刻 stop
+      if (!handle) {
+        // POST 仍在途：先记账，拿到句柄后立刻 stop
         if (get().streaming) cancelPending = true
         return
       }
-      // 两条通道各自停止（mock 无服务端 Run，real 会打 stop 端点）
-      mockHandle?.stop()
-      handle?.stop()
-      mockHandle = null
+      // 服务端 Run 真实停止（打 stop 端点）
+      handle.stop()
       handle = null
       flush()
       const id = streamingMsgId
@@ -794,23 +773,19 @@ export const useChat = create<ChatState>((set, get) => {
           return m
         }),
       }))
-      if (apiMode === 'real') {
-        // 服务端上下文同步截断（S10 消息级回滚）：目标消息起置灰 + 受影响文件回滚到 before 快照。
-        // 必须先回滚再起 Run（引擎在 Run 启动时装载历史，晚到会把待置灰消息喂进本轮上下文）；
-        // 回滚失败仍继续本地重发（服务端历史以 DB 为准，可稍后手工回滚），但会给出警示。
-        void (async () => {
-          try {
-            const rid = await api.rollbackToMessage(target.sessionId, target.seq)
-            lastRollbackBySession[target.sessionId] = rid
-          } catch {
-            useUI.getState().toast('warn', '服务端回滚失败，本轮上下文可能仍含旧消息')
-          } finally {
-            startRun(content)
-          }
-        })()
-        return
-      }
-      startRun(content)
+      // 服务端上下文同步截断（S10 消息级回滚）：目标消息起置灰 + 受影响文件回滚到 before 快照。
+      // 必须先回滚再起 Run（引擎在 Run 启动时装载历史，晚到会把待置灰消息喂进本轮上下文）；
+      // 回滚失败仍继续本地重发（服务端历史以 DB 为准，可稍后手工回滚），但会给出警示。
+      void (async () => {
+        try {
+          const rid = await api.rollbackToMessage(target.sessionId, target.seq)
+          lastRollbackBySession[target.sessionId] = rid
+        } catch {
+          useUI.getState().toast('warn', '服务端回滚失败，本轮上下文可能仍含旧消息')
+        } finally {
+          startRun(content)
+        }
+      })()
     },
 
     guide: (input) => {
@@ -820,7 +795,7 @@ export const useChat = create<ChatState>((set, get) => {
         startRun(text)
         return
       }
-      if (apiMode === 'real' && currentRunId) {
+      if (currentRunId) {
         // 引导（需求 §4.2）：运行中立即介入——消息经服务端落库（响应就地追加），
         // 引擎在轮次边界回灌上下文；Run 已结束（409）降级为待执行队列
         const sessionId = useSessions.getState().currentId
@@ -864,18 +839,14 @@ export const useChat = create<ChatState>((set, get) => {
         .messages.filter((m) => m.sessionId === target.sessionId && m.seq <= target.seq && !m.reverted)
         .map((m) => ({ ...m, id: `${newId}-${m.id}`, sessionId: newId }))
       set((s) => ({ messages: [...s.messages, ...copied] }))
-      if (apiMode === 'real') {
-        // 后端无「分叉时复制历史消息」端点：新会话在服务端是真建库的空会话，
-        // 前序消息只是本端缓存副本。文案必须如实说明，不得暗示服务端已有历史。
-        useUI
-          .getState()
-          .toast(
-            'info',
-            `已新建分支会话：服务端为空会话，此处 ${copied.length} 条前序消息仅本端可见；下一条消息起按新会话独立落库`,
-          )
-        return
-      }
-      useUI.getState().toast('success', `已分叉新会话（含此前 ${copied.length} 条消息）`)
+      // 后端无「分叉时复制历史消息」端点：新会话在服务端是真建库的空会话，
+      // 前序消息只是本端缓存副本。文案必须如实说明，不得暗示服务端已有历史。
+      useUI
+        .getState()
+        .toast(
+          'info',
+          `已新建分支会话：服务端为空会话，此处 ${copied.length} 条前序消息仅本端可见；下一条消息起按新会话独立落库`,
+        )
     },
 
     // 撤回对话到此处：该消息起后续全部置灰（保留可见），内容回填输入框
@@ -894,27 +865,23 @@ export const useChat = create<ChatState>((set, get) => {
         ),
         draft: target.content,
       }))
-      if (apiMode === 'real') {
-        // 等价性：api.rollbackToMessage(sid, seq) = POST /sessions/{sid}/rollback，
-        // 服务端「seq 起消息置灰（hidden，组装上下文时排除）+ 受影响文件回滚到 before 快照」，
-        // 与「撤回对话到此处」语义一致，故直接复用该已有方法。
-        void api
-          .rollbackToMessage(target.sessionId, target.seq)
-          .then((rid) => {
-            lastRollbackBySession[target.sessionId] = rid
-            useUI
-              .getState()
-              .toast('info', '已撤回至此处（服务端历史同步置灰），内容已回填输入框；发送新消息将覆盖此后历史')
-            return get().reloadMessages(target.sessionId)
-          })
-          .catch(() => {
-            // 失败：还原本地置灰与草稿，保证界面与服务端一致（否则会出现「看着撤回了、实际没撤」）
-            set({ messages: prevMessages, draft: prevDraft })
-            useUI.getState().toast('error', '服务端回滚失败，已还原本地状态（历史以服务端为准）')
-          })
-        return
-      }
-      useUI.getState().toast('info', '已撤回至此处，内容已回填输入框（发送新消息将覆盖此后历史）')
+      // 等价性：api.rollbackToMessage(sid, seq) = POST /sessions/{sid}/rollback，
+      // 服务端「seq 起消息置灰（hidden，组装上下文时排除）+ 受影响文件回滚到 before 快照」，
+      // 与「撤回对话到此处」语义一致，故直接复用该已有方法。
+      void api
+        .rollbackToMessage(target.sessionId, target.seq)
+        .then((rid) => {
+          lastRollbackBySession[target.sessionId] = rid
+          useUI
+            .getState()
+            .toast('info', '已撤回至此处（服务端历史同步置灰），内容已回填输入框；发送新消息将覆盖此后历史')
+          return get().reloadMessages(target.sessionId)
+        })
+        .catch(() => {
+          // 失败：还原本地置灰与草稿，保证界面与服务端一致（否则会出现「看着撤回了、实际没撤」）
+          set({ messages: prevMessages, draft: prevDraft })
+          useUI.getState().toast('error', '服务端回滚失败，已还原本地状态（历史以服务端为准）')
+        })
     },
 
     // 重新应用：清除撤回边界，所有消息与文件还原为最新
@@ -929,20 +896,16 @@ export const useChat = create<ChatState>((set, get) => {
         ),
         draft: get().draft === target.content ? '' : get().draft,
       }))
-      if (apiMode === 'real') {
-        const rid = lastRollbackBySession[target.sessionId]
-        if (!rid) {
-          useUI.getState().toast('warn', '本端没有可重放的回滚记录（重新应用仅在回滚后可用）')
-          return
-        }
-        void api
-          .reapplyRollback(target.sessionId, rid)
-          .then(() => get().reloadMessages(target.sessionId))
-          .then(() => useUI.getState().toast('success', '已重新应用，消息与文件还原为最新'))
-          .catch(() => useUI.getState().toast('error', '重新应用失败（回滚可能已被重放过）'))
-      } else {
-        useUI.getState().toast('success', '已重新应用，消息与文件还原为最新')
+      const rid = lastRollbackBySession[target.sessionId]
+      if (!rid) {
+        useUI.getState().toast('warn', '本端没有可重放的回滚记录（重新应用仅在回滚后可用）')
+        return
       }
+      void api
+        .reapplyRollback(target.sessionId, rid)
+        .then(() => get().reloadMessages(target.sessionId))
+        .then(() => useUI.getState().toast('success', '已重新应用，消息与文件还原为最新'))
+        .catch(() => useUI.getState().toast('error', '重新应用失败（回滚可能已被重放过）'))
     },
 
     // 删除对话：删除该提问及其后全部消息
@@ -955,30 +918,26 @@ export const useChat = create<ChatState>((set, get) => {
           (m) => !(m.sessionId === target.sessionId && m.seq >= target.seq),
         ),
       }))
-      if (apiMode === 'real') {
-        // 后端无「删除一段消息」端点。能做到的最接近语义是 S10 消息级回滚：
-        // 服务端把 seq 起消息置灰（hidden，组装上下文时排除）并回滚受影响文件，可 reapply 恢复；
-        // 界面按「已删除」呈现。⚠️ 必须显式告知用户：服务端是置灰而非物理删除，
-        // 否则用户会以为聊天记录已在服务端被抹掉。
-        void api
-          .rollbackToMessage(target.sessionId, target.seq)
-          .then((rid) => {
-            lastRollbackBySession[target.sessionId] = rid
-            // 不 reloadMessages：服务端置灰消息重拉回来会「删了又出现」，与本端「已删除」呈现冲突
-            useUI
-              .getState()
-              .toast(
-                'success',
-                '已删除该对话及后续内容：服务端仅置灰不再参与上下文（可重新应用恢复），未物理删除',
-              )
-          })
-          .catch(() => {
-            set({ messages: prevMessages })
-            useUI.getState().toast('error', '服务端回滚失败，已还原本地视图（未删除任何内容）')
-          })
-        return
-      }
-      useUI.getState().toast('success', '已删除该对话及后续内容')
+      // 后端无「删除一段消息」端点。能做到的最接近语义是 S10 消息级回滚：
+      // 服务端把 seq 起消息置灰（hidden，组装上下文时排除）并回滚受影响文件，可 reapply 恢复；
+      // 界面按「已删除」呈现。⚠️ 必须显式告知用户：服务端是置灰而非物理删除，
+      // 否则用户会以为聊天记录已在服务端被抹掉。
+      void api
+        .rollbackToMessage(target.sessionId, target.seq)
+        .then((rid) => {
+          lastRollbackBySession[target.sessionId] = rid
+          // 不 reloadMessages：服务端置灰消息重拉回来会「删了又出现」，与本端「已删除」呈现冲突
+          useUI
+            .getState()
+            .toast(
+              'success',
+              '已删除该对话及后续内容：服务端仅置灰不再参与上下文（可重新应用恢复），未物理删除',
+            )
+        })
+        .catch(() => {
+          set({ messages: prevMessages })
+          useUI.getState().toast('error', '服务端回滚失败，已还原本地视图（未删除任何内容）')
+        })
     },
 
     // ---------------- 数据权限审批（独立于工具审批，不阻塞 Run） ----------------
@@ -1025,29 +984,24 @@ export const useChat = create<ChatState>((set, get) => {
         return
       }
 
-      // 工具审批：real 与 mock 的决策通道不同，但**凭据来源相同**——只认 ap.id。
+      // 工具审批：凭据来源只认 ap.id。
       //
-      // real 曾经走 handle.resume()，而它依赖 attachRun 闭包里的 approvalId；
+      // 曾经走 handle.resume()，而它依赖 attachRun 闭包里的 approvalId；
       // 该变量只在收到 approval.request 事件时赋值，刷新恢复路径（fromSeq=-1 不补发历史）
       // 永远拿不到 → 审批条「看得见、点不动」。改为直接调 decideApproval（凭 ap.id）。
-      if (apiMode === 'mock') {
-        mockHandle?.resume(decision, reason)
-        set({ approval: null, runStatus: 'running' })
-      } else {
-        const sessionId = ap.runId ? currentRunSessionId ?? useSessions.getState().currentId : useSessions.getState().currentId
-        const runId = ap.runId || currentRunId
-        if (!sessionId || !runId) {
-          // 缺少定位信息时不假装成功：如实告知，保留审批条让用户重试
-          useUI.getState().toast('warn', '审批上下文已失效，请刷新后重试')
-          return
-        }
-        // 先乐观收起审批条（避免重复点击），失败再如实回填提示
-        set({ approval: null, runStatus: 'running' })
-        void api.decideApproval(sessionId, runId, ap.id, decision, reason).catch((err: unknown) => {
-          const msg = err instanceof Error ? err.message : '审批提交失败'
-          useUI.getState().toast('error', msg)
-        })
+      const sessionId = ap.runId ? currentRunSessionId ?? useSessions.getState().currentId : useSessions.getState().currentId
+      const runId = ap.runId || currentRunId
+      if (!sessionId || !runId) {
+        // 缺少定位信息时不假装成功：如实告知，保留审批条让用户重试
+        useUI.getState().toast('warn', '审批上下文已失效，请刷新后重试')
+        return
       }
+      // 先乐观收起审批条（避免重复点击），失败再如实回填提示
+      set({ approval: null, runStatus: 'running' })
+      void api.decideApproval(sessionId, runId, ap.id, decision, reason).catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : '审批提交失败'
+        useUI.getState().toast('error', msg)
+      })
       if (decision === 'allow_session') {
         useUI.getState().toast('success', `已记住规则：${ap.toolName} 在本会话内允许`)
       } else if (decision === 'deny') {

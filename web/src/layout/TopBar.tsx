@@ -5,7 +5,6 @@ import { useUI } from '../stores/uiStore'
 import { useSettings } from '../stores/settingsStore'
 import { roleLabel, useAuth } from '../stores/authStore'
 import { Button, IconButton } from '../components/ui'
-import { ModeBadge } from '../components/ModeBadge'
 import { ChangePasswordModal } from '../features/auth/ChangePasswordModal'
 import { SseStatus } from '../features/chat/SseStatus'
 import type { AccessMode } from '../types'
@@ -14,9 +13,8 @@ export function TopBar() {
   const { sessions, currentId, setAccessMode, setModel, workspaces, activeWorkspaceId } = useSessions()
   const { setSettings, theme, toggleTheme, sidebarOpen, toggleSidebar, toast } = useUI()
   const { user, loggedInAt, expiresAt, logout } = useAuth()
-  // 厂商列表以主库为唯一真源（real 模式由 settingsStore.loadProviders 拉取；
-  // mock 模式 settingsStore 内置演示数据）——不要再直接读 mock/data，否则 real 模式下
-  // 选中的模型不在列表里会导致选择器显示空白。
+  // 厂商列表以主库为唯一真源（settingsStore.loadProviders 从服务端拉取）——
+  // 不要在前端内置任何厂商/模型清单，否则选中项不在列表里会导致选择器显示空白。
   const providers = useSettings((st) => st.settings.providers)
   const [accountOpen, setAccountOpen] = useState(false)
   const [pwdOpen, setPwdOpen] = useState(false)
@@ -165,9 +163,6 @@ export function TopBar() {
       <IconButton onClick={() => setSettings(true)} title="程序设置" ariaLabel="打开设置">
         <Settings size={15} />
       </IconButton>
-
-      {/* 全局数据模式角标：🟢REAL / 🟡DEMO，任意页面一眼可辨真假 */}
-      <ModeBadge />
 
       {/* 账户菜单：账号密码登录态与退出 */}
       <div className="relative flex items-center" ref={accountRef}>

@@ -1,6 +1,5 @@
 import { create } from 'zustand'
 import type { ScheduledTask } from '../types'
-import { scheduledTasks as mockTasks } from '../mock/data'
 import { usePlugins } from './pluginStore'
 
 /**
@@ -17,8 +16,9 @@ interface ScheduleState {
 
 const HOUR = 3_600_000
 
-export const useSchedule = create<ScheduleState>((set, get) => ({
-  tasks: mockTasks,
+export const useSchedule = create<ScheduleState>((set) => ({
+  // 任务清单从空态起步（服务端暂无定时任务端点），由用户创建 / 客户端回灌填充
+  tasks: [],
 
   toggle: (id) =>
     set((s) => ({

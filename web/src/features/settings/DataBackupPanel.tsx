@@ -1,10 +1,9 @@
 import { useRef, useState } from 'react'
 import { Archive, Download, FileUp, PackageCheck } from 'lucide-react'
 import { Button } from '../../components/ui'
-import { RealModeNotice } from '../../components/RealModeNotice'
 import { useUI } from '../../stores/uiStore'
 import { useSessions } from '../../stores/sessionStore'
-import { api, apiMode } from '../../lib/api'
+import { api } from '../../lib/api'
 import type { RestoreResult } from '../../lib/api'
 
 /**
@@ -37,7 +36,6 @@ export function DataBackupPanel() {
   const toast = useUI((s) => s.toast)
   const sessions = useSessions((s) => s.sessions)
   const currentId = useSessions((s) => s.currentId)
-  const real = apiMode === 'real'
 
   const [busy, setBusy] = useState<Busy>(null)
   /** 本次面板最近一次失败的原始错误文案（不加工、不截断） */
@@ -118,14 +116,6 @@ export function DataBackupPanel() {
         </div>
       </div>
 
-      <RealModeNotice
-        text={
-          real
-            ? '本区块四个入口均直连真实端点（/artifacts/{id} · /sessions/{sid}/export · /data/backup · /data/restore）。失败时后端错误文案原样展示，不做任何静默兜底；/data/backup 与 /data/restore 为 owner 专用，非 owner 会收到 403。'
-            : '当前为 DEMO 模式：制品下载 / 会话导出 / 全量备份 / 恢复均**不可用**（不伪造 zip 内容，避免产生 0 字节假文件）。切换到 REAL 模式后本区块才真正打服务端。'
-        }
-      />
-
       {/* 1) 制品下载 */}
       <div className="rounded-lg border border-edge bg-panel2/40 p-2.5 space-y-2">
         <div className="flex items-center gap-1.5 text-[12px] font-medium text-ink">
@@ -138,7 +128,7 @@ export function DataBackupPanel() {
             placeholder="制品 ID（GET /artifacts/{id}）"
             className="h-8 flex-1 min-w-0 px-2.5 rounded-lg bg-panel2 border border-edge text-[12px] outline-none focus:border-accent placeholder:text-inkfaint font-mono"
           />
-          <Button variant="outline" disabled={!real || busy !== null} onClick={onDownloadArtifact}>
+          <Button variant="outline" disabled={busy !== null} onClick={onDownloadArtifact}>
             {busy === 'artifact' ? '下载中…' : '下载'}
           </Button>
         </div>
@@ -156,7 +146,7 @@ export function DataBackupPanel() {
           <div className="text-[11px] text-inkfaint break-all">
             目标会话：<span className="font-mono text-inkdim">{targetSessionId || '（无可用会话）'}</span>
           </div>
-          <Button variant="outline" disabled={!real || busy !== null || !targetSessionId} onClick={onExportSession}>
+          <Button variant="outline" disabled={busy !== null || !targetSessionId} onClick={onExportSession}>
             {busy === 'export' ? '导出中…' : '导出当前会话 zip'}
           </Button>
         </div>
@@ -166,7 +156,7 @@ export function DataBackupPanel() {
             <Archive size={12} className="text-inkdim" /> 全量备份
           </div>
           <div className="text-[11px] text-inkfaint">owner 专用；包含全局库与会话库。</div>
-          <Button variant="outline" disabled={!real || busy !== null} onClick={onBackup}>
+          <Button variant="outline" disabled={busy !== null} onClick={onBackup}>
             {busy === 'backup' ? '打包中…' : '下载全量备份 zip'}
           </Button>
         </div>
@@ -188,7 +178,7 @@ export function DataBackupPanel() {
               setConfirmRestore(false)
             }}
           />
-          <Button variant="outline" disabled={!real || busy !== null} onClick={() => fileRef.current?.click()}>
+          <Button variant="outline" disabled={busy !== null} onClick={() => fileRef.current?.click()}>
             选择备份 zip
           </Button>
           <span className="text-[11.5px] text-inkdim font-mono truncate max-w-[240px]">
@@ -199,13 +189,13 @@ export function DataBackupPanel() {
           <input
             type="checkbox"
             checked={confirmRestore}
-            disabled={!real || busy !== null || !restoreFile}
+            disabled={busy !== null || !restoreFile}
             onChange={(e) => setConfirmRestore(e.target.checked)}
             className="mt-0.5"
           />
           <span>我已知晓：恢复只解压到服务端暂存目录、不会自动生效，仍需停机替换数据目录。</span>
         </label>
-        <Button variant="outline" disabled={!real || busy !== null || !restoreFile || !confirmRestore} onClick={onRestore}>
+        <Button variant="outline" disabled={busy !== null || !restoreFile || !confirmRestore} onClick={onRestore}>
           {busy === 'restore' ? '恢复中…' : '上传并恢复'}
         </Button>
       </div>

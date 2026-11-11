@@ -496,6 +496,29 @@ export const API_PATHS = {
   devicePair: '/api/v1/devices/pair',
   /** C-3：端侧出站 WS（鉴权走 query `?token=`，浏览器端不持有设备令牌） */
   deviceWS: '/api/v1/devices/ws',
+  /**
+   * 凭设备令牌续签用户会话（免全局鉴权，handler 内只认 Bearer 设备令牌）。
+   *
+   * Web 前端**不调用**它：浏览器侧没有 device_token，续期由原生端（移动/桌面）完成。
+   * 列在这里仅为与 openapi.yaml / router.go 保持三方一致（契约自检要求）。
+   */
+  deviceSession: '/api/v1/devices/session',
+  /**
+   * 端侧自我解约（免全局鉴权，handler 内只认 Bearer 设备令牌）。
+   *
+   * **双向解绑的客户端方向**：端侧「解除本机绑定」时调用，服务端据此吊销该设备，
+   * 使其从 `GET /api/v1/devices` 默认列表消失。
+   *
+   * 与 `device(did)` 的 DELETE 分工：后者是管理端按 ID 吊销（需用户令牌），
+   * 本端点由端侧主动调用（只需 device_token）。端侧解绑时 user_token 可能已过期，
+   * 所以不能复用 DELETE —— 那是「客户端取消绑定后服务端没取消」的根因。
+   *
+   * Web 前端**不调用**它：浏览器侧没有 device_token。列在这里仅为与
+   * openapi.yaml / router.go 保持三方一致（契约自检要求）。
+   */
+  deviceUnpair: '/api/v1/devices/unpair',
+  /** 设备状态实时推送（SSE）：首帧 snapshot + 增量上下线 + device.revoked；**不续传** */
+  deviceEvents: '/api/v1/devices/events',
   /** C-6：会话租约（跨端写者归属） */
   sessionLease: (sid: string) => `/api/v1/sessions/${sid}/lease`,
   /* P1：Webhook 事件订阅 */

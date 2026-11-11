@@ -5,7 +5,6 @@ import { usePlugins } from '../../stores/pluginStore'
 import { useUI } from '../../stores/uiStore'
 import { Badge, Button, Empty, Modal, Switch, cn } from '../../components/ui'
 import { PromptModal, type PromptField } from '../../components/PromptModal'
-import { RealModeNotice } from '../../components/RealModeNotice'
 import type { ScheduledTask } from '../../types'
 
 const fmtTime = (t?: number) =>
@@ -86,7 +85,6 @@ export function ScheduledModal() {
         height="h-[min(720px,92dvh)] sm:h-[min(720px,86dvh)]"
       >
         <div className="flex flex-col h-full min-h-0">
-          <RealModeNotice text="定时任务仍是本地演示数据：调度器与运行记录属阶段 G，尚未接入服务端。" />
           {/* 固定头：调度说明 + 新建（不随列表滚动、不改变弹窗高度） */}
           <div className="shrink-0 border-b border-edge/60 bg-panel2/30 px-4 py-2.5">
             <div className="flex items-start gap-2">
@@ -98,6 +96,15 @@ export function ScheduledModal() {
                 <Plus size={13} />
                 <span>新建任务</span>
               </Button>
+            </div>
+            {/*
+              诚实边界（勿删）：本页任务清单来自 scheduleStore 的内存态
+              （tasks 初始为空数组，服务端暂无定时任务端点），
+              「立即运行」的 running → success 也是 setTimeout 本地模拟。
+              删掉这句就会让用户以为看到的是服务端真实调度状态。
+            */}
+            <div className="mt-1.5 text-[11px] text-warn leading-relaxed">
+              ⚠️ 本页任务清单为前端本地态（服务端暂无定时任务端点，刷新后不保留）；「立即运行」的状态变更为本地模拟。
             </div>
           </div>
 

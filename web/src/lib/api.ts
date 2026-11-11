@@ -1,19 +1,19 @@
 /**
- * 统一数据访问层（阶段 B-1 新增，demo 无此文件）。
+ * 统一数据访问层。
  *
- * 存在意义：让 UI 只依赖一层「同签名」的 ApiClient，
- * 在 `apiMode: 'mock' | 'real'` 之间切换而不改任何组件（阶段 B-2 起逐端点去 mock）。
+ * 存在意义：让 UI 只依赖一层「同签名」的 ApiClient，不直接拼 HTTP 细节。
+ *
+ * 历史沿革（2026-11 正式版）：本层曾同时提供 `mockApi` 与 `realApi` 两套实现，
+ * 由 `apiMode` 在运行期二选一（演示数据 / 真实后端）。正式版已下线整个 mock 通路，
+ * 现只剩 `realApi` 一套实现，`api` 直接指向它。
  *
  * 契约铁律：
  *   - HTTP 类型一律来自 `./apiTypes`（由 `api/openapi.yaml` 唯一定义，禁止自造字段）；
- *   - UI 领域模型来自 `../types`（Session/Message/Run 等），real 实现负责 DTO → UI 映射；
+ *   - UI 领域模型来自 `../types`（Session/Message/Run 等），本层负责 DTO → UI 映射；
  *   - 错误统一为 `ApiError`（携带 code / status / trace_id，trace_id 与后端日志一致）。
  */
 
-import type { AccessMode, ApprovalRule, Message, Project, ProjectApprovalRule, Run, RunStatus, Session, ToolCall, Risk, ToolStatus, Workspace, WorkspaceKind } from '../types'
-import * as mockData from '../mock/data'
-import { toolList } from '../mock/settingsData'
-import { startMockRun, type Decision, type StreamEvent } from '../mock/stream'
+import type { AccessMode, Approval, ApprovalRule, FileDiff, Message, Project, ProjectApprovalRule, Run, RunStatus, Session, ToolCall, Risk, ToolStatus, Workspace, WorkspaceKind } from '../types'
 import { SseClient, type SseState as SseStateName, type SseStateInfo } from './sse'
 import { extractFileDiff, extractResultContent } from './toolDiff'
 import {
@@ -66,6 +66,8 @@ import {
   type ToolSnapshot,
   type ToolTier,
   type User,
+  type WebviewExchangeRequest,
+  type WebviewExchangeResponse,
   type Webhook,
   type WebhookCreateInput,
   type WebhookListResponseDTO,
@@ -75,39 +77,19 @@ import {
   type WorkspaceDTO,
 } from './apiTypes'
 
-/* ============ 模式选择 ============ */
-
-export type ApiMode = 'mock' | 'real'
-
-/** 模式持久化键（开发期可在控制台 `localStorage.setItem('harness.apiMode','real')` 切换） */
-export const API_MODE_STORAGE_KEY = 'harness.apiMode'
+/* ============ 模式（正式版：恒为真实后端） ============ */
 
 /**
- * 解析当前数据模式：
- *   1. `VITE_API_MODE`（构建期注入，便于 CI/预览强制指定）
- *   2. `localStorage['harness.apiMode']`（运行期手动切换，便于对比 mock 基线）
- *   3. 默认：**一律 real**（dev 与构建产物同口径）。
+ * 数据来源类型。
  *
- * ⚠️ 默认值历史（2026-11 翻转）：dev 曾默认 mock，导致「用前端脚本启动 → 永远是 demo 页面」，
- * 用户无法察觉自己看的是演示数据。现统一默认 real。
- * 要演示数据没有脚本开关（web/run.sh 只服务正式前端），请改用原型入口 demo/run.sh（端口 5610），
- * 或在控制台 `localStorage.setItem('harness.apiMode','mock')` 后刷新。
+ * 历史沿革（2026-11 正式版收口）：项目曾有 `mock | real` 双模式，靠
+ * `localStorage['harness.apiMode']` 与 `VITE_API_MODE` 在演示数据与真实后端间切换，
+ * 并配有全局 REAL/DEMO 角标一键切换。正式版已**整体下线 mock 通路**：
+ * 演示数据目录、mockApi 实现、模式开关与角标全部删除，`api` 恒等于真实后端实现。
+ *
+ * 保留本类型（值域收敛为 `'real'`）是为了让 `ApiClient.mode` 等既有签名不必改动。
  */
-export function resolveApiMode(): ApiMode {
-  const env = (import.meta as unknown as { env?: Record<string, string | boolean | undefined> }).env
-  try {
-    const fromEnv = env?.VITE_API_MODE
-    if (fromEnv === 'real' || fromEnv === 'mock') return fromEnv
-    const stored = typeof localStorage !== 'undefined' ? localStorage.getItem(API_MODE_STORAGE_KEY) : null
-    if (stored === 'real' || stored === 'mock') return stored
-  } catch {
-    /* 工作于非浏览器环境（SSR/测试）时忽略 */
-  }
-  // 默认 real：dev 与单二进制内嵌产物同口径，绝不默认给用户看演示数据
-  return 'real'
-}
-
-export const apiMode: ApiMode = resolveApiMode()
+export type ApiMode = 'real'
 
 /* ============ 错误 ============ */
 
@@ -127,7 +109,27 @@ export class ApiError extends Error {
 
 /* ============ 公共类型 ============ */
 
-/** 一次 Run 的句柄（mock 与 real 同签名） */
+/**
+ * 流式事件（服务端 SSE payload 归一后的 UI 形态）。
+ *
+ * 历史沿革：本类型曾定义在 `../mock/stream`（演示数据生成器）里，正式版下线 mock 后
+ * 迁至此处的真实信源唯一入口，避免 UI 依赖已删除的演示模块。
+ */
+export type StreamEvent =
+  | { type: 'delta'; text: string }
+  | { type: 'reasoning'; text: string }
+  | { type: 'tool_start'; call: ToolCall }
+  | { type: 'tool_result'; callId: string; result: string; durationMs: number; diff?: FileDiff; skipped?: boolean; failed?: boolean }
+  | { type: 'tool_progress'; callId: string; chunk: string }
+  | { type: 'step'; tokens?: number; promptTokens?: number; cachedTokens?: number; reasoning?: string }
+  | { type: 'approval'; approval: Approval }
+  | { type: 'done'; tokensIn: number; tokensOut: number; cachedTokens?: number }
+  | { type: 'error'; code: string; message: string }
+
+/** 审批决策（与后端 approval 端点取值一致） */
+export type Decision = 'allow_once' | 'allow_session' | 'deny'
+
+/** 一次 Run 的句柄 */
 export interface RunHandle {
   readonly runId: string
   /** 停止 Run（服务端幂等） */
@@ -266,6 +268,8 @@ export interface ApiClient {
   login(req: LoginRequest): Promise<LoginResponse>
   /** SSO 免登（前端兜底自愈：vite dev / 纯静态部署时服务端未拦截 URL 参数）；凭据以 Cookie 落地，不回传 token */
   ssoLogin(req: SSORequest): Promise<{ user: User }>
+  /** 凭一次性 ticket 兑换降级 hg_sess 会话（免鉴权，凭据只走 Set-Cookie，不回传令牌） */
+  exchangeWebviewTicket(ticket: string): Promise<void>
   /** 修改密码（需已登录；成功后其他会话被吊销） */
   changePassword(req: ChangePasswordRequest): Promise<void>
   logout(): Promise<void>
@@ -803,185 +807,6 @@ function parseArgsOrEmpty(raw: string): Record<string, unknown> {
   }
 }
 
-/* ============ mock 实现（行为与 demo 一致） ============ */
-
-const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v)) as T
-
-const mockToolsSnapshot = (): ToolSnapshot => {
-  const summaries = toolList.map((t) => ({
-    name: t.name,
-    namespace: 'builtin',
-    tier: 'deferred' as ToolTier,
-    default_tier: 'deferred' as ToolTier,
-    cost_tokens: 18,
-    risk: t.risk as Risk,
-    executor: 'server' as const,
-    plugin_id: 'mock',
-    health: { status: 'available' as const, checked_at: new Date().toISOString() },
-  }))
-  return {
-    total: summaries.length,
-    core: [],
-    deferred: summaries,
-    on_demand: [],
-    cost_total: summaries.length * 18,
-    cost_core: 0,
-    cost_deferred: summaries.length * 18,
-    limits: { core_soft: 8, deferred_soft: 60 },
-    warnings: [],
-    plugins: [{ id: 'mock', name: 'Mock 工具集', version: '0.0.0', kind: 'builtin', default_tier: 'deferred', tools: summaries.map((s) => s.name) }],
-    overrides: {},
-    generated_at: new Date().toISOString(),
-  }
-}
-
-/* ============ 阶段 C：设备（mock 样例数据） ============ */
-
-/**
- * mock 设备样例：形态与真实 `GET /api/v1/devices` 一致（不回传令牌摘要）。
- * 仅用于 mock 模式下 UI 自检，**不参与任何真机逻辑**。
- */
-function mockDeviceList(): DeviceDTO[] {
-  const now = Date.now()
-  return [
-    {
-      id: 'dev-mock-desktop',
-      name: '桌面端 · Windows',
-      kind: 'desktop',
-      platform: 'windows',
-      status: 'online',
-      capabilities_hash: 'sha256:mock-1',
-      protocol_version: 1,
-      app_version: '0.1.0',
-      paired_at: now - 3_600_000,
-      last_seen_at: now - 8_000,
-      revoked_at: undefined,
-      capabilities: [
-        { device_id: 'dev-mock-desktop', name: 'run_command', version: '1', updated_at: now - 8_000 },
-        { device_id: 'dev-mock-desktop', name: 'read_file', version: '1', updated_at: now - 8_000 },
-      ],
-    },
-    {
-      id: 'dev-mock-mobile',
-      name: '移动端 · Android',
-      kind: 'mobile',
-      platform: 'android',
-      status: 'offline',
-      capabilities_hash: 'sha256:mock-2',
-      protocol_version: 1,
-      app_version: '0.1.0',
-      paired_at: now - 86_400_000,
-      last_seen_at: now - 5_400_000,
-      capabilities: [{ device_id: 'dev-mock-mobile', name: 'fetch_web_page', version: '1', updated_at: now - 5_400_000 }],
-    },
-  ]
-}
-
-/* ============ 阶段 E：MCP / 工具包（mock 样例数据） ============ */
-
-/**
- * mock MCP 视图：从 `mock/data.ts` 的 mcpServers 派生，字段与后端
- * `GET /api/v1/mcp/servers`（internal/service/mcp_service.go:51-74 ServerView）逐一对齐。
- * 注意 UI 的 McpServer.tools 是 McpToolInfo[]，后端只回 tool_count/allow_tools，
- * 因此 mock 侧把工具名映射成 McpToolInfo（risk 取自后端 default_risk 口径）。
- */
-function mockMcpViews(): MCPServerViewDTO[] {
-  return mockData.mcpServers.map((m) => ({
-    id: m.id,
-    name: m.name,
-    transport: m.transport,
-    command: m.command,
-    args: m.command ? m.command.split(' ').slice(1) : undefined,
-    cwd: undefined,
-    url: m.url,
-    env_keys: [],
-    header_keys: [],
-    enabled: m.enabled,
-    timeout_ms: 30_000,
-    max_output: 100_000,
-    default_risk: m.tools[0]?.risk ?? 'readonly',
-    allow_tools: m.tools.map((t) => t.name),
-    deny_tools: [],
-    health_interval_s: m.healthIntervalS ?? 60,
-    state: m.state === 'starting' ? 'degraded' : m.state,
-    calls: m.calls,
-    failures: m.failures,
-    tool_count: m.tools.length,
-    last_error: m.lastError,
-  }))
-}
-
-/** 入参 → 视图（create/update 的 mock 回包，字段口径同 ServerView）。 */
-function mockMcpViewOf(input: MCPServerInputDTO): MCPServerViewDTO {
-  return {
-    id: '',
-    name: input.name,
-    transport: input.transport,
-    command: input.command,
-    args: input.args,
-    cwd: input.cwd,
-    url: input.url,
-    env_keys: Object.keys(input.env ?? {}),
-    header_keys: Object.keys(input.headers ?? {}),
-    enabled: input.enabled ?? true,
-    timeout_ms: input.timeout_ms ?? 30_000,
-    max_output: input.max_output ?? 100_000,
-    default_risk: input.default_risk ?? 'readonly',
-    allow_tools: input.allow_tools ?? [],
-    deny_tools: input.deny_tools ?? [],
-    health_interval_s: input.health_interval_s ?? 60,
-    state: 'disabled',
-    calls: 0,
-    failures: 0,
-    tool_count: 0,
-  }
-}
-
-/**
- * mock 工具包视图：从 `mock/data.ts` 的 registryItems 中 kind='plugin' 派生，
- * 字段对齐 internal/service/package_service.go:71-83 PackageView。
- */
-function mockPackageViews(): PackageViewDTO[] {
-  return mockData.registryItems
-    .filter((r) => r.kind === 'plugin')
-    .map((r) => ({
-      id: r.id,
-      version: r.version,
-      previous_version: undefined,
-      name: r.name,
-      trust: r.signature,
-      namespace: 'demo',
-      enabled: !r.installed,
-      description: r.description,
-      tool_names: [],
-      state: r.installed ? 'ready' : 'installed',
-      last_error: undefined,
-    }))
-}
-
-/**
- * mock Webhook 订阅（演示态）：模块级可变数组，让新增/删除/启停在本次会话内自洽。
- * 字段对齐 internal/api/webhook_handler.go:14-21 webhookView（secret 只写不读 → 只有 has_secret）。
- */
-const mockWebhookStore: Webhook[] = [
-  {
-    id: 'wh-demo-1',
-    url: 'https://example.com/hooks/harness-go',
-    has_secret: true,
-    events: ['run.completed', 'run.failed'],
-    enabled: true,
-    created_at: Date.now() - 3 * 24 * 3_600_000,
-  },
-  {
-    id: 'wh-demo-2',
-    url: 'https://internal.example.com/approval-bot',
-    has_secret: false,
-    events: ['approval.requested'],
-    enabled: false,
-    created_at: Date.now() - 26 * 3_600_000,
-  },
-]
-
 /**
  * 工作空间 DTO → UI：**唯一的字段映射入口**（store / 组件里严禁手写映射）。
  *
@@ -1001,594 +826,6 @@ export function toUiWorkspace(w: WorkspaceDTO): Workspace {
     lastSeenAt: w.updated_at || undefined,
     builtin: w.device_id === '',
   }
-}
-
-export const mockApi: ApiClient = {
-  mode: 'mock',
-
-  async me() {
-    // mock 模式沿用 demo「直接进演示模式」的行为
-    return { id: 'mock-user', username: 'demo', display_name: '演示用户', role: 'admin', created_at: 0, updated_at: 0 }
-  },
-  async login(req) {
-    return { user: { id: 'mock-user', username: req.username, display_name: '演示用户', role: 'admin', created_at: 0, updated_at: 0 }, token: 'mock-token' }
-  },
-  async ssoLogin(req) {
-    // mock 模式无服务端会话，退化为按 user_name 直接进入演示态
-    const res = await mockApi.login({ username: req.user_name, password: req.pwd ?? '' })
-    return { user: res.user }
-  },
-  async changePassword() {
-    // mock 模式的密码校验由 authStore 的演示逻辑承担（localStorage 模拟服务端凭据），
-    // 此方法仅在 real 模式被调用，保留空实现以满足接口完整性。
-  },
-  async logout() {
-    /* no-op */
-  },
-
-  async listSessions() {
-    return clone(mockData.sessions)
-  },
-  async getSession(id) {
-    const found = mockData.sessions.find((s) => s.id === id)
-    if (!found) throw new ApiError('会话不存在', 'session.not_found', 404)
-    return clone(found)
-  },
-  async createSession(input) {
-    // mock 侧同样遵守「项目默认权限快照一次」语义，保持与 real 行为一致（便于对比调试）。
-    const proj = input.projectId ? mockData.projects.find((p) => p.id === input.projectId) : undefined
-    const sess: Session = {
-      id: `s-mock-${Date.now()}`,
-      title: input.title || '新对话',
-      projectId: input.projectId || undefined,
-      workspacePath: input.workspacePath,
-      // 显式值 > 项目默认 > confirm（与服务端 SessionService.Create 裁决链同口径）
-      accessMode: input.accessMode ?? proj?.defaultAccessMode ?? 'confirm',
-      modelRef: input.modelRef || 'openai/gpt-4o-mini',
-      updatedAt: Date.now(),
-    }
-    mockData.sessions.unshift(sess)
-    return clone(sess)
-  },
-  async renameSession(id, title) {
-    const found = mockData.sessions.find((s) => s.id === id)
-    if (found) {
-      found.title = title
-      found.updatedAt = Date.now()
-    }
-  },
-  async setSessionModel(id, modelRef) {
-    const found = mockData.sessions.find((s) => s.id === id)
-    if (found) {
-      found.modelRef = modelRef
-      found.updatedAt = Date.now()
-    }
-  },
-  async setSessionAccessMode(id, mode) {
-    const found = mockData.sessions.find((s) => s.id === id)
-    if (found) {
-      found.accessMode = mode
-      found.updatedAt = Date.now()
-    }
-  },
-  async archiveSession(id) {
-    const found = mockData.sessions.find((s) => s.id === id)
-    if (found) found.archivedAt = Date.now()
-  },
-  async unarchiveSession(id) {
-    const found = mockData.sessions.find((s) => s.id === id)
-    if (found) found.archivedAt = undefined
-  },
-  async rollbackToMessage(_sessionId, _messageSeq) {
-    // mock 无服务端历史：返回合成回滚 id（reapply 语义由 chatStore 本地状态承担）
-    return `rb-mock-${Date.now()}`
-  },
-  async reapplyRollback() {
-    /* mock：本地状态已在 chatStore 内回退 */
-  },
-  async listRollbacks(_sessionId) {
-    // mock 无服务端回滚历史：返回一条样例事件（字段与后端 Rollback 一致）
-    return [
-      {
-        id: 'rb-mock-1',
-        mode: 'message',
-        target: '12',
-        affected: [
-          {
-            tool_event_id: 'te-mock-1',
-            run_id: 'run-mock-1',
-            snapshot_before: 'snap-mock-before',
-            snapshot_after: 'snap-mock-after',
-            paths: ['src/demo.ts'],
-          },
-        ],
-        hidden_from_seq: 13,
-        restored: [{ path: 'src/demo.ts', action: 'restored', bytes: 1024 }],
-        created_at: Date.now() - 60_000,
-        reapplied_at: null,
-      },
-    ] as Rollback[]
-  },
-  async listSessionSnapshots(_sessionId) {
-    // mock 无服务端快照：返回一条样例锚点（字段与后端 Snapshot 一致）
-    return [
-      {
-        id: 'snap-mock-1',
-        session_id: 's-mock-1',
-        run_id: 'run-mock-1',
-        tool_event_id: 'te-mock-1',
-        kind: 'before',
-        paths: [{ path: 'src/demo.ts', hash: 'deadbeef', size: 1024 }],
-        size: 1024,
-        created_at: Date.now() - 120_000,
-      },
-    ] as Snapshot[]
-  },
-  async deleteSession(id) {
-    const i = mockData.sessions.findIndex((s) => s.id === id)
-    if (i >= 0) mockData.sessions.splice(i, 1)
-  },
-
-  // ---- 项目域（mock：内存态，语义与 real 对齐） ----
-  async listProjects() {
-    return clone(mockData.projects)
-  },
-  async createProject(input) {
-    const p: Project = {
-      id: `p-mock-${Date.now()}`,
-      name: input.name,
-      path: input.path,
-      // 缺省由「服务端」定 confirm（mock 侧同口径）
-      defaultAccessMode: input.defaultAccessMode ?? 'confirm',
-    }
-    mockData.projects.push(p)
-    return clone(p)
-  },
-  async updateProject(id, patch) {
-    const found = mockData.projects.find((p) => p.id === id)
-    if (!found) throw new ApiError('项目不存在', 'project.not_found', 404)
-    if (patch.name !== undefined) found.name = patch.name
-    if (patch.defaultAccessMode !== undefined) found.defaultAccessMode = patch.defaultAccessMode
-    if (patch.pinned !== undefined) found.pinned = patch.pinned
-  },
-  async deleteProject(id) {
-    const i = mockData.projects.findIndex((p) => p.id === id)
-    if (i >= 0) mockData.projects.splice(i, 1)
-    // 级联：清规则 + 会话归属归零（对齐服务端 DeleteProjectCascade）
-    for (let j = mockData.approvalRules.length - 1; j >= 0; j -= 1) {
-      if (mockData.approvalRules[j].projectId === id) mockData.approvalRules.splice(j, 1)
-    }
-    mockData.sessions.forEach((s) => {
-      if (s.projectId === id) s.projectId = undefined
-    })
-  },
-  async listProjectRules(projectId) {
-    return clone(mockData.approvalRules.filter((r) => r.projectId === projectId))
-  },
-  async addProjectRule(projectId, input) {
-    const exists = mockData.approvalRules.find(
-      (r) => r.projectId === projectId && r.toolName === input.toolName && r.pattern === input.pattern,
-    )
-    if (exists) return clone(exists) // 幂等：与服务端唯一索引语义一致
-    const rule: ApprovalRule = {
-      id: `ar-mock-${Date.now()}`,
-      projectId,
-      toolName: input.toolName,
-      pattern: input.pattern,
-      createdAt: Date.now(),
-    }
-    mockData.approvalRules.push(rule)
-    return clone(rule)
-  },
-  async removeProjectRule(projectId, ruleId) {
-    const i = mockData.approvalRules.findIndex((r) => r.id === ruleId && r.projectId === projectId)
-    if (i >= 0) mockData.approvalRules.splice(i, 1)
-  },
-
-  // ---- 工作空间域（mock：内存态，语义与 real 对齐） ----
-  async listWorkspaces() {
-    return clone(mockData.workspaces)
-  },
-  async createWorkspace(input) {
-    const seq = mockData.workspaces.filter((w) => !w.builtin).length + 1
-    const w: Workspace = {
-      id: `ws-mock-${Date.now()}`,
-      name: input.name.trim() || `新接入设备 ${seq}`,
-      kind: input.kind,
-      // mock 无真实设备 Hub：新建即演示为在线
-      online: true,
-      limbCount: 0,
-      lastSeenAt: Date.now(),
-      protocol: 'v1',
-    }
-    mockData.workspaces.push(w)
-    return clone(w)
-  },
-  async updateWorkspace(id, patch) {
-    const found = mockData.workspaces.find((w) => w.id === id)
-    if (!found) throw new ApiError('工作空间不存在', 'workspace.not_found', 404)
-    // kind 不参与更新（改 kind = 提权，real 侧服务端同样 400）
-    if (patch.name !== undefined) found.name = patch.name
-    return clone(found)
-  },
-  async deleteWorkspace(id) {
-    const idx = mockData.workspaces.findIndex((w) => w.id === id)
-    const found = mockData.workspaces[idx]
-    if (!found) throw new ApiError('工作空间不存在', 'workspace.not_found', 404)
-    // 内置服务端空间不可删除（服务端 repo_workspace.go:115 同样拒绝）
-    if (found.builtin) throw new ApiError('服务端内置空间不可删除', 'workspace.in_use', 409)
-    mockData.workspaces.splice(idx, 1)
-  },
-
-  async listMessages(sessionId) {
-    const list = mockData.messages.filter((m) => m.sessionId === sessionId)
-    // demo 的 messages 是跨会话样例：无匹配时回退到 s1 的全量样例
-    return clone(list.length > 0 ? list : mockData.messages)
-  },
-
-  async startRun(opts) {
-    const runId = `r-mock-${Date.now()}`
-    // mock 无真实 EventSource：如实上报「演示态」，顶栏同时有 🟡 DEMO 角标提示这是演示数据
-    opts.onSseState?.('open', { reason: 'mock-stream' })
-    const handle = startMockRun({
-      sessionId: opts.sessionId,
-      runId,
-      input: opts.input,
-      onEvent: opts.onEvent,
-    })
-    return {
-      runId,
-      stop: () => {
-        handle.stop()
-        opts.onSseState?.('closed', { reason: 'client_closed' })
-      },
-      // mock 无服务端事件流可重连（演示流不跨刷新存活）：空实现，不假装在跑
-      reconnect: () => undefined,
-    }
-  },
-  async getActiveRun() {
-    // mock 无真实服务端 Run（演示流不跨刷新存活），恒为空闲态
-    return null
-  },
-  attachRun(opts) {
-    // mock 无真实 EventSource：无法重放演示流，返回空句柄（不假装在跑）
-    return {
-      runId: opts.runId,
-      stop: () => undefined,
-      reconnect: () => undefined,
-    }
-  },
-  async getRun(sessionId, runId) {
-    return { id: runId, sessionId, status: 'running' }
-  },
-  async stopRun() {
-    /* mock 由 RunHandle.stop 处理 */
-  },
-  async decideApproval() {
-    // mock 的审批由 startMockRun 内部的 resumeResolve 驱动（chatStore 走 handle.resume），
-    // 无服务端端点可调；空实现保持契约完整（不伪造决策结果）。
-  },
-  async sendGuidance(_sessionId, _runId, input) {
-    // mock：无服务端轮次边界，引导以普通用户消息呈现
-    return { id: `m-guide-${Date.now()}`, seq: 0, content: String(input ?? '') }
-  },
-  async listToolEvents() {
-    return []
-  },
-
-  async getTools() {
-    return mockToolsSnapshot()
-  },
-  async getToolsInjection() {
-    const snap = mockToolsSnapshot()
-    return {
-      core: [],
-      deferred_index: snap.deferred.map((d) => ({ name: d.name, description: '', cost_tokens: d.cost_tokens })),
-      on_demand: [],
-      cost_core: 0,
-      cost_index: snap.cost_deferred,
-      cost_total: snap.cost_total,
-      limits: snap.limits,
-      warnings: [],
-    }
-  },
-  async patchToolTiers() {
-    return mockToolsSnapshot()
-  },
-
-  // ---- 核心 SOP（agent-core）：mock 走内存样例，仅用于无后端演示 ----
-  async getSOPCore() {
-    const c = '你是 harness-go 的编码助手。\n\n规则：\n1. 修改文件前先读取确认内容，不要凭猜测改动。\n2. 危险操作（删除、覆盖、执行命令）需用户确认。\n3. 回答简洁，先给结论再给细节。'
-    return {
-      content: c,
-      source: 'builtin' as const,
-      tokens: 90,
-      budget: 800,
-      builtin_content: c,
-      overridden: false,
-    }
-  },
-  async putSOPCore(content: string) {
-    const base = await this.getSOPCore()
-    return { ...base, content, source: 'custom' as const, overridden: true }
-  },
-  async resetSOPCore() {
-    return this.getSOPCore()
-  },
-  async getSOPEffective() {
-    const core = await this.getSOPCore()
-    return {
-      core,
-      entries: [],
-      workspace: '',
-      total_tokens: core.tokens,
-      system_preview: core.content,
-      truncated: false,
-      entry_limit: 6,
-    }
-  },
-
-  async getMaintenance() {
-    return { mode: 'mock', open_sessions: 0, pending_approvals: 0, unfinished_runs: 0 }
-  },
-
-  // ---- B-4：厂商 / 配置 / 统计 / 日志（mock 走 demo 样例） ----
-  async listProviders() {
-    return mockData.providers.map((p) => ({
-      id: p.id,
-      name: p.name,
-      base_url: p.baseUrl,
-      has_api_key: Boolean(p.apiKeyMasked),
-      models: p.models.map((m) => m.id),
-      enabled: p.enabled,
-      created_at: 0,
-      updated_at: 0,
-    }))
-  },
-  async createProvider(input) {
-    return {
-      id: `pv-mock-${Date.now()}`,
-      name: input.name ?? '新厂商',
-      base_url: input.base_url ?? '',
-      has_api_key: Boolean(input.api_key),
-      models: input.models ?? [],
-      enabled: input.enabled ?? true,
-      created_at: Date.now(),
-      updated_at: Date.now(),
-    }
-  },
-  async updateProviderById(id, input) {
-    return {
-      id,
-      name: input.name ?? '',
-      base_url: input.base_url ?? '',
-      has_api_key: Boolean(input.api_key),
-      models: input.models ?? [],
-      enabled: input.enabled ?? true,
-      created_at: 0,
-      updated_at: Date.now(),
-    }
-  },
-  async deleteProvider() {
-    /* no-op */
-  },
-  async testProvider() {
-    return { ok: true, latency_ms: 120, model: 'mock' }
-  },
-  async listProviderModels() {
-    return { items: ['mock-model-a', 'mock-model-b'], count: 2 }
-  },
-  async revealProviderKey() {
-    return { api_key: 'sk-mock-demo-key', has_key: true }
-  },
-  async getSettings() {
-    return {}
-  },
-  async patchSettings() {
-    return {}
-  },
-  async getStats() {
-    return { mode: 'mock' }
-  },
-  async getLogs() {
-    // mock 模式：前端演示数据由 mock/settingsData 提供，服务端接口只回空列表。
-    return { items: [] } as LogsResponse
-  },
-  async getAuditLlmCalls() {
-    // mock 模式无天库：回空列表并显式标注档位，让面板显示「无调用记录」而非报错。
-    return {
-      items: [],
-      total: 0,
-      snapshot_mode: 'preview',
-      retention_days: 30,
-      earliest_available_day: '',
-    } as AuditLlmCallsResponse
-  },
-  async getAuditToolEvents() {
-    return { items: [], total: 0, retention_days: 30, earliest_available_day: '' } as AuditToolEventsResponse
-  },
-  async getTokenStats() {
-    return {
-      from: 0,
-      to: 0,
-      group_by: 'model',
-      items: [],
-      total_calls: 0,
-      prompt_tokens: 0,
-      completion_tokens: 0,
-      cached_tokens: 0,
-      cache_hit_rate: 0,
-    } as TokenStatsResult
-  },
-  async getLogConfig() {
-    return { snapshot_mode: 'preview', retention_days: 30, level: 'warn' }
-  },
-
-  // ---- 阶段 C：设备（mock 走内存样例，与真实端点同签名） ----
-  async createDevicePairCode(req) {
-    return {
-      code: String(Math.floor(100000 + Math.random() * 900000)),
-      expires_at: Date.now() + 120_000,
-      ttl_s: 120,
-      device_name: req?.name,
-      device_kind: req?.kind,
-    }
-  },
-  async listDevices() {
-    return { items: mockDeviceList(), pair_ttl_s: 120, heartbeat_s: 15, offline_after_s: 45 }
-  },
-  async revokeDevice(id) {
-    const d = mockDeviceList().find((x) => x.id === id)
-    if (!d) throw new ApiError('设备不存在', 'device.not_found', 404)
-  },
-  async getSessionLease(sessionId) {
-    return { session_id: sessionId, holder: '', holder_kind: 'server', epoch: 0, active: true }
-  },
-
-  // ---- 阶段 E：MCP（mock 由内置表派生，与 real 同签名，绝不抛错） ----
-  async listMcpServers() {
-    return { items: mockMcpViews() }
-  },
-  async getMcpServer(id) {
-    const found = mockMcpViews().find((m) => m.id === id)
-    // 与 real 一致的 404 语义（避免组件因 undefined 崩溃）
-    if (!found) throw new ApiError('MCP Server 不存在', 'mcp.not_found', 404)
-    return found
-  },
-  async createMcpServer(input) {
-    return { ...mockMcpViewOf(input), id: `mcp-${Date.now()}`, state: 'disabled' }
-  },
-  async updateMcpServer(id, input) {
-    return { ...mockMcpViewOf(input), id }
-  },
-  async deleteMcpServer(id) {
-    if (!mockMcpViews().some((m) => m.id === id)) throw new ApiError('MCP Server 不存在', 'mcp.not_found', 404)
-  },
-  async testMcpServer(input) {
-    // 演示口径：随便给出一个「握手成功」样例，让 UI 的测试按钮可用但不造假连接
-    return { tool_names: ['demo_tool'], elapsed_ms: 218, server_info: `${input.name} (mock)` }
-  },
-  async reloadMcpServer(id) {
-    if (!mockMcpViews().some((m) => m.id === id)) throw new ApiError('MCP Server 不存在', 'mcp.not_found', 404)
-  },
-  async enableMcpServer(id) {
-    if (!mockMcpViews().some((m) => m.id === id)) throw new ApiError('MCP Server 不存在', 'mcp.not_found', 404)
-  },
-  async disableMcpServer(id) {
-    if (!mockMcpViews().some((m) => m.id === id)) throw new ApiError('MCP Server 不存在', 'mcp.not_found', 404)
-  },
-  async getMcpServerHealth(id) {
-    const m = mockMcpViews().find((x) => x.id === id)
-    if (!m) throw new ApiError('MCP Server 不存在', 'mcp.not_found', 404)
-    return {
-      id: m.id, name: m.name, transport: m.transport, state: m.state ?? 'disabled',
-      last_error: m.last_error, calls: m.calls ?? 0, failures: m.failures ?? 0,
-      tool_count: m.tool_count ?? 0,
-    }
-  },
-
-  // ---- 阶段 E：本地工具包（mock 由 registryItems 派生） ----
-  async listPackages() {
-    return { items: mockPackageViews() }
-  },
-  async installPackage(req) {
-    // 演示：按路径 basename 造一个已安装包视图（不落盘、不注册工具）
-    const base = req.path.replace(/\\/g, '/').split('/').pop() || 'demo.pkg.zip'
-    const name = base.replace(/\.[^.]+$/, '')
-    return {
-      view: {
-        id: `pkg-${Date.now()}`, version: '0.0.1', name, trust: 'signed', namespace: 'demo',
-        enabled: true, description: `演示安装：${base}`, tool_names: [], state: 'ready',
-      },
-      signed: true,
-      tools: 0,
-    }
-  },
-  async uninstallPackage(id) {
-    if (!mockPackageViews().some((p) => p.id === id)) throw new ApiError('工具包不存在', 'package.not_found', 404)
-  },
-  async rollbackPackage(id) {
-    const p = mockPackageViews().find((x) => x.id === id)
-    if (!p) throw new ApiError('工具包不存在', 'package.not_found', 404)
-    return { ...p, version: p.previous_version ?? p.version, previous_version: p.version }
-  },
-  async enablePackage(id) {
-    if (!mockPackageViews().some((p) => p.id === id)) throw new ApiError('工具包不存在', 'package.not_found', 404)
-  },
-  async disablePackage(id) {
-    if (!mockPackageViews().some((p) => p.id === id)) throw new ApiError('工具包不存在', 'package.not_found', 404)
-  },
-
-  // ---- P1：Webhook（mock 走模块级 demo 表，与 real 同签名，绝不抛「unavailable」） ----
-  async listWebhooks() {
-    return { items: mockWebhookStore.map((w) => ({ ...w })) }
-  },
-  async createWebhook(input) {
-    const created: Webhook = {
-      id: `wh-demo-${Date.now().toString(36)}`,
-      url: input.url,
-      // secret 只写不读：演示态同样只落布尔，不保存明文
-      has_secret: Boolean(input.secret),
-      events: input.events ?? [],
-      enabled: true,
-      created_at: Date.now(),
-    }
-    mockWebhookStore.unshift(created)
-    return { ...created }
-  },
-  async deleteWebhook(id) {
-    const i = mockWebhookStore.findIndex((w) => w.id === id)
-    if (i < 0) throw new ApiError('Webhook 订阅不存在', 'webhook.not_found', 404)
-    mockWebhookStore.splice(i, 1)
-  },
-  async enableWebhook(id) {
-    const w = mockWebhookStore.find((x) => x.id === id)
-    if (!w) throw new ApiError('Webhook 订阅不存在', 'webhook.not_found', 404)
-    w.enabled = true
-  },
-  async disableWebhook(id) {
-    const w = mockWebhookStore.find((x) => x.id === id)
-    if (!w) throw new ApiError('Webhook 订阅不存在', 'webhook.not_found', 404)
-    w.enabled = false
-  },
-  async testWebhook(id) {
-    const w = mockWebhookStore.find((x) => x.id === id)
-    if (!w) throw new ApiError('Webhook 订阅不存在', 'webhook.not_found', 404)
-    // 演示：不真正发网络请求；地址以 .invalid 结尾时模拟对端拒绝，便于查看失败样式
-    if (w.url.includes('.invalid')) return { status: 502, ok: false, error: 'dial tcp: connect: connection refused' }
-    return { status: 200, ok: true, error: '' }
-  },
-
-  /* ---- B-2：二进制能力在演示态**一律诚实拒绝** ---- */
-  // 铁律：绝不伪造 zip 内容 / 绝不返回空 Blob 冒充成功（用户会得到一个 0 字节文件而误以为导出成功）。
-  async downloadArtifact() {
-    throw new ApiError(
-      'mock 演示模式不支持制品下载：请切换到 real 模式（apiMode=real）后重试',
-      'mock.unsupported',
-      501,
-    )
-  },
-  async exportSession() {
-    throw new ApiError(
-      'mock 演示模式不支持会话导出：请切换到 real 模式（apiMode=real）后重试',
-      'mock.unsupported',
-      501,
-    )
-  },
-  async backupData() {
-    throw new ApiError(
-      'mock 演示模式不支持全量备份：请切换到 real 模式（apiMode=real）后重试',
-      'mock.unsupported',
-      501,
-    )
-  },
-  async restoreData() {
-    throw new ApiError(
-      'mock 演示模式不支持从备份恢复：请切换到 real 模式（apiMode=real）后重试',
-      'mock.unsupported',
-      501,
-    )
-  },
 }
 
 /* ============ real 实现（B-2 起逐端点启用） ============ */
@@ -1726,7 +963,7 @@ function mapSseToStreamEvent(type: string, data: string): StreamEvent | null {
  * 提交审批决策（B-3）：POST /sessions/{sid}/runs/{rid}/approvals/{aid}/decide
  *
  * 决策后服务端解除闸门阻塞，Run 继续在**同一条事件流**上推送。
- * 实现已收敛到 `realApi.decideApproval`（唯一入口），此处不再保留同名私有函数。
+ * 实现收敛在下方 `realApi.decideApproval`（唯一入口）。
  */
 
 export const realApi: ApiClient = {
@@ -1769,6 +1006,16 @@ export const realApi: ApiClient = {
     })
     // 凭据走 Set-Cookie（hg_sess），不落前端内存令牌
     return res
+  },
+  async exchangeWebviewTicket(ticket) {
+    // 方案 C 的 Web 侧落点：fragment 里的 ticket 由浏览器读出后在这里兑换，
+    // 服务端凭 ticket 下发 `Set-Cookie: hg_sess=...`（token kind=webview，只读会话）。
+    // request() 已默认 credentials:'include'，此处不得重复声明。
+    const body: WebviewExchangeRequest = { ticket }
+    await request<WebviewExchangeResponse>(API_PATHS.authWebviewExchange, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
   },
   async changePassword(req) {
     await request<void>(API_PATHS.authPassword, {
@@ -2387,10 +1634,5 @@ export const realApi: ApiClient = {
 
 /* ============ 出口 ============ */
 
-/** 当前生效的客户端（B-1 默认 mock，与 demo 行为一致） */
-export const api: ApiClient = apiMode === 'real' ? realApi : mockApi
-
-/** 便于调试：控制台可查看当前模式 */
-if (typeof window !== 'undefined') {
-  ;(window as unknown as { __harnessApiMode?: ApiMode }).__harnessApiMode = apiMode
-}
+/** 当前生效的客户端：正式版恒为真实后端（mock 通路已整体下线） */
+export const api: ApiClient = realApi

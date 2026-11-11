@@ -6,8 +6,7 @@ import {
   addModel, addProvider, removeModel, removeProvider, updateModel, updateProvider,
   PROVIDER_KEY_MASK, useSettings, type AppSettings, type CapSlot,
 } from '../../stores/settingsStore'
-import { fetchProviderModels } from '../../mock/settingsData'
-import { api, apiMode } from '../../lib/api'
+import { api } from '../../lib/api'
 import { Badge, Button, Field, Switch, inputCls } from '../../components/ui'
 import { cn } from '../../components/ui'
 
@@ -62,15 +61,6 @@ export function ModelSettingsSection() {
     }
     setTested((t) => ({ ...t, [p.id]: 'testing' }))
     setTestMsg((m) => ({ ...m, [p.id]: '' }))
-    // mock 模式：demo 的模拟延迟；real 模式：由服务端用该厂商发一次极小请求
-    if (apiMode === 'mock') {
-      setTimeout(() => {
-        setTested((t) => ({ ...t, [p.id]: 'ok' }))
-        setTestMsg((m) => ({ ...m, [p.id]: '模拟 218ms' }))
-        toast('success', `${p.name} 连接成功（模拟 218ms）`)
-      }, 500)
-      return
-    }
     try {
       // 所见即所测：把草稿当前值（未保存的模型 / Base URL / 刚输入的密钥）一并传给后端，
       // 「添加模型未保存」「新厂商未落库」也能按界面所见直接测；掩码占位不得当密钥回传
@@ -98,7 +88,7 @@ export function ModelSettingsSection() {
     }
   }
 
-  // 获取模型列表：real 模式真实请求上游 /models；失败直接报错，绝不回退本地样例
+  // 获取模型列表：真实请求上游 /models；失败直接报错，绝不回退本地样例
   const handleFetchModels = async (p: Provider) => {
     if (fetching[p.id]) return
     if (!p.baseUrl.trim()) {
@@ -106,16 +96,6 @@ export function ModelSettingsSection() {
       return
     }
     setFetching((f) => ({ ...f, [p.id]: true }))
-    if (apiMode === 'mock') {
-      setTimeout(() => {
-        const list = fetchProviderModels({ name: p.name, baseUrl: p.baseUrl })
-        setFetched((m) => ({ ...m, [p.id]: list }))
-        setMenuOpen((o) => ({ ...o, [p.id]: true }))
-        setFetching((f) => ({ ...f, [p.id]: false }))
-        toast('success', `成功获取 ${list.length} 个模型`)
-      }, 600)
-      return
-    }
     try {
       // 所见即所测：携带草稿里未保存的 Base URL / 刚输入的密钥，厂商未落库也能拉清单
       const res = await api.listProviderModels(p.id, {
@@ -144,10 +124,6 @@ export function ModelSettingsSection() {
     if (!next) return
     if (revealedKey[p.id] !== undefined) return
     if (!p.apiKeyMasked) return // 未配置密钥，无需拉取
-    if (apiMode === 'mock') {
-      setRevealedKey((k) => ({ ...k, [p.id]: 'sk-mock-demo-key' }))
-      return
-    }
     try {
       const res = await api.revealProviderKey(p.id)
       setRevealedKey((k) => ({ ...k, [p.id]: res.api_key ?? '' }))
@@ -166,18 +142,14 @@ export function ModelSettingsSection() {
     }
     let key = revealedKey[p.id]
     if (key === undefined) {
-      if (apiMode === 'mock') {
-        key = 'sk-mock-demo-key'
-      } else {
-        try {
-          const res = await api.revealProviderKey(p.id)
-          key = res.api_key ?? ''
-          setRevealedKey((k) => ({ ...k, [p.id]: key as string }))
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : '网络异常'
-          toast('error', `读取密钥失败：${msg}`)
-          return
-        }
+      try {
+        const res = await api.revealProviderKey(p.id)
+        key = res.api_key ?? ''
+        setRevealedKey((k) => ({ ...k, [p.id]: key as string }))
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : '网络异常'
+        toast('error', `读取密钥失败：${msg}`)
+        return
       }
     }
     if (!key) {

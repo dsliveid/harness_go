@@ -14,6 +14,7 @@ import { AdvancedModal } from '../features/settings/AdvancedModal'
 import { SidePanel } from '../features/advanced/SidePanel'
 import { Drawer, ToastHost, cn } from '../components/ui'
 import { applyUpdate, initPwa, usePwa } from '../lib/pwa'
+import { HostSettingsFab } from './HostSettingsFab'
 
 // 【PWA 降级】离线横幅已移除：登录后服务端执行的工具型应用，离线壳价值低；
 // 仅保留「新版本已就绪」更新提示与主屏安装能力。
@@ -96,6 +97,8 @@ export function AppShell() {
       <ScheduledModal />
       <MarketModal />
       <ToastHost />
+      {/* 契约三：客户端壳内的「返回宿主设置」浮标（纯浏览器不渲染）。 */}
+      <HostSettingsFab />
     </div>
   )
 }
