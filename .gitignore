@@ -100,5 +100,4 @@ demo/serve.err.log
 *.tar.gz
 dist
 
-# 专利交底与检索文档（本地保存，不入库）
 mydocs/
