@@ -50,7 +50,10 @@ type CreateSessionInput struct {
 // 归属裁决（协议 §3.3 / §5）：
 //   - WorkspaceID 非空 → 校验 Workspace 存在，否则 400（不留悬空引用）；
 //   - ProjectID 非空且 WorkspaceID 为空 → 从项目的 workspace_id 继承（缺省归属）；
-//   - 两者都空 → 纯对话，能力天花板为「仅对话」（由 run_service.conversationOnly 判定）。
+//   - 两者都空 → 纯对话，能力天花板为「仅对话」（由 run_service.resolveToolPolicy 判定）。
+//
+// 术语：WorkspaceID = 工作空间（执行面）；WorkspacePath = **项目目录**（磁盘落盘路径）。
+// 二者无关，权威定义见 docs/术语表-工作空间与项目目录.md。
 //
 // AccessMode 裁决链（顺序即优先级）：
 //  1. 显式传入的 in.AccessMode 合法（confirm|full）→ 直接采用；非空但非法 → 400 拒绝；
@@ -78,10 +81,16 @@ func (s *SessionService) Create(ctx context.Context, in CreateSessionInput) (*mo
 		// 项目里若存了非法值（历史脏数据），一律回落空串走 confirm 兜底，绝不放大权限。
 	}
 
-	// 执行面归属：显式 workspace_id 优先，其次从项目继承。
+	// 执行面归属：显式 workspace_id 优先，其次从项目继承，最后缺省绑服务端内置空间。
 	//
 	// 为什么必须校验存在性：能力判定靠 workspace.kind，悬空外键会让判定
 	// 走 fail-closed 分支（按仅对话），用户会莫名其妙失去工具能力却查不到原因。
+	//
+	// 【R1 工作空间必填】会话**必须**有工作空间归属，纯对话也不例外：
+	//   - 纯对话 = 绑服务端内置空间（ws-server）+ 无项目，能力天花板由 resolveToolPolicy
+	//     细分判定（无项目 → readonly，见 R1b）；
+	//   - 这样消除了「workspace_id 为空」这个特例分支，会话归属语义唯一。
+	// 项目仍为可选：纯对话就是「有工作空间、但没有项目」。
 	wsID := strings.TrimSpace(in.WorkspaceID)
 	if wsID != "" {
 		if _, err := s.main.Workspaces().Get(ctx, wsID); err != nil {
@@ -95,6 +104,11 @@ func (s *SessionService) Create(ctx context.Context, in CreateSessionInput) (*mo
 		if p, err := s.main.Projects().Get(ctx, pid); err == nil {
 			wsID = strings.TrimSpace(p.WorkspaceID)
 		}
+	}
+	if wsID == "" {
+		// 缺省归属：服务端内置空间。纯对话亦须绑定，不留空串。
+		// 注意：项目本身没有 workspace_id（或未指定项目）时才会走到这里。
+		wsID = store.BuiltinWorkspaceServerID
 	}
 
 	sess := &model.Session{

@@ -83,13 +83,17 @@ type handlers struct {
 // ============ 会话 ============
 
 type createSessionReq struct {
-	Title         string `json:"title"`
-	ModelRef      string `json:"model_ref"`
+	Title    string `json:"title"`
+	ModelRef string `json:"model_ref"`
+	// WorkspacePath 是**项目目录**（磁盘落盘路径），不是工作空间！
+	// 与 WorkspaceID（执行面归属）完全无关，仅命名同带 Workspace 前缀。
+	// 术语定义见 docs/术语表-工作空间与项目目录.md。
 	WorkspacePath string `json:"workspace_path"`
 	// ProjectID 归属项目；非空且未显式传 access_mode 时，服务端按项目默认控制权限快照继承。
 	ProjectID string `json:"project_id"`
-	// WorkspaceID 会话所属执行面（协议 §3.3）：空 = 纯对话（不允许工具）。
+	// WorkspaceID 会话所属**工作空间**（执行面，协议 §3.3）：空 = 纯对话（不允许工具）。
 	// 留空且 ProjectID 非空时，从项目的 workspace_id 继承。
+	// 规划：将改为必填（纯对话亦须绑定，缺省绑服务端内置空间）。
 	WorkspaceID string `json:"workspace_id"`
 	// AccessMode 可选显式覆盖（confirm|full）；留空 = 走项目默认权限继承。
 	AccessMode string `json:"access_mode"`
@@ -117,8 +121,12 @@ func (h *handlers) createSession(w http.ResponseWriter, r *http.Request) {
 	// 用令牌 kind 判定，不用请求体自报（自报可伪造）。webview 会话能做的只有对话：
 	// 强制清空 project_id / workspace_path，并锁 access_mode=confirm，双保险防提权。
 	//
-	// 注：这是「端侧自律 + 服务端兜底」的组合。真正不可绕过的是 run_service.conversationOnly
-	// ——即便有人绕过此处建了 mobile 空间的会话，能力判定仍会按 kind=mobile 拒绝工具。
+	// 🚨 注意：这里清空的 workspace_path 是**项目目录**（磁盘落盘路径），
+	// **不是** WorkspaceID（工作空间/执行面归属）——req.WorkspaceID 不在此处被清空。
+	// 二者仅命名同带 Workspace 前缀，语义完全无关，详见 docs/术语表-工作空间与项目目录.md。
+	//
+	// 注：这是「端侧自律 + 服务端兜底」的组合。真正不可绕过的是 run_service.resolveToolPolicy
+	// ——即便有人绕过此处建了 mobile 工作空间的会话，能力判定仍会按 kind=mobile 拒绝工具。
 	if h.currentTokenKind(r) == tokenKindWebview {
 		req.ProjectID = ""
 		req.WorkspacePath = ""

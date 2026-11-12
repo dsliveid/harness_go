@@ -111,6 +111,15 @@ const (
 	// 刻意与 CodeDeviceNotFound / CodeDeviceRevoked 区分：那两者要用户解绑重来，
 	// 这一条只需重新配对（设备令牌还在，但归属要重新授权）。
 	CodeDeviceOwnerUnknown Code = "device.owner_unknown"
+	// CodeDeviceOffline 归属设备离线，无法发起对话（R2 对话准入物理拦截）。
+	//
+	// 语义：会话绑定的工作空间所归属的设备此刻不在线（WS 无有效连接）。
+	// 与 fs.host_offline 的区别：那条是「列举目录时宿主离线」的读操作错误，
+	// 本条是「发起 Run 被拒」的写操作错误——前者降级为明确报错，后者**整个对话不可发起**。
+	//
+	// 前端应据此提示「设备已离线，请先让设备上线」，而非笼统的通用错误。
+	// 对照：服务端内置空间（ws-server）恒在线，永不返回本错误。
+	CodeDeviceOffline Code = "device.offline"
 )
 
 // Error 统一错误类型。
@@ -226,6 +235,8 @@ func StatusFor(code Code) int {
 		return http.StatusNotFound
 	case CodeConflict, CodeRunStateConflict, CodeApprovalAlreadyDecide,
 		CodeDeviceProtocolMismatch, CodeFSHostOffline, CodeFSHostUnsupported,
+		// 设备离线拒发起对话：属「当前状态不满足」而非「没权限」，409 让前端提示用户恢复设备。
+		CodeDeviceOffline,
 		// 归属未知是"状态需要修正"而非"没权限"：端侧要据此提示重新配对。
 		CodeDeviceOwnerUnknown:
 		return http.StatusConflict

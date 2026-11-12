@@ -185,9 +185,14 @@ func (s *BundleService) Import(ctx context.Context, zipPath string) (toolapi.Bun
 	}
 
 	// ① 新会话（主库行）
+	//
+	// 【R1 工作空间必填】导入包只带会话消息，不带设备归属；且导入后不应凭空获得
+	// 服务端宿主机的执行能力。故绑服务端内置空间（ws-server）+ 不设项目
+	// → resolveToolPolicy 判为 readonly（纯对话口径，见 R1b），安全对齐。
 	sess := &model.Session{
-		ID:    newID(),
-		Title: strings.TrimSpace(manifest.Title),
+		ID:          newID(),
+		Title:       strings.TrimSpace(manifest.Title),
+		WorkspaceID: store.BuiltinWorkspaceServerID,
 	}
 	if sess.Title == "" {
 		sess.Title = "导入会话"

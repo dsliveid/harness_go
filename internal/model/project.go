@@ -7,8 +7,9 @@ package model
 //     被快照继承到会话的 AccessMode；之后改项目默认值不影响已建会话。
 //   - Pinned：置顶（列表排序 pinned DESC, updated_at DESC）。
 //   - DeletedAt：软删时间（缺省 = 未删除）。
-//   - WorkspaceID：项目所属工作空间（执行面归属）；与 Path（磁盘受管目录）互相独立，
+//   - WorkspaceID：项目所属**工作空间**（执行面归属）；与 Path（**项目目录**，磁盘受管目录）互相独立，
 //     能力天花板由 Workspace.Kind 裁决（见 model.Workspace）。
+//     术语「工作空间 vs 项目目录」的权威定义见 docs/术语表-工作空间与项目目录.md。
 type Project struct {
 	ID                string `json:"id"`
 	Name              string `json:"name"`

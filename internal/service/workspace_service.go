@@ -359,6 +359,9 @@ const (
 	policyReasonOffline       = "当前工作空间的设备不在线，无法调用工具（设备恢复在线后自动可用）"
 	policyReasonMobile        = "当前为移动端，仅支持只读操作与对话"
 	policyReasonNoWorkspace   = "当前会话未绑定执行空间，仅支持只读操作与对话"
+	// policyReasonPureChat 纯对话（绑服务端空间但无项目）——R1b。
+	// 与 NoWorkspace 的区别：那条是「没有归属」（历史/异常态），本条是「有意为之的纯对话」。
+	policyReasonPureChat = "纯对话不支持调用工具，请在绑定了设备的项目中开启会话来使用工具"
 )
 
 // checkKindMatchesDevice 校验工作空间 kind 与归属设备形态一致（D5）。

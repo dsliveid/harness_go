@@ -697,6 +697,19 @@ func run() error {
 					logger.Warn("设备离线，在途端侧任务已降级", "device_id", deviceID, "tasks", n)
 				}
 			}
+			// R3：设备离线 → 自动中断该设备上所有进行中的 Run。
+			//
+			// 为什么必须中断而不是放任继续：设备离线后本会话已无法在其上执行任何
+			// 端侧操作，Run 原地空等只会让用户看到一串工具失败。直接取消让 Run
+			// 迁移到 cancelled 终态，语义与「设备离线即停止对话」一致。
+			//
+			// 服务端内置空间的 Run 不进反向索引（ExecutionDeviceID 为空），
+			// 故 ws-server 会话永不受任何设备离线事件波及（R5）。
+			if runSvc != nil {
+				if n := runSvc.CancelByDevice(deviceID); n > 0 {
+					logger.Warn("设备离线，进行中的对话已中断", "device_id", deviceID, "runs", n)
+				}
+			}
 		},
 	})
 	var deviceGateway *device.Gateway

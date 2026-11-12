@@ -78,15 +78,34 @@ func (e *policyEnv) policy(t *testing.T, wsID string) (agent.ToolPolicy, string)
 	return e.svc.resolveToolPolicy(e.ctx, &model.Session{ID: "sess-1", WorkspaceID: wsID})
 }
 
-// 内置服务端空间：恒 full（它自身就是执行宿主，不参与设备在线判定）。
+// 内置服务端空间：**有项目**时 full（有明确工作目录与执行意图）、**无项目**时 readonly（纯对话）。
+//
+// R1b 改造说明：此前该空间无条件 full，导致「纯对话」能在服务端宿主机上执行命令。
+// 现在按 project_id 细分——有项目 = 用户已声明执行意图，保持 full；无项目 = 纯对话，
+// 降为 readonly。这与「级联删除不得把会话迁到 ws-server 防提权」的铁律同源。
 func TestPolicyBuiltinServerWorkspaceIsFull(t *testing.T) {
 	env := newPolicyEnv(t)
-	p, reason := env.policy(t, store.BuiltinWorkspaceServerID)
+	// 有项目 → full
+	p, reason := env.svc.resolveToolPolicy(env.ctx, &model.Session{
+		ID: "sess-1", WorkspaceID: store.BuiltinWorkspaceServerID, ProjectID: "proj-1",
+	})
 	if p != agent.ToolPolicyFull {
-		t.Fatalf("内置服务端空间应为 full，得到 %s（reason=%q）", p, reason)
+		t.Fatalf("内置服务端空间（有项目）应为 full，得到 %s（reason=%q）", p, reason)
 	}
 	if reason != "" {
 		t.Fatalf("full 策略不应带拒绝文案，得到 %q", reason)
+	}
+}
+
+// 内置服务端空间 + 无项目 = 纯对话（R1b）：readonly，禁写禁命令。
+func TestPolicyBuiltinServerWorkspacePureChatIsReadonly(t *testing.T) {
+	env := newPolicyEnv(t)
+	p, reason := env.policy(t, store.BuiltinWorkspaceServerID)
+	if p != agent.ToolPolicyReadonly {
+		t.Fatalf("内置服务端空间（纯对话/无项目）应为 readonly，得到 %s（reason=%q）", p, reason)
+	}
+	if reason != policyReasonPureChat {
+		t.Fatalf("纯对话拒绝文案应为 %q，得到 %q", policyReasonPureChat, reason)
 	}
 }
 

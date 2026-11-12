@@ -102,15 +102,26 @@ const (
 )
 
 // Session 会话（主库）。
+//
+// ⚠️ 三个归属字段极易混淆，权威定义见 docs/术语表-工作空间与项目目录.md：
+//   - WorkspaceID   工作空间（执行面，对应一台设备）——决定能力天花板
+//   - ProjectID     项目（可选）——纯对话则无
+//   - WorkspacePath 【项目目录】（磁盘落盘路径）——决定工具在哪个目录执行
+//
+// 🚨 WorkspacePath 与 WorkspaceID **完全无关**，仅因命名都带 Workspace 前缀而易被误读。
+// 历史上曾据「清空 workspace_path」误判为「清空工作空间」并推出错误结论。
 type Session struct {
-	ID            string `json:"id"`
-	Title         string `json:"title"`
+	ID    string `json:"id"`
+	Title string `json:"title"`
+	// WorkspacePath 是**项目目录**（磁盘落盘路径），不是工作空间。
+	// 决定工具在哪个目录下执行；与 WorkspaceID（执行面归属）互相独立。
 	WorkspacePath string `json:"workspace_path"`
 	// ProjectID 会话归属项目（空串 = 纯对话，不隶属任何项目）。
 	ProjectID string `json:"project_id,omitempty"`
-	// WorkspaceID 会话归属工作空间（执行面）。
-	// 空 = 纯对话，无执行面；与 WorkspacePath（磁盘路径）互相独立：
-	// WorkspaceID 决定「能力天花板」（能否执行命令/写文件），WorkspacePath 只是该空间的落盘目录。
+	// WorkspaceID 会话归属工作空间（执行面，对应一台设备；或服务端内置空间 ws-server）。
+	// 空 = 纯对话，无执行面；与 WorkspacePath（**项目目录**）互相独立：
+	// WorkspaceID 决定「能力天花板」（能否执行命令/写文件），WorkspacePath 只决定落盘目录。
+	// 规划：工作空间将改为必填（纯对话亦须绑定，缺省绑服务端内置空间）。
 	WorkspaceID string `json:"workspace_id,omitempty"`
 	AccessMode  string `json:"access_mode"`
 	ModelRef    string `json:"model_ref"`

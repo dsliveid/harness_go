@@ -168,10 +168,15 @@ func (s *OpenAICompatService) resolveSession(ctx context.Context, req *OpenAICha
 	}
 
 	// 隐藏会话（source=openai）：回放客户端全量历史
+	//
+	// 【R1 工作空间必填】OpenAI 兼容端点没有「项目/工作空间」概念，且不提供工具调用，
+	// 故显式绑服务端内置空间（ws-server）——它是恒在线的纯对话执行面。
+	// 不绑会留空 workspace_id，导致 R2 准入校验与 resolveToolPolicy 都走异常分支。
 	sess := &model.Session{
-		ID:     "sess-" + newID(),
-		Title:  "OpenAI 接入 " + time.Now().Format("0102-150405"),
-		Source: "openai",
+		ID:          "sess-" + newID(),
+		Title:       "OpenAI 接入 " + time.Now().Format("0102-150405"),
+		Source:      "openai",
+		WorkspaceID: store.BuiltinWorkspaceServerID,
 	}
 	if err := s.main.Sessions().Create(ctx, sess); err != nil {
 		return "", "", "", wrapStoreErr(err, apperr.CodeInternal, "创建接入会话失败")

@@ -98,6 +98,14 @@ type RunService struct {
 
 	mu      sync.Mutex
 	cancels map[string]context.CancelFunc
+	// runDevices 设备 → 进行中 Run 的反向索引（R3 设备离线自动中断）。
+	//
+	// 为什么需要：cancels 是 runID → cancel 单向表，设备离线时无法反查
+	// 「这台设备上还跑着哪些 Run」。缺了它就只能全表扫描 + 逐条查库判断归属。
+	//
+	// 只登记**执行面归属该设备**的 Run：服务端内置空间（ExecutionDeviceID 为空）
+	// 的 Run 永不进索引 —— 服务端恒在线，不该被任何设备离线事件波及。
+	runDevices map[string]map[string]struct{}
 	// guidanceChans 运行中引导通道（§4.2）：runID → chan *model.Message（容量 16）。
 	// 与 cancels 同生命周期：Run 创建时注册、终态注销；Run 已结束的引导返回 409。
 	guidanceChans sync.Map
@@ -234,6 +242,16 @@ func (s *RunService) resolveToolPolicy(ctx context.Context, sess *model.Session)
 		if ws.Kind == model.WorkspaceKindMobile {
 			return agent.ToolPolicyReadonly, policyReasonMobile
 		}
+		// 【R1b 纯对话无工具调用】绑服务端空间但**无项目** = 纯对话。
+		//
+		// 语义：纯对话只是「聊天 + 看历史」，不应具备在服务端宿主机上执行命令/写文件的能力。
+		// 这与「级联删除不得把会话迁到 ws-server（防提权）」的安全铁律同源：
+		// 若迁过去的会话拿到 full，等于给了绕过设备归属的后门。
+		//
+		// 有项目则维持 full：项目意味着用户已明确声明工作目录与执行意图。
+		if strings.TrimSpace(sess.ProjectID) == "" {
+			return agent.ToolPolicyReadonly, policyReasonPureChat
+		}
 		return agent.ToolPolicyFull, ""
 	}
 	// 非内置空间必须有可用设备宿主，否则任何工具都只能落到服务端本地执行（D8 明令禁止）。
@@ -366,6 +384,23 @@ func (s *RunService) CreateRunWithSystem(ctx context.Context, sessionID, userInp
 	if err != nil {
 		return nil, wrapStoreErr(err, apperr.CodeSessionNotFound, "会话不存在")
 	}
+	// 【R2 对话准入·物理层拦截】归属设备离线 → 拒绝发起 Run。
+	//
+	// 为什么必须在 sess.Acquire 之前：一旦走到下方便会写用户消息、建会话库文件、
+	// 再调模型。离线时这些都该**零发生**——消息不落库、模型不被调用、token 不消耗。
+	//
+	// 这是与 resolveToolPolicy（工具准入/上下文层）**不同层次**的第二道闸：
+	//   - 本层挡「发起」：设备离线时整个对话不可开始，只能查看历史；
+	//   - 上层挡「跑一半掉线」：Run 进行中设备离线，工具被拒 → 由 R3 自动中断。
+	// 两层是纵深防御，不可互相替代。
+	//
+	// 判定复用 resolveToolPolicy 的权威结果（唯一入口铁律，不写第二套规则）：
+	//   - 仅当策略为 none 且原因是「设备离线」时才拦。其余 none 情形
+	//     （未绑定/设备已删/已解绑）沿用既有行为——它们不是「在线状态」问题，
+	//     强行拦会改变历史会话的可访问性，超出本次需求范围。
+	if policy, reason := s.resolveToolPolicy(ctx, sess); policy == agent.ToolPolicyNone && reason == policyReasonOffline {
+		return nil, apperr.New(apperr.CodeDeviceOffline, "%s", reason)
+	}
 	// 自动标题（对齐桌面端）：会话仍是默认标题时，用首条用户消息前 24 字生成；
 	// 用户已手动重命名则不覆盖。失败不阻断对话（标题是体验项不是正确性项）。
 	if title := deriveSessionTitle(sess.Title, userInput); title != "" {
@@ -433,7 +468,10 @@ func (s *RunService) CreateRunWithSystem(ctx context.Context, sessionID, userInp
 
 	// ⑤ 异步执行：脱离 HTTP 请求 ctx（否则请求一结束 Run 就被取消）
 	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	s.registerCancel(run.ID, cancel)
+	// 执行面归属（D7）提前解析：既用于注册反向索引（R3），也用于装配 RunRequest。
+	// 空串 = 服务端内置空间（ws-server），允许本地执行。
+	execDeviceID := s.executionDeviceID(ctx, sess)
+	s.registerCancelForDevice(run.ID, execDeviceID, cancel)
 
 	system := s.systemBase
 	if strings.TrimSpace(systemBase) != "" {
@@ -470,7 +508,7 @@ func (s *RunService) CreateRunWithSystem(ctx context.Context, sessionID, userInp
 		PolicyReason:    policyReason,
 		// 执行面归属（D7）：工具必须在**会话绑定的设备**上执行，绝不落到服务端本地。
 		// 空串 = 服务端内置空间（ws-server），允许本地执行。
-		ExecutionDeviceID: s.executionDeviceID(ctx, sess),
+		ExecutionDeviceID: execDeviceID,
 	}
 	// 运行中引导通道（§4.2）：随 Run 注册/注销，Guidance 端点推送、引擎轮次边界消费
 	guidanceCh := make(chan *model.Message, 16)
@@ -706,15 +744,79 @@ func (s *RunService) RecoverInterrupted(ctx context.Context) (int, error) {
 }
 
 func (s *RunService) registerCancel(runID string, cancel context.CancelFunc) {
+	s.registerCancelForDevice(runID, "", cancel)
+}
+
+// registerCancelForDevice 注册 Run 的取消句柄，并按执行面设备建立反向索引（R3）。
+//
+// deviceID 为空表示服务端内置空间的 Run：登记 cancel 但**不进反向索引**，
+// 这样任何设备离线事件都不会误伤服务端会话。
+func (s *RunService) registerCancelForDevice(runID, deviceID string, cancel context.CancelFunc) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.cancels[runID] = cancel
+	if deviceID == "" {
+		return
+	}
+	if s.runDevices == nil {
+		s.runDevices = make(map[string]map[string]struct{})
+	}
+	set := s.runDevices[deviceID]
+	if set == nil {
+		set = make(map[string]struct{})
+		s.runDevices[deviceID] = set
+	}
+	set[runID] = struct{}{}
 }
 
 func (s *RunService) unregisterCancel(runID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.cancels, runID)
+	// 同步清理反向索引，避免设备 → Run 映射无限增长（内存泄漏）。
+	for dev, set := range s.runDevices {
+		delete(set, runID)
+		if len(set) == 0 {
+			delete(s.runDevices, dev)
+		}
+	}
+}
+
+// CancelByDevice 中断指定设备上所有进行中的 Run（R3 设备离线自动中断）。
+//
+// 语义：设备离线意味着本会话已无法在其上执行任何端侧操作，原地空等只会
+// 让用户看到一串工具失败。这里直接取消，由引擎把 Run 迁移到 cancelled 终态。
+//
+// 不中断哪些：服务端内置空间的 Run（登记时 deviceID 为空，不在索引里），
+// 以及执行面归属其它设备的 Run。返回被中断的 Run 数量，便于调用方打日志。
+func (s *RunService) CancelByDevice(deviceID string) int {
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		return 0
+	}
+	s.mu.Lock()
+	// 先快照并摘除索引条目，再在锁外执行 cancel：
+	// cancel 会触发引擎回调并可能重入本结构，持锁调用有死锁风险。
+	set := s.runDevices[deviceID]
+	if len(set) == 0 {
+		s.mu.Unlock()
+		return 0
+	}
+	runIDs := make([]string, 0, len(set))
+	cancels := make([]context.CancelFunc, 0, len(set))
+	for runID := range set {
+		runIDs = append(runIDs, runID)
+		if c, ok := s.cancels[runID]; ok {
+			cancels = append(cancels, c)
+		}
+	}
+	delete(s.runDevices, deviceID)
+	s.mu.Unlock()
+
+	for _, c := range cancels {
+		c()
+	}
+	return len(runIDs)
 }
 
 // defaultSessionTitle 会话默认标题（session_service.Create 兜底值，与前端一致）。

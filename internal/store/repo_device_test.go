@@ -74,16 +74,16 @@ func TestMainDevicesMigration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 0011_device_owner.sql 落地后主库版本为 11。
-	if v != 11 {
-		t.Fatalf("主库 schema 版本期望 11，得到 %d", v)
+	// 0012_session_workspace_backfill.sql 落地后主库版本为 12。
+	if v != 12 {
+		t.Fatalf("主库 schema 版本期望 12，得到 %d", v)
 	}
 	req, err := RequiredSchemaVersion("main")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if req != 11 {
-		t.Fatalf("RequiredSchemaVersion(main) 期望 11，得到 %d", req)
+	if req != 12 {
+		t.Fatalf("RequiredSchemaVersion(main) 期望 12，得到 %d", req)
 	}
 }
 
@@ -618,12 +618,12 @@ func TestMigrationUpgradeFromV1(t *testing.T) {
 	}
 	// v1 库升级：0002_devices + 0003_retrieval + 0004_market + 0005_snapshots + 0006_webhooks
 	// + 0007_session_archive + 0008_projects + 0009_workspaces + 0010_pair_code_user
-	// + 0011_device_owner 共 10 个增量迁移。
-	if applied != 10 {
-		t.Fatalf("主库增量迁移应应用 10 个，得到 %d", applied)
+	// + 0011_device_owner + 0012_session_workspace_backfill 共 11 个增量迁移。
+	if applied != 11 {
+		t.Fatalf("主库增量迁移应应用 11 个，得到 %d", applied)
 	}
-	if v, _ := SchemaVersion(ctx, mdb); v != 11 {
-		t.Fatalf("主库升级后版本期望 11，得到 %d", v)
+	if v, _ := SchemaVersion(ctx, mdb); v != 12 {
+		t.Fatalf("主库升级后版本期望 12，得到 %d", v)
 	}
 	var title string
 	if err := mdb.QueryRowContext(ctx, `SELECT title FROM sessions WHERE id='old-s1'`).Scan(&title); err != nil {
