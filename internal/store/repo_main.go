@@ -36,10 +36,10 @@ func (r *SessionRepo) Create(ctx context.Context, sess *model.Session) error {
 		sess.Source = "ui"
 	}
 	_, err := r.s.conn().ExecContext(ctx,
-		`INSERT INTO sessions(id, title, workspace_path, project_id, workspace_id, access_mode, model_ref, user_id,
+		`INSERT INTO sessions(id, title, project_dir, project_id, workspace_id, access_mode, model_ref, user_id,
 		                     created_at, updated_at, source)
 		 VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
-		sess.ID, sess.Title, sess.WorkspacePath, sess.ProjectID, sess.WorkspaceID, sess.AccessMode, sess.ModelRef, sess.UserID,
+		sess.ID, sess.Title, sess.ProjectDir, sess.ProjectID, sess.WorkspaceID, sess.AccessMode, sess.ModelRef, sess.UserID,
 		sess.CreatedAt, sess.UpdatedAt, sess.Source)
 	if err != nil {
 		return fmt.Errorf("store: 创建会话失败: %w", err)
@@ -50,7 +50,7 @@ func (r *SessionRepo) Create(ctx context.Context, sess *model.Session) error {
 // 铁律：sessionColumns 与 SessionRepo.Create 的列清单、scanSession 的 Scan 实参
 // **必须三处严格同步**（顺序一致），漏改一处即静默错列。
 // 0009 新增 workspace_id 时三处同步位置：均紧随 project_id 之后。
-const sessionColumns = `id, title, workspace_path, project_id, workspace_id, access_mode, model_ref, user_id,
+const sessionColumns = `id, title, project_dir, project_id, workspace_id, access_mode, model_ref, user_id,
 	message_count, last_message_at, total_tokens, last_run_status,
 	created_at, updated_at, deleted_at, source, archived_at`
 
@@ -65,7 +65,7 @@ func scanSession(sc interface{ Scan(...any) error }) (model.Session, error) {
 		// workspace_id 由 0009 以可空列加入（回填后为非 NULL），仍用 NullString 兜底。
 		workspaceID sql.NullString
 	)
-	err := sc.Scan(&s.ID, &s.Title, &s.WorkspacePath, &s.ProjectID, &workspaceID, &s.AccessMode, &s.ModelRef, &s.UserID,
+	err := sc.Scan(&s.ID, &s.Title, &s.ProjectDir, &s.ProjectID, &workspaceID, &s.AccessMode, &s.ModelRef, &s.UserID,
 		&s.MessageCount, &lastMsg, &s.TotalTokens, &status,
 		&s.CreatedAt, &s.UpdatedAt, &deleted, &source, &archived)
 	if err != nil {

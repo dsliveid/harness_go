@@ -1,4 +1,4 @@
-import { create } from 'zustand'
+﻿import { create } from 'zustand'
 import type { AccessMode, ApprovalRule, DataScope, DataScopeGrant, DataScopeMode, PlanMode, Project, ProjectLink, Session, Workspace, WorkspaceKind } from '../types'
 import { api } from '../lib/api'
 import type { CreateWorkspaceInput } from '../lib/api'
@@ -232,7 +232,7 @@ export const useSessions = create<SessionState>((set, get) => ({
       const keep = get().currentId
       const current = list.some((s) => s.id === keep) ? keep : list[0].id
       // 归属恢复（踩坑：刷新后项目会话掉进「纯对话」）：
-      // 服务端 sessions 只有 workspace_path，没有 project_id / workspace_id，
+      // 服务端 sessions 只有 project_dir，没有 project_id / workspace_id，
       // toUiSession 映射不出归属 → 必须按已落库的目录反查项目，把 projectId/workspaceId 补回来。
       const withScope = adoptServerSessions(list, get().projects)
       // 当前空间若在新列表里已无任何可见会话（如它只是上次的临时空间），
@@ -406,7 +406,7 @@ export const useSessions = create<SessionState>((set, get) => ({
       title: '新对话',
       projectId,
       workspaceId: proj ? wsOfProject(proj) : get().activeWorkspaceId,
-      workspacePath: proj?.path,
+      projectDir: proj?.path,
       accessMode: proj?.defaultAccessMode ?? 'confirm',
       // 新会话模型：沿用同作用域最近会话的选择，其次全局 chat 槽位；为空 = 未选择
       modelRef: inheritModelRef(get().sessions, projectId),
@@ -424,7 +424,7 @@ export const useSessions = create<SessionState>((set, get) => ({
       .createSession({
         title: s.title,
         modelRef: s.modelRef,
-        workspacePath: s.workspacePath,
+        projectDir: s.projectDir,
         projectId,
       })
       .then((created) => {

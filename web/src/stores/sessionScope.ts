@@ -1,16 +1,19 @@
-/**
- * 会话归属（工作空间 / 项目）恢复：以**已落库的 workspace_path** 为唯一真源反查项目。
+﻿/**
+ * 会话归属（工作空间 / 项目）恢复：以**已落库的 project_dir** 为唯一真源反查项目。
  *
  * 背景（踩坑：会话刷新后掉进「纯对话」）：
- *   - 服务端 sessions 表只有 `workspace_path`，**没有** project_id / workspace_id
- *     （项目在前端目前是纯客户端概念，后端没有 projects 表与接口）。
- *   - `lib/api.ts` 的 toUiSession() 只能映射出 workspacePath，projectId / workspaceId 恒为 undefined。
+ *   - 服务端 sessions 表**曾经**只有 `project_dir`（原名 workspace_path），没有
+ *     project_id / workspace_id —— 那是本文件的成因，但**该前提已失效**：
+ *     服务端早已落地 project_id（0008_projects）与 workspace_id（0009_workspaces），
+ *     且 `lib/api.ts` 的 toUiSession() 现已按服务端权威值映射两者。
+ *   - 保留本反查仅作为「服务端字段为空时的兜底」，不再是无字段可用的唯一出路。
  *   - 而 Sidebar 的分组判据是 `wsOfSession(s, projects)` 与 `!s.projectId`：
- *     两个字段都是 undefined 时，会话必然落到内置空间 + 「纯对话」分组。
- *   → 结果：刷新前明明在项目/工作区里的对话，刷新后一律显示为纯对话。
+ *     两个字段都为空时会话才会落到内置空间 +「纯对话」分组。
+ *   → 历史上：刷新前明明在项目/工作区里的对话，刷新后一律显示为纯对话。
  *
- * 结论：归属恢复必须靠 `workspace_path` 反查项目目录（零迁移、零 API 契约变更）。
- * 反查不到时**不伪造归属**：保持 projectId 为空，但 workspacePath 仍在（顶栏照实显示真实目录）。
+ * 结论：优先信任服务端下发的 projectId / workspaceId；仅当它们缺失时，
+ * 才用 `project_dir` 反查项目目录兜底（反查不到**不伪造归属**：保持 projectId 为空，
+ * 但 projectDir 仍在，顶栏照实显示真实目录）。
  */
 import type { Project, Session, Workspace } from '../types'
 
@@ -44,8 +47,8 @@ export function resolveProjectByPath(path: string | undefined | null, projects: 
 /**
  * 把服务端会话列表补全为带归属的 UI 会话：
  *   ① 已有 projectId 的（本地乐观插入、尚未被服务端返回覆盖的壳）原样保留；
- *   ② 否则用 workspacePath 反查项目，命中则补 projectId + workspaceId；
- *   ③ 仍未命中 → projectId 留空（诚实归为纯对话），但保留 workspacePath。
+ *   ② 否则用 projectDir 反查项目，命中则补 projectId + workspaceId；
+ *   ③ 仍未命中 → projectId 留空（诚实归为纯对话），但保留 projectDir。
  */
 export function adoptServerSessions(list: Session[], projects: Project[]): Session[] {
   const overrides = loadScopeOverrides()
@@ -61,7 +64,7 @@ export function adoptServerSessions(list: Session[], projects: Project[]): Sessi
       return { ...s, projectId: proj.id, workspaceId: ov.workspaceId ?? s.workspaceId ?? proj.workspaceId }
     }
     // ③ 路径反查项目目录
-    const proj = resolveProjectByPath(s.workspacePath, projects)
+    const proj = resolveProjectByPath(s.projectDir, projects)
     if (!proj) {
       return ov?.workspaceId ? { ...s, workspaceId: ov.workspaceId } : s
     }
@@ -70,7 +73,7 @@ export function adoptServerSessions(list: Session[], projects: Project[]): Sessi
       projectId: proj.id,
       workspaceId: s.workspaceId ?? proj.workspaceId,
       // 服务端没带路径但项目有（如项目路径后补）：以项目路径为准，保证顶栏与归属一致
-      workspacePath: s.workspacePath ?? proj.path,
+      projectDir: s.projectDir ?? proj.path,
     }
   })
 }

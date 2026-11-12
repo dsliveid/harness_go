@@ -284,7 +284,7 @@ paths:
               properties:
                 title: { type: string }
                 model_ref: { type: string }
-                workspace_path: { type: string }
+                project_dir: { type: string }
       responses:
         "201":
           description: 已创建
@@ -2420,7 +2420,7 @@ components:
           description: 归属设备 ID；空串 = 服务端内置空间或未绑定设备的空间（后者 bound=false）
         root_path:
           type: string
-          description: 宿主侧根目录；服务端内置空间为空串（磁盘路径在会话的 workspace_path 上）
+          description: 宿主侧根目录；服务端内置空间为空串（磁盘路径在会话的 project_dir 上）
         online:
           type: boolean
           description: |
@@ -2660,7 +2660,7 @@ components:
       properties:
         id: { type: string }
         title: { type: string }
-        workspace_path: { type: string }
+        project_dir: { type: string }
         access_mode: { type: string, enum: [readonly, confirm, full] }
         model_ref: { type: string }
         user_id: { type: string }

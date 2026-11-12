@@ -485,7 +485,7 @@ func (s *RunService) CreateRunWithSystem(ctx context.Context, sessionID, userInp
 		}
 	}
 	// 工作区事实按会话注入：绑定/未绑定如实分叉，杜绝「未绑定却说自己在工作区内」的幻觉。
-	system = ComposeSystemBase(system, sess.WorkspacePath, s.workDir)
+	system = ComposeSystemBase(system, sess.ProjectDir, s.workDir)
 	// 能力天花板（协议 §4.1）：唯一入口在此，引擎只消费结果。
 	// 零工具策略下不注入任何工具（让模型根本看不到），且引擎侧做兜底短路拒绝。
 	toolPolicy, policyReason := s.resolveToolPolicy(ctx, sess)
@@ -496,7 +496,7 @@ func (s *RunService) CreateRunWithSystem(ctx context.Context, sessionID, userInp
 		ModelRef:        modelRef,
 		AccessMode:      approval.AccessMode(normalizeAccessMode(sess.AccessMode)),
 		SystemBase:      system,
-		SOP:             s.currentSOP(sess.WorkspacePath),
+		SOP:             s.currentSOP(sess.ProjectDir),
 		ProjectSummary:  "",
 		Tools:           s.filterTools(s.currentTools(), toolPolicy),
 		ActiveTools:     s.selectTools(ctx, userInput),

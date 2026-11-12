@@ -35,7 +35,7 @@ func (k WorkspaceKind) Valid() bool {
 //     （改 kind = 提权，服务层直接拒绝）。
 //   - DeviceID 空 = 服务端内置空间（ws-server），恒在线；非空 = 归属某台已配对设备，
 //     在线状态由设备域 Hub 实时派生（Online 属 service 层派生字段，不落库）。
-//   - RootPath：宿主侧根目录；服务端内置空间为空串（会话各自的 workspace_path 才是磁盘路径）。
+//   - RootPath：宿主侧根目录；服务端内置空间为空串（会话各自的 project_dir 才是磁盘路径）。
 type Workspace struct {
 	ID        string        `json:"id"`
 	Name      string        `json:"name"`

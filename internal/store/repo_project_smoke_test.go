@@ -82,7 +82,7 @@ func TestTmpProjectRepoSmoke(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if back.ProjectID != "proj-1" || back.AccessMode != "full" || back.WorkspacePath != "" {
+	if back.ProjectID != "proj-1" || back.AccessMode != "full" || back.ProjectDir != "" {
 		t.Fatalf("会话列错位: %+v", back)
 	}
 	// SetProject

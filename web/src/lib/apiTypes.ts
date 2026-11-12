@@ -1,4 +1,4 @@
-/**
+﻿/**
  * harness-go API 类型与路径常量 —— **由 `api/openapi.yaml` 人工对齐生成**。
  *
  * 契约铁律（docs/protocols.md §3）：
@@ -90,7 +90,7 @@ export interface ChangePasswordRequest {
 export interface Session {
   id: string;
   title: string;
-  workspace_path: string;
+  project_dir: string;
   access_mode: 'readonly' | 'confirm' | 'full';
   model_ref: string;
   user_id: string;
@@ -98,7 +98,7 @@ export interface Session {
   project_id?: string;
   /**
    * 归属工作空间（执行面）ID：空 = 纯对话（无执行宿主）。
-   * 与 workspace_path（磁盘目录）互相独立：workspace_id 决定能力天花板，path 只是落盘目录。
+   * 与 project_dir（磁盘目录）互相独立：workspace_id 决定能力天花板，path 只是落盘目录。
    */
   workspace_id?: string;
   message_count: number;
@@ -113,7 +113,7 @@ export interface Session {
 export interface CreateSessionRequest {
   title?: string;
   model_ref?: string;
-  workspace_path?: string;
+  project_dir?: string;
   /** 归属项目；非空且未传 access_mode 时，服务端按项目默认控制权限快照继承 */
   project_id?: string;
   /** 可选显式覆盖（confirm|full）；留空 = 走项目默认权限继承 */

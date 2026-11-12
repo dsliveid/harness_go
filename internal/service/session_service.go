@@ -35,10 +35,11 @@ func (s *SessionService) SetDeletedHook(fn func(ctx context.Context, sessionID s
 //
 // ProjectID 非空表示会话归属某项目；AccessMode 留空即走「项目默认权限继承」。
 type CreateSessionInput struct {
-	Title         string
-	ModelRef      string
-	WorkspacePath string
-	ProjectID     string
+	Title    string
+	ModelRef string
+	// ProjectDir 项目目录（磁盘落盘路径）。原名 WorkspacePath（0013 更名）。
+	ProjectDir string
+	ProjectID  string
 	// WorkspaceID 会话所属执行面（协议 §3.3）：空 = 纯对话（不允许工具）。
 	// 能力天花板由它所指 Workspace 的 kind 决定，是权限判定的唯一依据。
 	WorkspaceID string
@@ -52,7 +53,7 @@ type CreateSessionInput struct {
 //   - ProjectID 非空且 WorkspaceID 为空 → 从项目的 workspace_id 继承（缺省归属）；
 //   - 两者都空 → 纯对话，能力天花板为「仅对话」（由 run_service.resolveToolPolicy 判定）。
 //
-// 术语：WorkspaceID = 工作空间（执行面）；WorkspacePath = **项目目录**（磁盘落盘路径）。
+// 术语：WorkspaceID = 工作空间（执行面）；ProjectDir = **项目目录**（磁盘落盘路径，原名 WorkspacePath）。
 // 二者无关，权威定义见 docs/术语表-工作空间与项目目录.md。
 //
 // AccessMode 裁决链（顺序即优先级）：
@@ -115,7 +116,7 @@ func (s *SessionService) Create(ctx context.Context, in CreateSessionInput) (*mo
 		ID:            newID(),
 		Title:         in.Title,
 		ModelRef:      in.ModelRef,
-		WorkspacePath: in.WorkspacePath,
+		ProjectDir:    in.ProjectDir,
 		ProjectID:     strings.TrimSpace(in.ProjectID),
 		WorkspaceID:   wsID,
 		AccessMode:    mode,

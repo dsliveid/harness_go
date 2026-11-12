@@ -85,10 +85,10 @@ type handlers struct {
 type createSessionReq struct {
 	Title    string `json:"title"`
 	ModelRef string `json:"model_ref"`
-	// WorkspacePath 是**项目目录**（磁盘落盘路径），不是工作空间！
-	// 与 WorkspaceID（执行面归属）完全无关，仅命名同带 Workspace 前缀。
+	// ProjectDir 是**项目目录**（磁盘落盘路径），不是工作空间！
+	// 原名 WorkspacePath（术语治理 0013 更名）；与 WorkspaceID（执行面归属）完全无关。
 	// 术语定义见 docs/术语表-工作空间与项目目录.md。
-	WorkspacePath string `json:"workspace_path"`
+	ProjectDir string `json:"project_dir"`
 	// ProjectID 归属项目；非空且未显式传 access_mode 时，服务端按项目默认控制权限快照继承。
 	ProjectID string `json:"project_id"`
 	// WorkspaceID 会话所属**工作空间**（执行面，协议 §3.3）：空 = 纯对话（不允许工具）。
@@ -119,23 +119,24 @@ func (h *handlers) createSession(w http.ResponseWriter, r *http.Request) {
 	// 能力天花板前置约束（协议 §4.1）：移动端 WebView 会话不得创建带执行面的会话。
 	//
 	// 用令牌 kind 判定，不用请求体自报（自报可伪造）。webview 会话能做的只有对话：
-	// 强制清空 project_id / workspace_path，并锁 access_mode=confirm，双保险防提权。
+	// 强制清空 project_id / project_dir，并锁 access_mode=confirm，双保险防提权。
 	//
-	// 🚨 注意：这里清空的 workspace_path 是**项目目录**（磁盘落盘路径），
+	// 🚨 注意：这里清空的 project_dir 是**项目目录**（磁盘落盘路径），
 	// **不是** WorkspaceID（工作空间/执行面归属）——req.WorkspaceID 不在此处被清空。
-	// 二者仅命名同带 Workspace 前缀，语义完全无关，详见 docs/术语表-工作空间与项目目录.md。
+	// 二者语义完全无关，历史上前者名为 workspace_path 曾导致误判，
+	// 详见 docs/术语表-工作空间与项目目录.md。
 	//
 	// 注：这是「端侧自律 + 服务端兜底」的组合。真正不可绕过的是 run_service.resolveToolPolicy
 	// ——即便有人绕过此处建了 mobile 工作空间的会话，能力判定仍会按 kind=mobile 拒绝工具。
 	if h.currentTokenKind(r) == tokenKindWebview {
 		req.ProjectID = ""
-		req.WorkspacePath = ""
+		req.ProjectDir = ""
 		req.AccessMode = "confirm"
 	}
 	sess, err := h.d.Sessions.Create(r.Context(), service.CreateSessionInput{
 		Title:         req.Title,
 		ModelRef:      req.ModelRef,
-		WorkspacePath: req.WorkspacePath,
+		ProjectDir:    req.ProjectDir,
 		ProjectID:     req.ProjectID,
 		WorkspaceID:   req.WorkspaceID,
 		AccessMode:    req.AccessMode,

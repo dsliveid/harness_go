@@ -219,7 +219,7 @@ func (r *ChildRunner) Spawn(ctx context.Context, req toolapi.SpawnRequest) (tool
 	// 工作区事实与父 Run 同口径注入（子 Run 同样不许幻觉目录）。
 	wsPath := ""
 	if sess != nil {
-		wsPath = sess.WorkspacePath
+		wsPath = sess.ProjectDir
 	}
 	// 核心 SOP（agent-core）动态源：与父 Run 同口径，子 Run 亦须感知最新规则。
 	basePrompt := r.opts.SystemBase

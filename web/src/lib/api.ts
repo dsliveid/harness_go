@@ -1,4 +1,4 @@
-/**
+﻿/**
  * 统一数据访问层。
  *
  * 存在意义：让 UI 只依赖一层「同签名」的 ApiClient，不直接拼 HTTP 细节。
@@ -199,7 +199,7 @@ export interface AttachRunOptions {
 export interface CreateSessionInput {
   title?: string
   modelRef?: string
-  workspacePath?: string
+  projectDir?: string
   /**
    * 归属工作空间（执行面）ID。决定会话的能力天花板（能否执行命令/写文件）。
    * 留空 = 纯对话；服务端会从 projectId 继承，未继承到则为空。
@@ -663,9 +663,9 @@ export function toUiSession(s: ApiSession): Session {
     id: s.id,
     title: s.title,
     projectId: s.project_id || undefined,
-    // 执行面归属：服务端权威字段，前端不再靠 workspace_path 反查猜测。
+    // 执行面归属：服务端权威字段，前端不再靠 project_dir 反查猜测。
     workspaceId: s.workspace_id || undefined,
-    workspacePath: s.workspace_path || undefined,
+    projectDir: s.project_dir || undefined,
     accessMode: toAccessMode(s.access_mode),
     modelRef: s.model_ref,
     updatedAt: s.updated_at,
@@ -1072,7 +1072,7 @@ export const realApi: ApiClient = {
     const body: Record<string, unknown> = {
       title: input.title,
       model_ref: input.modelRef,
-      workspace_path: input.workspacePath,
+      project_dir: input.projectDir,
     }
     if (input.projectId) body.project_id = input.projectId
     // workspace_id 决定能力天花板：必须显式发送，否则会话落入「纯对话」失去执行面归属。

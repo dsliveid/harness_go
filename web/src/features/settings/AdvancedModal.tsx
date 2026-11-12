@@ -1,4 +1,4 @@
-import { Archive, Database, Palette, MonitorSmartphone, Blocks } from 'lucide-react'
+﻿import { Archive, Database, Palette, MonitorSmartphone, Blocks } from 'lucide-react'
 import { useUI } from '../../stores/uiStore'
 import { useSessions } from '../../stores/sessionStore'
 import { Button, Empty, Modal, Tabs } from '../../components/ui'
@@ -65,7 +65,7 @@ export function AdvancedModal() {
                       <div className="min-w-0 flex-1">
                         <div className="text-[13px] font-medium text-ink truncate">{s.title}</div>
                         <div className="text-[11px] text-inkfaint mt-0.5">
-                          归档于 {new Date(s.archivedAt ?? 0).toLocaleDateString('zh-CN')} · {s.workspacePath || '纯对话'}
+                          归档于 {new Date(s.archivedAt ?? 0).toLocaleDateString('zh-CN')} · {s.projectDir || '纯对话'}
                         </div>
                       </div>
                       <Button

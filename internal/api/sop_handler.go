@@ -100,7 +100,7 @@ func (h *handlers) getSOPEffective(w http.ResponseWriter, r *http.Request) {
 			writeError(w, r, err)
 			return
 		}
-		wsPath = sess.WorkspacePath
+		wsPath = sess.ProjectDir
 	}
 	// 基础提示取当前生效的核心 SOP（未装配时为空串，预览仍可返回条目部分）。
 	base := h.d.SOP.CoreText()

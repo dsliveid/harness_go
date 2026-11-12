@@ -1,4 +1,4 @@
-// ============ 基础枚举 ============
+﻿// ============ 基础枚举 ============
 export type Role = 'system' | 'user' | 'assistant' | 'tool'
 export type RunStatus = 'pending' | 'running' | 'waiting_approval' | 'completed' | 'failed' | 'cancelled' | 'interrupted'
 export type Risk = 'readonly' | 'write' | 'command' | 'danger'
@@ -87,7 +87,7 @@ export interface Session {
   projectId?: string
   /** 归属工作空间（缺省按 project 推导，纯对话缺省为内置服务端空间） */
   workspaceId?: string
-  workspacePath?: string
+  projectDir?: string
   accessMode: AccessMode
   modelRef: string
   updatedAt: number

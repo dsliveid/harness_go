@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+﻿import { useEffect, useRef, useState } from 'react'
 import { PanelLeft, PanelLeftClose, Lock, Unlock, Moon, Sun, Settings, Bot, ChevronDown, Folder, LogOut, KeyRound } from 'lucide-react'
 import { useSessions } from '../stores/sessionStore'
 import { useUI } from '../stores/uiStore'
@@ -85,7 +85,7 @@ export function TopBar() {
             )}
             <span className="shrink-0 opacity-40">·</span>
             <Folder size={10} className="shrink-0 opacity-70" />
-            <span className="truncate">{s.workspacePath || '纯对话 · 未绑定工作区'}</span>
+            <span className="truncate">{s.projectDir || '纯对话 · 未绑定工作区'}</span>
           </div>
         )}
       </div>

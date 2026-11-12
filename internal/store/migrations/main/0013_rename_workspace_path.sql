@@ -1,0 +1,25 @@
+-- 主库 0013：sessions.workspace_path 改名 project_dir（术语治理）
+-- 铁律：已发布的迁移文件永不修改，只能追加新文件。故 0001_init.sql 保持原样。
+
+-- 背景（为什么要改名）：
+--   sessions 表有两个都带 workspace 前缀、语义却完全无关的列：
+--     - workspace_id   → 工作空间（执行面，对应一台设备），决定能力天花板
+--     - workspace_path → 【项目目录】（磁盘落盘路径），决定工具在哪个目录执行
+--
+--   命名撞车已经造成过真实事故：2026-11-12 的需求评审中，据「WebView 会话强制
+--   清空 workspace_path」推断出「工作空间必填会打崩移动端」，并作为硬冲突上报。
+--   实际清空的是项目目录，与工作空间无关，该冲突并不存在。
+--
+--   注释能解释语义，但救不了误导性的命名。故把本项目目录列更名为 project_dir，
+--   让字段名自解释。权威术语定义见 docs/术语表-工作空间与项目目录.md。
+--
+-- 兼容性：
+--   1. SQLite RENAME COLUMN 自 3.25.0 起支持，本仓 modernc.org/sqlite v1.61.0
+--      对应 SQLite 3.4x，满足要求；
+--   2. RENAME COLUMN 会自动重建引用该列的对象（若存在索引/视图），无需手改；
+--   3. 列数据与顺序保持不变，仅改名，不涉及数据搬迁。
+--
+-- 破坏性变更（需三端同步）：
+--   API 对外 JSON 键 workspace_path → project_dir。本仓 web 前端已同步；
+--   移动端 harness_mobile / 桌面端 harness_desktop 为关联项目，需各自跟进。
+ALTER TABLE sessions RENAME COLUMN workspace_path TO project_dir;
