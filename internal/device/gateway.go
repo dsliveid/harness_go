@@ -59,6 +59,11 @@ type GatewayOptions struct {
 
 	// Handler 上行帧处理器（C-4 任务族；nil 时任务族帧回 device.task_unsupported）。
 	Handler FrameHandler
+	// PathQuery 目录列举 RPC（L1；nil 时 fs.list.result 帧按「无等待者」静默丢弃）。
+	//
+	// 之所以走独立字段而不并入 Handler：目录列举刻意**不**复用任务族链路
+	// （不落 tool_event、不参与 dispatcher 幂等缓存），见 pathquery.go 头注释。
+	PathQuery *PathQuery
 	// PendingCount 待派发任务数（填充 pong.pending；nil 恒 0）。
 	PendingCount func(deviceID string) int
 	// AcceptOptions 覆盖 WS 升级参数（测试用）。
@@ -73,6 +78,7 @@ type Gateway struct {
 	heartbeat    time.Duration
 	offlineAfter time.Duration
 	handler      FrameHandler
+	pathQuery    *PathQuery
 	pendingCount func(deviceID string) int
 	acceptOpts   *websocket.AcceptOptions
 
@@ -101,6 +107,7 @@ func NewGateway(opts GatewayOptions) *Gateway {
 		heartbeat:    hb,
 		offlineAfter: offline,
 		handler:      opts.Handler,
+		pathQuery:    opts.PathQuery,
 		pendingCount: opts.PendingCount,
 		acceptOpts:   opts.AcceptOptions,
 		now:          time.Now,
@@ -333,6 +340,24 @@ func (g *Gateway) handleFrame(c *Conn, env Envelope) (fatal bool, err error) {
 		return g.handler(context.Background(), c, env)
 
 	case MsgTaskDispatch, MsgLeaseRevoked:
+		// 服→端方向的帧被端侧上行发送 → 协议误用
+		return false, apperr.New(apperr.CodeInternal, "该帧类型不应由端侧发送")
+
+	case MsgFsListResult:
+		// 目录列举应答：按 req_id 配对投递给等待者。
+		//
+		// 无等待者是**正常**情况（请求已 3s 超时被清理，端侧迟到应答）——
+		// 用户快速翻目录时这会频繁发生，绝不能记 warn 刷日志。
+		var res FsListResultPayload
+		if dErr := env.Decode(&res); dErr != nil {
+			return false, dErr
+		}
+		if g.pathQuery != nil {
+			g.pathQuery.Deliver(env.ID, res)
+		}
+		return false, nil
+
+	case MsgFsList:
 		// 服→端方向的帧被端侧上行发送 → 协议误用
 		return false, apperr.New(apperr.CodeInternal, "该帧类型不应由端侧发送")
 

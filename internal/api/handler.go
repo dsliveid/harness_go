@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"log/slog"
@@ -14,6 +15,7 @@ import (
 	"harness-go/internal/device"
 	"harness-go/internal/events"
 	"harness-go/internal/logvault"
+	"harness-go/internal/model"
 	"harness-go/internal/service"
 )
 
@@ -61,6 +63,12 @@ type Deps struct {
 	// 由 cmd 注入（HARNESS_FS_ROOTS + 数据目录兜底，均已 Abs）。为空表示**拒绝列举**
 	// （失败即关闭，绝不放行全盘）。docs/工作区宿主与目录选择对接约定.md §4
 	FSRoots []string
+	// Hub 设备在线判定（L1 客户端宿主目录列举用；nil 表示设备域未启用）。
+	Hub interface{ Online(deviceID string) bool }
+	// PathQuery 客户端宿主目录列举 RPC（nil 时 device:<id> 明确报错，不回落本地）。
+	PathQuery *device.PathQuery
+	// DeviceCapabilities 查询设备已申报能力（nil 时跳过能力协商，靠派发超时兜底）。
+	DeviceCapabilities func(ctx context.Context, deviceID string) ([]model.Capability, error)
 	// DeviceWS 设备长连接网关（阶段 C-3；nil 时 /devices/ws 返回 503 device.disabled）
 	DeviceWS http.Handler
 	// DeviceState 设备状态广播总线（nil 时 /devices/events 返回 503 device.disabled）。

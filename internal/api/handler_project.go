@@ -51,6 +51,20 @@ func (h *handlers) createProject(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, projectsUnavailableErr())
 		return
 	}
+	// 移动端 WebView 不得创建项目（2026-11 产品决策：移动端只做纯对话）。
+	//
+	// 🚨 这里必须是**服务端**强制，不能只靠前端 `mobileCapabilities.createProject`
+	// 隐藏按钮 —— 前端声明可被任意脚本篡改，只是 UX 提示层（见 mobileCapabilities.ts
+	// 文件头「铁律二：不是安全边界」）。真正守住这条线的是本函数。
+	//
+	// 用令牌 kind 判定（`currentTokenKind`），与 createSession 的能力天花板约束
+	// 同一口径 —— 两处若各写一套判定，必然在后续演进中漂移，出现「会话禁了但项目没禁」
+	// 这种半开口子。
+	if h.currentTokenKind(r) == tokenKindWebview {
+		writeError(w, r, apperr.New(apperr.CodeForbidden,
+			"移动端不支持创建项目，请到电脑端操作"))
+		return
+	}
 	var req createProjectReq
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, r, err)

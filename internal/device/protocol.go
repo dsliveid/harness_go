@@ -50,6 +50,15 @@ const (
 	MsgTaskResult MessageType = "task.result"
 	// MsgLeaseRevoked 服→端：会话租约被其他端抢占（C-6）。
 	MsgLeaseRevoked MessageType = "lease.revoked"
+	// MsgFsList 服→端：目录列举请求（L1，工作区宿主目录选择）。
+	//
+	// 🚨 刻意**不**复用 task.dispatch：TaskRequest.TaskID/ToolEventID 是工具事件的
+	// 幂等键（落库主键），而目录浏览是高频、非审计操作；走 task 链路会让每次点开
+	// 目录都产生一条 tool_event，污染审计列表与日志统计，且会冲掉 dispatcher
+	// 只保留 256 条/5 分钟的幂等缓存。见 docs/工作区宿主与目录选择对接约定.md §3.4。
+	MsgFsList MessageType = "fs.list"
+	// MsgFsListResult 端→服：目录列举结果（L1）。
+	MsgFsListResult MessageType = "fs.list.result"
 )
 
 // 帧级错误码（信封 error.payload.code，与 apperr 的对外错误码区分：
@@ -86,7 +95,8 @@ func (t MessageType) IsTaskFrame() bool {
 func (t MessageType) Valid() bool {
 	switch t {
 	case MsgHello, MsgWelcome, MsgPing, MsgPong, MsgError,
-		MsgTaskDispatch, MsgTaskProgress, MsgTaskResult, MsgLeaseRevoked:
+		MsgTaskDispatch, MsgTaskProgress, MsgTaskResult, MsgLeaseRevoked,
+		MsgFsList, MsgFsListResult:
 		return true
 	}
 	return false
@@ -228,6 +238,47 @@ type ErrorPayload struct {
 	Message string `json:"message,omitempty"`
 	// Fatal 为 true 时服务端在写出本帧后关闭连接。
 	Fatal bool `json:"fatal,omitempty"`
+}
+
+// FsListPayload 目录列举请求（服→端，L1）。
+//
+// Path 为空串表示「未定位」：端侧应只返回 roots（盘符/挂载点/已声明的白名单根），
+// 让用户从根开始浏览（对齐 fs_handler.go 的服务端语义与前端 DirectoryPicker）。
+type FsListPayload struct {
+	Path      string `json:"path"`
+	WithRoots bool   `json:"with_roots,omitempty"`
+}
+
+// FsDirEntry 一个目录项。
+//
+// 只有 name 与 path，**刻意不含任何文件元数据**：这是目录选择器，不是文件浏览器，
+// 多一个字段就会诱使前端把浏览动作升级成枚举动作（见对接约定 §3.3 第 1、2 条）。
+type FsDirEntry struct {
+	Name string `json:"name"`
+	Path string `json:"path"`
+}
+
+// FsListResultPayload 目录列举结果（端→服，L1）。
+//
+// 字段与 web/src/lib/workspaceHost.ts 的 DirListing 逐字对齐，
+// 也对应桌面端 hd-core/src/executor/fs.rs 的 DirListing。
+type FsListResultPayload struct {
+	// Path 当前目录绝对路径（宿主本机口径）；空串 = 未定位（只有 roots）
+	Path string `json:"path"`
+	// Parent 上级目录；null 表示已在白名单根层级，**绝不返回 ".."**
+	Parent *string `json:"parent"`
+	// Separator 宿主路径分隔符（Windows `\`，POSIX `/`），前端据此切面包屑
+	Separator string `json:"separator"`
+	// Roots 可选根（仅在 Path 为空时给出）
+	Roots []FsDirEntry `json:"roots,omitempty"`
+	// Dirs 子目录（只含目录，永不含文件）
+	Dirs []FsDirEntry `json:"dirs"`
+	// Truncated 目录项过多被截断
+	Truncated bool `json:"truncated,omitempty"`
+	// Error 端侧拒绝/失败原因（非空表示本次列举失败，Code 用于映射对外错误码）
+	Error string `json:"error,omitempty"`
+	// Code 端侧错误码（如 path_denied / path_not_found），服务端据此映射 apperr
+	Code string `json:"code,omitempty"`
 }
 
 // TaskDispatchPayload 任务派发（C-4；形状在 A 阶段已冻结）。

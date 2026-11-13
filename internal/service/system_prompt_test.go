@@ -5,42 +5,70 @@ import (
 	"testing"
 )
 
-// TestComposeSystemBaseUnbound 未绑定工作区：必须明确声明纯对话，
-// 且不得出现「运行在用户的工作区内」这类与实际绑定状态矛盾的断言。
+// ============ SystemBase 工作区事实注入（提示词与执行根对齐）============
+//
+// 背景（2026-11 修正）：此前对已绑定会话无条件断言「文件工具相对路径以 project_dir
+// 为根」，但工具实际以进程启动目录为根。当 project_dir ≠ workDir 时，这句话是**假的**，
+// 模型会基于错误前提在错误目录里读写 —— 属于最隐蔽的一类缺陷（不报错、结果错）。
+//
+// 现在执行根已真正跟随 project_dir（execution_root.go + WithWorkspaceRoot），
+// 因此本组测试既要锁住「文案与真实行为一致」，也要锁住「未绑定时不得谎称已绑定」。
+
+// ① 已绑定且与进程目录不同 → 明确声明执行根 + 澄清两者区别。
+func TestComposeSystemBaseBoundDifferentFromWorkDir(t *testing.T) {
+	out := ComposeSystemBase("BASE", `F:\proj\demo`, `F:\WorkSpace\Other\harness_go`)
+
+	if !strings.Contains(out, `F:\proj\demo`) {
+		t.Fatalf("必须声明本会话工作区路径，实际: %s", out)
+	}
+	if !strings.Contains(out, "所有文件工具的相对路径都以该目录为根") {
+		t.Fatalf("必须如实声明执行根口径，实际: %s", out)
+	}
+	if !strings.Contains(out, "与本会话工作区无关") {
+		t.Fatalf("工作区与进程目录不同时必须澄清，避免模型混淆，实际: %s", out)
+	}
+	if !strings.HasPrefix(out, "BASE") {
+		t.Fatalf("基础提示必须被保留在开头，实际: %s", out)
+	}
+}
+
+// ② 已绑定且两者相同 → 不应出现多余的澄清（避免提示词噪音）。
+func TestComposeSystemBaseBoundSameAsWorkDir(t *testing.T) {
+	out := ComposeSystemBase("", `F:\proj`, `F:\proj`)
+	if strings.Contains(out, "与本会话工作区无关") {
+		t.Fatalf("两者相同时不应附加澄清，实际: %s", out)
+	}
+	if !strings.Contains(out, `F:\proj`) {
+		t.Fatalf("仍必须声明工作区路径，实际: %s", out)
+	}
+}
+
+// ③ 未绑定（纯对话）→ 必须声明纯对话，且不得声称已在项目目录内。
 func TestComposeSystemBaseUnbound(t *testing.T) {
-	base := "你是编码助手。"
-	got := ComposeSystemBase(base, "", `D:\WorkSpace\Project\harness_go`)
+	out := ComposeSystemBase("", "", `F:\WorkSpace\Other\harness_go`)
 
-	if !strings.HasPrefix(got, base) {
-		t.Fatalf("基础提示应保持在前缀，得到: %q", got)
+	if !strings.Contains(out, "未绑定工作区") {
+		t.Fatalf("未绑定时必须明确声明，实际: %s", out)
 	}
-	if !strings.Contains(got, "未绑定工作区") {
-		t.Fatalf("未绑定会话必须显式声明未绑定工作区，得到: %q", got)
+	if strings.Contains(out, "所有文件工具的相对路径都以该目录为根") {
+		t.Fatalf("未绑定时不得声明会话执行根，实际: %s", out)
 	}
-	if strings.Contains(got, "运行在用户的工作区内") {
-		t.Fatalf("未绑定会话不得声称运行在用户工作区内，得到: %q", got)
-	}
-	// 进程目录如实披露（作为工具落盘边界），但不能冒充用户绑定目录
-	if !strings.Contains(got, "harness_go") {
-		t.Fatalf("应如实披露工具落盘的服务端目录，得到: %q", got)
-	}
-	if !strings.Contains(got, "不是用户指定的工作区") {
-		t.Fatalf("披露进程目录时必须声明它不是用户工作区，得到: %q", got)
+	if !strings.Contains(out, `F:\WorkSpace\Other\harness_go`) {
+		t.Fatalf("未绑定时应披露进程目录作为兜底边界，实际: %s", out)
 	}
 }
 
-// TestComposeSystemBaseBound 已绑定工作区：声明真实目录并给出相对路径根口径。
-func TestComposeSystemBaseBound(t *testing.T) {
-	got := ComposeSystemBase("你是编码助手。", `D:\WorkSpace\Project\harness_mini`, "")
-	if !strings.Contains(got, "已绑定工作区") || !strings.Contains(got, "harness_mini") {
-		t.Fatalf("已绑定会话必须声明真实目录，得到: %q", got)
-	}
-	if strings.Contains(got, "未绑定工作区") {
-		t.Fatalf("已绑定会话不得出现未绑定声明，得到: %q", got)
+// ④ 空白路径等同未绑定（防 " " 被当成已绑定）。
+func TestComposeSystemBaseBlankIsUnbound(t *testing.T) {
+	out := ComposeSystemBase("", "   ", "")
+	if !strings.Contains(out, "未绑定工作区") {
+		t.Fatalf("空白路径应视为未绑定，实际: %s", out)
 	}
 }
 
-// TestComposeSystemBaseTrim 空基础提示 + 空白工作区：只输出工作区段落，不留前导空行。
+// ⑥ 空白基础提示 + 空白工作区：只输出工作区段落，不留前导空行。
+//
+// 对应改造前的 TestComposeSystemBaseTrim（行为契约不变）。
 func TestComposeSystemBaseTrim(t *testing.T) {
 	got := ComposeSystemBase("   ", "   ", "")
 	if strings.HasPrefix(got, "\n") {
@@ -48,5 +76,13 @@ func TestComposeSystemBaseTrim(t *testing.T) {
 	}
 	if !strings.Contains(got, "未绑定工作区") {
 		t.Fatalf("空白工作区按未绑定处理，得到: %q", got)
+	}
+}
+
+// ⑤ 基础提示为空时不得以换行开头（避免拼进 system prompt 后出现空行噪音）。
+func TestComposeSystemBaseEmptyBaseNoLeadingNewline(t *testing.T) {
+	out := ComposeSystemBase("", `F:\p`, "")
+	if strings.HasPrefix(out, "\n") {
+		t.Fatalf("输出不得以换行开头，实际: %q", out[:10])
 	}
 }

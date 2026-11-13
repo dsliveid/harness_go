@@ -64,8 +64,20 @@ export function hostOfWorkspace(ws: Workspace | undefined | null): HostID {
 }
 
 /**
- * 宿主能力状态。L0 阶段：device 宿主一律不可列举（服务端尚未实现派发，
- * 见对接约定 §5 L1），如实置灰而不是打开后报错。
+ * 宿主能力状态（按**工作空间 kind** 精确区分，不按客户端形态）。
+ *
+ * 2026-11 产品决策：
+ *  - `mobile` 工作空间：**不做目录浏览**。App 沙箱根没有浏览价值，且移动端
+ *    WebView 里根本拿不到本机文件系统，因此移动端空间一律置灰。
+ *  - `desktop` 工作空间：**已支持**。桌面端在 hello/ping 中申报了 `fs.list`，
+ *    服务端 `device:<id>` 可真实派发（见 internal/device/pathquery.go）。
+ *  - `server` 内置空间：服务端本地列举（L0）。
+ *
+ * ⚠️ 为什么不在此处探测设备是否真的申报了能力：
+ * 前端无法在渲染期同步得知（要额外打请求且结果会随设备重连抖动）。这里按 kind
+ * 给出**保守但可用**的判断，真正的能力闸门是服务端的 `fsDispatchDevice`
+ * ——未申报能力的设备（例如还没升级的旧桌面端）会被它拦成 `fs.host_unsupported`，
+ * 前端再把该错误如实展示即可。
  */
 export function hostStatus(ws: Workspace | undefined | null): HostStatus {
   const id = hostOfWorkspace(ws)
@@ -73,14 +85,48 @@ export function hostStatus(ws: Workspace | undefined | null): HostStatus {
     return { id, online: true, canList: true }
   }
   const online = !!ws?.online
+  // 移动端工作空间：产品决策明确不支持目录浏览。
+  if (ws?.kind === 'mobile') {
+    return {
+      id,
+      online,
+      canList: false,
+      reason: '移动端工作空间支持纯对话，不支持浏览或指定目录',
+    }
+  }
+  // 桌面端工作空间：服务端已支持派发。
+  if (ws?.kind === 'desktop') {
+    return {
+      id,
+      online,
+      canList: online,
+      reason: online ? undefined : '该工作区离线，无法列举其目录',
+    }
+  }
+  // 其余 kind（如 browser）：尚无列举实现，如实置灰。
   return {
     id,
     online,
     canList: false,
     reason: online
-      ? '该工作区暂不支持目录列举，请手动填写路径'
+      ? '该客户端工作区暂不支持目录浏览，请手动填写路径'
       : '该工作区离线，无法列举其目录',
   }
+}
+
+/**
+ * 能否在当前工作空间新建项目。
+ *
+ * 2026-11 产品决策：**移动端工作空间只支持纯对话，不支持添加项目**。
+ *
+ * 🚨 这是前端 UX 层面的一道闸，不是安全边界。服务端另有两道真强制：
+ *  1. `createProject` 按令牌 kind 拒绝 webview（移动端 WebView 会话）；
+ *  2. `resolveToolPolicy` 对 `kind=mobile` 的空间返回零工具。
+ * 本函数只负责"别让用户点一个注定失败的按钮"。
+ */
+export function canCreateProjectIn(ws: Workspace | undefined | null): boolean {
+  if (!ws) return true
+  return ws.kind !== 'mobile'
 }
 
 /* ============ 调用 ============ */

@@ -174,16 +174,47 @@ func (h *Host) SetBundles(b toolapi.BundleStore) { h.opts.Bundles = b }
 
 // ============ Workspace（沙箱实现） ============
 
+// workspace 受沙箱约束的文件访问实现。
+//
+// 双根设计（2026-11 目录选择放开）：
+//   - root：**进程级默认根**（main.go 注入的启动目录）。无 ctx 根时一律用它，
+//     保证所有既有调用点（未接会话上下文的测试、后台任务）行为完全不变；
+//   - ctx 根：由 tools.Runner 按会话 project_dir 注入（toolapi.WithWorkspaceRoot）。
+//     带 ctx 的方法优先采用它，从而让「用户选的目录」真正成为执行根。
+//
+// 🚨 安全铁律：无论用哪个根，绝对路径拒绝 + `..` 上跳拒绝 + 前缀归属校验三道
+// 防护必须原样保留。ctx 根只改变沙箱基准，绝不扩大授权范围。
 type workspace struct{ root string }
 
 // Root 实现 toolapi.Workspace。
+//
+// 注意：本方法无 ctx 参数，只能返回**进程级默认根**。需要会话根的场景请用
+// RootFor(ctx)（见 ContextWorkspace 接口），fs 插件的 glob/grep 已按此切换。
 func (w *workspace) Root() string { return w.root }
+
+// RootFor 返回本次调用实际生效的执行根（ctx 有会话根则用它，否则回落进程根）。
+func (w *workspace) RootFor(ctx context.Context) string {
+	if r, ok := toolapi.WorkspaceRootFrom(ctx); ok {
+		return r
+	}
+	return w.root
+}
 
 // Resolve 实现 toolapi.Workspace：拒绝绝对路径与越界路径。
 func (w *workspace) Resolve(rel string) (string, error) {
+	return w.resolveIn(w.root, rel)
+}
+
+// ResolveFor 同 Resolve，但按 ctx 会话根解析。
+func (w *workspace) ResolveFor(ctx context.Context, rel string) (string, error) {
+	return w.resolveIn(w.RootFor(ctx), rel)
+}
+
+// resolveIn 在有根 base 下解析 rel（三道沙箱防护的唯一实现）。
+func (w *workspace) resolveIn(base, rel string) (string, error) {
 	rel = strings.TrimSpace(rel)
 	if rel == "" || rel == "." {
-		return w.root, nil
+		return base, nil
 	}
 	if filepath.IsAbs(rel) {
 		return "", fmt.Errorf("%w: 不允许绝对路径 %q", toolapi.ErrInvalidArgs, rel)
@@ -192,17 +223,17 @@ func (w *workspace) Resolve(rel string) (string, error) {
 	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("%w: 路径越界 %q", toolapi.ErrInvalidArgs, rel)
 	}
-	abs := filepath.Join(w.root, clean)
-	rootWithSep := w.root + string(filepath.Separator)
-	if abs != w.root && !strings.HasPrefix(abs, rootWithSep) {
+	abs := filepath.Join(base, clean)
+	baseWithSep := base + string(filepath.Separator)
+	if abs != base && !strings.HasPrefix(abs, baseWithSep) {
 		return "", fmt.Errorf("%w: 路径越界 %q", toolapi.ErrInvalidArgs, rel)
 	}
 	return abs, nil
 }
 
 // ReadFile 实现 toolapi.Workspace。
-func (w *workspace) ReadFile(_ context.Context, rel string) ([]byte, error) {
-	abs, err := w.Resolve(rel)
+func (w *workspace) ReadFile(ctx context.Context, rel string) ([]byte, error) {
+	abs, err := w.ResolveFor(ctx, rel)
 	if err != nil {
 		return nil, err
 	}
@@ -210,8 +241,8 @@ func (w *workspace) ReadFile(_ context.Context, rel string) ([]byte, error) {
 }
 
 // WriteFile 实现 toolapi.Workspace。
-func (w *workspace) WriteFile(_ context.Context, rel string, data []byte, perm fs.FileMode) error {
-	abs, err := w.Resolve(rel)
+func (w *workspace) WriteFile(ctx context.Context, rel string, data []byte, perm fs.FileMode) error {
+	abs, err := w.ResolveFor(ctx, rel)
 	if err != nil {
 		return err
 	}
@@ -225,8 +256,8 @@ func (w *workspace) WriteFile(_ context.Context, rel string, data []byte, perm f
 }
 
 // List 实现 toolapi.Workspace。
-func (w *workspace) List(_ context.Context, rel string) ([]toolapi.Entry, error) {
-	abs, err := w.Resolve(rel)
+func (w *workspace) List(ctx context.Context, rel string) ([]toolapi.Entry, error) {
+	abs, err := w.ResolveFor(ctx, rel)
 	if err != nil {
 		return nil, err
 	}
@@ -252,8 +283,8 @@ func (w *workspace) List(_ context.Context, rel string) ([]toolapi.Entry, error)
 }
 
 // Stat 实现 toolapi.Workspace。
-func (w *workspace) Stat(_ context.Context, rel string) (toolapi.Entry, error) {
-	abs, err := w.Resolve(rel)
+func (w *workspace) Stat(ctx context.Context, rel string) (toolapi.Entry, error) {
+	abs, err := w.ResolveFor(ctx, rel)
 	if err != nil {
 		return toolapi.Entry{}, err
 	}
@@ -271,20 +302,21 @@ func (w *workspace) Stat(_ context.Context, rel string) (toolapi.Entry, error) {
 }
 
 // Remove 实现 toolapi.Workspace。
-func (w *workspace) Remove(_ context.Context, rel string) error {
-	abs, err := w.Resolve(rel)
+func (w *workspace) Remove(ctx context.Context, rel string) error {
+	base := w.RootFor(ctx)
+	abs, err := w.resolveIn(base, rel)
 	if err != nil {
 		return err
 	}
-	if abs == w.root {
+	if abs == base {
 		return fmt.Errorf("%w: 不允许删除工作区根", toolapi.ErrInvalidArgs)
 	}
 	return os.RemoveAll(abs)
 }
 
 // Exists 实现 toolapi.Workspace。
-func (w *workspace) Exists(_ context.Context, rel string) (bool, error) {
-	abs, err := w.Resolve(rel)
+func (w *workspace) Exists(ctx context.Context, rel string) (bool, error) {
+	abs, err := w.ResolveFor(ctx, rel)
 	if err != nil {
 		return false, err
 	}
@@ -297,6 +329,9 @@ func (w *workspace) Exists(_ context.Context, rel string) (bool, error) {
 	}
 	return false, sErr
 }
+
+// 编译期断言：支持 ctx 感知的执行根（供 fs 插件 glob/grep 使用）。
+var _ toolapi.ContextWorkspace = (*workspace)(nil)
 
 // ============ Config（只读视图） ============
 

@@ -66,6 +66,29 @@ type Workspace interface {
 	Exists(ctx context.Context, rel string) (bool, error)
 }
 
+// ContextWorkspace 可选能力：**ctx 感知的执行根**（2026-11 目录选择放开）。
+//
+// 背景：Workspace 的 Root()/Resolve() 都没有 ctx 参数，无法感知「本次调用属于
+// 哪个会话、该会话绑定了哪个项目目录」。而全局只有一个进程级根（启动目录），
+// 于是用户在下拉里选了 F:\Other\proj，工具实际仍在启动目录里读写。
+//
+// 解法：不改 Workspace（破坏性 ABI），而是声明这个**可选接口**；
+// 载体（hostimpl.workspace）实现它，需要会话根的插件用类型断言取用：
+//
+//	if cw, ok := host.Workspace().(toolapi.ContextWorkspace); ok {
+//	    root := cw.RootFor(ctx)          // 会话根，无 ctx 根时自动回落进程根
+//	}
+//
+// 🚨 刻意保持"可选"：任何只实现 Workspace 的桩（测试、第三方）依旧编译通过，
+// 断言失败时插件应回落 Root()，行为与改造前完全一致（渐进增强，非硬切换）。
+type ContextWorkspace interface {
+	Workspace
+	// RootFor 返回本次调用实际生效的执行根（ctx 有会话根则用它，否则进程根）。
+	RootFor(ctx context.Context) string
+	// ResolveFor 同 Resolve，但基于 ctx 会话根解析（沙箱防护与 Resolve 完全一致）。
+	ResolveFor(ctx context.Context, rel string) (string, error)
+}
+
 // CommandRequest 命令执行请求。
 type CommandRequest struct {
 	Cmd     string            `json:"cmd"`

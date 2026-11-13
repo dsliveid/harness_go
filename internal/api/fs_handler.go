@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -9,6 +10,8 @@ import (
 	"strings"
 
 	"harness-go/internal/apperr"
+	"harness-go/internal/device"
+	"harness-go/internal/model"
 )
 
 // ============ 文件系统（工作区宿主目录列举，L0 服务端宿主） ============
@@ -33,8 +36,10 @@ const (
 	fsMaxDirs = 500
 	// hostServer 服务端本地宿主标识
 	hostServer = "server"
-	// hostDevicePrefix 客户端宿主标识前缀（L1 预留）
+	// hostDevicePrefix 客户端宿主标识前缀（L1 已支持派发）
 	hostDevicePrefix = "device:"
+	// fsListCapability 客户端必须申报的能力名，否则不派发（对接约定 §7 C2）
+	fsListCapability = "fs.list"
 )
 
 // fsDirEntry 一个目录项（只含目录名与绝对路径，不含任何文件元数据）。
@@ -206,31 +211,120 @@ func fsRootsOf(roots []string) []fsDirEntry {
 
 // fsCheckHost 校验 host 参数的支持情况。
 //
-// 本期（L0）只支持 server：
-//   - host 为空 → 视为 server；
-//   - host=device:<id> → fs.host_unsupported（L1 待客户端就绪后改为真派发）。
+//   - host 为空或 "server" → 服务端本地列举（L0）；
+//   - host = "device:<id>" → 客户端宿主（L1）：本函数只做**格式**校验并返回 deviceID，
+//     真正的能力/在线判定由 fsDispatchDevice 完成（那里才能拿到 Deps）。
 //
-// ⚠️ 这里**绝不能**降级为服务端本地列举。
-func fsCheckHost(host string) (string, error) {
+// ⚠️ 历史：L1 未实现前这里对 device: 一律返回 fs.host_unsupported。现已改为
+// 真实派发，但**绝不**降级为服务端本地列举 —— 否则会把服务端目录列进客户端空间。
+func fsCheckHost(host string) (resolvedHost, deviceID string, err error) {
 	host = strings.TrimSpace(host)
 	if host == "" || host == hostServer {
-		return hostServer, nil
+		return hostServer, "", nil
 	}
 	if strings.HasPrefix(host, hostDevicePrefix) {
-		return "", apperr.New(apperr.CodeFSHostUnsupported, "该工作区暂不支持目录列举，请手动填写路径").WithDetails(map[string]any{
-			"host": host,
-		})
+		id := strings.TrimSpace(strings.TrimPrefix(host, hostDevicePrefix))
+		if id == "" {
+			// "device:" 后面没有设备 ID：配置错误，明确报错而不是猜一台设备。
+			return "", "", apperr.New(apperr.CodeFSHostUnsupported, "未指定设备 ID").WithDetails(map[string]any{
+				"host": host,
+			})
+		}
+		return host, id, nil
 	}
-	return "", apperr.New(apperr.CodeFSHostUnsupported, "未知的工作区宿主").WithDetails(map[string]any{
+	return "", "", apperr.New(apperr.CodeFSHostUnsupported, "未知的工作区宿主").WithDetails(map[string]any{
 		"host": host,
 	})
 }
 
+// fsDispatchDevice 向客户端宿主派发目录列举（L1）。
+//
+// 四道判定，顺序即优先级（任一不过就明确失败，**绝不**回落本地列举）：
+//  1. 设备域是否启用（PathQuery 未装配 → 405/409，诚实报错）；
+//  2. 设备是否在线（Hub 实时判定，不用库里的 status，避免陈旧状态骗人）；
+//  3. 设备是否申报 `fs.list` 能力（协议坑 1：在线 ≠ 有列举能力，直接派发会超时）；
+//  4. 派发并等 3s 应答（超时 → fs.host_timeout）。
+func (h *handlers) fsDispatchDevice(ctx context.Context, deviceID, path string) (*fsDirsResp, error) {
+	pq := h.d.PathQuery
+	if pq == nil {
+		return nil, apperr.New(apperr.CodeFSHostUnsupported,
+			"服务端未启用设备域，无法列举客户端目录，请手动填写路径")
+	}
+	if h.d.Hub == nil || !h.d.Hub.Online(deviceID) {
+		return nil, apperr.New(apperr.CodeFSHostOffline,
+			"该设备当前不在线，无法列举其目录").WithDetails(map[string]any{"device_id": deviceID})
+	}
+	// 能力协商：未申报 fs.list 的设备（例如还没升级的旧客户端）不能派发。
+	if h.d.DeviceCapabilities != nil {
+		caps, capErr := h.d.DeviceCapabilities(ctx, deviceID)
+		if capErr == nil && !hasFsListCapability(caps) {
+			return nil, apperr.New(apperr.CodeFSHostUnsupported,
+				"该设备未申报目录列举能力（fs.list），请升级客户端或手动填写路径").
+				WithDetails(map[string]any{"device_id": deviceID})
+		}
+		// capErr 不阻断：能力查询失败属于服务端内部问题，不能因此让用户无法选目录；
+		// 但此时仍由派发超时兜底（3s 内端侧没能力就会超时）。
+	}
+
+	res, err := pq.List(ctx, deviceID, path)
+	if err != nil {
+		return nil, err
+	}
+	return &fsDirsResp{
+		Host:      "device:" + deviceID,
+		Path:      res.Path,
+		Parent:    res.Parent,
+		Separator: res.Separator,
+		Roots:     fsConvertEntries(res.Roots),
+		Dirs:      fsConvertEntries(res.Dirs),
+		Truncated: res.Truncated,
+	}, nil
+}
+
+// fsConvertEntries 把端侧目录项转成对外 DTO。
+//
+// 端侧结果恒为 `untrusted`（对接约定 §4.6）：这里只透传 name/path 两个字段，
+// **不接受**端侧附加的任何额外元数据，避免未来端侧多传字段就顺带泄漏出去。
+func fsConvertEntries(in []device.FsDirEntry) []fsDirEntry {
+	out := make([]fsDirEntry, 0, len(in))
+	for _, e := range in {
+		out = append(out, fsDirEntry{Name: e.Name, Path: e.Path})
+	}
+	return out
+}
+
+// hasFsListCapability 判断能力列表里是否含 fs.list。
+//
+// 只认名字不看版本：目录列举的 v1 契约已冻结（只列目录），未来若升版也仍是
+// 兼容的扩展，没必要因版本号不同就把用户拒之门外。
+func hasFsListCapability(caps []model.Capability) bool {
+	for _, c := range caps {
+		if strings.TrimSpace(c.Name) == fsListCapability {
+			return true
+		}
+	}
+	return false
+}
+
 // listFSRoots GET /api/v1/fs/roots
 func (h *handlers) listFSRoots(w http.ResponseWriter, r *http.Request) {
-	host, err := fsCheckHost(r.URL.Query().Get("host"))
+	host, deviceID, err := fsCheckHost(r.URL.Query().Get("host"))
 	if err != nil {
 		writeError(w, r, err)
+		return
+	}
+	if deviceID != "" {
+		// 客户端宿主：roots 就是"未定位"的那次列举（path 为空）。
+		resp, dErr := h.fsDispatchDevice(r.Context(), deviceID, "")
+		if dErr != nil {
+			writeError(w, r, dErr)
+			return
+		}
+		writeJSON(w, http.StatusOK, fsRootsResp{
+			Host:      host,
+			Separator: resp.Separator,
+			Roots:     resp.Roots,
+		})
 		return
 	}
 	roots := h.fsAllowedRoots()
@@ -248,18 +342,29 @@ func (h *handlers) listFSRoots(w http.ResponseWriter, r *http.Request) {
 
 // listFSDirs GET /api/v1/fs/dirs
 func (h *handlers) listFSDirs(w http.ResponseWriter, r *http.Request) {
-	host, err := fsCheckHost(r.URL.Query().Get("host"))
+	host, deviceID, err := fsCheckHost(r.URL.Query().Get("host"))
 	if err != nil {
 		writeError(w, r, err)
 		return
 	}
+	raw := strings.TrimSpace(r.URL.Query().Get("path"))
+	if deviceID != "" {
+		// 客户端宿主：派发给设备，服务端不做任何本地列举（铁律 B）。
+		resp, dErr := h.fsDispatchDevice(r.Context(), deviceID, raw)
+		if dErr != nil {
+			writeError(w, r, dErr)
+			return
+		}
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+
 	roots := h.fsAllowedRoots()
 	if len(roots) == 0 {
 		writeError(w, r, apperr.New(apperr.CodeFSHostUnsupported, "服务端未配置可浏览的目录范围"))
 		return
 	}
 	sep := fsSeparator()
-	raw := strings.TrimSpace(r.URL.Query().Get("path"))
 	if raw == "" {
 		// 未指定路径：只回根列表，让前端从根开始浏览
 		writeJSON(w, http.StatusOK, fsDirsResp{

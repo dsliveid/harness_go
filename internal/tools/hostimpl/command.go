@@ -60,11 +60,17 @@ func (r *commandRunner) Run(ctx context.Context, req toolapi.CommandRequest) (to
 		timeout = MaxCommandTimeout
 	}
 	dir := strings.TrimSpace(req.Dir)
+	// 会话执行根优先（2026-11 目录选择放开）：ctx 无根时回落进程级 Root，
+	// 保证既有调用点行为不变。命令的 cmd.Dir 必须落在**生效根**之内。
+	root := r.opts.Root
+	if ctxRoot, ok := toolapi.WorkspaceRootFrom(ctx); ok {
+		root = ctxRoot
+	}
 	if dir == "" || dir == "." {
-		dir = r.opts.Root
+		dir = root
 	} else {
 		// 沙箱：相对路径必须落在工作区根内（与 Workspace.Resolve 同口径）
-		abs, err := resolveWithin(r.opts.Root, dir)
+		abs, err := resolveWithin(root, dir)
 		if err != nil {
 			return toolapi.CommandResult{}, err
 		}

@@ -291,10 +291,17 @@ func (s *WorkspaceService) view(ctx context.Context, w model.Workspace) Workspac
 		CanChat:   true,
 		ToolPolicy: string(agent.ToolPolicyFull),
 	}
-	// 内置服务端空间：它自身就是执行宿主，恒在线。
+	// 内置服务端空间：它自身就是执行宿主，恒在线（不依赖 device.Hub 的在线判定）。
+	//
+	// 🚨 这里必须**显式**置 Online = true：WorkspaceView 是值类型字面量初始化，
+	// 零值即 false。历史缺陷（2026-11）：注释写着「恒在线」但漏了这一行，于是
+	// 服务端明明在跑、接口也正常，前端拿到 online:false 后顶栏显示「离线」、
+	// 侧栏弹出「该工作空间离线，仅可查看历史对话」，把一个纯服务端空间误判成设备空间。
 	if w.ID == store.BuiltinWorkspaceServerID {
+		v.Online = true
 		if w.Kind == model.WorkspaceKindMobile {
-			v.ToolPolicy = string(agent.ToolPolicyReadonly)
+			// 移动端工作空间：仅纯对话（2026-11 产品决策收紧 → 零工具）。
+			v.ToolPolicy = string(agent.ToolPolicyNone)
 			v.PolicyReason = policyReasonMobile
 		}
 		return v
@@ -338,15 +345,22 @@ func (s *WorkspaceService) view(ctx context.Context, w model.Workspace) Workspac
 	v.DeviceStatus = string(dev.Status)
 	v.LastSeenAt = dev.LastSeenAt
 
+	// 移动端工作空间：仅纯对话（2026-11 产品决策收紧 → 零工具）。
+	//
+	// 🚨 必须放在「设备离线」判断**之前**：移动端本来就不提供工具，与设备是否
+	// 在线毫无关系。若放在后面，用户会看到「设备不在线，恢复在线后自动可用」，
+	// 于是等着设备上线 —— 但设备上线后依然零工具，属于无解的误导。
+	if w.Kind == model.WorkspaceKindMobile {
+		v.ToolPolicy = string(agent.ToolPolicyNone)
+		v.PolicyReason = policyReasonMobile
+		return v
+	}
+
 	// 设备存在且未解绑，但当前不在线 → 零工具（D3：绝不降级服务端本地执行）。
 	if !v.Online {
 		v.ToolPolicy = string(agent.ToolPolicyNone)
 		v.PolicyReason = policyReasonOffline
 		return v
-	}
-	if w.Kind == model.WorkspaceKindMobile {
-		v.ToolPolicy = string(agent.ToolPolicyReadonly)
-		v.PolicyReason = policyReasonMobile
 	}
 	return v
 }
@@ -357,7 +371,11 @@ const (
 	policyReasonDeviceMissing = "当前工作空间绑定的设备已删除，请重新绑定设备后再使用工具"
 	policyReasonDeviceRevoked = "当前工作空间绑定的设备已解绑，请重新绑定设备后再使用工具"
 	policyReasonOffline       = "当前工作空间的设备不在线，无法调用工具（设备恢复在线后自动可用）"
-	policyReasonMobile        = "当前为移动端，仅支持只读操作与对话"
+	// policyReasonMobile 移动端工作空间：纯对话（2026-11 产品决策）。
+	//
+	// 文案必须写「不提供工具能力」而不是旧的「仅支持只读操作」：策略已从 readonly
+	// 收紧为 none，若文案还说"可以只读"，用户会以为能读文件却全部失败。
+	policyReasonMobile      = "移动端仅支持纯对话，不提供任何工具能力（请在电脑端使用工具）"
 	policyReasonNoWorkspace   = "当前会话未绑定执行空间，仅支持只读操作与对话"
 	// policyReasonPureChat 纯对话（绑服务端空间但无项目）——R1b。
 	// 与 NoWorkspace 的区别：那条是「没有归属」（历史/异常态），本条是「有意为之的纯对话」。

@@ -240,7 +240,8 @@ func (s *RunService) resolveToolPolicy(ctx context.Context, sess *model.Session)
 	// 内置服务端空间：恒在线（它就是服务端自身），不参与设备在线判定。
 	if ws.ID == store.BuiltinWorkspaceServerID {
 		if ws.Kind == model.WorkspaceKindMobile {
-			return agent.ToolPolicyReadonly, policyReasonMobile
+			// 移动端工作空间：仅纯对话（2026-11 产品决策收紧）。
+			return agent.ToolPolicyNone, policyReasonMobile
 		}
 		// 【R1b 纯对话无工具调用】绑服务端空间但**无项目** = 纯对话。
 		//
@@ -268,11 +269,15 @@ func (s *RunService) resolveToolPolicy(ctx context.Context, sess *model.Session)
 	if dev.RevokedAt != nil {
 		return agent.ToolPolicyNone, policyReasonDeviceRevoked
 	}
+	// 移动端工作空间：仅纯对话（2026-11 产品决策收紧 → 零工具）。
+	//
+	// 与 workspace_service.view 的同一判断同理：必须在「离线」之前返回，
+	// 否则用户会为了"等设备上线"而白等（上线后依然零工具）。
+	if ws.Kind == model.WorkspaceKindMobile {
+		return agent.ToolPolicyNone, policyReasonMobile
+	}
 	if s.hub == nil || !s.hub.Online(ws.DeviceID) {
 		return agent.ToolPolicyNone, policyReasonOffline
-	}
-	if ws.Kind == model.WorkspaceKindMobile {
-		return agent.ToolPolicyReadonly, policyReasonMobile
 	}
 	return agent.ToolPolicyFull, ""
 }

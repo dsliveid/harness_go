@@ -11,7 +11,7 @@ import { Button, cn } from '../components/ui'
 import { PromptModal, type PromptField } from '../components/PromptModal'
 import { ProjectModal } from '../features/projects/ProjectModal'
 import { WorkspaceSwitcher } from '../components/WorkspaceSwitcher'
-import { hostStatus, hostOfWorkspace } from '../lib/workspaceHost'
+import { hostStatus, hostOfWorkspace, canCreateProjectIn } from '../lib/workspaceHost'
 import { canCreateProject } from '../lib/mobileCapabilities'
 
 interface MenuItem {
@@ -57,6 +57,9 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
   // L0 仅服务端宿主可列举；客户端宿主如实置灰并给出手填退路。
   const wsHostLabel = activeWs?.name ?? '服务端'
   const wsHost = hostStatus(activeWs)
+  // 移动端工作空间只支持纯对话，不提供「新建项目」入口（2026-11 产品决策）。
+  // 与壳能力声明（mobileCapabilities.createProject）取「与」：任一为 false 都不渲染。
+  const allowNewProject = canCreateProject() && canCreateProjectIn(activeWs)
   const wsProjects = projects.filter((p) => wsOfProject(p) === activeWorkspaceId)
   const active = sessions.filter(
     (s) => !s.archivedAt && wsOfSession(s, projects) === activeWorkspaceId,
@@ -196,7 +199,7 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
             {/* 新建项目入口：移动端壳声明 createProject=false 时不渲染（§4.3 能力声明）。
                 未注入声明（桌面端 / 浏览器）时为 true，渲染与改动前完全一致。
                 注意：这不是安全边界，服务端仍会独立校验（协议 §5.3）。 */}
-            {canCreateProject() && (
+            {allowNewProject && (
               <button
                 className="w-5 h-5 rounded hover:bg-panel2 flex items-center justify-center text-inkfaint hover:text-accent transition-colors"
                 title="新建项目"

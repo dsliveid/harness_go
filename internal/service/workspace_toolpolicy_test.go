@@ -219,16 +219,20 @@ func TestPolicyDeviceRevokedIsNone(t *testing.T) {
 	}
 }
 
-// 移动端在线 → readonly（可对话+只读，禁写禁命令）。
-func TestPolicyMobileOnlineIsReadonly(t *testing.T) {
+// 移动端在线 → none（2026-11 产品决策：移动端仅纯对话，零工具）。
+//
+// 历史口径是 readonly（可对话+只读）。收紧原因是产品明确定位移动端为
+// 「随时随地问答」，不做任何文件/命令操作；readonly 会让用户以为能读文件，
+// 实际处处受挫，反而不如直接不提供工具。
+func TestPolicyMobileOnlineIsNone(t *testing.T) {
 	env := newPolicyEnv(t)
 	env.addDevice(t, "dev-phone", model.DeviceKindMobile)
 	env.addWorkspace(t, "ws-phone", model.WorkspaceKindMobile, "dev-phone")
 	env.hub.online["dev-phone"] = true
 
 	p, reason := env.policy(t, "ws-phone")
-	if p != agent.ToolPolicyReadonly {
-		t.Fatalf("移动端空间应为 readonly，得到 %s", p)
+	if p != agent.ToolPolicyNone {
+		t.Fatalf("移动端空间应为 none（仅纯对话），得到 %s", p)
 	}
 	if reason != policyReasonMobile {
 		t.Fatalf("拒绝文案应为 %q，得到 %q", policyReasonMobile, reason)

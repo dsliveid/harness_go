@@ -38,6 +38,7 @@ import (
 	"harness-go/internal/market"
 	"harness-go/internal/mcp"
 	"harness-go/internal/memory"
+	"harness-go/internal/model"
 	"harness-go/internal/observ"
 	"harness-go/internal/prompt"
 	"harness-go/internal/retrieval"
@@ -664,6 +665,8 @@ func run() error {
 	// C-4：OnOffline 组合回调——先落库 offline，再让派发器**立即**收敛该设备的在途任务
 	// （离线立即降级，绝不等到 deadline）。dispatcher 在 hub 之后构造，故用闭包前置引用。
 	var deviceDispatcher *device.Dispatcher
+	// L1：客户端宿主目录列举 RPC（nil = 设备域未启用，device:<id> 会诚实报错）
+	var devicePathQuery *device.PathQuery
 	// 设备状态广播总线（供 /api/v1/devices/events SSE 实时推送上下线）。
 	// 与 events.Bus 是**两套**总线：后者是 per-Run 序号流，设备状态是「当前态」。
 	deviceState := device.NewStateBus(device.StateBusOptions{})
@@ -737,6 +740,8 @@ func run() error {
 			Hub:     deviceHub,
 			TaskTTL: deviceSvc.TaskTTL(),
 		})
+		// L1：客户端宿主目录列举 RPC（独立于任务派发链路，不落 tool_event）
+		devicePathQuery = device.NewPathQuery(deviceHub, logger)
 		deviceGateway = device.NewGateway(device.GatewayOptions{
 			Log:          logger,
 			Hub:          deviceHub,
@@ -744,6 +749,7 @@ func run() error {
 			Heartbeat:    deviceSvc.Heartbeat(),
 			OfflineAfter: deviceSvc.OfflineAfter(),
 			Handler:      deviceDispatcher.HandleFrame,
+			PathQuery:    devicePathQuery,
 			PendingCount: deviceDispatcher.PendingCount,
 		})
 		// C-5：执行面路由接线——device 优先，不可用则静默降级本地（不变量 5）。
@@ -758,12 +764,29 @@ func run() error {
 
 	// ⑪ 路由
 	// 工作区宿主目录列举的白名单根（L0）：默认只放开数据目录的**父级**（即本工作区根），
-	// 另可用 HARNESS_FS_ROOTS（分号分隔）追加。为空 = 前端目录选择器不可用（失败即关闭）。
-	fsRoots := resolveFSRoots(dataDir, os.Getenv("HARNESS_FS_ROOTS"))
+	// 另可用 config.yaml 的 workspace.fs_roots 或 HARNESS_FS_ROOTS（分号分隔）追加/覆盖。
+	// 为空 = 前端目录选择器不可用（失败即关闭）。
+	fsRoots := resolveFSRoots(dataDir, cfg.Workspace.FSRoots)
 	if len(fsRoots) > 0 {
-		logger.Info("工作区目录列举已启用", "roots", fsRoots)
+		logger.Info("工作区目录列举已启用",
+			"roots", fsRoots, "enforce", cfg.Workspace.EnforceFSRoots)
+		if len(fsRoots) <= 2 {
+			// 只在根数量很少（通常是默认的单根）时给这条提示，避免用户已显式放开多根时误扰。
+			logger.Info("提示：目录选择范围默认仅含启动目录；如需选择其他磁盘/项目目录，" +
+				"请配置 workspace.fs_roots 或环境变量 HARNESS_FS_ROOTS")
+		}
 	} else {
 		logger.Warn("未配置工作区目录列举根，前端目录选择将不可用（可设 HARNESS_FS_ROOTS）")
+	}
+
+	// 会话执行根：让「用户在目录选择器里选的 project_dir」真正成为工具沙箱基准。
+	// 未注入时工具一律回落进程根（= 改造前行为），故这里是纯增量。
+	toolRunner.WithExecutionRoots(service.NewExecutionRootResolver(
+		mainStore, fsRoots, cfg.Workspace.EnforceFSRoots, logger))
+	if !cfg.Workspace.EnforceFSRoots {
+		// 显式降级必须高亮：这意味着任何登录用户都能把项目目录指向主机任意位置。
+		logger.Warn("已关闭目录白名单强制（workspace.enforce_fs_roots=false）：" +
+			"会话项目目录可指向服务端主机任意位置，文件读写与命令执行面已放开，请确认部署形态为单机自用")
 	}
 
 	httpHandler := api.NewRouter(api.Deps{
@@ -793,6 +816,12 @@ func run() error {
 		Workspaces:  service.NewWorkspaceService(mainStore, deviceHub).WithSessionStore(sessionStore),
 		SOP:         sopSvc,
 		FSRoots:     fsRoots,
+		// L1 客户端宿主目录列举：Hub 判在线、PathQuery 派发、能力协商拦住未升级客户端。
+		Hub:        deviceHub,
+		PathQuery:  devicePathQuery,
+		DeviceCapabilities: func(ctx context.Context, deviceID string) ([]model.Capability, error) {
+			return mainStore.Capabilities().ListByDevice(ctx, deviceID)
+		},
 		DeviceWS:    deviceWSHandler(deviceGateway),
 		DeviceState: deviceState,
 		Bus:         bus,
@@ -867,25 +896,25 @@ func run() error {
 	return nil
 }
 
-// resolveFSRoots 计算「允许浏览的目录根」白名单（工作区宿主目录列举，L0）。
+// resolveFSRoots 计算「允许浏览与执行」的目录根白名单（工作区宿主目录列举，L0）。
 //
 // 规则（docs/工作区宿主与目录选择对接约定.md §4）：
 //   - 默认放开数据目录的**父级**：数据目录形如 <workspaceRoot>/data，
-//     故默认可浏览范围即该工作区根及其子树；
-//   - extra（HARNESS_FS_ROOTS，分号分隔）用于显式追加额外根，便于把工作区放在别处；
+//     故默认可浏览范围即该工作区根及其子树（与改造前完全一致，安全默认值）；
+//   - extra 来自 config.yaml 的 workspace.fs_roots（已由 config 层合并环境变量
+//     HARNESS_FS_ROOTS，故此处不再自行读 env —— 单一来源，避免两处口径漂移）；
 //   - 结果全部 Abs + Clean，去重后返回；为空表示「拒绝列举」（失败即关闭语义）。
-func resolveFSRoots(dataDir, extra string) []string {
+//
+// 🚨 extra 里的项若不存在会被**丢弃**（见下方 os.Stat），这是有意的：
+// 把拼错的路径静默塞进白名单，会让用户以为放开了却仍然选不了，更难排查。
+func resolveFSRoots(dataDir string, extra []string) []string {
 	candidates := make([]string, 0, 4)
 	if parent := filepath.Dir(filepath.Clean(dataDir)); parent != "" && parent != "." {
 		candidates = append(candidates, parent)
 	} else {
 		candidates = append(candidates, dataDir)
 	}
-	for _, seg := range strings.Split(extra, ";") {
-		if seg = strings.TrimSpace(seg); seg != "" {
-			candidates = append(candidates, seg)
-		}
-	}
+	candidates = append(candidates, extra...)
 
 	out := make([]string, 0, len(candidates))
 	seen := make(map[string]struct{}, len(candidates))

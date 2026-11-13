@@ -249,7 +249,9 @@ func invokeGlob(ctx context.Context, host toolapi.Host, call *toolapi.Call) (*to
 	if limit <= 0 {
 		limit = defaultGlobLimit
 	}
-	root := host.Workspace().Root()
+	// glob 遍历的起点必须是**本次调用的生效根**：ctx 有会话根（用户选的项目目录）
+	// 就用它，否则回落进程根。用 Root() 会忽略会话根，导致"选了目录仍只扫启动目录"。
+	root := workspaceRootFor(ctx, host.Workspace())
 	matches, err := globWalk(root, filepath.ToSlash(strings.TrimSpace(args.Pattern)), limit+1)
 	if err != nil {
 		return pluginkit.ErrorResult("glob: 模式非法: %v", err), nil
@@ -364,8 +366,9 @@ func invokeGrep(ctx context.Context, host toolapi.Host, call *toolapi.Call) (*to
 	if strings.TrimSpace(base) == "" {
 		base = "."
 	}
-	root := host.Workspace().Root()
-	absBase, err := host.Workspace().Resolve(base)
+	// grep 的根与基线同样取**生效根**（见 glob 处的说明）。
+	root := workspaceRootFor(ctx, host.Workspace())
+	absBase, err := workspaceResolveFor(ctx, host.Workspace(), base)
 	if err != nil {
 		return pluginkit.ErrorResult("grep: %v", err), nil
 	}
@@ -415,6 +418,25 @@ func invokeGrep(ctx context.Context, host toolapi.Host, call *toolapi.Call) (*to
 		truncated = fmt.Sprintf("\n…[达到上限 %d 条]", maxHits)
 	}
 	return pluginkit.TextResult("命中 %d 条：\n%s%s", len(hits), strings.Join(hits, "\n"), truncated), nil
+}
+
+// workspaceRootFor 返回本次调用的生效执行根。
+//
+// ctx 有会话根（用户选的项目目录）就用它，否则回落进程根 —— 后者保证所有
+// 未接会话上下文的调用点（测试、后台任务）行为与改造前完全一致。
+func workspaceRootFor(ctx context.Context, ws toolapi.Workspace) string {
+	if cw, ok := ws.(toolapi.ContextWorkspace); ok {
+		return cw.RootFor(ctx)
+	}
+	return ws.Root()
+}
+
+// workspaceResolveFor 按生效根解析相对路径（沙箱防护仍由载体执行）。
+func workspaceResolveFor(ctx context.Context, ws toolapi.Workspace, rel string) (string, error) {
+	if cw, ok := ws.(toolapi.ContextWorkspace); ok {
+		return cw.ResolveFor(ctx, rel)
+	}
+	return ws.Resolve(rel)
 }
 
 // 文本启发：含 NUL 字节即视为二进制。

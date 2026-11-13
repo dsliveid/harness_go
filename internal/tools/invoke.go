@@ -27,11 +27,45 @@ type Runner struct {
 	router  *router.Router
 	limits  loader.Limits
 	devices DeviceExecutor // 可为 nil（未接设备域 = 只用本地执行）
+	roots   ExecutionRootResolver
+}
+
+// ExecutionRootResolver 解析「该会话的工具执行根」（2026-11 目录选择放开）。
+//
+// 返回 ("", nil) 表示该会话没有可用执行根（纯对话/老数据），载体应回落进程根 —
+// 这不是错误，是正常状态，绝不可因此让工具调用失败。
+//
+// 返回 error 表示**越界或读取失败**：调用方必须回落进程根并告警，
+// 绝不能把未经验证的目录当成执行根（那等于绕过白名单）。
+type ExecutionRootResolver interface {
+	ResolveExecutionRoot(ctx context.Context, sessionID string) (string, error)
 }
 
 // NewRunner 创建执行适配器。
 func NewRunner(reg *registry.Registry, rtr *router.Router, limits loader.Limits) *Runner {
 	return &Runner{reg: reg, router: rtr, limits: limits}
+}
+
+// WithExecutionRoots 注入会话执行根解析器（可选；未注入时全部回落进程根）。
+//
+// 之所以用可选注入而非改构造函数：调用点较多（cmd 装配 / 集成测试），
+// 且未注入时应保持改造前行为（进程根），属渐进增强。
+func (r *Runner) WithExecutionRoots(res ExecutionRootResolver) *Runner {
+	r.roots = res
+	return r
+}
+
+// sessionRoot 解析本次调用的会话执行根（失败即关闭：出错时不注入，回落进程根）。
+func (r *Runner) sessionRoot(ctx context.Context, sessionID string) string {
+	if r.roots == nil || strings.TrimSpace(sessionID) == "" {
+		return ""
+	}
+	root, err := r.roots.ResolveExecutionRoot(ctx, sessionID)
+	if err != nil {
+		// 越界/读取失败一律不注入：宁可用进程根（保守），也不放行未校验目录。
+		return ""
+	}
+	return root
 }
 
 // 编译期断言：Runner 必须满足引擎端口。
@@ -70,6 +104,9 @@ func (r *Runner) Run(ctx context.Context, req agent.ToolRunRequest) (agent.ToolR
 		RunID:       req.RunID,
 		ToolEventID: req.ToolEventID,
 	})
+	// 会话执行根：让「用户选的项目目录」真正成为工具沙箱基准（2026-11 目录选择放开）。
+	// 解析失败/无根时为空串 → WithWorkspaceRoot 不落值 → 载体自动回落进程根。
+	callCtx = toolapi.WithWorkspaceRoot(callCtx, r.sessionRoot(ctx, req.SessionID))
 
 	res, invokeErr := tool.Invoke(callCtx, &toolapi.Call{
 		CallID:      req.ToolName + ":" + req.ToolEventID,

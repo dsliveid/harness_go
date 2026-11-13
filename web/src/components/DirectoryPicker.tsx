@@ -148,7 +148,11 @@ export function DirectoryPicker({
               <div className="min-w-0">
                 <div>{error.message}</div>
                 {error.code === 'fs.path_denied' && (
-                  <div className="text-inkdim mt-1">该目录不在服务端允许浏览的范围内（见 HARNESS_FS_ROOTS）。仍可直接手动填写路径。</div>
+                  <div className="text-inkdim mt-1">
+                    该目录不在服务端已开放的范围内。可在服务端配置文件的
+                    <code className="mx-1 px-1 rounded bg-panel3 font-mono">workspace.fs_roots</code>
+                    中开放更多目录，或直接手动填写路径。
+                  </div>
                 )}
                 {error.code === 'fs.host_unsupported' && (
                   <div className="text-inkdim mt-1">该工作区暂不支持目录列举，请在输入框手动填写路径。</div>
