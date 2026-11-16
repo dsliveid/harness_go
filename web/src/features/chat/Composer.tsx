@@ -20,28 +20,43 @@ const fmtSize = (n: number) =>
 
 export function Composer() {
   const { send, stop, streaming, queued, removeQueued, guide, draft, setDraft, tokensIn, tokensOut, cachedTokens } = useChat()
-  const { workspaces, activeWorkspaceId } = useSessions()
+  const { workspaces, sessions, currentId, activeWorkspaceId } = useSessions()
   const ref = useRef<HTMLTextAreaElement>(null)
   const fileRef = useRef<HTMLInputElement>(null)
   const [atts, setAtts] = useState<PendingAtt[]>([])
 
-  // 工作空间能力提示：离线/未绑定/已删除空间**仍可对话**，只是没有工具能力。
+  // 工作空间可发起对话 + 能力提示（2026-11 口径 1）。
   //
-  // 🚨 与旧逻辑的关键差异：以前这里用 `!online` 直接禁用输入，
-  // 等于把「可以聊天但调不了工具」的需求错做成「完全不能聊」。
-  // 现在只提示、不阻断——服务端 ToolPolicy 才是能力的唯一权威。
-  const activeWs = workspaces.find((w) => w.id === activeWorkspaceId)
+  // 🚨 两类"零工具"必须区分开，否则会误杀日常场景：
+  //   - 归属设备**离线** → 不可发起对话，仅可查看历史（canChat=false，禁用输入）；
+  //   - 未绑定 / 设备已删除 / 已解绑 → 仍可对话，只是没有工具能力（仅提示不阻断）。
+  //
+  // 判定依据一律取服务端 canChat 权威值，**不自行用 online/deviceId 推导**：
+  // 内置服务端空间 deviceId 为空但恒在线，而「未绑定设备」deviceId 同为空中却可对话，
+  // 两者无法靠前端字段区分。旧后端缺 canChat 时退化为 true（服务端 409 仍兜底）。
+  //
+  // 归属取「会话自身的 workspaceId」优先于当前激活空间：两者可能不同（用户切了空间
+  // 但当前会话仍归属旧空间），只认激活空间会误判能否发送。
+  const curSession = sessions.find((s) => s.id === currentId)
+  const wsId = curSession?.workspaceId ?? activeWorkspaceId
+  const activeWs = workspaces.find((w) => w.id === wsId)
+  const canChat = activeWs?.canChat ?? true
   const policy = activeWs?.toolPolicy ?? 'full'
   const policyHint =
-    policy === 'full'
-      ? null
-      : (activeWs?.policyReason
-        ?? (policy === 'readonly' ? '当前空间仅支持只读操作与对话' : '当前空间没有可用设备，可对话但无法调用工具'))
+    !canChat
+      ? (activeWs?.policyReason ?? '设备已离线，仅可查看历史对话')
+      : policy === 'full'
+        ? null
+        : (activeWs?.policyReason
+          ?? (policy === 'readonly' ? '当前空间仅支持只读操作与对话' : '当前空间没有可用设备，可对话但无法调用工具'))
 
   const total = tokensIn + tokensOut
   const cacheRate = tokensIn > 0 ? Math.round((cachedTokens / tokensIn) * 1000) / 10 : 0
 
   const submit = () => {
+    // 离线双保险：即使 textarea 被绕过（粘入后按 Enter / 触屏键盘），也不发起 Run。
+    // 服务端 CreateRunWithSystem 仍会独立 409（device.offline），这里是体验层短路。
+    if (!canChat) return
     const t = draft.trim()
     if (!t) return
     send(t)
@@ -153,7 +168,8 @@ export function Composer() {
           </div>
         )}
 
-        {/* 能力提示条：零工具/只读空间仍可正常输入发送，只是工具会被服务端拒绝 */}
+        {/* 能力提示条：零工具/只读空间仍可正常输入发送，只是工具会被服务端拒绝；
+            离线空间则提示「仅可查看历史」，输入框同时禁用（见下方 textarea） */}
         {policyHint && (
           <div className="mx-2.5 mt-2 px-2.5 py-1.5 rounded-lg bg-warn/10 border border-warn/25 text-[11px] leading-relaxed text-warn">
             {policyHint}
@@ -162,9 +178,14 @@ export function Composer() {
 
         <textarea
           ref={ref}
-          className="w-full min-h-[50px] max-h-[160px] px-3.5 pt-3 pb-2 bg-transparent outline-none focus:outline-none focus:ring-0 resize-none text-[14px] leading-relaxed text-ink placeholder:text-inkfaint border-none"
+          disabled={!canChat}
+          className="w-full min-h-[50px] max-h-[160px] px-3.5 pt-3 pb-2 bg-transparent outline-none focus:outline-none focus:ring-0 resize-none text-[14px] leading-relaxed text-ink placeholder:text-inkfaint border-none disabled:cursor-not-allowed disabled:opacity-60"
           placeholder={
-            streaming ? '运行中：输入指令将自动加入待执行队列…' : '输入指令，Enter 发送 / Shift+Enter 换行'
+            !canChat
+              ? '设备已离线，仅可查看历史对话'
+              : streaming
+                ? '运行中：输入指令将自动加入待执行队列…'
+                : '输入指令，Enter 发送 / Shift+Enter 换行'
           }
           value={draft}
           onChange={(e) => { setDraft(e.target.value); grow() }}
@@ -213,9 +234,9 @@ export function Composer() {
                 <span>停止</span>
               </Button>
             ) : (
-              <Button size="sm" variant="primary" onClick={submit} className="gap-1.5 px-3.5">
+              <Button size="sm" variant="primary" onClick={submit} disabled={!canChat} className="gap-1.5 px-3.5">
                 <Send size={12} />
-                <span>发送</span>
+                <span>{canChat ? '发送' : '设备离线'}</span>
               </Button>
             )}
           </div>

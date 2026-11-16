@@ -14,7 +14,7 @@ export interface Workspace {
   /** 工作空间显示名：内置空间固定为服务端，客户端接入时可自定义 */
   name: string
   kind: WorkspaceKind
-  /** 在线状态：离线空间仍可对话，但**没有工具能力**（服务端权威判定见 toolPolicy） */
+  /** 在线状态：离线空间**不可发起对话**（仅可查看历史），且没有工具能力 */
   online: boolean
   /** 绑定的肢体数量（可执行工具的端） */
   limbCount: number
@@ -47,6 +47,14 @@ export interface Workspace {
   toolPolicy: ToolPolicy
   /** 策略降级原因（服务端给出的人类可读文案，可直接展示） */
   policyReason?: string
+  /**
+   * 是否允许**发起对话**（服务端权威值 can_chat，2026-11 口径 1）。
+   *
+   * 离线 → false（仅可查看历史）；其余情形 true（含未绑定/已删除/已解绑的零工具空间）。
+   * 🚨 前端不得自行用 `online` 推导：内置服务端空间 deviceId 为空但恒在线，而
+   * 「未绑定设备」也 deviceId 为空却允许对话——两者无法靠 online/deviceId 区分。
+   */
+  canChat?: boolean
 }
 
 /** 工具能力策略（与 internal/agent.ToolPolicy 逐字一致） */

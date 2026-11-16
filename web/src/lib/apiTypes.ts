@@ -189,7 +189,13 @@ export interface WorkspaceDTO {
   tool_policy: ToolPolicyDTO;
   /** 策略降级原因（人类可读，可直接展示） */
   policy_reason?: string;
-  /** 是否可发起对话：恒 true（无设备也可对话，只是没有工具能力） */
+  /**
+   * 是否允许**发起对话**（2026-11 口径 1：由归属执行面可用性派生）。
+   *
+   * 归属设备离线 → false（仅可查看历史消息，前端必须禁用发送）；
+   * 其余情形 true（含「未绑定/已删除/已解绑」的零工具空间）。
+   * 与服务端 `CreateRunWithSystem` 的 409 `device.offline` 拦截同一结论。
+   */
   can_chat: boolean;
   created_at: number;
   updated_at: number;

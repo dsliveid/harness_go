@@ -851,6 +851,9 @@ export function toUiWorkspace(w: WorkspaceDTO): Workspace {
     // 服务端未下发（旧后端）时退化为 none：宁可少给能力，也不能凭空放行工具。
     toolPolicy: (w.tool_policy as ToolPolicy) ?? 'none',
     policyReason: w.policy_reason || undefined,
+    // 是否可发起对话：服务端权威值（口径 1）。旧后端缺该字段时按「允许」兜底——
+    // 服务端 CreateRunWithSystem 的 409 仍会拦住离线发起，退化只影响提示时机。
+    canChat: w.can_chat ?? true,
   }
 }
 

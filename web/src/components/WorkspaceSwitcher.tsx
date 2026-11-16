@@ -77,8 +77,12 @@ export function WorkspaceSwitcher() {
 
   const onPick = (w: Workspace) => {
     setWorkspace(w.id)
-    // 提示与能力策略严格对齐：零工具空间「可以对话、只是没有工具」，不是只读历史。
-    if (w.toolPolicy === 'none') {
+    // 提示与能力策略严格对齐（2026-11 口径 1）：
+    //   - 离线空间 → 「仅可查看历史」，不是「可对话但无工具」；
+    //   - 其它零工具空间（未绑定/已删除/已解绑）→ 「可对话、只是没有工具」。
+    if (w.canChat === false) {
+      toast('info', `已切换到「${w.name}」· ${w.policyReason ?? '设备已离线，仅可查看历史对话'}`)
+    } else if (w.toolPolicy === 'none') {
       toast('info', `已切换到「${w.name}」· ${w.policyReason ?? '该空间没有可用设备，可对话但无法调用工具'}`)
     } else {
       toast('success', `已切换到「${w.name}」`)
@@ -185,10 +189,16 @@ export function WorkspaceSwitcher() {
                       )}
                     </div>
                   )}
-                  {/* 无工具能力时给出原因：用户能明白「能聊但调不了工具」，而不是困惑按钮失效 */}
+                  {/* 能力不足时给出原因（服务端 policyReason 优先）：
+                      离线 → 「仅可查看历史」；其它零工具 → 「能聊但调不了工具」。 */}
                   {w.toolPolicy !== 'full' && (
                     <div className="mt-0.5 pl-3 text-[10px] text-warn/90 leading-relaxed">
-                      {w.policyReason ?? (w.toolPolicy === 'readonly' ? '仅支持只读操作与对话' : '仅可对话，无法调用工具')}
+                      {w.policyReason
+                        ?? (w.canChat === false
+                          ? '设备已离线，仅可查看历史对话'
+                          : w.toolPolicy === 'readonly'
+                            ? '仅支持只读操作与对话'
+                            : '仅可对话，无法调用工具')}
                     </div>
                   )}
                 </button>

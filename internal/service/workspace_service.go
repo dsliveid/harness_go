@@ -44,8 +44,14 @@ type WorkspaceView struct {
 	ToolPolicy string `json:"tool_policy"`
 	// PolicyReason 策略降级原因（人类可读，前端可直接展示）。
 	PolicyReason string `json:"policy_reason,omitempty"`
-	// CanChat 永远为 true（v2：无可用宿主也允许对话，只是没有工具能力）。
-	// 保留该字段是为了让前端不必自己推断「能不能发消息」。
+	// CanChat 是否允许**发起对话**：由归属执行面可用性派生（2026-11 口径 1 定案）。
+	//
+	// 规则：归属设备离线 → false（仅可查看历史）；其余情形恒 true。
+	// 「未绑定设备 / 设备已删除 / 设备已解绑」三类仍是 true——它们不是在线状态问题，
+	// 强拦会改变历史会话的可访问性（与 RunService R2 的拦截口径严格一致）。
+	//
+	// 与 RunService.resolveToolPolicy 同源：服务端 CreateRunWithSystem 的 409 拦截才是权威，
+	// 本字段只是把同一结论提前告知前端，避免"点了发送才报错"。
 	CanChat bool `json:"can_chat"`
 }
 
@@ -356,10 +362,18 @@ func (s *WorkspaceService) view(ctx context.Context, w model.Workspace) Workspac
 		return v
 	}
 
-	// 设备存在且未解绑，但当前不在线 → 零工具（D3：绝不降级服务端本地执行）。
+	// 设备存在且未解绑，但当前不在线 → 零工具 + 禁止发起对话（D3：绝不降级服务端本地执行）。
+	//
+	// CanChat=false 是 2026-11 口径 1 的裁决点：离线时对话没有承接方，放行只会让用户
+	// 看到模型正常回话而一切操作失败（等一个不会来的结果）。前端据此禁用输入框，
+	// 服务端 CreateRunWithSystem 仍独立 409 兜底（双闸，互不替代）。
+	//
+	// ⚠️ 宽限期（R9）不得在此处豁免：宽限期只管「进行中 Run 的存续」，
+	// 不放行任何新的发起入口。若在此加 withinGrace 判断即为越权。
 	if !v.Online {
 		v.ToolPolicy = string(agent.ToolPolicyNone)
 		v.PolicyReason = policyReasonOffline
+		v.CanChat = false
 		return v
 	}
 	return v
@@ -370,7 +384,11 @@ const (
 	policyReasonUnbound       = "当前工作空间未绑定设备，无法调用工具"
 	policyReasonDeviceMissing = "当前工作空间绑定的设备已删除，请重新绑定设备后再使用工具"
 	policyReasonDeviceRevoked = "当前工作空间绑定的设备已解绑，请重新绑定设备后再使用工具"
-	policyReasonOffline       = "当前工作空间的设备不在线，无法调用工具（设备恢复在线后自动可用）"
+	// policyReasonOffline 归属设备离线：**对话也不可发起**（2026-11 口径 1）。
+	//
+	// 文案必须同时否定"对话"与"工具"：旧文案是「无法调用工具（恢复在线后自动可用）」，
+	// 会被读成"还能聊，只是不能用工具"——恰好与本条裁决相反，导致缺陷长期未被发现。
+	policyReasonOffline = "当前工作空间的设备不在线，对话已暂停（仅可查看历史，设备恢复在线后自动可用）"
 	// policyReasonMobile 移动端工作空间：纯对话（2026-11 产品决策）。
 	//
 	// 文案必须写「不提供工具能力」而不是旧的「仅支持只读操作」：策略已从 readonly

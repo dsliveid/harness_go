@@ -462,6 +462,24 @@ export const useChat = create<ChatState>((set, get) => {
     const sessionId = useSessions.getState().currentId
     // 没有「默认模型」的隐式回退：会话未选择模型时直接拦截提示（避免静默落到 fake 回显模型）
     const session = useSessions.getState().sessions.find((s) => s.id === sessionId)
+    // 离线守卫（口径 1，2026-11）：只要归属执行面离线，**任何**发起新 Run 的入口一律拒绝
+    // —— send / retry / editResend / fork / 待执行队列 全都汇聚到本函数，故在此统一拦截。
+    //
+    // 🚨 宽限期不豁免：宽限期只覆盖「进行中 Run 的续跑」，不授权新的发起入口。
+    // 服务端 CreateRunWithSystem 仍独立 409（device.offline），此处是体验层短路
+    // （让用户立刻看到原因，而不是等请求返回）。
+    const sessState = useSessions.getState()
+    // 归属优先取**会话自身**的 workspaceId（服务端权威），其次当前激活空间。
+    // 只看 activeWorkspaceId 会漏判「会话归属其它空间」的情形。
+    const wsId = session?.workspaceId ?? sessState.activeWorkspaceId
+    const curWs = sessState.workspaces.find((w) => w.id === wsId)
+    if (curWs?.canChat === false) {
+      useUI.getState().toast(
+        'warn',
+        curWs.policyReason ?? '当前工作空间的设备不在线，对话已暂停（仅可查看历史）',
+      )
+      return
+    }
     if (!session?.modelRef) {
       useUI.getState().toast('warn', '请先选择模型')
       return

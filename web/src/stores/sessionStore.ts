@@ -415,7 +415,7 @@ export const useSessions = create<SessionState>((set, get) => ({
     set((st) => ({ sessions: [s, ...st.sessions], currentId: id }))
     // 新对话的 token 用量与上下文占用必须归零（否则沿用上个会话的累计量）
     syncUsage(id)
-    // 归属同步落服务端（sessions.project_id，阶段七起服务端已有一等项目实体），
+    // 归属同步落服务端（sessions.project_id / sessions.workspace_id）。
     // 本地 override 仍保留：用于承接前端独有的 workspaceId 分组。
     if (projectId || s.workspaceId) setScopeOverride(id, { projectId, workspaceId: s.workspaceId })
     // 先乐观插入（同步返回 id 供调用方 select），再以服务端返回的会话替换本地壳。
@@ -426,12 +426,19 @@ export const useSessions = create<SessionState>((set, get) => ({
         modelRef: s.modelRef,
         projectDir: s.projectDir,
         projectId,
+        // 🚨 workspaceId 必须上送（2026-11 修复）：服务端缺失时兜底为 ws-server（恒在线），
+        // 于是「归属离线设备」的会话会被记成「绑服务端空间的纯对话」，R2 离线拦截
+        // （resolveToolPolicy → policyReasonOffline）结构上永不可能触发。
+        // 只写本地 override 是不够的：归属是服务端权威字段，必须落库。
+        workspaceId: s.workspaceId,
       })
       .then((created) => {
         set((st) => ({
           sessions: st.sessions.map((x) =>
-            // 服务端已回传 projectId；workspaceId 仍是前端概念，保留本地值兜底。
-            x.id === id ? { ...created, projectId: created.projectId ?? x.projectId, workspaceId: x.workspaceId } : x,
+            // 服务端已回传 workspace_id（R1 起落库）；回包缺字段时才用本地值兜底。
+            x.id === id
+              ? { ...created, projectId: created.projectId ?? x.projectId, workspaceId: created.workspaceId ?? x.workspaceId }
+              : x,
           ),
           currentId: st.currentId === id ? created.id : st.currentId,
         }))
