@@ -277,9 +277,11 @@ function CommandRow({ cmd, onStop, canStop }: { cmd: CommandRun; onStop: () => v
   const elapsed = formatElapsed(Date.now() - cmd.startedAt)
   return (
     <div className="rounded-lg border border-edge p-2.5">
-      <div className="flex items-center gap-2">
-        <span className="w-2 h-2 rounded-full bg-ok animate-pulse shrink-0" title="执行中" />
-        <code className="font-mono text-[12px] text-ink flex-1 min-w-0 truncate break-all" title={cmd.cmd}>{cmd.cmd}</code>
+      <div className="flex items-start gap-2">
+        <span className="w-2 h-2 mt-1.5 rounded-full bg-ok animate-pulse shrink-0" title="执行中" />
+        {/* 命令行完整展示（折行而非省略号）：这里唯一目的就是让用户看清跑的是哪条命令，
+            用 truncate 会把长命令截断成读不出来的半句。 */}
+        <code className="font-mono text-[12px] text-ink flex-1 min-w-0 whitespace-pre-wrap break-all">{cmd.cmd}</code>
         <StateBadge state="running" />
       </div>
       <div className="mt-1.5 flex items-center gap-2 text-[11px] text-inkfaint font-mono">

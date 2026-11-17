@@ -93,25 +93,27 @@ type ToolsConfig struct {
 	DynamicMinTopK int `yaml:"dynamic_min_top_k"` // 默认 2
 }
 
-// WorkspaceConfig 工作区目录访问配置（2026-11 目录选择放开）。
+// WorkspaceConfig 工作区目录访问配置（2026-11 目录选择口径：默认整机）。
 //
-// 背景：目录选择器的白名单此前**只**能由环境变量 HARNESS_FS_ROOTS 控制，
-// 用户在 Web 界面看到「该目录不在服务端允许的范围内（见 HARNESS_FS_ROOTS）」
-// 却无处可改 —— 对一个 Web 产品来说这是不可接受的运维门槛。
-// 现在把同一份白名单下沉为可持久化配置，环境变量仍可覆盖（运维应急口径）。
+// 口径（用户明确要求，2026-11 变更）：
+//   - **默认不限制**：fs_roots 为空时，目录选择器可浏览**整台服务器**
+//     （Windows 各逻辑盘符 / POSIX "/"），无需任何配置；
+//   - **配置即限制**：一旦 fs_roots 非空，可浏览范围严格收敛为该范围内，
+//     其余目录返回 fs.path_denied（这就是「只有设置了限制才控制范围」）。
 //
-// 优先级：HARNESS_FS_ROOTS（分号分隔） > config.yaml workspace.fs_roots > 默认（数据目录父级）。
+// 环境变量 HARNESS_FS_ROOTS（分号分隔）仍可覆盖 config.yaml（运维应急口径），
+// 优先级：HARNESS_FS_ROOTS > config.yaml workspace.fs_roots > 默认（整机）。
 //
-// 🚨 安全铁律：这些根同时是**浏览白名单**与**会话执行根白名单**。
-// 放开到整盘（如 C:\ / /）等于把服务端主机读写权交给任何登录用户 —— 仅在
-// local 单机自用形态下建议这样做，且启动日志会打印实际生效的根供审计。
+// 🚨 安全铁律：这些根同时是**浏览范围**与**会话执行根范围**。
+// 默认整机 = 任何登录用户都能把项目目录指向主机任意位置（含文件读写与命令 cwd），
+// 仅适用于单机自用形态；多用户/公网部署请显式配置 fs_roots 收窄。
+// 启动日志会明确打印当前是「默认整机」还是「受限模式」以及实际根列表，供审计。
 type WorkspaceConfig struct {
 	// FSRoots 允许浏览与执行（读/写/命令 cwd）的绝对目录根。
-	// 空 = 默认只放开数据目录的父级（即启动目录），与改造前行为一致。
+	// 空 = 不限制（默认整机）。
 	FSRoots []string `yaml:"fs_roots"`
-	// EnforceFSRoots 是否强制会话执行根落在 FSRoots 白名单内。
-	// 默认 true（失败即关闭）。仅在明确知道风险时置 false，
-	// 用于「单机自用、希望项目目录可任意选」的场景。
+	// EnforceFSRoots 是否强制会话执行根落在 FSRoots 范围内。
+	// 默认 true：会话项目目录越界即拒绝作为执行根并回落进程根。
 	EnforceFSRoots bool `yaml:"enforce_fs_roots"`
 }
 
@@ -339,10 +341,10 @@ func Default() Config {
 			DynamicMinTopK:    2,
 		},
 		Workspace: WorkspaceConfig{
-			// 默认不放开额外根：只浏览/执行数据目录的父级（= 启动目录），
-			// 与改造前行为完全一致。安全默认值，放开须用户显式配置。
+			// 默认为空 = 不限制目录选择范围（可浏览整台服务器）。
+			// 只有显式配置根之后才收敛为受限模式。
 			FSRoots: nil,
-			// 默认强制白名单：会话项目目录越界即回落进程根。
+			// 默认强制执行根范围校验：有配置时越界即回落进程根。
 			EnforceFSRoots: true,
 		},
 		Devices: DevicesConfig{
@@ -553,7 +555,8 @@ func applyEnv(cfg *Config, env func(string) string) error {
 		{"HARNESS_DEVICES_OFFLINE_AFTER_S", intVal(&cfg.Devices.OfflineAfterS)},
 		{"HARNESS_DEVICES_TASK_TTL_S", intVal(&cfg.Devices.TaskTTLS)},
 		{"HARNESS_DEVICES_STRICT_APPROVAL", boolVal(&cfg.Devices.StrictApprovalDevice)},
-		// 目录白名单：分号分隔（Windows 盘符含冒号，不能用冒号/逗号分隔）。
+		// 目录范围：分号分隔（Windows 盘符含冒号，不能用冒号/逗号分隔）。
+		// 未设置 = 不限制（默认整机）；设置后 = 仅限该范围。
 		// 环境变量在此**覆盖** config.yaml 的同名配置（运维应急口径）。
 		{"HARNESS_FS_ROOTS", func(v string) error {
 			cfg.Workspace.FSRoots = splitRoots(v)

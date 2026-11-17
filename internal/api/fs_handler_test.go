@@ -242,3 +242,26 @@ func urlEscape(p string) string {
 		" ", "%20",
 	).Replace(p)
 }
+
+// TestFSRootLabel 根条目显示名：盘符根显示 "C:"，不算成 "\"（2026-11 默认整机后
+// 根列表就是各盘符，显示名不可读会直接暴露在 UI 上）。
+func TestFSRootLabel(t *testing.T) {
+	// 普通配置目录：取末级名
+	dir := t.TempDir()
+	if got := fsRootLabel(dir); got != filepath.Base(filepath.Clean(dir)) {
+		t.Fatalf("普通目录显示名应为末级名，得到 %q", got)
+	}
+
+	if runtime.GOOS != "windows" {
+		if got := fsRootLabel("/"); got != "/" {
+			t.Fatalf("POSIX 根显示名应为 /，得到 %q", got)
+		}
+		return
+	}
+	for _, root := range []string{`C:\`, `D:\`} {
+		vol := filepath.VolumeName(root) // "C:" / "D:"
+		if got := fsRootLabel(root); got != vol {
+			t.Fatalf("盘符根 %q 显示名应为 %q，得到 %q", root, vol, got)
+		}
+	}
+}

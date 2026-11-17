@@ -763,20 +763,24 @@ func run() error {
 	}
 
 	// ⑪ 路由
-	// 工作区宿主目录列举的白名单根（L0）：默认只放开数据目录的**父级**（即本工作区根），
-	// 另可用 config.yaml 的 workspace.fs_roots 或 HARNESS_FS_ROOTS（分号分隔）追加/覆盖。
-	// 为空 = 前端目录选择器不可用（失败即关闭）。
-	fsRoots := resolveFSRoots(dataDir, cfg.Workspace.FSRoots)
+	// 工作区宿主目录列举的范围（L0）：**默认放开整台服务器**（Windows 各盘符 / POSIX "/"）；
+	// 只有在 config.yaml 的 workspace.fs_roots 或 HARNESS_FS_ROOTS（分号分隔）显式配置了
+	// 根之后，可浏览范围才收敛为该配置范围内（显式限制）。
+	// 配置了但全部无效 = 前端目录选择器不可用（失败即关闭，不静默放开）。
+	fsRoots, fsRestricted := resolveFSRoots(dataDir, cfg.Workspace.FSRoots)
 	if len(fsRoots) > 0 {
-		logger.Info("工作区目录列举已启用",
-			"roots", fsRoots, "enforce", cfg.Workspace.EnforceFSRoots)
-		if len(fsRoots) <= 2 {
-			// 只在根数量很少（通常是默认的单根）时给这条提示，避免用户已显式放开多根时误扰。
-			logger.Info("提示：目录选择范围默认仅含启动目录；如需选择其他磁盘/项目目录，" +
-				"请配置 workspace.fs_roots 或环境变量 HARNESS_FS_ROOTS")
+		if fsRestricted {
+			logger.Info("工作区目录选择已启用（受限模式：仅限配置的根）",
+				"roots", fsRoots, "enforce", cfg.Workspace.EnforceFSRoots)
+		} else {
+			logger.Info("工作区目录选择已启用（默认整机：未配置 workspace.fs_roots，可浏览服务器全部目录）",
+				"roots", fsRoots, "enforce", cfg.Workspace.EnforceFSRoots)
+			logger.Warn("目录选择范围为**整台服务器**：任何登录用户都可把项目目录指向主机任意位置" +
+				"（项目目录同时是文件读写与命令 cwd 的执行根）。如需限制，" +
+				"请配置 workspace.fs_roots 或 HARNESS_FS_ROOTS")
 		}
 	} else {
-		logger.Warn("未配置工作区目录列举根，前端目录选择将不可用（可设 HARNESS_FS_ROOTS）")
+		logger.Error("workspace.fs_roots 中没有任何有效目录，前端目录选择将不可用（请检查配置路径是否存在）")
 	}
 
 	// 会话执行根：让「用户在目录选择器里选的 project_dir」真正成为工具沙箱基准。
@@ -896,25 +900,39 @@ func run() error {
 	return nil
 }
 
-// resolveFSRoots 计算「允许浏览与执行」的目录根白名单（工作区宿主目录列举，L0）。
+// resolveFSRoots 计算「允许浏览与执行」的目录根范围（工作区宿主目录列举，L0）。
 //
-// 规则（docs/工作区宿主与目录选择对接约定.md §4）：
-//   - 默认放开数据目录的**父级**：数据目录形如 <workspaceRoot>/data，
-//     故默认可浏览范围即该工作区根及其子树（与改造前完全一致，安全默认值）；
-//   - extra 来自 config.yaml 的 workspace.fs_roots（已由 config 层合并环境变量
-//     HARNESS_FS_ROOTS，故此处不再自行读 env —— 单一来源，避免两处口径漂移）；
-//   - 结果全部 Abs + Clean，去重后返回；为空表示「拒绝列举」（失败即关闭语义）。
+// 口径（2026-11 变更，用户明确要求）：
+//   - **默认不限制**：extra（config.yaml 的 workspace.fs_roots / HARNESS_FS_ROOTS）为空时，
+//     放开整台服务器的文件系统根（Windows 各逻辑盘符，POSIX "/"），
+//     目录选择器可浏览整机任意目录；
+//   - **显式配置即限制**：extra 非空时，范围严格收敛为 extra 里的根及其子树，
+//     其余目录一律 fs.path_denied（这就是「只有设置了限制才控制范围」）；
+//   - extra 里的项若全部无效（不存在/非目录）→ 返回空切片，上层明确报错
+//     （失败即关闭，**不静默降级为整机**，否则一次拼写错误就把限制悄悄放开了）。
 //
-// 🚨 extra 里的项若不存在会被**丢弃**（见下方 os.Stat），这是有意的：
-// 把拼错的路径静默塞进白名单，会让用户以为放开了却仍然选不了，更难排查。
-func resolveFSRoots(dataDir string, extra []string) []string {
-	candidates := make([]string, 0, 4)
-	if parent := filepath.Dir(filepath.Clean(dataDir)); parent != "" && parent != "." {
-		candidates = append(candidates, parent)
+// 返回值 restricted 仅用于启动日志与审计：true = 受限模式，false = 默认整机。
+//
+// 🚨 安全提示：restricted=false 意味着任何登录用户都能把项目目录指向主机任意位置
+// （项目目录同时是文件读写与命令 cwd 的执行根）。这是用户显式选择的单机自用口径，
+// main 必须在启动日志里打印该状态与实际根列表，便于事后审计。
+func resolveFSRoots(dataDir string, extra []string) (roots []string, restricted bool) {
+	candidates := make([]string, 0, len(extra)+1)
+	if len(extra) > 0 {
+		candidates = append(candidates, extra...)
+		restricted = true
 	} else {
-		candidates = append(candidates, dataDir)
+		// 默认整机：枚举平台文件系统根；枚举失败（受限环境）时降级为数据目录父级，
+		// 保证「默认路径」不会退化成完全不可选。
+		candidates = append(candidates, filesystemRoots()...)
+		if len(candidates) == 0 {
+			if parent := filepath.Dir(filepath.Clean(dataDir)); parent != "" && parent != "." {
+				candidates = append(candidates, parent)
+			} else {
+				candidates = append(candidates, dataDir)
+			}
+		}
 	}
-	candidates = append(candidates, extra...)
 
 	out := make([]string, 0, len(candidates))
 	seen := make(map[string]struct{}, len(candidates))
@@ -938,7 +956,7 @@ func resolveFSRoots(dataDir string, extra []string) []string {
 		seen[key] = struct{}{}
 		out = append(out, abs)
 	}
-	return out
+	return out, restricted
 }
 
 // deviceWSHandler 把网关包装为可 nil 的 http.Handler（未启用设备域时返回 nil，

@@ -1,9 +1,10 @@
 import { useState } from 'react'
-import { ShieldAlert, Check, CheckCheck, X, Database, Smartphone } from 'lucide-react'
+import { ShieldAlert, Check, CheckCheck, X, Database, Smartphone, Terminal } from 'lucide-react'
 import { useChat } from '../../stores/chatStore'
 import { Badge, Button, inputCls } from '../../components/ui'
 import { DATA_SCOPE_HINT, DATA_SCOPE_LABEL } from '../../lib/dataScopes'
 import { canDecideApproval } from '../../lib/mobileCapabilities'
+import { buildCommandLine, commandDir, isCommandTool } from '../../lib/commandLine'
 
 export function ApprovalBar() {
   const { approval, respond } = useChat()
@@ -20,6 +21,15 @@ export function ApprovalBar() {
   const isData = approval.kind === 'data'
   const riskTone = approval.risk === 'danger' ? 'red' : approval.risk === 'command' ? 'yellow' : 'blue'
   const scope = approval.dataScope
+  // 命令类审批的完整命令行（后端只下发 {cmd, args[]}，命令行需展示层拼装）
+  const isCmd = isCommandTool(approval.toolName, approval.risk)
+  const cmdLine = isCmd ? buildCommandLine(approval.args) : ''
+  const cmdDir = isCmd ? commandDir(approval.args) : ''
+  // 命令类参数已由命令行块完整呈现，chip 不再重复罗列 cmd/args/dir/timeout_s
+  const CMD_ARG_KEYS = new Set(['cmd', 'command', 'args', 'dir', 'timeout_s'])
+  const argEntries = Object.entries(approval.args || {}).filter(
+    ([k]) => !(isCmd && CMD_ARG_KEYS.has(k)),
+  )
 
   return (
     <div className="mx-3 sm:mx-5 mb-2.5 rounded-2xl border border-warn/40 bg-panel p-3.5 slide-up">
@@ -50,15 +60,34 @@ export function ApprovalBar() {
         {approval.summary}
       </div>
 
+      {/* 命令类审批：审批点就是「要不要跑这条命令」，摘要（如「执行命令」）不足以判断，
+          必须把完整命令行摆出来（折行不截断），让用户看清参数后再决定允许/拒绝。 */}
+      {cmdLine && (
+        <div className="mt-2 rounded-lg border border-warn/30 bg-[#090d14] overflow-hidden">
+          <div className="flex items-center gap-1.5 px-2.5 h-7 border-b border-edge/60 bg-panel2/60 text-[10.5px] text-inkfaint font-mono select-none">
+            <Terminal size={10} className="text-amber-400" />
+            完整命令行
+          </div>
+          <code className="block px-2.5 py-2 font-mono text-[11.5px] leading-5 text-[#e6edf3] whitespace-pre-wrap break-all select-text">
+            {cmdLine}
+          </code>
+          {cmdDir && (
+            <div className="px-2.5 py-1 border-t border-edge/40 text-[10.5px] text-inkfaint font-mono">
+              cwd: {cmdDir}
+            </div>
+          )}
+        </div>
+      )}
+
       {isData && scope && (
         <div className="mt-1.5 text-[11px] text-inkfaint leading-relaxed">
           该请求触达「{DATA_SCOPE_LABEL[scope]}」：{DATA_SCOPE_HINT[scope]}。
         </div>
       )}
 
-      {Object.keys(approval.args || {}).length > 0 && (
+      {argEntries.length > 0 && (
         <div className="mt-2 flex flex-wrap gap-1.5 text-[11px] font-mono">
-          {Object.entries(approval.args).map(([k, v]) => (
+          {argEntries.map(([k, v]) => (
             <span key={k} className="inline-flex items-center gap-1 rounded-md bg-panel2 px-2 py-0.5 border border-edge/80">
               <span className="text-inkfaint">{k}:</span>
               <span className="text-ink font-medium max-w-[240px] truncate" title={String(v)}>{String(v)}</span>

@@ -59,9 +59,11 @@ type Deps struct {
 	Workspaces *service.WorkspaceService
 	// SOP 核心 SOP（agent-core 出厂内置 + 运行时覆盖；nil 时返回 unavailable）
 	SOP *service.SOPService
-	// FSRoots 允许浏览的目录根白名单（工作区宿主目录列举，L0 服务端宿主）：
-	// 由 cmd 注入（HARNESS_FS_ROOTS + 数据目录兜底，均已 Abs）。为空表示**拒绝列举**
-	// （失败即关闭，绝不放行全盘）。docs/工作区宿主与目录选择对接约定.md §4
+	// FSRoots 允许浏览的目录范围（工作区宿主目录列举，L0 服务端宿主）：
+	// 由 cmd 注入（默认为整机文件系统根；配置了 workspace.fs_roots / HARNESS_FS_ROOTS
+	// 时即为受限范围，均已 Abs + Clean）。
+	// ⚠️ 为空只表示「配置的根全部无效」→ 明确拒绝列举，绝不静默放行全盘。
+	// docs/工作区宿主与目录选择对接约定.md §4
 	FSRoots []string
 	// Hub 设备在线判定（L1 客户端宿主目录列举用；nil 表示设备域未启用）。
 	Hub interface{ Online(deviceID string) bool }

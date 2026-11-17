@@ -70,7 +70,14 @@ export function DirectoryPicker({
   const current = listing?.path ?? ''
   const crumbs = breadcrumbs(current, listing?.separator ?? '/')
   const entries: DirEntry[] = listing ? (current ? listing.dirs : listing.roots) : []
-  const canAscend = !!(listing && current && listing.parent)
+  /**
+   * 已定位到某个根（盘符根 / 配置的受限根）时，服务端刻意返回 parent=null
+   * （绝不回 ".."，见 internal/api/fs_handler.go 的 parent 计算）。
+   * 但 UI 侧「上一级」不该因此置灰：根之上还有「根列表」这一层视图，
+   * 只是它不是文件系统里的上级目录，而是未定位状态（loadRoots）。
+   */
+  const atRootLevel = !!(listing && current && !listing.parent)
+  const canAscend = !!(listing && current)
 
   const footer = (
     <>
@@ -149,9 +156,9 @@ export function DirectoryPicker({
                 <div>{error.message}</div>
                 {error.code === 'fs.path_denied' && (
                   <div className="text-inkdim mt-1">
-                    该目录不在服务端已开放的范围内。可在服务端配置文件的
+                    该目录不在服务端可浏览的范围内（仅当服务端配置了
                     <code className="mx-1 px-1 rounded bg-panel3 font-mono">workspace.fs_roots</code>
-                    中开放更多目录，或直接手动填写路径。
+                    限制时才会出现）。可改用左侧其它目录，或直接手动填写该路径。
                   </div>
                 )}
                 {error.code === 'fs.host_unsupported' && (
@@ -197,10 +204,15 @@ export function DirectoryPicker({
           <Button
             size="sm"
             variant="ghost"
-            disabled={!canAscend}
-            onClick={() => { if (listing?.parent) void loadPath(listing.parent) }}
+            disabled={!canAscend || loading}
+            title={atRootLevel ? '回到根列表（盘符/根目录列表）' : '返回上级目录'}
+            onClick={() => {
+              if (listing?.parent) { void loadPath(listing.parent); return }
+              // 已在根层级：上跳不是文件系统目录，而是「根列表」视图
+              void loadRoots()
+            }}
           >
-            上一级
+            {atRootLevel ? '回到根列表' : '上一级'}
           </Button>
         </div>
       </div>

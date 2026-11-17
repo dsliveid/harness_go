@@ -1,6 +1,7 @@
 import type {
   CommandRun, Message, PlanDoc, PlanStep, Subagent, TodoItem, ToolCall,
 } from '../types'
+import { buildCommandLine } from './commandLine'
 
 /**
  * 运行态派生层：把「真实工具调用序列」折算成右侧浮动编排栏要展示的四类数据。
@@ -189,14 +190,16 @@ function deriveSubagents(entries: CallEntry[]): Subagent[] {
   return out
 }
 
-/** 拼出可读命令行（后端 args 形如 {cmd, args[], dir, timeout_s}） */
+/**
+ * 拼出可读命令行。
+ *
+ * 实现已收敛到 `lib/commandLine.ts`（与对话流工具卡片共用一份拼法），
+ * 这里保留薄封装只为不改动下方调用点。history：本文件此前是 `join(' ')`，
+ * 含空格的参数（如 `git commit -m "fix a b"`）会被渲染成分裂的多段，
+ * 复制到终端语义不同；现在统一走带引号转义的拼装。
+ */
 function buildCmdLine(args: Record<string, unknown> | undefined): string {
-  const cmd = typeof args?.cmd === 'string' ? args.cmd.trim() : ''
-  if (!cmd) return ''
-  const rest = Array.isArray(args?.args)
-    ? args.args.filter((a): a is string => typeof a === 'string')
-    : []
-  return [cmd, ...rest].join(' ')
+  return buildCommandLine(args)
 }
 
 /**

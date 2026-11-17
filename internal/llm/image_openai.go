@@ -379,18 +379,8 @@ func (p *OpenAIImages) send(ctx context.Context, url string, body []byte) ([]byt
 	return raw, nil
 }
 
-// withUpstreamMessage 把上游 error.message 拼进错误信息（诊断更直接）。
-func withUpstreamMessage(base *Error, raw []byte) *Error {
-	var payload struct {
-		Error struct {
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(raw, &payload); err == nil && strings.TrimSpace(payload.Error.Message) != "" && base != nil {
-		base.Message = base.Message + ": " + payload.Error.Message
-	}
-	return base
-}
+// withUpstreamMessage 见 openai_compat.go（同包单一定义，避免两处行为漂移）：
+// 这里额外把 payload 原文留档到 Error.UpstreamBody，并做长度截断。
 
 // sniffMIME 极简魔数判定（PNG/JPEG/GIF/WebP），无法识别时回退 image/png。
 func sniffMIME(data []byte) string {

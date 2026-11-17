@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -403,9 +404,10 @@ func (e *Engine) loop(ctx context.Context, sdb SessionDB, req RunRequest, usage 
 			CreatedAt: e.deps.Now(),
 		}
 		if len(out.toolCalls) > 0 {
-			if raw, mErr := json.Marshal(out.toolCalls); mErr == nil {
-				assistantMsg.ToolCallsJSON = raw
-			}
+			// 绝不能「marshal 失败就什么都不写」：那会让 assistant 消息丢掉 tool_calls 声明，
+			// 而后续 tool 结果照常落库 → 历史里出现孤儿 tool 消息 → 上游每次重放都 400。
+			// 见 sanitizeToolCalls 的说明（真实事故：会话被永久污染）。
+			assistantMsg.ToolCallsJSON = marshalToolCalls(e, req, out.toolCalls)
 		}
 		if err := sdb.AppendMessage(ctx, assistantMsg); err != nil {
 			return model.RunFailed, "", "persist_failed", err.Error(), tokens
@@ -932,7 +934,56 @@ func (e *Engine) loadHistory(ctx context.Context, sdb SessionDB) ([]llm.Message,
 	for _, m := range msgs {
 		out = append(out, toLLMMessage(&m))
 	}
-	return out, nil
+	// 兼容历史脏数据：早期版本在 tool_calls 序列化失败时会丢掉 assistant 的声明，
+	// 却仍把 tool 结果落库，于是库里留下「tool_call_id 无人声明」的孤儿 tool 消息。
+	// 这类消息一旦被重放，上游必然 400（协议要求 tool 消息紧跟声明它的 assistant）。
+	// 已在写入侧修复（见 marshalToolCalls），但**老会话仍需在此过滤才能恢复可用**。
+	return dropOrphanToolMessages(out), nil
+}
+
+// dropOrphanToolMessages 丢弃没有对应 assistant 声明的 tool 消息。
+//
+// 协议口径（OpenAI Chat Completions）：
+//   - 每条 role=tool 的消息必须通过 tool_call_id 指向**紧邻之前**某个 assistant 的 tool_calls；
+//   - 未被应答的 tool_call 同样违规，因此配对失败时连声明一起丢弃最稳妥。
+//
+// 实现按序扫描：遇到 assistant 时把它的 tool_call id 记入待答集合，
+// 遇到 tool 且能在待答集合中命中才算合法并消费掉；否则丢弃。
+// 这样「重复应答」「顺序错乱」「凭空出现」三种脏数据都能被清掉。
+func dropOrphanToolMessages(in []llm.Message) []llm.Message {
+	out := make([]llm.Message, 0, len(in))
+	pending := make(map[string]struct{}) // 当前 assistant 声明过、尚未被应答的 tool_call id
+	dropped := 0
+	for _, m := range in {
+		switch m.Role {
+		case llm.RoleAssistant:
+			pending = make(map[string]struct{}, len(m.ToolCalls))
+			for _, tc := range m.ToolCalls {
+				if tc.ID != "" {
+					pending[tc.ID] = struct{}{}
+				}
+			}
+			out = append(out, m)
+		case llm.RoleTool:
+			if _, ok := pending[m.ToolCallID]; ok {
+				delete(pending, m.ToolCallID)
+				out = append(out, m)
+				continue
+			}
+			// 孤儿 tool 消息：丢弃（不重放，避免上游 400）
+			dropped++
+		default:
+			// user / system 等出现即视为一轮新输入，之前未应答的 tool_call 不再需要配对
+			pending = make(map[string]struct{})
+			out = append(out, m)
+		}
+	}
+	if dropped > 0 {
+		// 必须留痕：说明该会话历史里存在脏数据（写入侧修复前遗留）。
+		slog.WarnContext(context.Background(), "历史中存在孤儿 tool 消息，已丢弃以保请求合法",
+			"dropped", dropped, "kept", len(out), "total", len(in))
+	}
+	return out
 }
 
 func (e *Engine) transition(ctx context.Context, sdb SessionDB, runID string, to model.RunStatus, stopReason, errCode, errMsg string) error {
@@ -1053,6 +1104,51 @@ func normalizeArgs(raw json.RawMessage) json.RawMessage {
 		return json.RawMessage(`{}`)
 	}
 	return b
+}
+
+// marshalToolCalls 序列化 assistant 的 tool_calls 供落库，**永不返回 nil**。
+//
+// 为什么必须保证非 nil（真实事故，会话被永久污染）：
+// llm.ToolCall.Arguments 是 json.RawMessage，一旦模型给出的参数不是合法 JSON
+// （空串、流式被截断成 "["、畸形对象），json.Marshal 会整段失败。
+// 旧写法 `if raw, err := json.Marshal(...); err == nil { ... }` 把失败静默吞掉，
+// 于是 assistant 消息丢掉了 tool_calls 声明，但引擎仍照常执行工具并把 tool 结果落库，
+// 历史中便留下「tool_call_id 无任何 assistant 声明过」的孤儿 tool 消息。
+// 下一次请求重放该历史时，OpenAI 兼容上游直接 400（bad_request）。
+//
+// 修法对齐老版本 harness_mini：那边 arguments 存 JSON 字符串，天然不会序列化失败；
+// 这里保持 Arguments 为 RawMessage（与流式解析一致），但在落库前把非法参数归一为
+// 合法 JSON，确保「声明与结果永远成对」。
+//
+// 归一策略与 normalizeArgs 一致：非法时先尝试包成 JSON 字符串保留原文，
+// 连字符串化都失败则退化为 {}。宁可参数降级，也不能丢声明。
+func marshalToolCalls(e *Engine, req RunRequest, tcs []llm.ToolCall) json.RawMessage {
+	safe := make([]llm.ToolCall, 0, len(tcs))
+	sanitized := 0
+	for _, tc := range tcs {
+		args := normalizeArgs(tc.Arguments)
+		if string(args) != string(tc.Arguments) {
+			sanitized++
+		}
+		safe = append(safe, llm.ToolCall{ID: tc.ID, Name: tc.Name, Arguments: args})
+	}
+	if sanitized > 0 {
+		// 参数被降级必须留痕：模型反复吐畸形参数是上游/提示词问题的信号。
+		slog.WarnContext(context.Background(), "工具调用参数非法，已归一化以保全 tool_calls 声明",
+			"session_id", req.SessionID,
+			"run_id", req.RunID,
+			"sanitized", sanitized,
+			"total", len(tcs),
+		)
+	}
+	raw, err := json.Marshal(safe)
+	if err != nil {
+		// 归一后理论上不可达；兜底仍返回空数组而非 nil，避免声明整段消失。
+		slog.ErrorContext(context.Background(), "tool_calls 序列化失败，已降级为空数组",
+			"session_id", req.SessionID, "run_id", req.RunID, "err", err)
+		return json.RawMessage(`[]`)
+	}
+	return raw
 }
 
 // toolMessage 构造回灌给模型的 tool 消息。

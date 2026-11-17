@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/rand"
 	"net/http"
 	"strconv"
@@ -191,8 +192,11 @@ func (p *OpenAICompat) fetchModelList(ctx context.Context, url string) ([]string
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
-		return nil, classifyStatus(resp)
+		// 与 doWithRetry 同一口径：保留上游报文，否则「模型清单拉不到」同样无法排障
+		rawErrBody := readErrorBody(resp)
+		le := withUpstreamMessage(classifyStatus(resp), rawErrBody)
+		p.logUpstreamFailure(ctx, le, nil, 0)
+		return nil, le
 	}
 	// 模型清单通常几十~几百 KB，限 8MB 防御异常响应
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
@@ -411,9 +415,12 @@ func (p *OpenAICompat) doWithRetry(ctx context.Context, body []byte) (*http.Resp
 		if resp.StatusCode == http.StatusOK {
 			return resp, nil
 		}
-		le := classifyStatus(resp)
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 8<<10))
+		// 先读报文再分类：上游真实原因只存在于响应体里，绝不能丢（见 readErrorBody 注释）。
+		// 读取是限长的，因此读完之后无需再 drain。
+		rawErrBody := readErrorBody(resp)
 		_ = resp.Body.Close()
+		le := withUpstreamMessage(classifyStatus(resp), rawErrBody)
+		p.logUpstreamFailure(ctx, le, body, attempt)
 		if !le.Retryable() {
 			return nil, le
 		}
@@ -465,6 +472,161 @@ func (p *OpenAICompat) backoff(attempt int, lastErr *Error) time.Duration {
 	// ±20% 抖动，避免多 Run 同时重试打爆上游
 	jitter := time.Duration(rand.Int63n(int64(d)/5+1)) - d/10
 	return d + jitter
+}
+
+// ============ 上游错误现场留档 ============
+
+const (
+	// maxErrorBodyBytes 读取上游错误响应体的上限。
+	// 8KB 足以容纳任何厂商的错误 JSON；同时防御异常上游回传超大 HTML 错误页。
+	maxErrorBodyBytes = 8 << 10
+	// maxUpstreamReasonRunes 拼进人话文案（error_message）的上游原因长度上限。
+	// 文案会进前端与 runs 表投影，过长会撑爆 UI 且淹没真正的分类信息。
+	maxUpstreamReasonRunes = 600
+)
+
+// readErrorBody 读取（并截断）错误响应体，供诊断留档。
+//
+// 为什么必须读而不是丢弃（真实事故教训）：4xx 的真实原因——参数非法、
+// 上下文超限、模型不存在、消息序列缺配对的 tool 结果——**只存在于上游报文里**。
+// 此前这里写作 `io.Copy(io.Discard, ...)`，导致前端只能看到「请求被上游拒绝」
+// 这句笼统文案，日志与审计库里也查不到任何 status / 原文，排障彻底死胡同。
+//
+// 返回值可能是 nil（读失败或响应为空）：调用方不得因此报错，
+// 诊断信息缺失永远不能影响主链路。
+func readErrorBody(resp *http.Response) []byte {
+	if resp == nil || resp.Body == nil {
+		return nil
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+	if err != nil {
+		return nil
+	}
+	return raw
+}
+
+// drainAndClose 丢弃剩余响应体（限 8KB）后关闭。
+//
+// 为什么要 drain：不读到 EOF 直接 Close 会让底层连接无法复用，
+// 每失败一次就丢掉一条 TCP 连接（批量重试时会明显放大上游压力）。
+func drainAndClose(resp *http.Response) {
+	if resp == nil || resp.Body == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxErrorBodyBytes))
+	_ = resp.Body.Close()
+}
+
+// truncateRunes 按字符（而非字节）截断，避免把中文切成非法 UTF-8。
+func truncateRunes(s string, max int) string {
+	if max <= 0 {
+		return s
+	}
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max]) + "…"
+}
+
+// upstreamReason 从上游错误响应体中提炼一句人话原因。
+//
+// 兼容三类真实形状（都实际遇到过，不能只认 OpenAI 一种）：
+//  1. {"error":{"message":"..."}}              —— OpenAI / DeepSeek / Qwen / vLLM
+//  2. {"type":"error","error":{"type":"...","message":"..."}} —— Anthropic
+//  3. {"message":"..."} / {"detail":"..."}     —— 各类网关 / FastAPI 风格
+//
+// 解析不出时返回空串，由调用方决定是否回退到原文（如 HTML 502 页）。
+func upstreamReason(raw []byte) string {
+	var outer struct {
+		Error   json.RawMessage `json:"error"`
+		Message string          `json:"message"`
+		Detail  string          `json:"detail"`
+	}
+	if err := json.Unmarshal(raw, &outer); err != nil {
+		return ""
+	}
+	if len(outer.Error) > 0 {
+		// error 既可能是对象（OpenAI/Anthropic），也可能是字符串
+		var asObj struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		}
+		if err := json.Unmarshal(outer.Error, &asObj); err == nil {
+			msg := strings.TrimSpace(asObj.Message)
+			typ := strings.TrimSpace(asObj.Type)
+			switch {
+			case msg != "" && typ != "":
+				return typ + ": " + msg
+			case msg != "":
+				return msg
+			case typ != "":
+				return typ
+			}
+		}
+		var asStr string
+		if err := json.Unmarshal(outer.Error, &asStr); err == nil {
+			if s := strings.TrimSpace(asStr); s != "" {
+				return s
+			}
+		}
+	}
+	if m := strings.TrimSpace(outer.Message); m != "" {
+		return m
+	}
+	return strings.TrimSpace(outer.Detail)
+}
+
+// withUpstreamMessage 把上游原因拼进错误文案，并把原文留档到 Error.UpstreamBody。
+//
+// 分工明确：Message 保持「分类人话 + 一句上游原因」（可展示），
+// UpstreamBody 保留原文（只进结构化日志/审计，不直接给用户看）。
+// raw 为非 JSON（HTML 错误页、纯文本）时，Message 不上色，仅留档原文。
+func withUpstreamMessage(base *Error, raw []byte) *Error {
+	if base == nil {
+		return nil
+	}
+	if len(raw) > maxErrorBodyBytes {
+		raw = raw[:maxErrorBodyBytes]
+	}
+	// 字节截断可能把中文切成半个字符；非法 UTF-8 进日志/JSON 序列化会变成替换符，
+	// 这里先清洗再加工，保证 UpstreamBody 始终是合法文本。
+	body := strings.TrimSpace(strings.ToValidUTF8(string(raw), ""))
+	if body == "" {
+		return base
+	}
+	base.UpstreamBody = truncateRunes(body, maxUpstreamReasonRunes)
+	if reason := upstreamReason([]byte(body)); reason != "" {
+		base.Message = base.Message + ": " + truncateRunes(reason, maxUpstreamReasonRunes)
+	}
+	return base
+}
+
+// logUpstreamFailure 把上游失败现场写入结构化日志（slog），供事后排障。
+//
+// 为什么在 llm 层就记而不只依赖 agent 的审计库：模型清单拉取（ListModels）
+// 根本不经过 agent，出错时前端只有一个聚合文案；这里统一留档才能覆盖两条链路。
+//
+// 红线：**绝不记录请求体**。请求体里有完整对话、系统提示词与工具结果，
+// 落盘即等于把用户对话写进日志文件；只记长度用于判断是否请求体过大。
+func (p *OpenAICompat) logUpstreamFailure(ctx context.Context, le *Error, reqBody []byte, attempt int) {
+	if le == nil {
+		return
+	}
+	attrs := []any{
+		"provider", p.name,
+		"endpoint", p.endpoint,
+		"status", le.StatusCode,
+		"kind", string(le.Kind),
+		"retryable", le.Retryable(),
+		"attempt", attempt,
+		"req_bytes", len(reqBody),
+		"session_id", p.sessionID,
+	}
+	if le.UpstreamBody != "" {
+		attrs = append(attrs, "upstream_body", le.UpstreamBody)
+	}
+	slog.WarnContext(ctx, "上游模型调用失败", attrs...)
 }
 
 // classifyStatus 把非 200 响应分类为可判定重试与否的错误。

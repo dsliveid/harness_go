@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import {
   Bot, Terminal, FileText, FileCode2, Search, Wrench,
-  ChevronDown, ChevronRight, Clock, ArrowRight, Download
+  ChevronDown, ChevronRight, Clock, ArrowRight, Download, Copy, Check, FolderOpen
 } from 'lucide-react'
 import type { ToolCall } from '../types'
 import { Badge, Button, StateBadge, cn } from './ui'
@@ -9,6 +9,7 @@ import { CodeBlock } from './CodeBlock'
 import { DiffView } from './DiffView'
 import { useUI } from '../stores/uiStore'
 import { useWorkspace } from '../stores/workspaceStore'
+import { buildCommandLine, commandDir, commandTimeout, isCommandTool } from '../lib/commandLine'
 
 const RISK: Record<string, { tone: 'gray' | 'blue' | 'yellow' | 'red'; text: string }> = {
   readonly: { tone: 'gray', text: '只读' },
@@ -53,9 +54,32 @@ export function ToolCard({ call, onRevertHunk }: { call: ToolCall; onRevertHunk?
   }, [call.status, live])
   // 实时输出折叠面板：默认展开，用户可收起
   const [liveOpen, setLiveOpen] = useState(true)
-  const risk = RISK[call.risk] || RISK.readonly
-  const hasBody = Boolean(call.result || call.liveOutput || call.diff || Object.keys(call.args || {}).length)
   const { toast } = useUI()
+  const risk = RISK[call.risk] || RISK.readonly
+  // 命令类工具（run_command / shell 等）：命令行由 {cmd, args[]} 拼装而成，
+  // 后端不下发 cmdline 字段，故此处显式拼出完整命令行并单独呈现，
+  // 不再只靠 args chip 里的 `cmd: xxx`（会被 max-w-280px 截断，看不到完整命令）。
+  const isCmd = isCommandTool(call.name, call.risk)
+  const cmdLine = isCmd ? buildCommandLine(call.args) : ''
+  const cmdDir = isCmd ? commandDir(call.args) : ''
+  const cmdTimeout = isCmd ? commandTimeout(call.args) : 0
+  // 命令类参数已由「完整命令行 + 上下文」完整呈现，args chip 不再重复展示
+  const CMD_ARG_KEYS = new Set(['cmd', 'command', 'args', 'dir', 'timeout_s'])
+  const argEntries = Object.entries(call.args || {}).filter(
+    ([k]) => !(isCmd && CMD_ARG_KEYS.has(k)),
+  )
+  const [cmdCopied, setCmdCopied] = useState(false)
+  const copyCmd = async () => {
+    try {
+      await navigator.clipboard.writeText(cmdLine)
+      setCmdCopied(true)
+      setTimeout(() => setCmdCopied(false), 1400)
+    } catch {
+      setCmdCopied(false)
+      toast('error', '复制失败：浏览器未授予剪贴板权限，请手动选中命令行复制')
+    }
+  }
+  const hasBody = Boolean(call.result || call.liveOutput || call.diff || Object.keys(call.args || {}).length)
   // 实时输出容器：新 chunk 到达时自动滚底（用户手动上翻查看历史时不被强制拉回）
   const liveRef = useRef<HTMLPreElement>(null)
   useEffect(() => {
@@ -107,10 +131,22 @@ export function ToolCard({ call, onRevertHunk }: { call: ToolCall; onRevertHunk?
 
         <span className="font-mono text-[12px] font-semibold text-ink shrink-0 tracking-tight">{call.name}</span>
 
+        {/* 命令类工具：标题行直接露出命令行预览（单行省略，hover 出全量；展开后有完整块）。
+            这样折叠状态下也能一眼看出「跑的是什么命令」，而不是只看到一个 run_command 工具名。 */}
+        {cmdLine && (
+          <span
+            className="min-w-0 flex-1 truncate font-mono text-[11.5px] text-inkdim"
+            title={cmdLine}
+          >
+            {cmdLine}
+          </span>
+        )}
+
         <Badge tone={risk.tone}>{risk.text}</Badge>
         <StateBadge state={call.status} />
 
-        <span className="flex-1" />
+        {/* 命令行预览已占用弹性空间时不再补占位，避免右侧信息被挤成一半宽度 */}
+        {!cmdLine && <span className="flex-1" />}
 
         {spawnTarget && (
           <span
@@ -141,9 +177,46 @@ export function ToolCard({ call, onRevertHunk }: { call: ToolCall; onRevertHunk?
 
       {open && (
         <div className="px-3.5 pb-3.5 space-y-2.5 border-t border-edge pt-2.5 bg-panel2">
-          {Object.keys(call.args || {}).length > 0 && (
+          {/* 完整命令行：后端只下发 {cmd, args[]}，命令行是拼出来的。
+              这里用 whitespace-pre-wrap + break-all 保证长命令自动折行、绝不省略号截断，
+              并附一键复制（复制的是可直接粘进终端的命令串，含参数引号转义）。 */}
+          {cmdLine && (
+            <div className="rounded-lg border border-edge/70 bg-[#090d14] overflow-hidden">
+              <div className="flex items-center justify-between gap-2 px-2.5 h-7 border-b border-edge/60 bg-panel2/60">
+                <span className="inline-flex items-center gap-1.5 text-[10.5px] text-inkfaint font-mono select-none">
+                  <Terminal size={10} className="text-amber-400" />
+                  完整命令行
+                </span>
+                <button
+                  type="button"
+                  className="inline-flex items-center gap-1 text-[10.5px] text-inkfaint hover:text-ink transition-colors px-1 py-0.5 rounded hover:bg-panel3"
+                  onClick={copyCmd}
+                  title="复制完整命令行"
+                >
+                  {cmdCopied ? <Check size={11} className="text-ok" /> : <Copy size={11} />}
+                  <span>{cmdCopied ? '已复制' : '复制'}</span>
+                </button>
+              </div>
+              <code className="block px-2.5 py-2 font-mono text-[11.5px] leading-5 text-[#e6edf3] whitespace-pre-wrap break-all select-text">
+                {cmdLine}
+              </code>
+              {(cmdDir || cmdTimeout > 0) && (
+                <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-2.5 py-1 border-t border-edge/40 text-[10.5px] text-inkfaint font-mono">
+                  {cmdDir && (
+                    <span className="inline-flex items-center gap-1">
+                      <FolderOpen size={10} />
+                      cwd: {cmdDir}
+                    </span>
+                  )}
+                  {cmdTimeout > 0 && <span>timeout: {cmdTimeout}s</span>}
+                </div>
+              )}
+            </div>
+          )}
+
+          {argEntries.length > 0 && (
             <div className="flex flex-wrap gap-1.5 text-[11px]">
-              {Object.entries(call.args).map(([k, v]) => (
+              {argEntries.map(([k, v]) => (
                 <span key={k} className="inline-flex items-center gap-1 rounded-md bg-panel px-2 py-0.5">
                   <span className="text-inkfaint">{k}:</span>
                   <span className="text-ink font-mono font-medium max-w-[280px] truncate" title={typeof v === 'string' ? v : JSON.stringify(v)}>
@@ -164,7 +237,9 @@ export function ToolCard({ call, onRevertHunk }: { call: ToolCall; onRevertHunk?
 
           {call.result && !call.diff && (
             call.result.includes('\n') || call.result.length > 80
-              ? <CodeBlock code={call.result} lang={call.name === 'run_command' ? 'bash' : 'text'} />
+              // 命令类工具的返回值是 stdout/stderr（输出），不是命令本身；
+              // 标签写 bash 会和上方「完整命令行」混淆，故明确标为「输出」。
+              ? <CodeBlock code={call.result} lang={isCmd ? '输出' : 'text'} />
               : (
                 <div className="text-[12px] text-ink font-mono bg-panel p-2.5 rounded-lg break-words">
                   {call.result}

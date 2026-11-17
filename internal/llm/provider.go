@@ -121,7 +121,13 @@ type Error struct {
 	StatusCode int
 	Message    string
 	RetryAfter int // 秒（来自 Retry-After 头，0 表示未知）
-	cause      error
+	// UpstreamBody 上游原始响应报文（已截断，仅用于诊断）。
+	//
+	// 为什么单独留一个字段而不只拼进 Message：Message 会透传到前端 error_message
+	// 与 runs 表投影，必须是稳定的人话；原始报文可能含 HTML 错误页/超长 JSON，
+	// 只应进结构化日志与审计副本。字段留空表示上游未返回可读报文。
+	UpstreamBody string
+	cause        error
 }
 
 // Error 实现 error 接口。

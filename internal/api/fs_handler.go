@@ -18,17 +18,19 @@ import (
 //
 // 端点清单（契约见 docs/工作区宿主与目录选择对接约定.md §3.2）：
 //
-//	GET /api/v1/fs/roots?host=server        列出可选根（Windows 盘符 / POSIX 白名单根）
+//	GET /api/v1/fs/roots?host=server        列出可选根（默认整机：Windows 各盘符 / POSIX "/"；
+//	                                        配置了 workspace.fs_roots 时仅列该范围）
 //	GET /api/v1/fs/dirs?host=server&path=X  列出该目录下的子目录
 //
 // 设计红线（改动前务必读完）：
 //  1. **只读列举**：仅 os.ReadDir 拿元数据，**绝不 os.ReadFile**；
 //     这是目录选择器，不是文件浏览器 —— 泄露面必须锁死在「目录名」。
 //  2. **只返回目录**：文件项一律过滤掉（前端 UI 也据此不放文件入口）。
-//  3. **穿越防护**：Clean → DataDir 一致性校验 → 白名单 Rel 校验，三道叠加。
-//  4. **不跟随软链**：软链可能是环，也可能指向白名单之外，直接跳过。
-//  5. **L1 占位**：host=device:<id> 本期统一返回 fs.host_unsupported，
-//     前端据此把客户端空间置灰。**绝不允许**静默回退到服务端本地列举，
+//  3. **穿越防护**：Clean → 绝对路径校验 → 范围归属 Rel 校验，三道叠加。
+//     范围默认是整机，但 `..` 穿越与相对路径仍一律拒绝（口径不变）。
+//  4. **不跟随软链**：软链可能是环，也可能指向范围之外，直接跳过。
+//  5. **L1 拆分为派发**：host=device:<id> 走 fsDispatchDevice 真实派发，
+//     **绝不允许**静默回退到服务端本地列举，
 //     否则会把服务端目录列进客户端空间（见对接约定 §2.2 坑 2/坑 3）。
 //  6. **不得产生 tool_events**：目录浏览是高频非审计操作，本文件不接触 engine 与 Dispatcher。
 const (
@@ -155,12 +157,14 @@ func fsResolvePath(raw string, roots []string) (string, error) {
 		return "", apperr.New(apperr.CodeFSPathDenied, "必须提供绝对路径")
 	}
 	abs := filepath.Clean(raw)
-	// ③ 白名单归属校验
+	// ③ 范围归属校验（默认整机；仅当服务端配置了 fs_roots 时才是真正的「限制」）
 	if len(roots) == 0 {
-		return "", apperr.New(apperr.CodeFSPathDenied, "服务端未配置可浏览的目录范围")
+		return "", apperr.New(apperr.CodeFSPathDenied,
+			"服务端配置的目录范围无效，暂无可浏览的目录（请检查 workspace.fs_roots）")
 	}
 	if !fsWithinRoots(abs, roots) {
-		return "", apperr.New(apperr.CodeFSPathDenied, "该目录不在服务端允许的范围内").WithDetails(map[string]any{
+		return "", apperr.New(apperr.CodeFSPathDenied,
+			"该目录不在服务端配置的目录范围内").WithDetails(map[string]any{
 			"path": abs,
 		})
 	}
@@ -200,13 +204,32 @@ func fsListSubdirs(dir string) (dirs []fsDirEntry, truncated bool, err error) {
 	return dirs, truncated, nil
 }
 
-// fsRootsOf 列出白名单根（供 /fs/roots 与 /fs/dirs 未定位时使用）。
+// fsRootsOf 列出根范围（供 /fs/roots 与 /fs/dirs 未定位时使用）。
+//
+// 根可能是「整机默认范围」（各逻辑盘符 / "/"）或「用户配置的受限根」，展示名需分别处理：
+//   - Windows 盘符根 `C:\`：filepath.Base 得到 `\`（不可读），改为 `C:`；
+//   - POSIX 根 `/`：filepath.Base 得到 `/`，保持不变；
+//   - 普通配置目录：取末级目录名。
 func fsRootsOf(roots []string) []fsDirEntry {
 	out := make([]fsDirEntry, 0, len(roots))
 	for _, r := range roots {
-		out = append(out, fsDirEntry{Name: filepath.Base(r), Path: r})
+		out = append(out, fsDirEntry{Name: fsRootLabel(r), Path: r})
 	}
 	return out
+}
+
+// fsRootLabel 计算根条目的显示名（仅用于 UI，不参与任何安全判定）。
+func fsRootLabel(root string) string {
+	vol := filepath.VolumeName(root)
+	// 盘符根（"C:\" 或 "C:/"）：VolumeName 为 "C:"，去掉它后面就只剩分隔符
+	if vol != "" && (root == vol || root == vol+string(filepath.Separator) || root == vol+"/") {
+		return vol
+	}
+	base := filepath.Base(root)
+	if base == "" || base == "." || base == string(filepath.Separator) {
+		return root
+	}
+	return base
 }
 
 // fsCheckHost 校验 host 参数的支持情况。
@@ -329,8 +352,10 @@ func (h *handlers) listFSRoots(w http.ResponseWriter, r *http.Request) {
 	}
 	roots := h.fsAllowedRoots()
 	if len(roots) == 0 {
-		// 未配置任何可浏览根：明确报错而非放行
-		writeError(w, r, apperr.New(apperr.CodeFSHostUnsupported, "服务端未配置可浏览的目录范围"))
+		// 配置的 fs_roots 全部无效：明确报错而非放行（沿用 host_unsupported 码，
+		// 语义是「服务端当前没有可列举的范围」，与前端既有分支兼容）
+		writeError(w, r, apperr.New(apperr.CodeFSHostUnsupported,
+			"服务端配置的目录范围无效，暂无可浏览的目录（请检查 workspace.fs_roots）"))
 		return
 	}
 	writeJSON(w, http.StatusOK, fsRootsResp{
