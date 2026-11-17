@@ -8,6 +8,7 @@ import { useUI } from '../../stores/uiStore'
 import { Check, Clock, Copy, GitBranch, GitCompare, RotateCcw, RotateCw, Trash2, Zap, Sparkles } from 'lucide-react'
 import { ProcessDrawer, formatStepMs, formatStepTokens } from './ProcessDrawer'
 import { ReasoningCard } from './ReasoningCard'
+import { RunProgressInline, type RunPhase } from './LiveProgress'
 import type { Message } from '../../types'
 
 interface TurnGroup {
@@ -30,6 +31,10 @@ interface MessageThreadProps {
   messages: Message[]
   streaming?: boolean
   reasoning?: string
+  /** 运行阶段：决定「加载中」文案（posting/connecting/waiting） */
+  runPhase?: RunPhase
+  /** 运行开始时间戳：执行时长秒表基准 */
+  runStartedAt?: number
   actions: ThreadActions
   /** 传 false 隐藏复制按钮（子进程详情等浮窗对话） */
   showCopy?: boolean
@@ -42,7 +47,7 @@ interface MessageThreadProps {
 }
 
 export function MessageList() {
-  const { streaming, reasoning, fork, revertTo, reapply, deleteFrom } = useChat()
+  const { streaming, reasoning, fork, revertTo, reapply, deleteFrom, runPhase, runStartedAt } = useChat()
   const currentId = useSessions((s) => s.currentId)
   const messages = useChat((s) => s.messagesOf(currentId))
 
@@ -52,6 +57,8 @@ export function MessageList() {
         messages={messages}
         streaming={streaming}
         reasoning={reasoning}
+        runPhase={runPhase}
+        runStartedAt={runStartedAt}
         actions={{ fork, revertTo, reapply, deleteFrom }}
       />
     </div>
@@ -63,6 +70,8 @@ export function MessageThread({
   messages,
   streaming = false,
   reasoning = '',
+  runPhase = 'waiting',
+  runStartedAt = 0,
   actions,
   showCopy = true,
   scrollCls,
@@ -132,6 +141,8 @@ export function MessageThread({
               isLast={i === turns.length - 1}
               running={streaming}
               reasoning={reasoning}
+              runPhase={runPhase}
+              runStartedAt={runStartedAt}
               actions={actions}
               showCopy={showCopy}
             />
@@ -157,6 +168,8 @@ export function MessageThread({
               isLast={index === turns.length - 1}
               running={streaming}
               reasoning={reasoning}
+              runPhase={runPhase}
+              runStartedAt={runStartedAt}
               actions={actions}
               showCopy={showCopy}
             />
@@ -171,11 +184,13 @@ export function MessageThread({
  * 单轮对话块（参照桌面端双轨容器模型）：
  * 「第 N 轮」分隔条 → 用户提问 → 执行过程抽屉（N 个步骤）→ 最终交付答复
  */
-function TurnBlock({ turn, isLast, running, reasoning, actions, showCopy }: {
+function TurnBlock({ turn, isLast, running, reasoning, runPhase, runStartedAt, actions, showCopy }: {
   turn: TurnGroup
   isLast: boolean
   running: boolean
   reasoning: string
+  runPhase: RunPhase
+  runStartedAt: number
   actions: ThreadActions
   showCopy: boolean
 }) {
@@ -234,7 +249,17 @@ function TurnBlock({ turn, isLast, running, reasoning, actions, showCopy }: {
           <ProcessDrawer steps={process} running={active} reasoning={active ? reasoning : undefined} />
         )}
 
-        {deliverableForRender && <MessageItem key={deliverableForRender.id} msg={deliverableForRender} actions={actions} />}
+        {deliverableForRender && (
+          <MessageItem
+            key={deliverableForRender.id}
+            msg={deliverableForRender}
+            actions={actions}
+            // 只有「本轮的进行中答复」才带阶段与秒表：历史轮次给 undefined，
+            // 避免给已完成的旧消息挂上一个永不停止的计时器。
+            runPhase={active ? runPhase : undefined}
+            runStartedAt={active ? runStartedAt : undefined}
+          />
+        )}
 
         {/* 轮次底部指标栏 */}
         <TurnFooterBar turn={turn} streaming={active} actions={actions} showCopy={showCopy} />
@@ -332,7 +357,13 @@ function TurnFooterBar({ turn, streaming, actions, showCopy }: { turn: TurnGroup
   )
 }
 
-function MessageItem({ msg, actions }: { msg: Message; actions: ThreadActions }) {
+function MessageItem({ msg, actions, runPhase, runStartedAt }: {
+  msg: Message
+  actions: ThreadActions
+  /** 仅「本轮进行中的答复」传入；历史消息不传（否则会挂上永不停止的计时器） */
+  runPhase?: RunPhase
+  runStartedAt?: number
+}) {
   if (msg.role === 'user') {
     const reverted = Boolean(msg.revertedAt)
     const actBtn = 'w-7 h-7 rounded-lg hover:bg-panel2 flex items-center justify-center transition-all shrink-0 active:scale-95'
@@ -418,12 +449,13 @@ function MessageItem({ msg, actions }: { msg: Message; actions: ThreadActions })
       )}
 
       {msg.streaming && !msg.content && (
-        <div className="flex items-center gap-1.5 text-inkfaint text-[12px] py-1">
-          <span className="w-1.5 h-1.5 rounded-full bg-accent inline-block typing-dot" />
-          <span className="w-1.5 h-1.5 rounded-full bg-accent inline-block typing-dot" />
-          <span className="w-1.5 h-1.5 rounded-full bg-accent inline-block typing-dot" />
-          <span className="ml-1 text-[12px] font-medium text-inkdim">思考中…</span>
-        </div>
+        // 「消息已上屏 → 下方加载中动画」（对齐老版本 animate-bounce 三点错峰）。
+        // 阶段文案随 runPhase 推进，并把已等待时长打在文案里 —— 时间在动 = 程序活着。
+        <RunProgressInline
+          running={Boolean(msg.streaming)}
+          startedAt={runStartedAt ?? 0}
+          phase={runPhase ?? 'waiting'}
+        />
       )}
     </div>
   )

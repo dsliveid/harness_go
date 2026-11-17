@@ -10,6 +10,9 @@ import { useSessions } from './sessionStore'
 import { useSse } from './sseStore'
 import { useUI } from './uiStore'
 import { useWorkspace } from './workspaceStore'
+// 运行阶段类型与加载动画共用一份定义（LiveProgress 是「加载中」视觉的唯一真源），
+// 避免 store 与视图各写一套阶段枚举导致文案漂移。
+import type { RunPhase } from '../features/chat/LiveProgress'
 
 // 模块级流式缓冲：delta 累积后按 50ms 批量提交，避免逐 token setState
 //
@@ -25,6 +28,15 @@ let currentRunId: string | null = null
 /** 当前被跟踪 Run 所属会话（切会话后仍要继续跟踪原 Run，故与 currentId 分开记） */
 let currentRunSessionId: string | null = null
 let stepStartAt = 0
+/**
+ * 本轮 Run 的发起时刻（毫秒）：执行时长秒表的唯一基准。
+ *
+ * 为什么用模块级变量 + store 双写：秒表要从「用户按下发送」那一刻起算，
+ * 而不是从「服务端返回 run_id」或「首字节到达」起算 —— 后者会把用户最在意的
+ * 静默期（POST 同步阻塞 + TTFT）整段排除在计时之外，看起来「只跑了 2 秒」，
+ * 与用户实际体感（等了 15 秒）严重不符。
+ */
+let runStartedAtMs = 0
 /** 每会话最近一次消息级回滚的事件 id（real 模式 reapply 依据；S10 语义，刷新后从服务端 rollbacks 列表不可得时降级为不可重放） */
 const lastRollbackBySession: Record<string, string> = {}
 
@@ -103,6 +115,19 @@ interface ChatState {
   /** 会话累计缓存命中 tokens（加权命中率分母为 tokensIn） */
   cachedTokens: number
   lastError: string | null
+  /**
+   * 当前 Run 的阶段（决定「加载中」文案）。
+   *
+   * posting = POST /runs 在途（服务端在建库/落库/记忆召回/SOP读盘/工具检索）
+   * connecting = run_id 已拿到、SSE 正在建连
+   * waiting = 连接已开、等模型首字（TTFT）
+   *
+   * 分三段是本次「界面无反应」修复的关键：用户能看见阶段在推进，
+   * 而不是对着一个永不变化的「思考中」怀疑卡死。
+   */
+  runPhase: RunPhase
+  /** 当前 Run 的发起时刻（毫秒，0 = 空闲）。执行时长秒表基准，见 LiveProgress。 */
+  runStartedAt: number
   // 说明：上下文「智能压缩」交互链路已整体下线（后端无压缩器 / 无压缩记录表 / 无压缩接口，
   // 保留入口即静默失败）。此处不再持有任何压缩状态与方法，真实 token 水位仅由 tokensIn/tokensOut/cachedTokens 承载。
   /** 推送一条数据权限审批（不阻塞 Run） */
@@ -122,6 +147,8 @@ interface ChatState {
   reapply: (msgId: string) => void
   deleteFrom: (msgId: string) => void
   messagesOf: (sessionId: string) => Message[]
+  /** 当前 Run 已执行步数（用于进度条「第 N 步」） */
+  currentStepCount: () => number
   /** 以 DB 为准重拉某会话的消息快照（real 模式；断线重连/resync 时对齐） */
   reloadMessages: (sessionId: string) => Promise<void>
   /**
@@ -270,6 +297,9 @@ export const useChat = create<ChatState>((set, get) => {
       runStatus,
       reasoning: '',
       approval: null,
+      // 收口必须清掉阶段与秒表基准：否则进度条会在 Run 结束后继续计时（假运行态）
+      runPhase: 'idle' as RunPhase,
+      runStartedAt: 0,
       ...(opts.error ? { lastError: opts.error } : {}),
       ...usagePatch,
     }))
@@ -278,6 +308,7 @@ export const useChat = create<ChatState>((set, get) => {
     currentRunId = null
     currentRunSessionId = null
     handle = null
+    runStartedAtMs = 0
     // 订阅结束：如实回到空闲态（顶栏不再残留「已连接」假象）
     useSse.getState().detachRun()
     // 排队输入继续依次执行（失败与成功同语义：不因一次结束阻塞后续）
@@ -508,6 +539,9 @@ export const useChat = create<ChatState>((set, get) => {
     stepStartAt = now
     pendingText = ''
     pendingReasoning = ''
+    // 秒表基准 = 用户按下发送这一刻（now），不是服务端返回 run_id 之后：
+    // POST 同步阻塞是同一次等待的一部分，必须计入执行时长。
+    runStartedAtMs = now
     set((s) => ({
       messages: [...s.messages, userMsg, assistantMsg],
       streaming: true,
@@ -515,6 +549,9 @@ export const useChat = create<ChatState>((set, get) => {
       reasoning: '',
       lastError: null,
       approval: null,
+      // 三阶段推进：posting →（拿到 run_id）connecting →（SSE open）waiting
+      runPhase: 'posting' as RunPhase,
+      runStartedAt: now,
     }))
 
     const onStreamEvent = makeStreamEventHandler(sessionId)
@@ -538,6 +575,10 @@ export const useChat = create<ChatState>((set, get) => {
         },
         onSseState: (state, info) => {
           applySseState(state, info)
+          // 连接已开 → 进入「等模型首字」阶段（静默期的最后一段）
+          if (state === 'open' && get().runPhase === 'connecting') {
+            set({ runPhase: 'waiting' as RunPhase })
+          }
           // 服务端返回真实 runId 后回填订阅目标（本地壳 id 与真实 id 不同）
           if (state === 'open' && currentRunId && useSse.getState().runId !== currentRunId) {
             useSse.getState().retargetRun(currentRunId)
@@ -548,6 +589,9 @@ export const useChat = create<ChatState>((set, get) => {
       .then((h) => {
         handle = h
         currentRunId = h.runId
+        // POST 已返回（run_id 到手）、SSE 已开始建连 → 静默期进入第二段。
+        // 只从 posting 推进，不覆盖已到 waiting 的状态（SSE 若已 open，onSseState 会先接管）。
+        if (get().runPhase === 'posting') set({ runPhase: 'connecting' as RunPhase })
         // 只回填 id，不重置已建立的连接阶段
         if (useSse.getState().runId && useSse.getState().runId !== h.runId) useSse.getState().retargetRun(h.runId)
         if (cancelPending) {
@@ -575,20 +619,50 @@ export const useChat = create<ChatState>((set, get) => {
     tokensOut: 0,
     cachedTokens: 0,
     lastError: null,
+    runPhase: 'idle' as RunPhase,
+    runStartedAt: 0,
     draft: '',
 
     setDraft: (text) => set({ draft: text }),
 
     messagesOf: (sessionId) => get().messages.filter((m) => m.sessionId === sessionId && !m.reverted),
 
+    /**
+     * 当前 Run 已执行的步数（会话内 assistant 消息条数）。
+     *
+     * 用途：进度条上的「第 N 步」。服务端每个 step 都会追加一条 assistant 消息
+     * （chatStore 的 'step' 分支），所以这个计数天然与真实执行步数对齐，
+     * 不需要新增状态字段，也不会与 messages 产生两份真相。
+     */
+    currentStepCount: () => {
+      const sid = useSessions.getState().currentId
+      if (!sid) return 0
+      return get().messages.filter((m) => m.sessionId === sid && m.role === 'assistant').length
+    },
+
     // 以 DB 为准重拉消息快照：断线重连（resync）后覆盖本地流式态
     reloadMessages: async (sessionId) => {
       if (!sessionId) return
       try {
         const list = await api.listMessages(sessionId)
-        set((s) => ({
-          messages: [...s.messages.filter((m) => m.sessionId !== sessionId), ...list],
-        }))
+        set((s) => {
+          // 🚨 缺陷修复（2026-11，用户反馈「首次发送后消息又没了」）：
+          // startRun 会在 POST 前把 userMsg + 空 assistant 壳乐观上屏，而 `onResync`
+          // 与 `resumeRun` 都会调用本方法做全量替换。首次发送时服务端可能**还没写完**
+          // 用户消息、assistant 消息更是要等流结束才落库 —— 整段替换会把刚上屏的消息
+          // 凭空抹掉，用户看到「发送 → 消息消失 → 一片空白」，体感就是彻底没反应。
+          //
+          // 保留规则（只认 seq，不认 id：服务端消息 id 与本地乐观 id 必然不同）：
+          //   DB 里没有该 seq，说明这条乐观消息尚未落库，必须保留。
+          //   一旦服务端落库（seq 被占用），自然被 DB 版本取代，无需手工去重。
+          const others = s.messages.filter((m) => m.sessionId !== sessionId)
+          const serverSeqs = new Set(list.map((m) => m.seq))
+          const keepLocal =
+            s.streaming && currentRunSessionId === sessionId
+              ? s.messages.filter((m) => m.sessionId === sessionId && !serverSeqs.has(m.seq))
+              : []
+          return { messages: [...others, ...list, ...keepLocal] }
+        })
         // 历史消息里的工具调用是运行态数据的回灌源：切换会话 / 刷新后右侧浮动栏
         // 靠这一次派生恢复出该会话自己的 todos/plans/subagents/commands
         syncWorkspaceFromMessages()
@@ -620,11 +694,15 @@ export const useChat = create<ChatState>((set, get) => {
       // 切回时靠本方法重新接回）。否则输入框会误显「运行中」、顶栏残留连接态。
       if (get().streaming && currentRunSessionId && currentRunSessionId !== sessionId) {
         flush()
-        set({ streaming: false, runStatus: 'completed', reasoning: '', approval: null })
+        set({
+          streaming: false, runStatus: 'completed', reasoning: '', approval: null,
+          runPhase: 'idle' as RunPhase, runStartedAt: 0,
+        })
         streamingMsgId = null
         currentRunId = null
         currentRunSessionId = null
         handle = null
+        runStartedAtMs = 0
         useSse.getState().detachRun()
       }
       let active: ActiveRunDTO | null = null
@@ -660,11 +738,18 @@ export const useChat = create<ChatState>((set, get) => {
       stepStartAt = now
       pendingText = ''
       pendingReasoning = ''
+      // 刷新恢复：Run 已在服务端跑了一段时间，但前端拿不到服务端起始时刻
+      // （ActiveRunDTO 无 createdAt），故以「恢复这一刻」为基准诚实计时，
+      // 绝不编造一个更早的时间让时长看起来更完整。
+      runStartedAtMs = now
       set((s) => ({
         streaming: true,
         runStatus: active?.status === 'waiting_approval' ? 'waiting_approval' : 'running',
         reasoning: '',
         lastError: null,
+        // 恢复的 Run 早已过了 POST/建连阶段，直接进「等模型输出」
+        runPhase: 'waiting' as RunPhase,
+        runStartedAt: now,
         messages: s.messages.map((m) => (m.id === streamingMsgId ? { ...m, streaming: true } : m)),
       }))
       // 顶栏如实进入「连接中」，此后由 SseClient 状态机接管
@@ -757,10 +842,14 @@ export const useChat = create<ChatState>((set, get) => {
         runStatus: 'cancelled',
         approval: null,
         reasoning: '',
+        // 主动停止同样要归零阶段与秒表（否则进度条会一直转）
+        runPhase: 'idle' as RunPhase,
+        runStartedAt: 0,
         messages: s.messages.map((m) =>
           m.id === id ? { ...m, streaming: false, durationMs: Date.now() - stepStartAt } : m,
         ),
       }))
+      runStartedAtMs = 0
       useUI.getState().toast('info', '已停止本次运行（Run 标记为 cancelled）')
     },
 
