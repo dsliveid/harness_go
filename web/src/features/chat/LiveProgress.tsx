@@ -1,19 +1,25 @@
 /**
- * 实时进度可视化（对齐老版本 harness_mini 的 MessageItem/formatDuration 体感）。
+ * 实时进度可视化（对齐老版本 harness_mini 的 MessageItem 体感）。
  *
  * 存在意义（2026-11）：首次发送消息时，前端在「POST /runs 同步阻塞 + LLM 首字延迟(TTFT)」
- * 这段静默期里**没有任何进度反馈** —— 消息虽然已乐观上屏，但下方只有一个静止的三点，
- * 用户无法判断「到底在跑还是卡死」。老版本的做法是：
+ * 这段静默期里**没有任何进度反馈** —— 用户无法判断「到底在跑还是卡死」。
+ * 老版本的做法是：
  *   ① `animate-bounce` 三点错峰弹跳（明确「正在加载」）；
- *   ② `liveTurnDuration` 每轮持续计时，配 `Clock animate-spin` 转圈图标，
+ *   ② 整轮持续计时 `正在执行... 21分5秒`，配 `Clock animate-spin` 转圈图标，
  *      让用户**看得见时间在走**（时间在动 = 进程活着）。
  *
- * 本文件把这两点抽成独立单元，供「消息气泡下方」与「输入框上方常驻条」两处复用，
- * 避免两份计时器各写一套（老版本踩过的重复状态机问题）。
+ * 🚨 计时基准铁律（2026-11 修正，上一版踩过的坑）：
+ *   基准必须来自**消息自身的时间戳**（本轮 user 消息的 createdAt），
+ *   而不是 store 里的全局「运行开始时刻」。老版本 types.ts:888-890 正是这么做的
+ *   （`turnStartTime = currentTurnUser.createdAt`）。
+ *
+ *   为什么全局字段会出错：停止某个 Run 后再切换对话，全局字段会被 resumeRun /
+ *   切会话分支重置为「此刻」→ 秒表从 0 重新开始，用户看到时长莫名倒退。
+ *   而消息 createdAt 是服务端落库的不可变事实：切走、切回、刷新都读到同一个值，
+ *   秒表自然接着走，无需任何额外的状态同步。
  */
 
 import { useEffect, useState } from 'react'
-import { Clock, Loader2 } from 'lucide-react'
 import { cn } from '../../components/ui'
 
 /**
@@ -35,10 +41,9 @@ export function formatDuration(ms?: number | null): string {
 /**
  * 实时秒表：从 startedAt 起按 tick 间隔刷新已过毫秒数。
  *
- * - `running=false` 或 `startedAt<=0` 时**停止计时并归零**，不保留上一轮的残留值
- *   （否则切会话/收口后会显示上一个 Run 的时长，属于假数据）。
+ * - `running=false` 或 `startedAt<=0` 时**停止计时并归零**，不保留上一轮的残留值。
  * - 只在运行中挂 interval，非运行态不产生任何定时器（避免每轮空转）。
- * - 返回 0 表示「尚未开始」，调用方可据此决定是否渲染整条进度。
+ * - 返回 0 表示「尚未开始」，调用方可据此决定是否渲染计时。
  */
 export function useLiveElapsed(startedAt: number, running: boolean, tickMs = 100): number {
   const [elapsed, setElapsed] = useState(0)
@@ -62,7 +67,7 @@ export function useLiveElapsed(startedAt: number, running: boolean, tickMs = 100
 /**
  * 三点错峰弹跳加载动画（对齐老版本 MessageItem.tsx:244-256 的 animate-bounce 错峰）。
  *
- * 为什么不复用在用的 `.typing-dot`：那是 opacity+scale 呼吸效果，视觉上「静止感」更强；
+ * 为什么不复用 `.typing-dot`：那是 opacity+scale 呼吸效果，视觉上「静止感」更强；
  * 老版本用的是纵向位移弹跳，用户更容易识别为「加载中」。
  */
 export function LoadingDots({ className }: { className?: string }) {
@@ -79,18 +84,21 @@ export function LoadingDots({ className }: { className?: string }) {
   )
 }
 
-/** 运行阶段：决定文案。时间轴顺序即枚举顺序。 */
+/** 运行阶段：决定「加载中」文案。 */
 export type RunPhase = 'idle' | 'posting' | 'connecting' | 'waiting'
 
 /**
  * 阶段文案。
  *
  * 为什么分三段而不是一句「思考中」：首次发送的静默期由两段构成——
- * POST 在途（服务端同步做建库/落库/记忆召回/SOP 读盘/工具检索）与
+ * POST 在途（服务端同步做建库/落库/记忆召回/SOP读盘/工具检索）与
  * 模型首字延迟。用户看到「正在创建运行」→「正在建立连接」→「模型思考中」
  * 的推进，才能确信程序没有卡死。
+ *
+ * `hasTimer=false`（startedAt 未知）时**不显示时长**：
+ * 显示一个永不变化的「0.1s」比不显示更像卡死，宁可只留动画。
  */
-function phaseText(phase: RunPhase, elapsed: number, hasTimer = true): string {
+export function phaseText(phase: RunPhase, elapsed: number, hasTimer: boolean): string {
   const base = (() => {
     switch (phase) {
       case 'posting':
@@ -104,15 +112,18 @@ function phaseText(phase: RunPhase, elapsed: number, hasTimer = true): string {
     }
   })()
   if (!base) return ''
-  // hasTimer=false（startedAt 未知，如刷新恢复失败的兜底）时**不显示时长**：
-  // 显示一个永不变化的「0.1s」比不显示更像卡死，宁可只留动画。
   return hasTimer ? `${base} ${formatDuration(elapsed) || '0.1s'}` : base
 }
 
 interface RunProgressInlineProps {
   /** 是否处于运行中 */
   running: boolean
-  /** 运行开始时间戳（毫秒），0/空表示未知 */
+  /**
+   * 本轮开始时刻（毫秒）。
+   *
+   * 🚨 必须传**本轮 user 消息的 createdAt**，绝不能传 store 里的全局运行时刻：
+   * 后者在停止/切换对话时会被重置，导致秒表从头开始（上一版的实际缺陷）。
+   */
   startedAt: number
   phase?: RunPhase
   className?: string
@@ -133,46 +144,6 @@ export function RunProgressInline({ running, startedAt, phase = 'waiting', class
       <span className="text-[12px] font-medium text-inkdim">
         {phaseText(phase, elapsed, startedAt > 0)}
       </span>
-    </div>
-  )
-}
-
-interface LiveProgressBarProps {
-  running: boolean
-  startedAt: number
-  phase?: RunPhase
-  /** 本轮已完成步数（可选，用于展示执行进度） */
-  stepCount?: number
-}
-
-/**
- * 输入框上方的常驻执行时长条。
- *
- * 为什么常驻在输入框上方而不是消息流末尾：消息流是可滚动的，用户往上翻看历史时
- * 末尾的耗时会被滚出视野 —— 「始终显示」的要求就落空了。输入框区域是固定可见区，
- * 放这里才能真正做到「对话过程中下方始终显示执行时长」。
- */
-export function LiveProgressBar({ running, startedAt, phase = 'waiting', stepCount = 0 }: LiveProgressBarProps) {
-  const elapsed = useLiveElapsed(startedAt, running)
-  if (!running) return null
-  const hasTimer = startedAt > 0
-  return (
-    <div className="px-3 sm:px-5 pt-1.5 select-none">
-      <div className="max-w-[860px] mx-auto flex items-center gap-2 rounded-lg border border-accent/25 bg-accent/[0.06] px-3 py-1.5 slide-up">
-        {/* 转圈图标：与老版本 `Clock animate-spin` 同语义 —— 图标在转 = 进程活着 */}
-        <Loader2 size={13} className="text-accent animate-spin shrink-0" />
-        <span className="text-[12px] font-medium text-accent">{phaseText(phase, elapsed, hasTimer) || '运行中…'}</span>
-        {stepCount > 1 && (
-          <span className="text-[11px] text-inkfaint font-mono shrink-0">第 {stepCount} 步</span>
-        )}
-        {/* 时钟+时长常驻右侧：即使阶段文案很长被截断，秒表也始终可见 */}
-        {hasTimer && (
-          <span className="ml-auto inline-flex items-center gap-1 text-[11px] text-inkfaint font-mono shrink-0">
-            <Clock size={11} className="opacity-70" />
-            <span>{formatDuration(elapsed) || '0.1s'}</span>
-          </span>
-        )}
-      </div>
     </div>
   )
 }

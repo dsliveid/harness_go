@@ -214,6 +214,29 @@ func defaultPolicyReason(p ToolPolicy) string {
 	return "当前工作空间未连接可用的执行设备，无法调用工具"
 }
 
+// detachedCtx 返回一个**不受父 ctx 取消影响**的记账用 ctx（5s 超时兜底不泄漏）。
+//
+// 为什么必须有（2026-11 实测缺陷）：Run 取消（用户停止 / 设备离线 / 请求断开）后，
+// 父 ctx 立刻 Done。若收尾写入（终态迁移、摘要回写、工具事件收口、消息落库）
+// 复用它，database/sql 会直接返回 context canceled 而**不执行 SQL**，且调用点普遍
+// 以 `_ =` 忽略错误 —— 结果就是「Run 明明停了，库里还挂着 running / pending」，
+// 前端刷新后据此重建为「正在对话中」、工具卡片永远「执行中…」。
+//
+// 铁律：取消只该停止「继续干活」，绝不该吞掉「记账」。
+func detachedCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+}
+
+// dbctx 单次记账用的脱离取消 ctx（不关心 cancel：5s 超时定时器自行回收）。
+//
+// 与 detachedCtx 同一目的，只是为了在 `sdb.Xxx(ctx, ...)` 调用点做**最小改动**替换：
+// 每次写入各取一个新 ctx，绝不复用一个长寿命 ctx（工具可能跑几分钟，
+// 共享的 5s 超时会在收尾时早已到期 → 又变成「写不进去」）。
+func dbctx(ctx context.Context) context.Context {
+	c, _ := detachedCtx(ctx)
+	return c
+}
+
 // Execute 执行 Run，阻塞直到终态。
 //
 // 返回 error 仅表示「执行过程异常」，Run 的最终状态始终以数据库为准。
@@ -237,6 +260,8 @@ func (e *Engine) Execute(ctx context.Context, req RunRequest) error {
 	case e.sem <- struct{}{}:
 		defer func() { <-e.sem }()
 	case <-ctx.Done():
+		// 排队期间就被取消：Run 已建（pending），必须如实收口，否则 active-run 永远命中它。
+		e.finishCancelled(req, "queue_canceled")
 		return ctx.Err()
 	}
 
@@ -256,20 +281,28 @@ func (e *Engine) Execute(ctx context.Context, req RunRequest) error {
 		}()
 	}
 
-	sdb, err := e.deps.Sessions.Session(ctx, req.SessionID)
+	// 记账类操作一律脱离取消 ctx（见 detachedCtx 注释）：即便此刻 Run 已被取消，
+	// 仍必须能读到 Run 行并写终态，否则前端刷新后会把它当成「进行中」。
+	dctx := dbctx(ctx)
+	sdb, err := e.deps.Sessions.Session(dctx, req.SessionID)
 	if err != nil {
 		return fmt.Errorf("agent: 打开会话库失败: %w", err)
 	}
 
-	run, err := sdb.GetRun(ctx, req.RunID)
+	run, err := sdb.GetRun(dctx, req.RunID)
 	if err != nil {
 		return fmt.Errorf("agent: 读取 Run 失败: %w", err)
+	}
+	// 已被其它路径（StopRun 同步收口 / 启动恢复）收口为终态：不再抢占 running，
+	// 也不改动已有终态（幂等交由 store.Transition 兜底），但如实返回错误供上层观测。
+	if run.Status.IsTerminal() {
+		return fmt.Errorf("agent: 非法状态迁移 %s → %s（Run 已结束）", run.Status, model.RunRunning)
 	}
 	// 状态机校验（单点收口）
 	if err := CheckTransition(run.Status, model.RunRunning); err != nil {
 		return err
 	}
-	if err := e.transition(ctx, sdb, req.RunID, model.RunRunning, "", "", ""); err != nil {
+	if err := e.transition(dctx, sdb, req.RunID, model.RunRunning, "", "", ""); err != nil {
 		return err
 	}
 	e.publishStatus(req.RunID, req.SessionID, model.RunRunning, "", "", "", nil)
@@ -277,9 +310,16 @@ func (e *Engine) Execute(ctx context.Context, req RunRequest) error {
 	usage := &runUsage{}
 	final, stopReason, errCode, errMsg, tokens := e.loop(ctx, sdb, req, usage)
 
-	if err := e.transition(ctx, sdb, req.RunID, final, stopReason, errCode, errMsg); err != nil {
-		// 终态迁移失败不掩盖原始错误
-		return fmt.Errorf("agent: 终态迁移失败: %w (原始状态=%s)", err, final)
+	// 终态收口：**绝不能因 ctx 已取消而失败早退**。
+	//
+	// 历史缺陷（勿回退）：这里原用 req ctx 调 Transition，取消后 SQL 不执行 → 报错 →
+	// 直接 return，跳过下面两步 Summary 回写与终态事件 → 库里永远 running，
+	// 前端刷新（F5）后根据 /active-run 重建为「正在对话中」。三条路径统一走 detachedCtx。
+	tctx, tcancel := detachedCtx(ctx)
+	defer tcancel()
+	var transitionErr error
+	if err := e.transition(tctx, sdb, req.RunID, final, stopReason, errCode, errMsg); err != nil {
+		transitionErr = err
 	}
 	// ③ 摘要回写主库（**不同事务、最终一致**；失败只影响列表新鲜度）
 	//
@@ -288,16 +328,41 @@ func (e *Engine) Execute(ctx context.Context, req RunRequest) error {
 	// 若回写滞后于终态可观测，则会出现「Run 已 completed，但 last_run_status 仍为空」
 	// 的瞬时不一致（TestEndToEndChatFlow 曾因此以约 60% 概率偶发失败）。
 	if e.deps.Summary != nil {
-		_ = e.deps.Summary.AddTokensAndStatus(ctx, req.SessionID, tokens, final)
+		_ = e.deps.Summary.AddTokensAndStatus(tctx, req.SessionID, tokens, final)
 	}
 
 	e.publishStatus(req.RunID, req.SessionID, final, stopReason, errCode, errMsg, usage)
 	e.deps.Events.CloseRun(req.RunID)
 
+	if transitionErr != nil {
+		return fmt.Errorf("agent: 终态迁移失败: %w (原始状态=%s)", transitionErr, final)
+	}
 	if final == model.RunFailed {
 		return fmt.Errorf("agent: Run 失败: %s %s", errCode, errMsg)
 	}
 	return nil
+}
+
+// finishCancelled 前置失败路径的 Run 收口（并发闸门排队被取消 / 打开会话库失败前）。
+//
+// 必须存在：这些路径原本直接 return，Run 停在 pending 永不收口 ——
+// /active-run 会一直把它当作「进行中」返回，前端刷新后重建为正在对话。
+func (e *Engine) finishCancelled(req RunRequest, stopReason string) {
+	ctx, cancel := detachedCtx(context.Background())
+	defer cancel()
+	sdb, err := e.deps.Sessions.Session(ctx, req.SessionID)
+	if err != nil {
+		return
+	}
+	if run, err := sdb.GetRun(ctx, req.RunID); err == nil && run.Status.IsTerminal() {
+		return
+	}
+	_ = e.transition(ctx, sdb, req.RunID, model.RunCancelled, stopReason, "", "")
+	if e.deps.Summary != nil {
+		_ = e.deps.Summary.AddTokensAndStatus(ctx, req.SessionID, 0, model.RunCancelled)
+	}
+	e.publishStatus(req.RunID, req.SessionID, model.RunCancelled, stopReason, "", "", nil)
+	e.deps.Events.CloseRun(req.RunID)
 }
 
 // runUsage per-Run 用量累计（P1：落 runs 表 + 终态 run.status 事件出栈）。
@@ -409,7 +474,7 @@ func (e *Engine) loop(ctx context.Context, sdb SessionDB, req RunRequest, usage 
 			// 见 sanitizeToolCalls 的说明（真实事故：会话被永久污染）。
 			assistantMsg.ToolCallsJSON = marshalToolCalls(e, req, out.toolCalls)
 		}
-		if err := sdb.AppendMessage(ctx, assistantMsg); err != nil {
+		if err := sdb.AppendMessage(dbctx(ctx), assistantMsg); err != nil {
 			return model.RunFailed, "", "persist_failed", err.Error(), tokens
 		}
 		if e.deps.Summary != nil {
@@ -433,7 +498,7 @@ func (e *Engine) loop(ctx context.Context, sdb SessionDB, req RunRequest, usage 
 			toolMsg.RunID = req.RunID
 			toolMsg.CreatedAt = e.deps.Now()
 			// tool 消息同样落库（消息最终内容以 DB 为准）
-			if err := sdb.AppendMessage(ctx, toolMsg); err != nil {
+			if err := sdb.AppendMessage(dbctx(ctx), toolMsg); err != nil {
 				return model.RunFailed, "", "persist_failed", err.Error(), tokens
 			}
 			history = append(history, toLLMMessage(toolMsg))
@@ -675,13 +740,19 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 	localExec := model.ToolEventExec{Executor: model.ExecutorServer, SourceTrust: model.TrustTrusted}
 	startedAt := e.deps.Now()
 	ev.StartedAt = &startedAt
-	if err := sdb.InsertToolEvent(ctx, ev); err != nil {
+	if err := sdb.InsertToolEvent(dbctx(ctx), ev); err != nil {
 		return toolMessage(tc, "工具事件落库失败: "+err.Error()), false
 	}
 	e.publish(req.RunID, events.TypeToolStarted, map[string]any{
 		"tool_event_id": eventID,
 		"tool_name":     tc.Name,
 		"risk":          string(risk),
+		// args 必须与「开始」一起下发（协议 §tool.started payload 本就含 args）。
+		// 此前漏发，前端工具卡片 payload.args 恒为空对象 → 命令类工具（run_command）在执行中
+		// 只显示流式输出、看不到「当前跑的是什么命令」（命令行是 cmd+args 拼出来的，
+		// 后端不下发 cmdline，前端无从拼装）。与落库 ev.ArgsJSON 同源（都用 normalizeArgs），
+		// 保证「历史回看」与「实时流」看到的命令行完全一致。
+		"args": normalizeArgs(tc.Arguments),
 	})
 
 	// ===== 能力天花板短路（协议 §4.1 / §4.2）=====
@@ -703,7 +774,7 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 			reason = defaultPolicyReason(req.ToolPolicy)
 		}
 		// 落库为 denied（审计可查），并保留 risk 便于回溯。
-		_ = sdb.FinishToolEvent(ctx, eventID, model.ToolDenied, "", "", reason, localExec)
+		_ = sdb.FinishToolEvent(dbctx(ctx), eventID, model.ToolDenied, "", "", reason, localExec)
 		e.publish(req.RunID, events.TypeToolResult, map[string]any{
 			"tool_event_id": eventID,
 			"tool_name":     tc.Name,
@@ -741,7 +812,7 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 	reason := verdict.Reason
 	if verdict.NeedApproval {
 		if _, err := e.deps.Gate.RegisterWithDevice(eventID, requester, required); err != nil {
-			_ = sdb.FinishToolEvent(ctx, eventID, model.ToolError, "", "", err.Error(), localExec)
+			_ = sdb.FinishToolEvent(dbctx(ctx), eventID, model.ToolError, "", "", err.Error(), localExec)
 			return toolMessage(tc, "审批登记失败: "+err.Error()), false
 		}
 		// 状态机闭环（单一真相铁律）：审批等待**必须**落到 runs.status=waiting_approval。
@@ -753,7 +824,7 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 		//   ③ 跨端/审计看到的是 running，无法区分「在跑」与「在等人」。
 		// 迁移失败**必须硬失败**（绝不能静默降级回旧行为）：否则又回到「看得见审批、点不动」的死链。
 		if err := e.transition(ctx, sdb, req.RunID, model.RunWaitingApproval, "", "", ""); err != nil {
-			_ = sdb.FinishToolEvent(ctx, eventID, model.ToolError, "", "", err.Error(), localExec)
+			_ = sdb.FinishToolEvent(dbctx(ctx), eventID, model.ToolError, "", "", err.Error(), localExec)
 			return toolMessage(tc, "审批状态迁移失败: "+err.Error()), false
 		}
 		e.publishStatus(req.RunID, req.SessionID, model.RunWaitingApproval, "", "", "", nil)
@@ -782,7 +853,7 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 		// （state.go 允许 waiting_approval → cancelled），避免与取消语义打架。
 		if ctx.Err() == nil {
 			if err := e.transition(ctx, sdb, req.RunID, model.RunRunning, "", "", ""); err != nil {
-				_ = sdb.FinishToolEvent(ctx, eventID, model.ToolError, "", "", err.Error(), localExec)
+				_ = sdb.FinishToolEvent(dbctx(ctx), eventID, model.ToolError, "", "", err.Error(), localExec)
 				return toolMessage(tc, "审批后状态回迁失败: "+err.Error()), false
 			}
 			e.publishStatus(req.RunID, req.SessionID, model.RunRunning, "", "", "", nil)
@@ -795,14 +866,14 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 			"required_device_id":  required,
 		})
 		if ctx.Err() != nil {
-			_ = sdb.FinishToolEvent(ctx, eventID, model.ToolDenied, "", "", "Run 已取消", localExec)
+			_ = sdb.FinishToolEvent(dbctx(ctx), eventID, model.ToolDenied, "", "", "Run 已取消", localExec)
 			return toolMessage(tc, "denied: Run 已取消"), true
 		}
 	}
 
 	if decision == approval.Deny {
 		// 拒绝原因回传模型，让它换方案继续（不中断 Run）
-		_ = sdb.FinishToolEvent(ctx, eventID, model.ToolDenied, "", "", reason, localExec)
+		_ = sdb.FinishToolEvent(dbctx(ctx), eventID, model.ToolDenied, "", "", reason, localExec)
 		e.publish(req.RunID, events.TypeToolResult, map[string]any{
 			"tool_event_id": eventID,
 			"status":        string(model.ToolDenied),
@@ -817,7 +888,7 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 	// 执行
 	if e.deps.Tools == nil {
 		const msg = "工具执行器未注册（A 阶段仅协议骨架）"
-		_ = sdb.FinishToolEvent(ctx, eventID, model.ToolError, "", "", msg, localExec)
+		_ = sdb.FinishToolEvent(dbctx(ctx), eventID, model.ToolError, "", "", msg, localExec)
 		e.publish(req.RunID, events.TypeToolResult, map[string]any{
 			"tool_event_id": eventID,
 			"status":        string(model.ToolError),
@@ -841,7 +912,7 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 	})
 	if runErr != nil {
 		errText := runErr.Error()
-		_ = sdb.FinishToolEvent(ctx, eventID, model.ToolError, "", "", errText, localExec)
+		_ = sdb.FinishToolEvent(dbctx(ctx), eventID, model.ToolError, "", "", errText, localExec)
 		e.publish(req.RunID, events.TypeToolResult, map[string]any{
 			"tool_event_id": eventID,
 			"status":        string(model.ToolError),
@@ -859,7 +930,7 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 		DeviceID:    result.DeviceID,
 		SourceTrust: result.SourceTrust,
 	}.Normalized()
-	_ = sdb.FinishToolEvent(ctx, eventID, result.Status, result.ResultJSON, result.ResultBlob,
+	_ = sdb.FinishToolEvent(dbctx(ctx), eventID, result.Status, result.ResultJSON, result.ResultBlob,
 		result.Error, execInfo)
 	// 审计副本（天库）：会话库的 tool_events 是事实源，这里额外投递一条可丢弃的查询副本。
 	// 丢失只影响跨会话按时间审计，不影响任何业务功能。

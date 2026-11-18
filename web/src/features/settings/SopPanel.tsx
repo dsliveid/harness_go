@@ -1,19 +1,211 @@
 import { useEffect, useState } from 'react'
 import { api } from '../../lib/api'
-import type { SOPCore } from '../../lib/apiTypes'
-import { Badge, Button } from '../../components/ui'
+import type { PlanMode, SOPCatalog, SOPCore, SOPItem } from '../../lib/apiTypes'
+import { Badge, Button, Switch } from '../../components/ui'
 import { cn } from '../../components/ui'
-import { ShieldCheck, RotateCcw, Copy, Check } from 'lucide-react'
+import { ShieldCheck, RotateCcw, Copy, Check, Layers } from 'lucide-react'
 
 type Mode = 'builtin' | 'custom'
 
 /**
- * Agent 核心 SOP 编辑器（agent-core）。
+ * 工程作业程序目录：按层级分组渲染 + 逐条启停 + 规划模式切换。
  *
- * 三态语义（由「data/sop/agent-core.md 文件是否存在」单一裁决，不存独立模式字段）：
- *   系统内置：文件不存在 → 用出厂 embed 内容，**只读预览**；
- *   自定义　：文件存在　 → 用文件内容，可编辑保存；
- *   重置　　：删除文件　 → 回落出厂（需二次确认）。
+ * 为什么单独抽组件：这一段的真源与上方「核心 SOP 编辑器」完全不同
+ * （代码真源 vs 用户正文），共用 state 只会让两处互相污染。
+ */
+function SopCatalogSection({
+  catalog,
+  msg,
+  saving,
+  planModes,
+  onToggle,
+  onEnableAll,
+  onChangePlanMode,
+}: {
+  catalog: SOPCatalog | null
+  msg: { tone: 'ok' | 'err'; text: string } | null
+  saving: boolean
+  planModes: Array<{ id: PlanMode; label: string; hint: string }>
+  onToggle: (item: SOPItem) => void
+  onEnableAll: () => void
+  onChangePlanMode: (next: PlanMode) => void
+}) {
+  if (!catalog) {
+    return (
+      <div className="pt-2 border-t border-edge/60">
+        <div className="text-[12px] text-inkdim">正在读取工程规范目录…</div>
+      </div>
+    )
+  }
+
+  const items = catalog.items
+  const hardCount = items.filter((i) => i.is_hard_rule).length
+  const enabledCount = items.length - catalog.disabled.length
+  // 按层级分组（服务端已按出现顺序返回，这里只做视觉分组，不重排语义）
+  const phases = Array.from(new Set(items.map((i) => i.phase))).sort((a, b) => a - b)
+
+  return (
+    <div className="flex flex-col gap-3 pt-3 border-t border-edge/60">
+      <div className="flex items-start justify-between gap-4">
+        <div className="min-w-0">
+          <div className="text-[13px] font-medium flex items-center gap-2">
+            <Layers size={15} className="text-accent" />
+            工程作业程序（原生 SOP）
+          </div>
+          <div className="text-[12px] text-inkdim mt-1 leading-relaxed max-w-[560px]">
+            这部分由服务端代码定义（随版本升级），界面只决定「启用 / 关闭」。关闭后模型在该维度解除硬性约束，
+            <span className="text-warn">下一轮对话立即生效</span>。
+          </div>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          <Badge tone={catalog.disabled.length > 0 ? 'yellow' : 'green'}>
+            已启用 {enabledCount} / {items.length}
+          </Badge>
+          {catalog.disabled.length > 0 && (
+            <Button size="sm" variant="ghost" onClick={onEnableAll} disabled={saving} className="text-accent">
+              全部启用
+            </Button>
+          )}
+        </div>
+      </div>
+
+      {/* 规划模式：决定「方案先行」规则渲染哪个变体（会影响模型是否停下来等确认） */}
+      <div className="flex flex-col gap-2">
+        <div className="text-[12px] font-semibold text-accent px-0.5">规划模式</div>
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+          {planModes.map((m) => {
+            const active = catalog.plan_mode === m.id
+            return (
+              <button
+                key={m.id}
+                onClick={() => onChangePlanMode(m.id)}
+                disabled={saving}
+                className={cn(
+                  'text-left p-2.5 rounded-xl border transition-colors',
+                  active ? 'border-accent/60 bg-accent/10' : 'border-edge bg-panel2/30 hover:border-edge/80',
+                )}
+              >
+                <div className={cn('text-[12px] font-medium', active ? 'text-accent' : '')}>{m.label}</div>
+                <div className="text-[11px] text-inkfaint mt-0.5 leading-relaxed">{m.hint}</div>
+              </button>
+            )
+          })}
+        </div>
+      </div>
+
+      {msg && (
+        <div className={cn('text-[11px]', msg.tone === 'ok' ? 'text-ok' : 'text-danger')}>{msg.text}</div>
+      )}
+
+      {hardCount > 0 && (
+        <div className="text-[11px] text-inkfaint">
+          其中 {hardCount} 条为硬性安全规范（开关置灰），不可关闭。
+        </div>
+      )}
+
+      {phases.map((phase) => {
+        const group = items.filter((i) => i.phase === phase)
+        return (
+          <div key={phase} className="flex flex-col gap-2">
+            <div className="flex items-center gap-2 text-[12px] font-semibold text-accent px-0.5">
+              <span className="w-2 h-2 rounded-full bg-accent" />
+              <span>{group[0].phase_label}</span>
+            </div>
+            {group.map((item) => {
+              const enabled = item.is_hard_rule || !catalog.disabled.includes(item.id)
+              return (
+                <div
+                  key={item.id}
+                  className={cn(
+                    'border rounded-xl p-3 flex items-start justify-between gap-3 transition-colors',
+                    enabled ? 'border-edge bg-panel2/30' : 'border-edge/50 opacity-75',
+                  )}
+                >
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <code className="text-[13px] font-mono font-medium bg-panel2 px-1.5 py-0.5 rounded border border-edge/60">
+                        {item.id}
+                      </code>
+                      <span className="text-[12px] font-medium">{item.name}</span>
+                      <span
+                        className={cn(
+                          'text-[11px] px-1.5 py-0.5 rounded-md border font-medium',
+                          CATEGORY_CLS[item.category] ?? 'text-inkdim bg-panel2 border-edge/60',
+                        )}
+                      >
+                        {item.category_label}
+                      </span>
+                      <span className="text-[11px] px-1.5 py-0.5 rounded-md border border-edge/60 text-inkfaint">
+                        {item.scope_label}
+                      </span>
+                    </div>
+                    <div className="text-[12px] text-inkdim mt-1.5 leading-relaxed">{item.description}</div>
+                    <div className="text-[11px] text-inkfaint mt-1.5 flex items-start gap-1">
+                      <span>↳</span>
+                      <span>{item.disable_effect}</span>
+                    </div>
+                    {/* 变体对比：同一规则在主 / 子 / 各模式下措辞不同，界面如实展示 */}
+                    {item.variants.length > 1 && (
+                      <div className="mt-1.5 flex items-center gap-1 flex-wrap">
+                        {item.variants.map((v) => (
+                          <span
+                            key={v.label}
+                            className="text-[10px] px-1.5 py-0.5 rounded border border-edge/60 text-inkfaint"
+                          >
+                            {v.label}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0 pt-0.5">
+                    <span
+                      className={cn(
+                        'text-[12px] select-none whitespace-nowrap',
+                        enabled ? 'text-ok font-medium' : 'text-inkdim',
+                      )}
+                    >
+                      {item.is_hard_rule ? '常驻' : enabled ? '启用' : '禁用'}
+                    </span>
+                    <Switch
+                      checked={enabled}
+                      onChange={() => onToggle(item)}
+                      disabled={item.is_hard_rule || saving}
+                      title={item.is_hard_rule ? `${item.name}（硬性规范，不可关闭）` : `${enabled ? '禁用' : '启用'} ${item.name}`}
+                    />
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+const CATEGORY_CLS: Record<string, string> = {
+  thinking: 'text-cyan-400 bg-cyan-500/12 border-cyan-500/30',
+  workflow: 'text-warn bg-warn/12 border-warn/30',
+  orchestration: 'text-accent2 bg-accent2/12 border-accent2/30',
+  quality: 'text-accent bg-accent/12 border-accent/30',
+  memory: 'text-ok bg-ok/12 border-ok/30',
+  safety: 'text-danger bg-danger/12 border-danger/30',
+}
+
+/** 规划模式选项（决定「方案先行」规则渲染哪个变体）。 */
+const PLAN_MODES: Array<{ id: PlanMode; label: string; hint: string }> = [
+  { id: 'standard', label: '标准模式', hint: '大改动才落计划，不做强门禁' },
+  { id: 'always_plan', label: 'Always Plan', hint: '生成计划后必须停下等确认' },
+  { id: 'always_proceed', label: 'Always Proceed', hint: '生成计划后自动推进施工' },
+]
+
+/**
+ * Agent SOP 设置面板。
+ *
+ * 两部分（真源不同，绝不互相覆盖）：
+ *   ① 核心 SOP（agent-core）：用户可编辑正文，落 data/sop/agent-core.md，受 token 预算约束；
+ *   ② 工程作业程序（/sop/catalog）：**代码即真源**，界面只渲染与逐条启停 + 切规划模式。
  *
  * 红线：切到「系统内置」页签**绝不删除**自定义文件 —— 否则手滑一次就丢失调教成果。
  */
@@ -24,6 +216,11 @@ export function SopPanel() {
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState<{ tone: 'ok' | 'err'; text: string } | null>(null)
   const [copied, setCopied] = useState(false)
+
+  // 工程作业程序目录（服务端单一真源；前端不硬编码任何规则文案）
+  const [catalog, setCatalog] = useState<SOPCatalog | null>(null)
+  const [catalogMsg, setCatalogMsg] = useState<{ tone: 'ok' | 'err'; text: string } | null>(null)
+  const [savingCatalog, setSavingCatalog] = useState(false)
 
   const load = async () => {
     try {
@@ -36,8 +233,17 @@ export function SopPanel() {
     }
   }
 
+  const loadCatalog = async () => {
+    try {
+      setCatalog(await api.getSOPCatalog())
+    } catch (e) {
+      setCatalogMsg({ tone: 'err', text: e instanceof Error ? e.message : '读取工程规范目录失败' })
+    }
+  }
+
   useEffect(() => {
     void load()
+    void loadCatalog()
   }, [])
 
   if (!core) {
@@ -109,6 +315,37 @@ export function SopPanel() {
     } catch {
       setMsg({ tone: 'err', text: '复制失败，请手动选择文本复制' })
     }
+  }
+
+  // 保存启停 + 规划模式：整单提交（服务端先校验后落库，绝不半生效）。
+  const saveCatalog = async (nextDisabled: string[], nextMode: PlanMode) => {
+    setSavingCatalog(true)
+    setCatalogMsg(null)
+    try {
+      const res = await api.putSOPCatalog({ disabled: nextDisabled, plan_mode: nextMode })
+      setCatalog(res)
+      setCatalogMsg({ tone: 'ok', text: '已保存，下一轮对话立即生效（无需重启）' })
+    } catch (e) {
+      setCatalogMsg({ tone: 'err', text: e instanceof Error ? e.message : '保存失败' })
+      // 失败即回读真实状态，避免界面停留在「假已保存」的乐观态。
+      void loadCatalog()
+    } finally {
+      setSavingCatalog(false)
+    }
+  }
+
+  const toggleItem = (item: SOPItem) => {
+    if (!catalog || item.is_hard_rule) return
+    const off = catalog.disabled.includes(item.id)
+    const nextDisabled = off
+      ? catalog.disabled.filter((id) => id !== item.id)
+      : [...catalog.disabled, item.id]
+    void saveCatalog(nextDisabled, catalog.plan_mode)
+  }
+
+  const enableAll = () => {
+    if (!catalog) return
+    void saveCatalog([], catalog.plan_mode)
   }
 
   return (
@@ -202,6 +439,19 @@ export function SopPanel() {
           </Button>
         )}
       </div>
+
+      <SopCatalogSection
+        catalog={catalog}
+        msg={catalogMsg}
+        saving={savingCatalog}
+        planModes={PLAN_MODES}
+        onToggle={toggleItem}
+        onEnableAll={enableAll}
+        onChangePlanMode={(next) => {
+          if (!catalog || catalog.plan_mode === next) return
+          void saveCatalog(catalog.disabled, next)
+        }}
+      />
     </div>
   )
 }

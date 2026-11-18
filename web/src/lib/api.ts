@@ -31,6 +31,8 @@ import {
   type AuditToolEventsResponse,
   type SOPCore,
   type SOPEffective,
+  type SOPCatalog,
+  type PlanMode,
   type TokenStatsResult,
   type LoginRequest,
   type LoginResponse,
@@ -45,6 +47,9 @@ import {
   type PackageListResponseDTO,
   type PackageViewDTO,
   type PairCodeDTO,
+  type MarketInstallRequestDTO,
+  type MarketItemDTO,
+  type MarketRegistryDTO,
   type ProviderDTO,
   type ProviderInput,
   type ProviderModelsInput,
@@ -65,6 +70,10 @@ import {
   type ToolInjection,
   type ToolSnapshot,
   type ToolTier,
+  type SkillView,
+  type SkillListResponseDTO,
+  type SkillDetailResponseDTO,
+  type SkillSaveRequestDTO,
   type User,
   type WebviewExchangeRequest,
   type WebviewExchangeResponse,
@@ -374,14 +383,37 @@ export interface ApiClient {
   getTools(): Promise<ToolSnapshot>
   getToolsInjection(): Promise<ToolInjection>
   patchToolTiers(tiers: Record<string, ToolTier>): Promise<ToolSnapshot>
+  /**
+   * 启用/停用系统内置工具（服务端自身能力开关）。
+   *
+   * 为什么内置工具只有启停没有装缷：内置工具随程序发布、编译期注册，
+   * 不存在独立制品可安装/卸载；停用 = 不注入 + 不可调用，重新启用即恢复原档位。
+   */
+  setToolEnabled(name: string, enabled: boolean): Promise<ToolSnapshot>
+  /** 技能库：列出全部技能（含技能库落地根，供界面明示位置） */
+  listSkills(): Promise<SkillListResponseDTO>
+  /** 技能库：读取单个技能全文 */
+  getSkill(name: string): Promise<SkillDetailResponseDTO>
+  /** 技能库：沉淀/覆盖技能（与 Agent 的 skill_save 同源） */
+  saveSkill(req: SkillSaveRequestDTO): Promise<SkillView>
+  /** 技能库：卸载技能（删除整个技能目录） */
+  deleteSkill(name: string): Promise<void>
+  /** 外部市场：拉取索引（未配置时 status/reason 如实返回，不抛错） */
+  getMarketRegistry(): Promise<MarketRegistryDTO>
+  /** 外部市场：下载并安装制品（服务端做 sha256 + 验签双校验） */
+  installMarketItem(req: MarketInstallRequestDTO): Promise<MarketItemDTO>
   /** 核心 SOP：读取生效快照（含 builtin_content，切页签无需再请求） */
   getSOPCore(): Promise<SOPCore>
   /** 核心 SOP：保存自定义（首次保存即 fork，下一轮对话生效） */
   putSOPCore(content: string): Promise<SOPCore>
   /** 核心 SOP：重置为出厂内置（完整 undo） */
   resetSOPCore(): Promise<SOPCore>
-  /** 核心 SOP：生效预览（核心 + 项目级条目 + token 合计） */
+  /** 核心 SOP：生效预览（核心 + 生效规则 + 项目级条目 + token 合计） */
   getSOPEffective(sessionId?: string): Promise<SOPEffective>
+  /** 原生 SOP 目录：全集 + 当前启停状态 + 规划模式（前端不硬编码规则文案） */
+  getSOPCatalog(): Promise<SOPCatalog>
+  /** 原生 SOP 目录：保存逐条启停与规划模式（下一轮对话立即生效） */
+  putSOPCatalog(input: { disabled: string[]; plan_mode?: PlanMode }): Promise<SOPCatalog>
   // 运维
   getMaintenance(): Promise<Record<string, unknown>>
   // 厂商（B-4）
@@ -823,6 +855,27 @@ function parseArgsOrEmpty(raw: string): Record<string, unknown> {
 }
 
 /**
+ * 事件流转（SSE）的 args 归一。
+ *
+ * 为什么不能直接 `(payload.args as Record<string, unknown>) ?? {}`：
+ * 服务端 `normalizeArgs` 遇到模型给出的非法 JSON 时，会**降级为包一层 JSON 字符串**
+ * （`json.Marshal(string(raw))`），此时 `payload.args` 是字符串而非对象。
+ * 强转后 `Object.entries('{"cmd":..}')` 会拆成 `0/1/2...` 索引键，
+ * 命令类工具则拼不出命令行 —— 视觉上就是「只能看到输出、看不到当前跑的是什么命令」。
+ * 故字符串一律先解析；对象原样返回；其余（null/数字/数组）退化为空对象。
+ */
+function normalizeEventArgs(raw: unknown): Record<string, unknown> {
+  if (typeof raw === 'string') {
+    // 字符串可能是 JSON 原文，也可能是「被降级包过的」原文串，解析一次即可
+    return parseArgsOrEmpty(raw)
+  }
+  if (typeof raw === 'object' && raw !== null && !Array.isArray(raw)) {
+    return raw as Record<string, unknown>
+  }
+  return {}
+}
+
+/**
  * 工作空间 DTO → UI：**唯一的字段映射入口**（store / 组件里严禁手写映射）。
  *
  * 映射要点（后端 snake_case 派生字段 vs UI 既有形态）：
@@ -907,7 +960,11 @@ function mapSseToStreamEvent(type: string, data: string): StreamEvent | null {
         call: {
           id: String(payload.tool_event_id ?? ''),
           name: String(payload.tool_name ?? ''),
-          args: (payload.args as Record<string, unknown>) ?? {},
+          // 容错口径与 normalizeToolCall 一致：服务端下发的 args 理论上已是 JSON 对象，
+          // 但其落库前会经 normalizeArgs 归一 —— 模型给出非法 JSON 时会被**降级包成字符串**
+          // （`"{\"cmd\":..."`）。若这里直接强转，字符串会被 Object.entries 拆成索引键，
+          // 命令类工具拼不出命令行（表现为「只看到输出、看不到在跑什么命令」）。
+          args: normalizeEventArgs(payload.args),
           status: 'running' as ToolStatus,
           risk: (payload.risk as Risk) ?? 'write',
         },
@@ -1332,6 +1389,38 @@ export const realApi: ApiClient = {
       body: JSON.stringify({ tiers }),
     })
   },
+  async setToolEnabled(name, enabled) {
+    return request<ToolSnapshot>(enabled ? API_PATHS.toolEnable(name) : API_PATHS.toolDisable(name), {
+      method: 'POST',
+      headers: authHeaders(),
+    })
+  },
+  async listSkills() {
+    return request<SkillListResponseDTO>(API_PATHS.skills, { headers: authHeaders() })
+  },
+  async getSkill(name) {
+    return request<SkillDetailResponseDTO>(API_PATHS.skill(name), { headers: authHeaders() })
+  },
+  async saveSkill(req) {
+    return request<SkillView>(API_PATHS.skills, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify(req),
+    })
+  },
+  async deleteSkill(name) {
+    await request<void>(API_PATHS.skill(name), { method: 'DELETE', headers: authHeaders() })
+  },
+  async getMarketRegistry() {
+    return request<MarketRegistryDTO>(API_PATHS.marketRegistry, { headers: authHeaders() })
+  },
+  async installMarketItem(req) {
+    return request<MarketItemDTO>(API_PATHS.marketInstall, {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify(req),
+    })
+  },
 
   // ---- 核心 SOP（agent-core）：出厂内置 + 运行时覆盖 ----
   /** 读取核心 SOP 生效快照（含 builtin_content，切页签无需再请求）。 */
@@ -1350,10 +1439,22 @@ export const realApi: ApiClient = {
   async resetSOPCore() {
     return request<SOPCore>(API_PATHS.sopCore, { method: 'DELETE', headers: authHeaders() })
   },
-  /** 生效预览：核心 SOP + 项目级条目 + token 合计。 */
+  /** 生效预览：核心 SOP + 生效规则 + 项目级条目 + token 合计。 */
   async getSOPEffective(sessionId?: string) {
     const q = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''
     return request<SOPEffective>(`${API_PATHS.sopEffective}${q}`, { headers: authHeaders() })
+  },
+  /** 原生 SOP 目录：全集 + 启停状态 + 规划模式。 */
+  async getSOPCatalog() {
+    return request<SOPCatalog>(API_PATHS.sopCatalog, { headers: authHeaders() })
+  },
+  /** 原生 SOP 目录：保存逐条启停与规划模式（校验失败整单 400，不会半生效）。 */
+  async putSOPCatalog(input) {
+    return request<SOPCatalog>(API_PATHS.sopCatalog, {
+      method: 'PUT',
+      headers: authHeaders(),
+      body: JSON.stringify(input),
+    })
   },
 
   async getMaintenance() {

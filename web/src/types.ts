@@ -3,7 +3,7 @@ export type Role = 'system' | 'user' | 'assistant' | 'tool'
 export type RunStatus = 'pending' | 'running' | 'waiting_approval' | 'completed' | 'failed' | 'cancelled' | 'interrupted'
 export type Risk = 'readonly' | 'write' | 'command' | 'danger'
 export type AccessMode = 'confirm' | 'full'
-export type ToolStatus = 'pending' | 'running' | 'ok' | 'error' | 'denied'
+export type ToolStatus = 'pending' | 'running' | 'ok' | 'error' | 'denied' | 'cancelled'
 export type ApprovalDecision = 'allow_once' | 'allow_session' | 'deny'
 
 // ============ 工作空间（服务端大脑 + 多客户端接入） ============
@@ -348,6 +348,14 @@ export interface RegistryItem {
   progress?: number
   /** 支持的客户端平台（缺省视为全平台） */
   platforms?: PlatformSupport
+  /**
+   * 外部市场制品 ID（market registry 索引中的 id）。
+   *
+   * 为什么单列：本结构是 UI 领域模型，id 可能被前端派生过（如 `reg:` 前缀），
+   * 而服务端 `POST /api/v1/market/install` 只认 registry 索引里的原始 id。
+   * 缺省表示该条目不来自外部市场，安装按钮会明确拒绝而非盲发请求。
+   */
+  registryId?: string
 }
 
 // ============ 计划 / 待办 / 技能 / 记忆 ============

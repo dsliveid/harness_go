@@ -104,6 +104,11 @@ func newTestServerWithDevices(t *testing.T) (*httptest.Server, string, *service.
 	}
 	providerSvc := service.NewProviderService(service.ProviderServiceOptions{Main: mainStore, Cipher: cipher})
 	settingsSvc := service.NewSettingsService(mainStore)
+	// 核心 SOP：出厂内置 + 运行时覆盖（dataDir 即 t.TempDir，天然隔离）。
+	// 与生产装配同口径：启停 / 规划模式来自 settings 表（后置注入，打破构造循环）。
+	sopSvc := service.NewSOPService(dir, 800)
+	sopSvc.SetDisabledProvider(settingsSvc.DisabledSOPs)
+	sopSvc.SetPlanModeProvider(settingsSvc.PlanMode)
 	logSvc := service.NewLogService("", 100)
 	// 阶段 C-2：设备域（配对 / 列表 / 吊销），TTL 120s
 	// 阶段 C-6：会话租约（Hub 由 SetHub 后置注入，打破构造期循环）
@@ -146,9 +151,10 @@ func newTestServerWithDevices(t *testing.T) (*httptest.Server, string, *service.
 		// 工作空间域：删除语义（migrate_refs）与「移除后刷新复活」回归依赖它装配。
 		Workspaces: service.NewWorkspaceService(mainStore, deviceHub),
 		// 核心 SOP：出厂内置 + 运行时覆盖（dataDir 即 t.TempDir，天然隔离）。
-		SOP: service.NewSOPService(dir, 800),
-		Bus: bus,
-		Auth:        tokenSvc,
+		// 与生产装配同口径：启停与规划模式来自 settings 表（后置注入）。
+		SOP:  sopSvc,
+		Bus:  bus,
+		Auth: tokenSvc,
 		AuthConfig: AuthConfig{
 			SSOEnabled:   true,
 			SSOMode:      "plain",

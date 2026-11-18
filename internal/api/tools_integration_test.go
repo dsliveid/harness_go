@@ -268,6 +268,57 @@ func TestToolsInjectionAndTierPatch(t *testing.T) {
 		map[string]any{"tiers": map[string]string{}}, http.StatusBadRequest, nil)
 }
 
+// TestToolEnableDisable 校验内置工具启停：停用后不注入、快照标记 enabled=false，
+// 重新启用后原档位恢复（内置工具不可安装/卸载，只有可用性开关）。
+func TestToolEnableDisable(t *testing.T) {
+	srv, token := newToolsTestServer(t)
+
+	type snapT struct {
+		Core     []struct {
+			Name    string `json:"name"`
+			Tier    string `json:"tier"`
+			Enabled bool   `json:"enabled"`
+		} `json:"core"`
+		Disabled []string `json:"disabled"`
+	}
+	var snap snapT
+
+	// 基线：echo 启用中，disabled 为空
+	doJSON(t, http.MethodGet, srv.URL+"/api/v1/tools", token, nil, http.StatusOK, &snap)
+	if len(snap.Core) != 1 || !snap.Core[0].Enabled || len(snap.Disabled) != 0 {
+		t.Fatalf("基线应全部启用: %+v", snap)
+	}
+
+	// 停用：快照标记 enabled=false 且记录在 disabled 清单
+	doJSON(t, http.MethodPost, srv.URL+"/api/v1/tools/echo/disable", token, nil, http.StatusOK, &snap)
+	if snap.Core[0].Enabled {
+		t.Fatalf("停用后 enabled 应为 false: %+v", snap.Core[0])
+	}
+	if len(snap.Disabled) != 1 || snap.Disabled[0] != "echo" {
+		t.Fatalf("停用清单异常: %+v", snap.Disabled)
+	}
+
+	// 停用必须真生效：注入集合里不再出现该工具（模型看不到）
+	var inj struct {
+		Core []struct {
+			Name string `json:"name"`
+		} `json:"core"`
+	}
+	doJSON(t, http.MethodGet, srv.URL+"/api/v1/tools/injection", token, nil, http.StatusOK, &inj)
+	if len(inj.Core) != 0 {
+		t.Fatalf("停用后不得注入，得到 %d 条", len(inj.Core))
+	}
+
+	// 重新启用：档位原样恢复（不是被重置成别的档）
+	doJSON(t, http.MethodPost, srv.URL+"/api/v1/tools/echo/enable", token, nil, http.StatusOK, &snap)
+	if !snap.Core[0].Enabled || snap.Core[0].Tier != "core" || len(snap.Disabled) != 0 {
+		t.Fatalf("重新启用后应恢复 core 档: %+v", snap)
+	}
+
+	// 未知工具 → 400（不得写入永不适用的配置）
+	doJSON(t, http.MethodPost, srv.URL+"/api/v1/tools/ghost/disable", token, nil, http.StatusBadRequest, nil)
+}
+
 // TestEchoToolInvokedAndRecorded 出口验收：模型真实调用 echo 且 tool_events 落库。
 func TestEchoToolInvokedAndRecorded(t *testing.T) {
 	srv, token := newToolsTestServer(t)

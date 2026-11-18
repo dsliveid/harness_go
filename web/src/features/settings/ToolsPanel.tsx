@@ -72,11 +72,13 @@ function PlatformBadges({ meta, client }: { meta: ToolInstallMeta; client: Devic
   )
 }
 
-function ToolItem({ name, enabled, onToggle, client }: {
+function ToolItem({ name, enabled, onToggle, client, serverMode }: {
   name: string
   enabled: boolean
   onToggle: () => void
   client: DeviceNode
+  /** 服务端节点：内置工具只有启用/停用，没有安装/卸载（编译期注册，无独立制品） */
+  serverMode?: boolean
 }) {
   const t = toolList.find((x) => x.name === name)!
   const meta = toolInstallInfo(t.name, t.group)
@@ -108,7 +110,7 @@ function ToolItem({ name, enabled, onToggle, client }: {
         </div>
       </div>
       <div className="flex items-center gap-2 shrink-0 pt-0.5">
-        {meta.installable && (
+        {!serverMode && meta.installable && (
           installed ? (
             <Button
               size="sm"
@@ -131,10 +133,18 @@ function ToolItem({ name, enabled, onToggle, client }: {
             </Button>
           )
         )}
+        {serverMode && (
+          <span
+            className="text-[11px] text-inkfaint"
+            title="内置工具随服务端发布，编译期注册：不提供安装/卸载，只能启用或停用"
+          >
+            随服务端内置 · 仅启停
+          </span>
+        )}
         <span className={cn('text-[12px] select-none whitespace-nowrap', enabled ? 'text-ok font-medium' : 'text-inkdim')}>
-          {enabled ? '启用' : '禁用'}
+          {enabled ? '启用' : '停用'}
         </span>
-        <Switch checked={enabled} onChange={onToggle} title={`${enabled ? '禁用' : '启用'} ${t.name}`} />
+        <Switch checked={enabled} onChange={onToggle} title={`${enabled ? '停用' : '启用'} ${t.name}`} />
       </div>
     </div>
   )
@@ -289,14 +299,46 @@ function ServerToolSnapshot() {
 
 export function ToolsPanel({ client, query = '' }: { client: DeviceNode; query?: string }) {
   const { settings, setDisabledTools } = useSettings()
+  const { toolSnapshot, setServerToolEnabled, loadRemoteCapabilities } = usePlugins()
+  const toast = useUI((s) => s.toast)
   const d = settings
   const kw = query.trim().toLowerCase()
   const match = (s: string) => !kw || s.toLowerCase().includes(kw)
-  const isEnabled = (name: string) => !d.disabledTools.includes(name)
-  const toggle = (name: string) => setDisabledTools(toggleDisabled(d.disabledTools, name))
-  const enableAll = () => setDisabledTools([])
 
-  const disabledCount = d.disabledTools.length
+  // 服务端节点：启停必须走服务端真实端点（内置工具编译期注册，只有可用性开关）。
+  // 客户端节点：维持 settingsStore 的本地态（客户端本机能力未上报到服务端）。
+  const serverMode = client.platform === 'server'
+  const disabledOnServer = new Set(toolSnapshot?.disabled ?? [])
+  const isEnabled = (name: string) =>
+    serverMode ? !disabledOnServer.has(name) : !d.disabledTools.includes(name)
+  const toggle = (name: string) => {
+    if (!serverMode) {
+      setDisabledTools(toggleDisabled(d.disabledTools, name))
+      return
+    }
+    const next = !isEnabled(name)
+    setServerToolEnabled(name, next)
+      .then(() => toast('success', `${next ? '已启用' : '已停用'} ${name}（下一轮对话生效）`))
+      .catch((e: unknown) => toast('error', `操作失败：${e instanceof Error ? e.message : String(e)}`))
+  }
+  const enableAll = () => {
+    if (!serverMode) {
+      setDisabledTools([])
+      return
+    }
+    const disabled = toolSnapshot?.disabled ?? []
+    if (disabled.length === 0) return
+    void Promise.all(disabled.map((n) => setServerToolEnabled(n, true)))
+      .then(() => toast('success', `已启用 ${disabled.length} 个内置工具`))
+      .catch((e: unknown) => toast('error', `操作失败：${e instanceof Error ? e.message : String(e)}`))
+  }
+
+  // 进入面板即拉取服务端真值（服务端节点需要 disabled 清单，客户端也复用同一份远端能力）
+  useEffect(() => {
+    if (serverMode) void loadRemoteCapabilities()
+  }, [serverMode, loadRemoteCapabilities])
+
+  const disabledCount = serverMode ? (toolSnapshot?.disabled?.length ?? 0) : d.disabledTools.length
   const installableCount = toolList.filter((t) => {
     const meta = toolInstallInfo(t.name, t.group)
     return meta.installable && supportsClient(meta.platforms, client.os)
@@ -311,9 +353,10 @@ export function ToolsPanel({ client, query = '' }: { client: DeviceNode; query?:
         <div className="min-w-0">
           <div className="text-[13px] font-medium">系统内置工具</div>
           <div className="text-[12px] text-inkdim mt-0.5 leading-relaxed">
-            禁用的工具将不会注册到 Agent 工具列表，模型无法调用。
-            当前客户端（{client.name}）可安装 {installableCount} / {toolList.length} 个，已安装 {installedCount} 个；
-            平台支持按 移动端 / PC 端（Windows、Linux）分别判定。
+            {serverMode
+              ? '内置工具随服务端发布（编译期注册），不提供安装/卸载，只能启用或停用。停用的工具不进注入集合、模型无法调用；下一轮对话生效，重启后仍保持。'
+              : `禁用的工具将不会注册到 Agent 工具列表，模型无法调用。当前客户端（${client.name}）可安装 ${installableCount} / ${toolList.length} 个，已安装 ${installedCount} 个；
+            平台支持按 移动端 / PC 端（Windows、Linux）分别判定。`}
           </div>
         </div>
         <div className="flex items-center gap-2.5 shrink-0">
@@ -346,6 +389,7 @@ export function ToolsPanel({ client, query = '' }: { client: DeviceNode; query?:
                   enabled={isEnabled(t.name)}
                   onToggle={() => toggle(t.name)}
                   client={client}
+                  serverMode={serverMode}
                 />
               ))}
             </div>

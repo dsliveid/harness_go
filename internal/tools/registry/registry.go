@@ -58,6 +58,10 @@ type SpecSummary struct {
 	Namespace   string           `json:"namespace"`
 	Tier        toolapi.Tier     `json:"tier"`         // 生效档位（已应用覆盖）
 	DefaultTier toolapi.Tier     `json:"default_tier"` // 插件声明档位
+	// Enabled 是否启用（false = 已停用，不注入且不可调用；与 tier 正交）。
+	// 为什么必须有它：tier 只决定注入深度，停用必须单独表达，否则 UI 无法区分
+	// 「按需工具」与「被用户停用的工具」。
+	Enabled     bool             `json:"enabled"`
 	CostTokens  int              `json:"cost_tokens"`
 	Risk        toolapi.Risk     `json:"risk"`
 	Executor    toolapi.Executor `json:"executor"`
@@ -88,6 +92,8 @@ type Snapshot struct {
 	Warnings     []string                `json:"warnings"`
 	Plugins      []PluginInfo            `json:"plugins"`
 	Overrides    map[string]toolapi.Tier `json:"overrides"`
+	// Disabled 已停用的工具名（升序）：前端据此渲染启停开关且不需要逐条推断。
+	Disabled     []string                `json:"disabled"`
 	GeneratedAt  time.Time               `json:"generated_at"`
 }
 
@@ -115,7 +121,12 @@ type Registry struct {
 	order     []string
 	plugins   map[string]*pluginEntry
 	overrides map[string]toolapi.Tier
-	warnings  []string
+	// disabled 被用户停用的工具名集合（与 tier 正交：停用 = 不注入 + 不可调用）。
+	//
+	// 为什么不用「派生 tier=off」：tier 语义是注入深度，若混入停用态，
+	// 重新启用时就丢失了原档位；且宽进严出契约里 tier 不决定能否执行。
+	disabled map[string]struct{}
+	warnings []string
 	// loggedWarnings 上一次**已打印**的告警内容（仅用于日志去重，不对外暴露）。
 	// 与 warnings 职责不同：warnings 是当前真实告警（Warnings()/Snapshot 暴露），
 	// loggedWarnings 是「上次打过的」快照——两者混用会让去重失效（每次重算都重打日志）。
@@ -129,6 +140,7 @@ func New(opts Options) *Registry {
 		tools:     make(map[string]*entry),
 		plugins:   make(map[string]*pluginEntry),
 		overrides: make(map[string]toolapi.Tier),
+		disabled:  make(map[string]struct{}),
 	}
 }
 
@@ -241,12 +253,18 @@ func (r *Registry) RegisterTool(t toolapi.Tool, pluginID string) error {
 }
 
 // Resolve 解析工具（返回的 Spec 已应用 tier 覆盖；未注册返回 ErrNotFound）。
+//
+// 被停用的工具返回 ErrUnavailable：停用是**硬门禁**（用户显式关掉的能力，
+// 引擎必须拿到明确失败而不是静默执行），与「未注入」的宽进严出不同。
 func (r *Registry) Resolve(name string) (toolapi.Tool, toolapi.Spec, error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	e, ok := r.tools[name]
 	if !ok {
 		return nil, toolapi.Spec{}, fmt.Errorf("%w: %s", toolapi.ErrNotFound, name)
+	}
+	if r.isDisabledLocked(name) {
+		return nil, toolapi.Spec{}, fmt.Errorf("%w: %s 已被停用（可在插件市场重新启用）", toolapi.ErrUnavailable, name)
 	}
 	spec := e.spec
 	spec.Tier = r.tierLocked(e)
@@ -265,6 +283,8 @@ func (r *Registry) Risk(name string) (toolapi.Risk, bool) {
 }
 
 // Specs 返回全部工具规格（tier 已应用覆盖，按注册顺序）。
+//
+// **包含已停用工具**（Enabled=false）：UI 需要完整清单才能渲染启停开关。
 func (r *Registry) Specs() []toolapi.Spec {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -343,6 +363,9 @@ func (r *Registry) PluginHealth(pluginID string) toolapi.Health {
 // InjectedSpecs 返回**当前应注入**的工具规格：health 为 unavailable/degraded
 // 的插件（如 MCP Server 熔断）整体移出注入集合（docs/MCP接入设计.md §6）。
 // 已注册但被移出的工具仍可被调用（Resolve 不受影响——宽进严出）。
+//
+// 例外：**被用户停用的工具（disabled）必须移出且不可调用**（Resolve 直接报错），
+// 因为停用是用户的显式意图，不是健康态波动。
 func (r *Registry) InjectedSpecs() []toolapi.Spec {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -352,11 +375,56 @@ func (r *Registry) InjectedSpecs() []toolapi.Spec {
 		if e.health.Status == toolapi.HealthUnavailable || e.health.Status == toolapi.HealthDegraded {
 			continue
 		}
+		if r.isDisabledLocked(name) {
+			continue
+		}
 		s := e.spec
 		s.Tier = r.tierLocked(e)
 		out = append(out, s)
 	}
 	return out
+}
+
+// SetDisabled 设置「已停用工具」集合（来自主库 settings.tools.disabled，仅允许已知工具名）。
+//
+// 与 SetOverrides 同范式：未注册工具名静默忽略（工具可能尚未安装/已卸载），
+// 这样「先写配置后装插件」也能在插件注册后按名字生效——只要再次调用本方法。
+func (r *Registry) SetDisabled(names []string) {
+	clean := make(map[string]struct{}, len(names))
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+		if _, ok := r.tools[name]; !ok {
+			continue
+		}
+		clean[name] = struct{}{}
+	}
+	r.disabled = clean
+	r.refreshWarningsLocked()
+}
+
+// Disabled 返回已停用工具名副本（升序）。
+func (r *Registry) Disabled() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]string, 0, len(r.disabled))
+	for name := range r.disabled {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// isDisabledLocked 判定工具是否被停用（调用方须已持有读锁或写锁）。
+func (r *Registry) isDisabledLocked(name string) bool {
+	if len(r.disabled) == 0 {
+		return false
+	}
+	_, ok := r.disabled[name]
+	return ok
 }
 
 // SetOverrides 设置 tier 覆盖（来自主库 settings.tools.tiers，仅允许已知工具名）。
@@ -402,12 +470,20 @@ func (r *Registry) Snapshot() Snapshot {
 	for k, v := range r.overrides {
 		snap.Overrides[k] = v
 	}
+	if len(r.disabled) > 0 {
+		snap.Disabled = make([]string, 0, len(r.disabled))
+		for name := range r.disabled {
+			snap.Disabled = append(snap.Disabled, name)
+		}
+		sort.Strings(snap.Disabled)
+	}
 	for _, name := range r.order {
 		e := r.tools[name]
 		s := e.spec
 		s.Tier = r.tierLocked(e)
 		sum := SpecSummary{
 			Name: s.Name, Namespace: s.Namespace, Tier: s.Tier, DefaultTier: e.defaultTier,
+			Enabled:    !r.isDisabledLocked(name),
 			CostTokens: s.CostTokens, Risk: s.Risk, Executor: s.Executor,
 			PluginID: e.pluginID, Health: e.health,
 		}

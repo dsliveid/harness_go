@@ -8,7 +8,7 @@ import type {
   DeviceNode, ExtensionItem, ExtensionKind, McpServer, PlatformSupport, RegistryItem, Risk,
 } from '../../types'
 import { toolInstallInfo, toolList } from '../../lib/toolCatalog'
-import { supportsClient, unsupportedReason, clientPlatformLabel } from '../../lib/platform'
+import { ALL_PLATFORMS, supportsClient, unsupportedReason, clientPlatformLabel } from '../../lib/platform'
 import { ToolsPanel } from '../settings/ToolsPanel'
 
 
@@ -20,18 +20,18 @@ import { ToolsPanel } from '../settings/ToolsPanel'
 
 type ViewTab = 'builtin' | 'installed' | 'market' | 'extended'
 
-export type CapabilityKind = 'tool' | 'mcp' | 'skill' | 'ext' | 'reg'
+export type CapabilityKind = 'tool' | 'mcp' | 'skill' | 'ext' | 'reg' | 'pkg'
 
 export const KEY_PREFIX: Record<Exclude<CapabilityKind, 'tool'>, string> = {
-  mcp: 'mcp:', skill: 'skill:', ext: 'ext:', reg: 'reg:',
+  mcp: 'mcp:', skill: 'skill:', ext: 'ext:', reg: 'reg:', pkg: 'pkg:',
 }
 
 const KIND_TEXT: Record<CapabilityKind, string> = {
-  tool: '工具', mcp: 'MCP', skill: '技能', ext: '拓展', reg: '市场制品',
+  tool: '工具', mcp: 'MCP', skill: '技能', ext: '拓展', reg: '市场制品', pkg: '工具包',
 }
 
 const KIND_TONE: Record<CapabilityKind, 'blue' | 'purple' | 'cyan' | 'green' | 'gray'> = {
-  tool: 'green', mcp: 'blue', skill: 'purple', ext: 'cyan', reg: 'gray',
+  tool: 'green', mcp: 'blue', skill: 'purple', ext: 'cyan', reg: 'gray', pkg: 'gray',
 }
 
 // ---------------- 通用小组件 ----------------
@@ -113,6 +113,21 @@ function InstallAction({ itemKey, platforms, client, disabled, note }: {
   const installing = client.installing.includes(itemKey)
   const compatible = supportsClient(platforms, client.os)
 
+  // 服务端节点：技能 / 拓展 / 市场制品都**没有**服务端安装端点（服务端能力来自
+  // 编译期内置工具 + settings 里的 MCP Server + 本地 zip 工具包），
+  // 因此必须显式禁用并说明原因 —— 绝不能渲染一个点了没反应的按钮（假象比缺失更糟）。
+  if (client.platform === 'server') {
+    return (
+      <Button
+        size="sm"
+        variant="ghost"
+        disabled
+        title="服务端无该能力的安装端点：服务端能力来自内置工具（仅启停）、MCP Server 与本地 zip 工具包"
+      >
+        服务端不支持
+      </Button>
+    )
+  }
   if (disabled) {
     return <Button size="sm" variant="ghost" disabled title={note ?? '该能力不提供独立安装'}>不可安装</Button>
   }
@@ -197,6 +212,18 @@ function resolveInstalled(client: DeviceNode, kinds: CapabilityKind[]): Installe
       const name = key.slice(KEY_PREFIX.ext.length)
       const e = extensions.find((x) => x.name === name)
       if (e) entry = { key, kind: 'ext', name, description: e.description, version: e.version }
+    } else if (key.startsWith(KEY_PREFIX.pkg)) {
+      // 服务端本地工具包（服务端节点专属）：id 来自 GET /api/v1/packages
+      const id = key.slice(KEY_PREFIX.pkg.length)
+      const p = usePlugins.getState().packages.find((x) => x.id === id)
+      if (p) {
+        entry = {
+          key, kind: 'pkg', name: p.name, description: p.description || `工具包 · ${p.tool_names?.length ?? 0} 个工具`,
+          version: p.version,
+          // 工具包只在服务端本地运行，无「客户端平台」概念 → 全平台可展示
+          platforms: ALL_PLATFORMS,
+        }
+      }
     } else if (key.startsWith(KEY_PREFIX.reg)) {
       const id = key.slice(KEY_PREFIX.reg.length)
       const r = registryItems.find((x) => x.id === id)
@@ -226,6 +253,21 @@ function resolveInstalled(client: DeviceNode, kinds: CapabilityKind[]): Installe
 
 function InstalledPane({ client, kinds, hint }: { client: DeviceNode; kinds: CapabilityKind[]; hint: React.ReactNode }) {
   const list = resolveInstalled(client, kinds)
+  const toast = useUI((s) => s.toast)
+  const serverTarget = client.platform === 'server'
+  // 服务端节点的「已装清单」里有两类东西：
+  //   - 工具包（pkg:）：有真实卸载端点 → 走 uninstallServerPackage；
+  //   - 内置工具 / MCP：无卸载概念（内置随程序发布、MCP 由配置托管）→ 禁用并说明。
+  const uninstall = (i: InstalledEntry) => {
+    if (i.kind === 'pkg') {
+      usePlugins.getState().uninstallServerPackage(i.key.slice(KEY_PREFIX.pkg.length))
+        .then(() => toast('success', `${i.name} 已卸载`))
+        .catch((e: unknown) => toast('error', `卸载失败：${e instanceof Error ? e.message : String(e)}`))
+      return
+    }
+    usePlugins.getState().uninstallOnClient(i.key)
+  }
+  const removable = (i: InstalledEntry) => !serverTarget || i.kind === 'pkg'
   return (
     <>
       <PageHint>{hint}</PageHint>
@@ -238,15 +280,28 @@ function InstalledPane({ client, kinds, hint }: { client: DeviceNode; kinds: Cap
               {i.version && <Badge>{i.version}</Badge>}
               <Badge tone="green">已安装</Badge>
               <span className="flex-1" />
-              <Button
-                size="sm"
-                variant="ghost"
-                className="gap-1 text-inkdim hover:text-err"
-                onClick={() => usePlugins.getState().uninstallOnClient(i.key)}
-              >
-                <Trash2 size={11} />
-                卸载
-              </Button>
+              {removable(i) ? (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="gap-1 text-inkdim hover:text-err"
+                  onClick={() => uninstall(i)}
+                >
+                  <Trash2 size={11} />
+                  卸载
+                </Button>
+              ) : (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  disabled
+                  title={i.kind === 'tool'
+                    ? '服务端内置工具随程序发布，不可卸载；只能停用（见「系统内置」页签的启停开关）'
+                    : '服务端 MCP Server 由配置托管，不可卸载；可在「系统内置」页签停用或删除配置'}
+                >
+                  不可卸载
+                </Button>
+              )}
             </div>
             <div className="text-[12px] text-inkfaint mt-1 leading-relaxed truncate">{i.description || '—'}</div>
             <div className="mt-1.5"><PlatformTags platforms={i.platforms} client={client} /></div>
@@ -256,7 +311,9 @@ function InstalledPane({ client, kinds, hint }: { client: DeviceNode; kinds: Cap
           <Empty
             icon={<Download size={22} className="text-inkfaint" />}
             title={`${client.name} 暂无已安装${kinds.map((k) => KIND_TEXT[k]).join(' / ')}`}
-            hint="在「系统内置」或「市场」中点击「安装到此端」即可落地到当前客户端"
+            hint={serverTarget
+              ? '服务端能力来自内置工具（仅启停）、MCP Server 与本地 zip 工具包'
+              : '在「系统内置」或「市场」中点击「安装到此端」即可落地到当前客户端'}
           />
         )}
       </div>
@@ -266,11 +323,28 @@ function InstalledPane({ client, kinds, hint }: { client: DeviceNode; kinds: Cap
 
 // ---------------- 市场制品卡片 ----------------
 function RegistryCard({ r, client }: { r: RegistryItem; client: DeviceNode }) {
-  const { installRegistry } = usePlugins()
+  const { installFromMarket } = usePlugins()
   const toast = useUI((s) => s.toast)
   const key = `${KEY_PREFIX.reg}${r.id}`
   const installed = client.installed.includes(key)
   const compatible = supportsClient(r.platforms, client.os)
+  // 外部市场制品只能落到「服务端」或具体客户端本机：
+  //   - 服务端：走 POST /market/install（服务端下载 + sha256 + 验签 + 落盘）
+  //   - 客户端：需要端侧自行安装（当前无端侧安装端点，明确禁用而非点了没反应）
+  const serverTarget = client.platform === 'server'
+  const [busy, setBusy] = useState(false)
+
+  const doInstall = () => {
+    if (!r.registryId) {
+      toast('warn', `${r.name} 未关联外部市场制品 ID，无法从市场安装`)
+      return
+    }
+    setBusy(true)
+    installFromMarket(r.registryId, r.kind === 'plugin' ? 'package' : 'skill')
+      .then(() => toast('success', `${r.name} 已从外部市场安装（已完成完整性校验与验签）`))
+      .catch((e: unknown) => toast('error', `安装失败：${e instanceof Error ? e.message : String(e)}`))
+      .finally(() => setBusy(false))
+  }
 
   return (
     <div className="rounded-xl border border-edge bg-panel p-3.5 shadow-subtle hover:border-edge2 transition-all">
@@ -279,20 +353,28 @@ function RegistryCard({ r, client }: { r: RegistryItem; client: DeviceNode }) {
         <Badge>{r.version}</Badge>
         <Badge tone={r.signature === 'signed' ? 'green' : 'yellow'}>{r.signature === 'signed' ? '已签名' : '未签名'}</Badge>
         <span className="flex-1" />
-        {installed ? (
-          <InstallAction itemKey={key} platforms={r.platforms} client={client} />
+        {serverTarget ? (
+          installed ? (
+            <Button size="sm" variant="ghost" disabled title="已安装：可在「已安装」页签卸载">已安装</Button>
+          ) : (
+            <Button
+              size="sm"
+              variant="primary"
+              disabled={busy}
+              title="服务端将从外部市场源下载制品，并做 sha256 完整性与 ed25519 验签校验"
+              onClick={doInstall}
+            >
+              {busy ? '安装中…' : '安装到服务端'}
+            </Button>
+          )
         ) : (
           <Button
             size="sm"
-            variant="primary"
-            disabled={!compatible || Boolean(r.installing)}
-            title={!compatible ? unsupportedReason(r.platforms, client) : `下载并安装到 ${client.name}`}
-            onClick={() => {
-              installRegistry(r.id)
-              toast('info', `开始下载 ${r.name}（${r.sizeMb}MB）并安装到 ${client.name}`)
-            }}
+            variant="ghost"
+            disabled
+            title="客户端侧无市场安装端点：外部市场制品目前只能装到服务端；客户端请在端内自行安装"
           >
-            {r.installing ? '安装中…' : compatible ? '安装到此端' : '该端不支持'}
+            该端暂不支持
           </Button>
         )}
       </div>
@@ -316,12 +398,20 @@ function RegistryCard({ r, client }: { r: RegistryItem; client: DeviceNode }) {
  * 设计意图：工具包是「服务端本地 zip 安装」的一等公民（market_handler.go:213-214），
  * 与端侧本机安装是两条不同链路，因此独立成块展示，不与 mock 的端节点清单混算。
  * 安装入参是**服务端本地路径**（无 HTTP 上传），故此处不提供上传按钮。
+ *
+ * 服务端节点下这些操作全部有真实端点（enable/disable/卸载/回滚），
+ * 因此必须可点：这正是「服务端其他功能与客户端保持一致」的落点。
  */
-function ServerPackagesPanel({ packages, loading, error }: {
+function ServerPackagesPanel({ packages, loading, error, client }: {
   packages: PackageViewDTO[]
   loading?: boolean
   error?: string
+  /** 当前管理目标；只有服务端节点能管理工具包（客户端与工具包是两条链路） */
+  client?: DeviceNode
 }) {
+  const toast = useUI((s) => s.toast)
+  const { setServerPackageEnabled, uninstallServerPackage, rollbackServerPackage } = usePlugins()
+  const serverMode = client?.platform === 'server'
   return (
     <div className="rounded-xl border border-edge bg-panel2/20 p-3 space-y-2">
       <div className="flex items-center gap-2 flex-wrap">
@@ -332,7 +422,9 @@ function ServerPackagesPanel({ packages, loading, error }: {
       {error && <div className="text-[11px] text-err">拉取失败：{error}</div>}
       {loading && <div className="text-[11px] text-inkfaint">加载中…</div>}
       {!loading && packages.length === 0 && !error && (
-        <div className="text-[11px] text-inkfaint">服务端尚未安装任何工具包（安装入参为服务端本地 zip 路径，Web 端无上传通道）。</div>
+        <div className="text-[11px] text-inkfaint">
+          服务端尚未安装任何工具包（安装入参为服务端本地 zip 路径，Web 端无上传通道，需在服务端侧安装）。
+        </div>
       )}
       <div className="space-y-1.5">
         {packages.map((p) => (
@@ -349,6 +441,49 @@ function ServerPackagesPanel({ packages, loading, error }: {
               <span className="text-[10px] text-inkfaint">工具 {p.tool_names.length}</span>
             )}
             {p.last_error && <span className="text-[10px] text-err truncate max-w-[240px]" title={p.last_error}>{p.last_error}</span>}
+            {serverMode && (
+              <span className="flex items-center gap-1 shrink-0">
+                {p.previous_version && (
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    title={`回滚到 v${p.previous_version}`}
+                    onClick={() => {
+                      rollbackServerPackage(p.id)
+                        .then(() => toast('success', `${p.name} 已回滚到 v${p.previous_version}`))
+                        .catch((e: unknown) => toast('error', `回滚失败：${e instanceof Error ? e.message : String(e)}`))
+                    }}
+                  >
+                    回滚
+                  </Button>
+                )}
+                <Button
+                  size="sm"
+                  variant={p.enabled ? 'ghost' : 'primary'}
+                  title={p.enabled ? '停用（保留安装，注销工具）' : '启用（保留安装，重新注册工具）'}
+                  onClick={() => {
+                    setServerPackageEnabled(p.id, !p.enabled)
+                      .then(() => toast('success', `${p.name} 已${p.enabled ? '停用' : '启用'}`))
+                      .catch((e: unknown) => toast('error', `操作失败：${e instanceof Error ? e.message : String(e)}`))
+                  }}
+                >
+                  {p.enabled ? '停用' : '启用'}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="text-inkdim hover:text-err"
+                  title="卸载（注销工具 + 清目录 + 删行）"
+                  onClick={() => {
+                    uninstallServerPackage(p.id)
+                      .then(() => toast('success', `${p.name} 已卸载`))
+                      .catch((e: unknown) => toast('error', `卸载失败：${e instanceof Error ? e.message : String(e)}`))
+                  }}
+                >
+                  卸载
+                </Button>
+              </span>
+            )}
           </div>
         ))}
       </div>
@@ -388,10 +523,19 @@ export function ToolsPane({ client }: { client: DeviceNode }) {
       {view === 'builtin' && (
         <>
           <PageHint>
-            系统内置工具随程序发布，各端可<span className="text-inkdim">自行安装</span>到本机执行。当前端（{client.name}）可安装 {installableOfClient} / {toolList.length} 个；
-            移动端不支持 shell 执行类工具，Windows 与 Linux 分别判定（如 bash 脚本、Chromium 依赖）。
+            {client.platform === 'server' ? (
+              <>
+                服务端的内置工具随程序发布（编译期注册），<span className="text-inkdim">不提供安装/卸载</span>，
+                只能在下方卡片上<span className="text-inkdim">启用或停用</span>；停用后既不注入模型也不可调用，重启后保持。
+              </>
+            ) : (
+              <>
+                系统内置工具随程序发布，各端可<span className="text-inkdim">自行安装</span>到本机执行。当前端（{client.name}）可安装 {installableOfClient} / {toolList.length} 个；
+                移动端不支持 shell 执行类工具，Windows 与 Linux 分别判定（如 bash 脚本、Chromium 依赖）。
+              </>
+            )}
           </PageHint>
-          <ServerPackagesPanel packages={packages} loading={remoteStatus === 'loading'} error={remoteError} />
+          <ServerPackagesPanel packages={packages} loading={remoteStatus === 'loading'} error={remoteError} client={client} />
           <ToolsPanel client={client} query={kw} />
         </>
       )}
@@ -400,7 +544,7 @@ export function ToolsPane({ client }: { client: DeviceNode }) {
         <InstalledPane
           client={client}
           kinds={['tool']}
-          hint={<>当前客户端已落地的工具清单（内置工具 + 市场制品）。此视图只反映「{client.name}」本机状态，切换客户端即可查看其他端。</>}
+          hint={<>当前已落地的工具清单（内置工具 + 服务端工具包 + 市场制品）。此视图只反映「{client.name}」本端状态，切换目标即可查看其他端。</>}
         />
       )}
 
@@ -586,17 +730,50 @@ function McpCard({ m, client, action }: { m: McpServer; client: DeviceNode; acti
 
 // ---------------- 技能 ----------------
 export function SkillsPane({ client }: { client: DeviceNode }) {
-  const { skills, registryItems, extensions } = usePlugins()
+  const {
+    skills, registryItems, extensions, skillViews, skillRoot, skillDir,
+    loadSkills, loadRemoteCapabilities, installSkill, uninstallSkill, installFromMarket,
+  } = usePlugins()
+  const toast = useUI((s) => s.toast)
   const [view, setView] = useState<ViewTab>('builtin')
   const [q, setQ] = useState('')
+  const [busy, setBusy] = useState<string | null>(null)
   const kw = q.trim().toLowerCase()
   const match = (s: string) => !kw || s.toLowerCase().includes(kw)
+  const serverTarget = client.platform === 'server'
+
+  // 技能真源在磁盘（.harness/skills）：进入页签即按磁盘真值刷新，
+  // 保证 Agent 刚沉淀的技能立刻可见。
+  useEffect(() => {
+    if (serverTarget) {
+      void loadSkills()
+    } else {
+      void loadRemoteCapabilities()
+    }
+  }, [serverTarget, loadSkills, loadRemoteCapabilities])
 
   const market = registryItems.filter((r) => r.kind === 'skill')
   const marketList = market.filter((r) => match(`${r.name} ${r.description}`))
+  // 🚨 已安装必须在表格前面（用户明确要求）：
+  // 技能已装判定 = 磁盘上存在同名技能（skillViews 是真源，不是前端记忆）。
+  const installedNames = new Set(skillViews.map((s) => s.name))
+  const marketSorted = [...marketList].sort((a, b) => {
+    const ai = installedNames.has(a.name) ? 0 : 1
+    const bi = installedNames.has(b.name) ? 0 : 1
+    if (ai !== bi) return ai - bi
+    return a.name.localeCompare(b.name)
+  })
   const builtinList = skills.filter((k) => k.origin === 'builtin').filter((k) => match(`${k.name} ${k.description}`))
   const extAll = extensions.filter((e) => e.kind === 'skill')
-  const installedCount = resolveInstalled(client, ['skill']).length
+  const installedCount = serverTarget ? skillViews.length : resolveInstalled(client, ['skill']).length
+
+  const run = (label: string, fn: () => Promise<void>) => {
+    setBusy(label)
+    fn()
+      .then(() => toast('success', `${label} 完成`))
+      .catch((e: unknown) => toast('error', `${label} 失败：${e instanceof Error ? e.message : String(e)}`))
+      .finally(() => setBusy(null))
+  }
 
   return (
     <div className="space-y-3">
@@ -608,48 +785,155 @@ export function SkillsPane({ client }: { client: DeviceNode }) {
       {view === 'builtin' && (
         <>
           <PageHint>
-            系统内置技能可把技能目录（含脚本）安装到客户端 .harness/skills/ 后本地执行。
-            依赖脚本运行时（py / sh / ps1）的技能仅 PC 端可安装，移动端仅支持读取说明的纯提示型技能。
+            {serverTarget ? (
+              <>
+                技能真源是 <code className="font-mono bg-panel2 px-1 rounded">{skillDir}/&lt;name&gt;/SKILL.md</code>
+                {skillRoot ? <span className="text-inkfaint">（根：{skillRoot}）</span> : null}。
+                与 Agent 的 skill_list / skill_save <span className="text-inkdim">读写同一份文件</span>：
+                界面装的技能 Agent 立刻可用，Agent 沉淀的技能这里立刻可见。
+                目录不存在时视为空库（全新部署的正常状态）。
+              </>
+            ) : (
+              <>
+                系统内置技能可把技能目录（含脚本）安装到客户端 .harness/skills/ 后本地执行。
+                依赖脚本运行时（py / sh / ps1）的技能仅 PC 端可安装，移动端仅支持读取说明的纯提示型技能。
+              </>
+            )}
           </PageHint>
-          <div className="space-y-2">
-            {builtinList.map((k) => (
-              <div key={k.id} className="rounded-xl border border-edge bg-panel p-3 shadow-subtle hover:border-edge2 transition-all">
-                <div className="flex items-center gap-2 flex-wrap">
-                  <span className="text-[13px] font-medium text-ink">{k.name}</span>
-                  <Badge tone="blue">系统内置</Badge>
-                  <span className="flex-1" />
-                  <InstallAction itemKey={`${KEY_PREFIX.skill}${k.name}`} platforms={k.platforms} client={client} />
-                </div>
-                <div className="text-[12px] text-inkfaint mt-1 leading-relaxed">{k.description}</div>
-                <div className="mt-1.5"><PlatformTags platforms={k.platforms} client={client} /></div>
+
+          {serverTarget && (
+            <div className="rounded-xl border border-edge bg-panel p-3 space-y-2">
+              <div className="flex items-center gap-2 flex-wrap">
+                <span className="text-[12px] font-semibold text-ink">服务端技能库</span>
+                <Badge tone="blue">{skillViews.length} 个</Badge>
+                <span className="flex-1" />
+                <Button size="sm" variant="ghost" onClick={() => void loadSkills()}>刷新</Button>
               </div>
-            ))}
-            {builtinList.length === 0 && <Empty icon={<Sparkles size={22} className="text-inkfaint" />} title={kw ? '没有匹配的内置技能' : '暂无内置技能'} />}
-          </div>
+              {skillViews.length === 0 ? (
+                <div className="text-[11px] text-inkfaint">
+                  技能库为空。可在会话中让 Agent 用 skill_save 沉淀，或从「市场」页签安装。
+                </div>
+              ) : (
+                <div className="space-y-1.5">
+                  {skillViews.map((s) => (
+                    <div key={s.name} className="flex items-center gap-2 flex-wrap rounded-lg border border-edge/70 bg-panel px-2.5 py-1.5">
+                      <span className="font-mono text-[12px] font-medium text-ink">{s.name}</span>
+                      <Badge tone={s.origin === 'market' ? 'blue' : 'gray'}>{s.origin === 'market' ? '市场' : '本地'}</Badge>
+                      <span className="text-[11px] text-inkfaint truncate max-w-[380px]">{s.description}</span>
+                      <span className="flex-1" />
+                      <span className="text-[10px] text-inkfaint font-mono">{s.path}</span>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        className="text-inkdim hover:text-err"
+                        disabled={busy !== null}
+                        title="删除整个技能目录（含附属脚本）"
+                        onClick={() => run(`卸载 ${s.name}`, () => uninstallSkill(s.name))}
+                      >
+                        卸载
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="text-[10px] text-inkfaint">
+                提示：Web 端按服务端**进程根**读写；Agent 在某项目会话里沉淀的技能落在该项目目录下，两者是不同目录。
+              </div>
+            </div>
+          )}
+
+          {!serverTarget && (
+            <div className="space-y-2">
+              {builtinList.map((k) => (
+                <div key={k.id} className="rounded-xl border border-edge bg-panel p-3 shadow-subtle hover:border-edge2 transition-all">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-[13px] font-medium text-ink">{k.name}</span>
+                    <Badge tone="blue">系统内置</Badge>
+                    <span className="flex-1" />
+                    <InstallAction itemKey={`${KEY_PREFIX.skill}${k.name}`} platforms={k.platforms} client={client} />
+                  </div>
+                  <div className="text-[12px] text-inkfaint mt-1 leading-relaxed">{k.description}</div>
+                  <div className="mt-1.5"><PlatformTags platforms={k.platforms} client={client} /></div>
+                </div>
+              ))}
+              {builtinList.length === 0 && <Empty icon={<Sparkles size={22} className="text-inkfaint" />} title={kw ? '没有匹配的内置技能' : '暂无内置技能'} />}
+            </div>
+          )}
         </>
       )}
 
       {view === 'installed' && (
-        <InstalledPane
-          client={client}
-          kinds={['skill']}
-          hint={<>当前客户端已安装技能：内置技能 / 市场下载 / 拓展生成，均落地在本地 .harness/skills/。卸载后回到可重新安装状态。</>}
-        />
+        serverTarget ? (
+          <div className="space-y-2">
+            <PageHint>服务端已落地技能（真源：{skillDir}/）。与「系统内置」页签一致，这里按磁盘真值展示。</PageHint>
+            {skillViews.length === 0 ? (
+              <Empty icon={<Sparkles size={22} className="text-inkfaint" />} title="服务端技能库为空" />
+            ) : skillViews.map((s) => (
+              <div key={s.name} className="flex items-center gap-2 flex-wrap rounded-xl border border-edge bg-panel p-3">
+                <span className="font-mono text-[13px] font-medium text-ink">{s.name}</span>
+                <Badge tone="green">已安装</Badge>
+                <span className="text-[11px] text-inkfaint truncate">{s.description}</span>
+                <span className="flex-1" />
+                <Button size="sm" variant="ghost" className="text-inkdim hover:text-err"
+                  onClick={() => run(`卸载 ${s.name}`, () => uninstallSkill(s.name))}>卸载</Button>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <InstalledPane
+            client={client}
+            kinds={['skill']}
+            hint={<>当前客户端已安装技能：内置技能 / 市场下载 / 拓展生成，均落地在本地 .harness/skills/。卸载后回到可重新安装状态。</>}
+          />
+        )
       )}
 
       {view === 'market' && (
         <>
-          <PageHint>技能市场：从 registry 下载并安装到当前客户端（{client.name}）。</PageHint>
+          <PageHint>
+            技能市场来自<span className="text-inkdim">外部 registry</span>（见「市场」页签顶部说明）：
+            安装后写服务端技能库，并完成 sha256 完整性与验签校验。已安装排在前面。
+          </PageHint>
           <div className="space-y-2">
-            {marketList.map((r) => <RegistryCard key={r.id} r={r} client={client} />)}
-            {marketList.length === 0 && <Empty icon={<Search size={22} className="text-inkfaint" />} title={kw ? '没有匹配的技能' : '暂无内容'} />}
+            {marketSorted.map((r) => (
+              <div key={r.id} className="rounded-xl border border-edge bg-panel p-3.5 shadow-subtle hover:border-edge2 transition-all">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-[13px] font-semibold text-ink">{r.name}</span>
+                  <Badge>{r.version}</Badge>
+                  {installedNames.has(r.name) && <Badge tone="green">已安装</Badge>}
+                  <span className="flex-1" />
+                  {installedNames.has(r.name) ? (
+                    <Button size="sm" variant="ghost" className="text-inkdim hover:text-err"
+                      title="从服务端技能库卸载（删除整个技能目录）"
+                      onClick={() => run(`卸载 ${r.name}`, () => uninstallSkill(r.name))}>卸载</Button>
+                  ) : (
+                    <Button
+                      size="sm"
+                      variant="primary"
+                      disabled={!serverTarget || busy !== null || !r.registryId}
+                      title={!serverTarget
+                        ? '外部市场制品目前只能装到服务端；客户端请在端内自行安装'
+                        : !r.registryId ? '该条目未关联外部市场 ID' : '从外部市场安装到服务端技能库'}
+                      onClick={() => {
+                        if (!r.registryId) return
+                        run(`安装 ${r.name}`, async () => { await installFromMarket(r.registryId!, 'skill') })
+                      }}
+                    >
+                      安装到服务端
+                    </Button>
+                  )}
+                </div>
+                <div className="text-[12px] text-inkdim mt-1.5 leading-relaxed">{r.description}</div>
+              </div>
+            ))}
+            {marketSorted.length === 0 && <Empty icon={<Search size={22} className="text-inkfaint" />} title={kw ? '没有匹配的技能' : '暂无内容'} />}
           </div>
         </>
       )}
 
       {view === 'extended' && (
         <>
-          <PageHint>拓展技能 = 程序把一次成功经验固化为可复用技能（save_skill 自演化），自检通过并经审批后即可安装到当前客户端。</PageHint>
+          <PageHint>拓展技能 = 程序把一次成功经验固化为可复用技能（save_skill 自演化），自检通过并经审批后即可安装。</PageHint>
           <ExtensionList client={client} kind="skill" query={kw} />
         </>
       )}
@@ -703,6 +987,9 @@ function ExtensionCard({ e, client }: { e: ExtensionItem; client: DeviceNode }) 
   const testFailed = e.selfTest === 'failed'
   const key = `${KEY_PREFIX.ext}${e.name}`
   const onThisClient = client.installed.includes(key)
+  // 服务端节点：拓展落地也走「安装到某端本机」，服务端无对应端点。
+  // 保留「停用/启用/移除」这类能力态操作（它们改的是拓展自身状态），只拦「安装到此端」。
+  const serverTarget = client.platform === 'server'
 
   return (
     <div className="rounded-xl border border-edge bg-panel p-3.5 shadow-subtle hover:border-edge2 transition-all">
@@ -720,23 +1007,34 @@ function ExtensionCard({ e, client }: { e: ExtensionItem; client: DeviceNode }) 
         {e.signature === 'unsigned' && <Badge tone="yellow">未签名</Badge>}
         <span className="flex-1" />
         {draft && (
-          <Button
-            size="sm"
-            variant="primary"
-            disabled={testFailed}
-            title={testFailed ? '自检未通过：需修复实现并重跑自检后才可安装' : `自检通过后安装到 ${client.name}`}
-            onClick={() => {
-              installExtension(e.id)
-              toast('success', `已安装拓展${EXT_KIND_TEXT[e.kind]}「${e.name}」到 ${client.name}`)
-            }}
-          >
-            安装到此端
-          </Button>
+          serverTarget ? (
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled
+              title="服务端无拓展安装端点：拓展只能安装到具体客户端本机"
+            >
+              服务端不支持
+            </Button>
+          ) : (
+            <Button
+              size="sm"
+              variant="primary"
+              disabled={testFailed}
+              title={testFailed ? '自检未通过：需修复实现并重跑自检后才可安装' : `自检通过后安装到 ${client.name}`}
+              onClick={() => {
+                installExtension(e.id)
+                toast('success', `已安装拓展${EXT_KIND_TEXT[e.kind]}「${e.name}」到 ${client.name}`)
+              }}
+            >
+              安装到此端
+            </Button>
+          )
         )}
         {installed && (
           <>
             <Button size="sm" variant="ghost" onClick={() => { toggleExtension(e.id); toast('info', `已停用「${e.name}」`) }}>停用</Button>
-            {!onThisClient && (
+            {!onThisClient && !serverTarget && (
               <Button
                 size="sm"
                 variant="outline"
@@ -748,7 +1046,7 @@ function ExtensionCard({ e, client }: { e: ExtensionItem; client: DeviceNode }) 
                 安装到此端
               </Button>
             )}
-            {onThisClient && (
+            {onThisClient && !serverTarget && (
               <Button
                 size="sm"
                 variant="ghost"

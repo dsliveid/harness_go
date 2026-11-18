@@ -5,12 +5,15 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"time"
 
 	"harness-go/internal/agent"
 	"harness-go/internal/apperr"
 	"harness-go/internal/approval"
+	"harness-go/internal/events"
 	"harness-go/internal/model"
 	"harness-go/internal/prompt"
+	"harness-go/internal/sop"
 	"harness-go/internal/store"
 )
 
@@ -31,6 +34,14 @@ type RunServiceOptions struct {
 	//
 	// 为 nil 或返回空串时退回 SystemBase 静态值（降级不注入空系统提示）。
 	CoreSOPFunc func() string
+	// RulesFunc 动态原生 SOP 规则源（工程作业程序）。
+	//
+	// 参数为会话事实（IsSub / PlanMode / SessionID），由本服务按会话如实填写；
+	// 返回已渲染的规则行（含序号）。不缓存 → 用户关掉某条规范后下一轮即生效。
+	//
+	// 与 CoreSOPFunc 的关系：core 是人格段（可被用户覆盖），本字段是规则清单
+	// （代码真源、可逐条启停）。两者拼接顺序为 core → ## 工作区 → 规则。
+	RulesFunc func(ctx context.Context, rc sop.Context) []string
 	// WorkDir 服务端进程工作目录（工具相对路径的实际落盘根）。
 	// 仅用于在「会话未绑定工作区」时向模型如实交代边界，不冒充用户的绑定目录。
 	WorkDir string
@@ -69,6 +80,12 @@ type RunServiceOptions struct {
 	// 这是运行时事实，只在设备域 Hub 里。nil Hub 绝不等于「全部在线」，
 	// 而是「无法确认在線」→ 按离线处理（fail-closed），宁可降级为零工具。
 	Hub HubOnline
+	// Events Run 事件发布源（per-Run），用于「未选择模型」的即时收口语义。
+	//
+	// 为什么服务层也需要它：未选模型的 Run **不进引擎**（不调模型、不耗 token），
+	// 因此没有引擎来发终态事件；但前端有乐观气泡在转圈，必须有人告诉它「已结束」。
+	// nil 时跳过发布（单测/降级），DB 仍是唯一权威。
+	Events agent.EventPublisher
 }
 
 // RunService Run 用例：创建（异步执行）/ 停止 / 查询 / 启动恢复。
@@ -79,12 +96,14 @@ type RunService struct {
 	systemBase string
 	// coreSOPFunc 动态核心 SOP 源（agent-core）；nil 表示用静态 systemBase。
 	coreSOPFunc func() string
-	workDir     string
-	sop         []string
-	sopFunc     func(wsPath string) []string
-	tools       []prompt.ToolRef
-	toolRefs    func() []prompt.ToolRef
-	gate        *approval.Gate
+	// rulesFunc 动态原生 SOP 规则源；nil 表示不注入规则段（降级为旧行为）。
+	rulesFunc func(ctx context.Context, rc sop.Context) []string
+	workDir   string
+	sop       []string
+	sopFunc   func(wsPath string) []string
+	tools     []prompt.ToolRef
+	toolRefs  func() []prompt.ToolRef
+	gate      *approval.Gate
 	// toolSelector 动态工具检索（D-2）；nil 表示不做动态检索。
 	toolSelector ToolSelector
 	// memory 记忆四层召回源（D-3）；nil 表示不注入记忆。
@@ -95,6 +114,8 @@ type RunService struct {
 	catalog agent.ToolCatalog
 	// hub 设备在线判定；nil 时设备空间一律按离线处理（fail-closed）。
 	hub HubOnline
+	// events Run 事件发布源；nil 时不发布终态事件（DB 仍是权威）。
+	events agent.EventPublisher
 
 	mu      sync.Mutex
 	cancels map[string]context.CancelFunc
@@ -119,6 +140,7 @@ func NewRunService(opts RunServiceOptions) *RunService {
 		engine:         opts.Engine,
 		systemBase:     opts.SystemBase,
 		coreSOPFunc:    opts.CoreSOPFunc,
+		rulesFunc:      opts.RulesFunc,
 		workDir:        opts.WorkDir,
 		sop:            opts.SOP,
 		sopFunc:        opts.SOPFunc,
@@ -130,6 +152,7 @@ func NewRunService(opts RunServiceOptions) *RunService {
 		strictApproval: opts.StrictApprovalDevice,
 		catalog:        opts.Catalog,
 		hub:            opts.Hub,
+		events:         opts.Events,
 		cancels:        make(map[string]context.CancelFunc),
 	}
 }
@@ -157,6 +180,18 @@ func (s *RunService) SetHub(hub HubOnline) {
 		return
 	}
 	s.hub = hub
+}
+
+// appendRules 把原生 SOP 规则段追加到系统提示（未装配规则源时原样返回）。
+//
+// 抽成方法而不是内联：主 Run 与子 Run 必须走同一条装配口径，
+// 差异只在 isSub 这个会话事实（决定 main_only / sub_only 的作用域切换）。
+func (s *RunService) appendRules(ctx context.Context, system, sessionID string, isSub bool) string {
+	if s == nil || s.rulesFunc == nil {
+		return system
+	}
+	rc := sop.Context{SessionID: sessionID, IsSub: isSub}
+	return composeRulesSection(system, s.rulesFunc(ctx, rc))
 }
 
 // currentTools 返回本轮应注入的工具定义（动态优先）。
@@ -416,12 +451,13 @@ func (s *RunService) CreateRunWithSystem(ctx context.Context, sessionID, userInp
 	if modelRef == "" {
 		modelRef = sess.ModelRef
 	}
-	if modelRef == "" {
-		// 未指定模型时不阻断对话：折算为 "default"，由 ProviderResolver 按
-		// agent.default_model（设置 → 能力模型槽位 chat）→ 首个启用厂商的首个模型解析；
-		// 全都不可用才回退 fake provider（单二进制开箱可用），回退时会打 Warn 日志。
-		modelRef = "default"
-	}
+	// 未选择模型 = 只保存消息、不产生回复（2026-11 产品口径）。
+	//
+	// 🚨 这里**不再**折算为 "default"：旧逻辑会让未选模型的会话静默落到
+	// agent.default_model → fake provider 回显，用户「以为自己在聊天，其实是在
+	// 跟假模型对答」。新口径：用户消息照常落库（消息记录保留、刷新可见），
+	// 但本轮**不进引擎**——不调模型、不消耗 token、不产生 assistant 消息。
+	noModel := strings.TrimSpace(modelRef) == ""
 
 	sdb, err := s.sessions.Acquire(ctx, sessionID)
 	if err != nil {
@@ -441,14 +477,22 @@ func (s *RunService) CreateRunWithSystem(ctx context.Context, sessionID, userInp
 	// ② 摘要回写主库（最终一致）
 	_ = s.main.Sessions().TouchMessage(ctx, sessionID, userMsg.CreatedAt)
 
-	// ③ 创建 Run（pending）
+	// ③ 创建 Run
 	executor := model.ExecutorServer
 	if deviceID != "" {
 		executor = model.ExecutorDevice
 	}
+	// 未选模型的 Run 直接建为终态 completed：状态机禁止 pending → completed 跳跃
+	// （见 agent/state.go），而这一轮**从未真正开始执行**，伪造 pending→running
+	// 只会让前端闪一下「运行中」再收口。建库即终态是最诚实的表达：
+	// 「本次发送已受理且已结束，只是没有回复」。
+	initialStatus := model.RunPending
+	if noModel {
+		initialStatus = model.RunCompleted
+	}
 	run := &model.Run{
 		ID:        newID(),
-		Status:    model.RunPending,
+		Status:    initialStatus,
 		ModelRef:  modelRef,
 		Executor:  executor,
 		DeviceID:  deviceID,
@@ -465,7 +509,20 @@ func (s *RunService) CreateRunWithSystem(ctx context.Context, sessionID, userInp
 	// Run 永远不会被置 interrupted；② 会话列表的「运行中」徽标判据同样永不命中。
 	// 这里补写一次即可让投影全程跟随真相，无需新增接口/表/字段。
 	// 失败不阻断 Run（投影是展示项，真相在会话库），与 TouchMessage 同口径。
-	_ = s.main.Sessions().AddTokensAndStatus(ctx, sessionID, 0, model.RunPending)
+	_ = s.main.Sessions().AddTokensAndStatus(ctx, sessionID, 0, initialStatus)
+
+	// ③' 未选择模型：到此收口并返回（消息已落库、Run 已终态）。
+	//
+	// 为什么在引擎之前返回：这一轮的唯一产物是「用户消息被保存」。进引擎意味着
+	// 模型解析 / 记忆召回 / SOP 读盘 / 工具检索全部白跑，且一旦 resolver 回退到
+	// default/fake provider 就会产出**假回复**——那正是本需求要消除的行为。
+	//
+	// 事件：前端已乐观上屏了空 assistant 气泡，必须收到终态才会停转圈，
+	// 这里补发一次 run.status(completed)，前端据此走既有的单点收口 settleRun。
+	if noModel {
+		s.publishNoModelCompleted(run.ID, sessionID)
+		return run, nil
+	}
 
 	// ④ 记忆召回（D-3）：每 Run 一次，core 进稳定前缀、tail 置尾。
 	// 召回失败降级为空块（记忆是优化项，绝不阻断对话 —— 与工具检索同口径）。
@@ -491,6 +548,9 @@ func (s *RunService) CreateRunWithSystem(ctx context.Context, sessionID, userInp
 	}
 	// 工作区事实按会话注入：绑定/未绑定如实分叉，杜绝「未绑定却说自己在工作区内」的幻觉。
 	system = ComposeSystemBase(system, sess.ProjectDir, s.workDir)
+	// 原生 SOP 规则段（工程作业程序）：必须拼在「## 工作区」之后 ——
+	// 规则正文里「见上方 ## 工作区」的指代才成立。
+	system = s.appendRules(ctx, system, sessionID, false)
 	// 能力天花板（协议 §4.1）：唯一入口在此，引擎只消费结果。
 	// 零工具策略下不注入任何工具（让模型根本看不到），且引擎侧做兜底短路拒绝。
 	toolPolicy, policyReason := s.resolveToolPolicy(ctx, sess)
@@ -530,6 +590,32 @@ func (s *RunService) CreateRunWithSystem(ctx context.Context, sessionID, userInp
 	}()
 
 	return run, nil
+}
+
+// publishNoModelCompleted 为「未选择模型」的 Run 发布终态事件并关闭事件源。
+//
+// 为什么服务层自己要发事件：这一轮没进引擎，没有引擎替它发 run.status，
+// 而前端 startRun 已乐观上屏空 assistant 气泡并在等 SSE。若这里静默返回：
+//   - 前端永远转圈（streaming / runPhase 无终态可依据）；
+//   - SSE 连接一直挂着直到超时。
+//
+// 发 completed（不是 failed）+ CloseRun → 前端走既有单点收口 settleRun，
+// 页面表现为「消息已发出、没有回复」，与产品口径一致。
+//
+// 事件发布失败不影响返回（DB 是权威，前端另有 resync 兜底）。
+func (s *RunService) publishNoModelCompleted(runID, sessionID string) {
+	if s == nil || s.events == nil {
+		return
+	}
+	// usage 全 0：本轮不调模型，token 真实为零（不是缺失值）。
+	_, _ = s.events.Publish(runID, events.TypeRunStatus, map[string]any{
+		"status":        string(model.RunCompleted),
+		"session_id":    sessionID,
+		"stop_reason":   "no_model_selected",
+		"input_tokens":  int64(0),
+		"output_tokens": int64(0),
+	})
+	s.events.CloseRun(runID)
 }
 
 // Guidance 运行中引导（需求 §4.2，对齐桌面端「待执行列表 → 引导」）。
@@ -574,15 +660,78 @@ func (s *RunService) Guidance(ctx context.Context, sessionID, runID, input strin
 	return msg, nil
 }
 
-// StopRun 停止正在运行的 Run（ctx 取消 → 引擎迁移到 cancelled）。
-func (s *RunService) StopRun(_ context.Context, runID string) error {
-	s.mu.Lock()
-	cancel, ok := s.cancels[runID]
-	s.mu.Unlock()
-	if !ok {
-		return apperr.New(apperr.CodeRunStateConflict, "Run 未在运行")
+// StopRun 停止正在运行的 Run（用户主动中断）。
+//
+// 【2026-11 缺陷修复 · 勿回退】此前本方法只做 cancel(ctx)，把「Run 落库收口」
+// 完全托付给引擎 goroutine。但引擎收尾三步（终态迁移 / 摘要回写 / 终态事件）当时
+// 复用的是**已取消的 ctx** —— database/sql 在 ctx 取消后直接返回 context canceled，
+// SQL 根本没执行，错误又被引擎 `_ =` 吞掉。实测后果：
+//
+//	① GET /sessions/{sid}/active-run 仍返回该 Run → 刷新（F5）后界面重建为「正在对话中」；
+//	② sessions.last_run_status 停在 running → 会话列表「运行中」徽标永久粘住；
+//	③ tool_events 停在 pending/running → 工具卡片（run_command）永久「执行中…」。
+//
+// 所以这里**同步幂等收口**：取消 → 迁 cancelled → 收口未完成工具事件。
+// 引擎随后（若已跑到检查点）会再收一次，Transition 与 FailOpenByRun 均幂等，无副作用。
+//
+// sessionID 为空时只做取消（无法定位会话库）—— 现存调用点（HTTP 路由 / 任务管理器）
+// 都持有 sid，正常路径不会走到这里。
+func (s *RunService) StopRun(ctx context.Context, sessionID, runID string) error {
+	runID = strings.TrimSpace(runID)
+	if runID == "" {
+		return invalidArg("run_id 不能为空")
 	}
-	cancel()
+	// ① 先取消：停止「继续干活」（引擎在下一个检查点退出，不再产出新内容）
+	s.mu.Lock()
+	cancel, registered := s.cancels[runID]
+	s.mu.Unlock()
+	if registered && cancel != nil {
+		cancel()
+	}
+	if strings.TrimSpace(sessionID) == "" {
+		if !registered {
+			return apperr.New(apperr.CodeRunStateConflict, "Run 未在运行")
+		}
+		return nil
+	}
+
+	// ② 记账脱离请求 ctx：客户端断开 / 超时也绝不能让「已停止」这个事实丢失。
+	dctx, dcancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer dcancel()
+
+	sdb, err := s.sessions.Acquire(dctx, sessionID)
+	if err != nil {
+		return err
+	}
+	run, err := sdb.Runs().Get(dctx, runID)
+	if err != nil {
+		return wrapStoreErr(err, apperr.CodeRunNotFound, "Run 不存在")
+	}
+	// 幂等：双击停止 / 引擎抢先收口都视为成功（前端不该看到「停止失败」）。
+	if !run.Status.IsTerminal() {
+		if err := sdb.Runs().Transition(dctx, runID, model.RunCancelled, "user_stopped", "", ""); err != nil {
+			return err
+		}
+	}
+	// 主库投影跟随真相：漏写会让会话列表徽标与 RecoverInterrupted 筛选继续看到 running。
+	// （Main 未装配时跳过：投影是展示项，真相在会话库。）
+	if s.main != nil {
+		_ = s.main.Sessions().AddTokensAndStatus(dctx, sessionID, 0, model.RunCancelled)
+	}
+	// 未完成工具事件收口：这是「命令还显示在进行中」的直接修复点。
+	_, _ = sdb.ToolEvents().FailOpenByRun(dctx, runID, "已停止（用户中断）")
+	// 终态事件：其它端（桌面端/移动端）据此停止转圈，不必等下一次 active-run 轮询。
+	if s.events != nil {
+		_, _ = s.events.Publish(runID, events.TypeRunStatus, map[string]any{
+			"status":      string(model.RunCancelled),
+			"session_id":  sessionID,
+			"stop_reason": "user_stopped",
+		})
+		s.events.CloseRun(runID)
+	}
+	// 注销取消句柄与引导通道（引擎 goroutine 稍后会重复注销，幂等）
+	s.unregisterCancel(runID)
+	s.guidanceChans.Delete(runID)
 	return nil
 }
 

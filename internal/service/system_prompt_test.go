@@ -86,3 +86,47 @@ func TestComposeSystemBaseEmptyBaseNoLeadingNewline(t *testing.T) {
 		t.Fatalf("输出不得以换行开头，实际: %q", out[:10])
 	}
 }
+
+// ============ 原生 SOP 规则段装配（规则必须真的进系统提示）============
+
+// TestComposeRulesSectionAppended 规则段必须拼在「## 工作区」之后且以双空行分隔。
+func TestComposeRulesSectionAppended(t *testing.T) {
+	base := ComposeSystemBase("人格", `F:\p`, "")
+	out := composeRulesSection(base, []string{"1. 【规则A】：正文A", "2. 【规则B】：正文B"})
+
+	if !strings.Contains(out, "## 工作规则") {
+		t.Fatalf("缺少「## 工作规则」段标题，实际: %s", out)
+	}
+	if !strings.Contains(out, "1. 【规则A】：正文A") || !strings.Contains(out, "2. 【规则B】：正文B") {
+		t.Fatalf("规则行未被原样注入，实际: %s", out)
+	}
+	// 顺序：工作区段必须在规则段之前（规则正文里「见上方 ## 工作区」的指代依赖它）
+	if strings.Index(out, "## 工作区") > strings.Index(out, "## 工作规则") {
+		t.Fatalf("工作区段必须在规则段之前，实际: %s", out)
+	}
+	if !strings.HasPrefix(out, "人格") {
+		t.Fatalf("人格段必须保持在开头，实际: %s", out)
+	}
+}
+
+// TestComposeRulesSectionEmptyIsNoop 无规则时绝不注入空段落（降级不产生噪音）。
+func TestComposeRulesSectionEmptyIsNoop(t *testing.T) {
+	base := "人格\n\n## 工作区\n已绑定"
+	if got := composeRulesSection(base, nil); got != base {
+		t.Fatalf("无规则时应原样返回，实际: %q", got)
+	}
+}
+
+// TestWorkerRoleClassification 实施工人 vs 常驻协作者的角色判定（决定「施工工人准则」是否注入）。
+func TestWorkerRoleClassification(t *testing.T) {
+	for _, role := range []string{"", "subagent", "subprocess", "worker", "SubAgent"} {
+		if !isWorkerRole(role) {
+			t.Fatalf("%q 应被判为实施工人", role)
+		}
+	}
+	for _, role := range []string{"security-auditor", "image_gen", "vision", "架构师"} {
+		if isWorkerRole(role) {
+			t.Fatalf("%q 是协作者，不应被判为实施工人", role)
+		}
+	}
+}

@@ -11,6 +11,7 @@ import (
 
 	"harness-go/internal/apperr"
 	"harness-go/internal/config"
+	"harness-go/internal/sop"
 	"harness-go/internal/store"
 )
 
@@ -19,6 +20,20 @@ import (
 // 前端「设置 → 能力模型槽位 chat」落库为 `<providerID>/<modelID>`，
 // 运行时由 ProviderResolver 在 model_ref 为空/"default" 时消费（见 provider_resolver.go）。
 const settingsKeyDefaultModel = "agent.default_model"
+
+// settingsKeyDisabledSOPs 用户关闭的工程规范 ID 列表（`["safe_code_edit", ...]`）。
+//
+// 为什么是 settings 键而不是 SOP 目录里的字段：开关属于**用户配置**（随账号/工作区走），
+// 而规则文案属于**代码真源**（随二进制升级走）。混在一起会导致「升级后被用户旧副本冻结」。
+const settingsKeyDisabledSOPs = "agent.disabled_sops"
+
+// settingsKeyPlanMode 规划模式（standard | always_plan | always_proceed）。
+//
+// 为什么先落在全局 settings：Go 内核的项目表暂无 plan_mode 字段（前端项目草稿
+// 仍只在本机持久化）。规则变体判定需要一个**服务端权威值**，否则 always_plan
+// 分支在真实运行中永不可达（只有 always_proceed 会因子会话命中而「侥幸可达」）。
+// 待项目级 plan_mode 落库后，只需替换 SOPService 的 planModeProvider 实现，规则层零改动。
+const settingsKeyPlanMode = "agent.plan_mode"
 
 // 报文抓取日志的三个可写配置键（设置页「日志与诊断」面板）。
 // 与 config.Log.SnapshotMode / config.Log.RetentionDays / config.Log.Level 同义，
@@ -41,6 +56,8 @@ var settingsWhitelist = map[string]bool{
 	settingsKeyDefaultModel: true,
 	"agent.access_mode":     true,
 	"agent.max_steps":       true,
+	settingsKeyDisabledSOPs: true,
+	settingsKeyPlanMode:     true,
 	"tools.tiers":           true,
 	"storage.quota_warn":    true,
 	// 报文抓取档位与保留天数：白名单不放开的话 Patch 会直接拒写，
@@ -91,7 +108,75 @@ var settingsValidators = map[string]func(json.RawMessage) error{
 		}
 		return nil
 	},
+	settingsKeyDisabledSOPs: func(v json.RawMessage) error {
+		// 只做「形状 + 存在性」校验：ID 必须真实存在于 SOP 目录。
+		//
+		// 为什么校验存在性：拼错一个 ID 会变成「开关点了没反应」的静默失效，
+		// 用户无从判断是界面 bug 还是自己写错了 —— 这类静默必须在入口 400。
+		// 为什么要去重：重复 ID 会让前端计数与实际生效条数不一致。
+		var ids []string
+		if err := json.Unmarshal(v, &ids); err != nil {
+			return invalidArg("%s 必须是字符串数组（规则 ID 列表）", settingsKeyDisabledSOPs)
+		}
+		known := make(map[string]bool, len(sopCatalogIDs))
+		for _, id := range sopCatalogIDs {
+			known[id] = true
+		}
+		seen := make(map[string]bool, len(ids))
+		for _, id := range ids {
+			if strings.TrimSpace(id) == "" {
+				return invalidArg("%s 不允许包含空 ID", settingsKeyDisabledSOPs)
+			}
+			if !known[id] {
+				return invalidArg("%s 含未知规则 ID: %q（可用 get /api/v1/sop/catalog 查看全集）",
+					settingsKeyDisabledSOPs, id)
+			}
+			// 硬规则不可关闭：静默丢弃会让「界面显示禁用、实际仍在生效」，
+			// 用户以为放开了约束而其实没放开 —— 必须显式拒绝。
+			if hardRuleIDs[id] {
+				return invalidArg("规则 %q 是硬性安全规范，不可关闭（前端应置灰该开关）", id)
+			}
+			if seen[id] {
+				return invalidArg("%s 含重复规则 ID: %q", settingsKeyDisabledSOPs, id)
+			}
+			seen[id] = true
+		}
+		return nil
+	},
+	settingsKeyPlanMode: func(v json.RawMessage) error {
+		var mode string
+		if err := json.Unmarshal(v, &mode); err != nil {
+			return invalidArg("%s 必须是字符串（standard|always_plan|always_proceed）", settingsKeyPlanMode)
+		}
+		switch strings.TrimSpace(mode) {
+		case sop.PlanModeStandard, sop.PlanModeAlwaysPlan, sop.PlanModeAlwaysProceed:
+			return nil
+		}
+		return invalidArg("%s 取值非法: %q（合法值: standard|always_plan|always_proceed）",
+			settingsKeyPlanMode, mode)
+	},
 }
+
+// sopCatalogIDs 原生 SOP 目录的全部规则 ID（单次启动算一次即可，目录是编译期常量）。
+var sopCatalogIDs = func() []string {
+	items := sop.Catalog()
+	out := make([]string, 0, len(items))
+	for _, it := range items {
+		out = append(out, it.ID)
+	}
+	return out
+}()
+
+// hardRuleIDs 硬规则 ID 集合（不可关闭；与渲染侧 sop.Context.isDisabled 同一口径）。
+var hardRuleIDs = func() map[string]bool {
+	out := map[string]bool{}
+	for _, def := range sop.Definitions() {
+		if def.Item.IsHardRule {
+			out[def.Item.ID] = true
+		}
+	}
+	return out
+}()
 
 // SettingsService 通用键值配置用例（B-4）。
 type SettingsService struct {
@@ -142,6 +227,101 @@ func (s *SettingsService) Patch(ctx context.Context, patch map[string]json.RawMe
 		}
 	}
 	return s.Get(ctx)
+}
+
+// DisabledSOPs 读取用户关闭的工程规范 ID 列表（未写过 / 读失败均返回 nil = 全开）。
+//
+// 供 SOPService 的 disabledProvider 注入使用：每 Run 调用一次 → 改完下一轮即生效。
+// 铁律：读失败一律当作「没有关闭任何规范」，绝不因存储抖动而静默削减规则。
+func (s *SettingsService) DisabledSOPs(ctx context.Context) []string {
+	if s == nil || s.main == nil {
+		return nil
+	}
+	raw, err := s.main.Settings().Get(ctx, settingsKeyDisabledSOPs)
+	if err != nil || len(raw) == 0 {
+		return nil
+	}
+	var ids []string
+	if json.Unmarshal(raw, &ids) != nil {
+		return nil
+	}
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if t := strings.TrimSpace(id); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// SetDisabledSOPs 写入用户关闭的工程规范 ID 列表（nil 等价于全部启用）。
+//
+// 校验口径与 settingsValidators 完全一致（走 Patch 的同一路径，杜绝两套实现漂移）。
+func (s *SettingsService) SetDisabledSOPs(ctx context.Context, ids []string) ([]string, error) {
+	if s == nil || s.main == nil {
+		return nil, ErrSOPUnavailable
+	}
+	clean := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if t := strings.TrimSpace(id); t != "" {
+			clean = append(clean, t)
+		}
+	}
+	raw, err := json.Marshal(clean)
+	if err != nil {
+		return nil, invalidArg("%s 序列化失败: %v", settingsKeyDisabledSOPs, err)
+	}
+	if verify, ok := settingsValidators[settingsKeyDisabledSOPs]; ok {
+		if err := verify(raw); err != nil {
+			return nil, err
+		}
+	}
+	if _, err := s.Patch(ctx, map[string]json.RawMessage{settingsKeyDisabledSOPs: raw}); err != nil {
+		return nil, err
+	}
+	return clean, nil
+}
+
+// PlanMode 读取当前规划模式（未设置 / 读失败 / 非法值统一回落 standard）。
+//
+// 供 SOPService 的 planModeProvider 注入使用：每 Run 调用一次 → 切完下一轮即生效。
+func (s *SettingsService) PlanMode(ctx context.Context) string {
+	if s == nil || s.main == nil {
+		return sop.PlanModeStandard
+	}
+	raw, err := s.main.Settings().Get(ctx, settingsKeyPlanMode)
+	if err != nil || len(raw) == 0 {
+		return sop.PlanModeStandard
+	}
+	var mode string
+	if json.Unmarshal(raw, &mode) != nil {
+		return sop.PlanModeStandard
+	}
+	return mode
+}
+
+// SetPlanMode 写入规划模式（值域校验走 settingsValidators 同一套）。
+func (s *SettingsService) SetPlanMode(ctx context.Context, mode string) (string, error) {
+	if s == nil || s.main == nil {
+		return sop.PlanModeStandard, ErrSOPUnavailable
+	}
+	mode = strings.TrimSpace(mode)
+	if mode == "" {
+		mode = sop.PlanModeStandard
+	}
+	raw, err := json.Marshal(mode)
+	if err != nil {
+		return sop.PlanModeStandard, invalidArg("%s 序列化失败: %v", settingsKeyPlanMode, err)
+	}
+	if verify, ok := settingsValidators[settingsKeyPlanMode]; ok {
+		if err := verify(raw); err != nil {
+			return sop.PlanModeStandard, err
+		}
+	}
+	if _, err := s.Patch(ctx, map[string]json.RawMessage{settingsKeyPlanMode: raw}); err != nil {
+		return sop.PlanModeStandard, err
+	}
+	return mode, nil
 }
 
 // 日志倒序读取的分块大小。64KB 是「单次 read 的 IO 成本」与「跨块残片内存」的平衡点：
@@ -490,9 +670,9 @@ func parseLogTime(line string) (int64, bool) {
 
 // parseLevel 抽取日志级别（小写）。按「结构化字段优先」的优先级判定：
 //
-//	1. json：`"level":"ERROR"` —— slog 的 JSONHandler 输出；
-//	2. text：`level=ERROR`    —— slog 的 TextHandler 输出；
-//	3. 都取不到才回退到旧 detectLevel 的裸子串匹配（向后兼容非 slog 产出的行）。
+//  1. json：`"level":"ERROR"` —— slog 的 JSONHandler 输出；
+//  2. text：`level=ERROR`    —— slog 的 TextHandler 输出；
+//  3. 都取不到才回退到旧 detectLevel 的裸子串匹配（向后兼容非 slog 产出的行）。
 //
 // 为什么必须优先走结构化字段：旧实现用 strings.Contains(line, "ERROR")，
 // 只要工具参数/错误消息正文里出现 "ERROR" 一词，整行就被误判成 error 级，

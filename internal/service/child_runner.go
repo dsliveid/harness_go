@@ -22,6 +22,7 @@ import (
 	"harness-go/internal/approval"
 	"harness-go/internal/model"
 	"harness-go/internal/prompt"
+	"harness-go/internal/sop"
 	"harness-go/internal/store"
 	"harness-go/pkg/toolapi"
 )
@@ -52,6 +53,11 @@ type ChildRunnerOptions struct {
 	SOPFunc func(wsPath string) []string
 	// CoreSOPFunc 动态核心 SOP 源（agent-core）；与父 Run 同口径，nil 时用 SystemBase。
 	CoreSOPFunc func() string
+	// RulesFunc 动态原生 SOP 规则源；与父 Run 同口径，nil 时不注入规则段。
+	//
+	// 与父 Run 的唯一差别是作用域：这里以 IsSub=true 调用，
+	// 于是 main_only 规则自动消失、sub_only 规则自动出现（无需调用方显式判断）。
+	RulesFunc func(ctx context.Context, rc sop.Context) []string
 	// MaxDepth 深度上限（<=0 用默认 2）。
 	MaxDepth int
 	// MaxConcurrent 同会话在途上限（<=0 用默认 4）。
@@ -228,13 +234,25 @@ func (r *ChildRunner) Spawn(ctx context.Context, req toolapi.SpawnRequest) (tool
 			basePrompt = core
 		}
 	}
+	// 原生 SOP 规则段：与父 Run 同源同顺序（core → ## 工作区 → 规则），
+	// 唯一差别是 IsSub=true → 作用域自动切换为子会话视角。
+	systemBase := ComposeSystemBase(basePrompt, wsPath, r.opts.WorkDir)
+	if r.opts.RulesFunc != nil {
+		rc := sop.Context{
+			SessionID: req.SessionID,
+			IsSub:     true,
+			// 协作者（ask_collaborator）不是实施工人，豁免「施工工人准则」。
+			IsCollaborator: !isWorkerRole(req.AgentRole),
+		}
+		systemBase = composeRulesSection(systemBase, r.opts.RulesFunc(ctx, rc))
+	}
 	areq := agent.RunRequest{
 		RunID:      run.ID,
 		SessionID:  req.SessionID,
 		UserInput:  input,
 		ModelRef:   modelRef,
 		AccessMode: accessMode,
-		SystemBase: ComposeSystemBase(basePrompt, wsPath, r.opts.WorkDir),
+		SystemBase: systemBase,
 		SOP:        r.currentSOP(wsPath),
 		LockKey:    spawnLockKey(req.SessionID, run.ID),
 	}
@@ -365,6 +383,22 @@ func sessAccessMode(ctx context.Context, main *store.MainStore, sessionID string
 		return string(approval.ModeConfirm)
 	}
 	return sess.AccessMode
+}
+
+// isWorkerRole 判断子 Run 的角色是否为「实施工人」（专职子 Agent / 子进程）。
+//
+// 语义边界：`spawn_subagent` 传 "subagent"、`spawn_subprocess` 传 "subprocess"，
+// 都属实施工人；`ask_collaborator` 传的是用户自定义的**协作者名**（如
+// "security-auditor" / "image_gen"），属常驻协作者，豁免「施工工人准则」。
+//
+// 空角色按实施工人处理（保守：蓝图约束对未知角色施加以更安全）。
+func isWorkerRole(role string) bool {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "", "subagent", "subprocess", "worker":
+		return true
+	default:
+		return false
+	}
 }
 
 // spawnLockKey 子 Run 的会话锁键。

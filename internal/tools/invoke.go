@@ -184,6 +184,14 @@ func (r *Runner) Specs() []toolapi.Spec { return r.reg.Specs() }
 // SetOverrides 更新全局 tier 覆盖（持久化由 service 层负责）。
 func (r *Runner) SetOverrides(over map[string]toolapi.Tier) { r.reg.SetOverrides(over) }
 
+// SetDisabled 更新「已停用工具」集合（持久化由 service 层负责）。
+//
+// 停用会同时从注入集合移除并在 Resolve 直接失败，即「模型看不到也调不动」。
+func (r *Runner) SetDisabled(names []string) { r.reg.SetDisabled(names) }
+
+// Disabled 返回当前已停用工具名（升序）。
+func (r *Runner) Disabled() []string { return r.reg.Disabled() }
+
 // Risk 实现 agent.ToolCatalog：把契约风险级翻译为引擎的 model.Risk（取值一致）。
 func (r *Runner) Risk(toolName string) (model.Risk, bool) {
 	rk, ok := r.reg.Risk(toolName)

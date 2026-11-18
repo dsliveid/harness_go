@@ -207,6 +207,41 @@ mcp:
   allow_unsigned: false
 
 # ---------------------------------------------------------------------------
+# market — 外部市场（远端 registry）
+# ---------------------------------------------------------------------------
+# 与上面的 mcp 段分工（刻意分开，语义不同，不可合并）：
+#   - mcp    管「连接托管」：MCP Server 建连、stdio 放行、工具包信任根；
+#   - market 管「制品下载」：从远端 registry 拉索引并下载制品（工具包 / 技能）。
+#
+# 🚨 这是**外部来源**：服务端会从远端 URL 下载并落盘执行制品，因此强制：
+#   ① 索引必须声明 sha256，下载内容逐字节比对（不匹配即拒绝）；
+#   ② 制品必须能通过 ed25519 验签（信任根为本段的 trusted_keys）；
+#   ③ trusted_keys 为空且 allow_unsigned=false → 一律拒绝（无法证明来源）。
+# 未配置 registry_url 时界面会明确显示「未配置」，绝不展示空市场冒充正常。
+market:
+  # 外部市场总开关（关闭时相关端点返回 unavailable；不影响已装制品运行）
+  enabled: false
+
+  # 远端索引地址（JSON）。示例：https://market.example.com/index.json
+  # 索引形状：{"version":1,"items":[{"id","name","version","kind":"package|skill",
+  #   "description","author","size_bytes","sha256","download_url"}]}
+  # download_url 可为相对路径（按索引地址解析）。为空 = 未配置。
+  registry_url: ""
+
+  # 受信 ed25519 公钥（64 位 hex），市场制品的信任根。
+  # 为空且 allow_unsigned=false 时：任何市场安装都会被拒绝（无法证明来源）。
+  trusted_keys: []
+
+  # 是否允许安装未签名制品。默认 false（与 mcp.allow_unsigned 同一出口铁律）。
+  allow_unsigned: false
+
+  # 索引缓存秒数（避免每次打开市场弹窗都打远端）。默认 300。
+  cache_ttl_sec: 300
+
+  # 拉取索引 / 下载制品的超时秒数。默认 30。
+  timeout_sec: 30
+
+# ---------------------------------------------------------------------------
 # log — 日志
 # ---------------------------------------------------------------------------
 log:

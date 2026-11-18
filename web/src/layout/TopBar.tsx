@@ -36,7 +36,8 @@ export function TopBar() {
 
   const models = providers.filter((p) => p.enabled).flatMap((p) => p.models.map((m) => ({ ref: `${p.id}/${m.id}`, name: m.id, limit: m.contextLimit, providerName: p.name })))
   const currentModel = models.find((m) => m.ref === s?.modelRef)
-  // 没有「默认模型」这种模糊选项：未选择就是未选择（空值显示占位「请先选择模型」）。
+  // 没有「默认模型」这种模糊选项：未选择就是未选择（空值显示占位「未选择模型…」，
+  // 消息仍可发送并保存，只是本轮不产生回复）。
   // 会话的 modelRef 不在已启用厂商列表（厂商被禁用/删除）时补原样占位项，避免受控 select 显示空白。
   const modelChoices =
     !s || !s.modelRef || models.some((m) => m.ref === s.modelRef)
@@ -105,10 +106,10 @@ export function TopBar() {
               onChange={(e) => setModel(s.id, e.target.value)}
               title="会话级模型（切换不影响其他会话）"
             >
-              {/* 未选择模型时显示醒目占位；发送消息会被拦截提示 */}
+              {/* 未选择模型时显示醒目占位：消息仍可发送并保存，但本轮不会产生回复 */}
               {!s.modelRef && (
                 <option value="" className="bg-panel text-warn">
-                  请先选择模型
+                  未选择模型（消息照常保存，本轮不回复）
                 </option>
               )}
               {/* 会话原 modelRef 已不在启用厂商列表（厂商被禁用/删除）→ 保留为孤立占位项 */}

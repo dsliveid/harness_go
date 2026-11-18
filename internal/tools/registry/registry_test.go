@@ -62,6 +62,54 @@ func TestRegisterPluginAndResolve(t *testing.T) {
 	}
 }
 
+// TestDisableToolSemantics 校验停用语义（核心不变量）：
+//   - 停用 = 移出注入集合 + Resolve 直接失败（不注入也不可调用）；
+//   - 停用不改 spec.tier（重新启用后原档位原样恢复）；
+//   - 未注册工具名写入时静默忽略（不能因配置残留让启动失败）。
+func TestDisableToolSemantics(t *testing.T) {
+	r := New(Options{})
+	p := &stubPlugin{tools: []toolapi.Tool{
+		newTool("echo", toolapi.TierCore, toolapi.RiskReadonly),
+		newTool("webfetch", toolapi.TierDeferred, toolapi.RiskReadonly),
+	}}
+	if err := r.RegisterPlugin(context.Background(), manifestFor("builtin.mix", toolapi.TierDeferred, "echo", "webfetch"), p); err != nil {
+		t.Fatalf("注册失败: %v", err)
+	}
+
+	r.SetDisabled([]string{"echo", "ghost-not-registered"})
+	if got := r.Disabled(); len(got) != 1 || got[0] != "echo" {
+		t.Fatalf("未注册名应被静默忽略，得到 %v", got)
+	}
+
+	// 注入集合：只剩 webfetch
+	injected := r.InjectedSpecs()
+	if len(injected) != 1 || injected[0].Name != "webfetch" {
+		t.Fatalf("停用工具不得注入，得到 %+v", injected)
+	}
+	// 可调用性：停用工具必须报 ErrUnavailable（而非 ErrNotFound——注册还在，只是不可用）
+	if _, _, err := r.Resolve("echo"); !errors.Is(err, toolapi.ErrUnavailable) {
+		t.Fatalf("停用工具应返回 ErrUnavailable，得到 %v", err)
+	}
+	// 档位不受影响：重新启用即恢复 core
+	snap := r.Snapshot()
+	if len(snap.Disabled) != 1 || snap.Disabled[0] != "echo" {
+		t.Fatalf("快照 disabled 清单异常: %v", snap.Disabled)
+	}
+	for _, s := range snap.Core {
+		if s.Name == "echo" && s.Enabled {
+			t.Fatalf("core 档内停用工具 enabled 应为 false: %+v", s)
+		}
+	}
+
+	r.SetDisabled(nil)
+	if _, spec, err := r.Resolve("echo"); err != nil || spec.Tier != toolapi.TierCore {
+		t.Fatalf("重新启用后应恢复可解析且档位为 core，得到 err=%v tier=%q", err, spec.Tier)
+	}
+	if len(r.Snapshot().Disabled) != 0 {
+		t.Fatal("清空后 disabled 应为空")
+	}
+}
+
 func TestDuplicateToolNameRejected(t *testing.T) {
 	r := New(Options{})
 	p1 := &stubPlugin{tools: []toolapi.Tool{newTool("dup", toolapi.TierCore, toolapi.RiskReadonly)}}

@@ -28,6 +28,7 @@ import (
 
 	"harness-go/internal/agent"
 	"harness-go/internal/api"
+	"harness-go/internal/apperr"
 	"harness-go/internal/approval"
 	"harness-go/internal/auth"
 	"harness-go/internal/config"
@@ -72,12 +73,20 @@ var (
 // 这里只写**与运行时无关**的角色与规则。会话是否绑定工作区属于运行时事实，
 // 由 service.ComposeSystemBase 按会话注入——不要在此断言「运行在用户的工作区内」，
 // 否则未绑定工作区的纯对话会话会出现「顶栏说未绑定、模型却自称在工作区内」的自相矛盾。
-const defaultSystemBase = `你是 harness-go 的编码助手。
+const defaultSystemBase = `你是 harness-go 的编码 Agent，运行在用户的本地工作区中。
 
-规则：
-1. 修改文件前先读取确认内容，不要凭猜测改动。
+## 角色定位
+谨慎、专业的工程实现者：先查清事实再动手，改动最小且可验证，交付前必自检。
+
+## 基础口径
+1. 修改文件前先读取确认内容（用 read_file 核对原文），不要凭猜测改动。
 2. 危险操作（删除、覆盖、执行命令）需用户确认。
-3. 回答简洁，先给结论再给细节。`
+3. 回答简洁：先给结论，再给细节。
+
+## 规范分层（不要混淆两处真源）
+- 本文件只承载**人格与基础口径**，可通过界面「Agent SOP → 核心 SOP」调教，保存后下一轮对话即刻生效。
+- 具体工程作业程序（意图门禁、方案先行、协同拆分、精益研读、边读边记、安全红线等）由 internal/sop/catalog.go 作为代码真源统一注入，可在界面逐条启停，**不要在此重复声明**。
+`
 
 func main() {
 	// 离线救命通道：reset-password 子命令必须在 run() 之前分流。
@@ -324,6 +333,39 @@ func run() error {
 		defer mcpMgr.StopAll()
 	}
 
+	// ⑦''' 技能库服务：与技能插件共用**同一个** workspace 实例（保证单一真源 + 同一套沙箱防护）。
+	// 之所以无条件装配（不受 cfg.MCP.Enabled 影响）：技能是 Agent 内建工具
+	// （skill_list/read/save），不依赖外部插件开关；关掉 MCP 不该让界面看不到技能。
+	skillSvc := service.NewSkillService(service.SkillServiceOptions{Workspace: toolHost.Workspace()})
+
+	// ⑦'''' 外部市场服务（远端 registry）：**复用** PackageService / SkillService 的安装内核，
+	// 不重复实现验签与目录规则。它只有在 MCP 子系统启用时才可能装工具包
+	// （工具包就是 MCP stdio 插件），故 InstallPackage 在未启用时为 nil。
+	marketSvc := service.NewMarketService(service.MarketServiceOptions{
+		Enabled:       cfg.Market.Enabled,
+		RegistryURL:   cfg.Market.RegistryURL,
+		AllowUnsigned: cfg.Market.AllowUnsigned,
+		CacheTTL:      time.Duration(cfg.Market.CacheTTLSec) * time.Second,
+		Timeout:       time.Duration(cfg.Market.TimeoutSec) * time.Second,
+		DataDir:       dataDir,
+		InstallPackage: func(ctx context.Context, zipPath string) (string, error) {
+			if pkgSvc == nil {
+				return "", apperr.New(apperr.CodeUnavailable, "工具包子系统未启用（mcp.enabled=false），无法安装工具包制品")
+			}
+			res, err := pkgSvc.Install(ctx, zipPath)
+			if err != nil {
+				return "", err
+			}
+			return res.View.ID, nil
+		},
+		InstallSkill: func(ctx context.Context, name, description, body string) error {
+			_, err := skillSvc.Save(ctx, service.SaveInput{Name: name, Description: description, Body: body})
+			return err
+		},
+		HasSkill: func(ctx context.Context, name string) bool { return skillSvc.Has(ctx, name) },
+		Logger:   logger,
+	})
+
 	// ⑦'' C-6：会话租约管理器（跨端单写者）。
 	//
 	// 必须在引擎之前构造（引擎 Execute 需要它），而推送 lease.revoked 依赖 WS 网关的
@@ -388,6 +430,8 @@ func run() error {
 		SOPFunc: sopBodies,
 		// 核心 SOP（agent-core）动态源：子 Run 与父 Run 同口径（体感一致）。
 		CoreSOPFunc: sopSvc.BindCore(),
+		// 原生 SOP 规则段：同一真源，作用域由 IsSub 自动切换（子会话见子规则）。
+		RulesFunc: sopSvc.BindRules(),
 	})
 	toolHost.SetChildRunner(childRunner)
 	toolHost.SetCommandRunner(hostimpl.NewCommandRunner(hostimpl.CommandOptions{
@@ -461,8 +505,12 @@ func run() error {
 		Engine:     engine,
 		SystemBase: defaultSystemBase,
 		WorkDir:    workDir,
+		// 未选择模型时的终态事件发布（该轮不进引擎，无引擎替它收口）
+		Events: bus,
 		// 核心 SOP（agent-core）动态源：每 Run 读取，界面改完下一轮即生效。
 		CoreSOPFunc: sopSvc.BindCore(),
+		// 原生 SOP 规则段（工程作业程序）：同一真源，主会话作用域。
+		RulesFunc: sopSvc.BindRules(),
 		// 每轮重新取工具定义：PATCH /tools/tiers 改档后下一轮对话即生效
 		ToolRefs: toolRunner.PromptRefs,
 		// B-3：审批决策端点需经同一闸门提交（引擎在此登记待决项）
@@ -515,8 +563,8 @@ func run() error {
 	taskMgr := service.NewTaskManager(service.TaskManagerOptions{
 		Sessions:  sessionStore,
 		Snapshots: snapStore,
-		RunStop: func(hctx context.Context, _ string, runID string) error {
-			return runSvc.StopRun(hctx, runID)
+		RunStop: func(hctx context.Context, sid, runID string) error {
+			return runSvc.StopRun(hctx, sid, runID)
 		},
 	})
 	bundleSvc := service.NewBundleService(service.BundleServiceOptions{
@@ -555,6 +603,9 @@ func run() error {
 	maintenanceSvc := service.NewMaintenanceService(mainStore, sessionStore, runSvc, gate.PendingCount)
 	toolSvc := service.NewToolService(toolRunner, mainStore)
 	toolSvc.LoadOverrides(ctx)
+	// 内置工具停用清单必须在此加载：此时插件已全部注册，
+	// Registry.SetDisabled 才不会把「尚未注册」的名字当未知项丢弃。
+	toolSvc.LoadDisabled(ctx)
 
 	// ⑩' B-4：厂商（api_key 密文落库）+ 配置 + 日志尾行
 	providerSvc := service.NewProviderService(service.ProviderServiceOptions{
@@ -562,6 +613,10 @@ func run() error {
 		Cipher: secretCipher,
 	})
 	settingsSvc := service.NewSettingsService(mainStore)
+	// 原生 SOP 的「逐条启停」与「规划模式」来源：settings 表（每 Run 重读 → 改完即生效）。
+	// 后置注入而非构造注入：SOPService 早于 SettingsService 装配（打破循环依赖）。
+	sopSvc.SetDisabledProvider(settingsSvc.DisabledSOPs)
+	sopSvc.SetPlanModeProvider(settingsSvc.PlanMode)
 	// ⑩' B-4：厂商（api_key 密文落库）+ 配置 + 日志尾行、审计日志库族
 	logSvc := service.NewLogService(filepath.Join(dataDir, "app.log"), 500)
 
@@ -810,6 +865,8 @@ func run() error {
 		Devices:     deviceSvc,
 		MCP:         mcpSvc,
 		Packages:    pkgSvc,
+		Skills:      skillSvc,
+		Market:      marketSvc,
 		Rollback:    rollbackSvc,
 		Artifacts:   service.NewArtifactService(service.ArtifactServiceOptions{DataDir: dataDir}),
 		Bundles:     bundleSvc,

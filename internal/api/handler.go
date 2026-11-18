@@ -42,6 +42,10 @@ type Deps struct {
 	// MCP / Packages 外部插件子系统（阶段 E；nil 时相关端点返回 unavailable）
 	MCP      *service.MCPService
 	Packages *service.PackageService
+	// Skills 技能库（.harness/skills 唯一真源的服务端通道；nil 时相关端点返回 unavailable）
+	Skills *service.SkillService
+	// Market 外部市场（远端 registry 拉取 + 下载安装；nil 时相关端点返回 unavailable）
+	Market *service.MarketService
 	// Rollback 快照回滚（阶段 G / S10；nil 时相关端点返回 unavailable）
 	Rollback *service.RollbackService
 	// Artifacts 制品下载（R4：按快照 CAS 引用寻址；nil 时相关端点返回 unavailable）
@@ -309,7 +313,9 @@ func (h *handlers) activeRun(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handlers) stopRun(w http.ResponseWriter, r *http.Request) {
-	if err := h.d.Runs.StopRun(r.Context(), r.PathValue("rid")); err != nil {
+	// sid 必须传给服务层：停止不只是取消 ctx，还要把 Run / tool_events / 主库投影
+	// 一并收口（见 RunService.StopRun 注释），收口需要会话库句柄。
+	if err := h.d.Runs.StopRun(r.Context(), r.PathValue("sid"), r.PathValue("rid")); err != nil {
 		writeError(w, r, err)
 		return
 	}

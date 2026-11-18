@@ -321,6 +321,8 @@ export interface ToolSummary {
   namespace: string;
   tier: ToolTier;
   default_tier: ToolTier;
+  /** 是否启用：false = 已停用（不注入且不可调用），与 tier 正交 */
+  enabled: boolean;
   cost_tokens: number;
   risk: Risk;
   executor: Executor;
@@ -349,6 +351,8 @@ export interface ToolSnapshot {
   warnings: string[];
   plugins: ToolPluginInfo[];
   overrides: Record<string, ToolTier>;
+  /** 已停用的工具名（升序）；与各 summary.enabled 一致，供 UI 直接渲染启停开关 */
+  disabled: string[];
   generated_at: string;
 }
 
@@ -356,6 +360,80 @@ export interface ToolIndexEntry {
   name: string;
   description: string;
   cost_tokens: number;
+}
+
+/* ============ 技能库（.harness/skills 唯一真源） ============ */
+
+/**
+ * 技能视图。
+ * 来源：internal/service/skill_service.go SkillView（json 标签同名）。
+ * origin：builtin = 随程序发布；local = 本地目录/Agent 沉淀；market = 外部市场下载。
+ */
+export interface SkillView {
+  name: string;
+  description: string;
+  origin: 'builtin' | 'local' | 'market';
+  path: string;
+  size: number;
+  mod_time: number;
+}
+
+/** GET /api/v1/skills 响应：清单 + 技能库落地根（界面需明示位置）。 */
+export interface SkillListResponseDTO {
+  items: SkillView[];
+  root: string;
+  dir: string;
+}
+
+/** POST /api/v1/skills 入参（与 Agent 的 skill_save 工具同形）。 */
+export interface SkillSaveRequestDTO {
+  name: string;
+  description: string;
+  body: string;
+}
+
+/** GET /api/v1/skills/{name} 响应：视图 + SKILL.md 全文。 */
+export interface SkillDetailResponseDTO {
+  view: SkillView;
+  content: string;
+}
+
+/* ============ 外部市场（远端 registry） ============ */
+
+/** 市场是否可用：非 ready 时 reason 必须被界面明示。 */
+export type MarketStatus = 'ready' | 'disabled' | 'unconfigured' | 'error';
+
+/** 市场制品条目（package = 工具包 zip；skill = 技能）。 */
+export interface MarketItemDTO {
+  id: string;
+  name: string;
+  version: string;
+  kind: 'package' | 'skill';
+  description?: string;
+  author?: string;
+  size_bytes?: number;
+  /** 制品内容摘要（hex）：服务端下载后逐字节比对 */
+  sha256: string;
+  download_url: string;
+}
+
+/** GET /api/v1/market/registry 响应。 */
+export interface MarketRegistryDTO {
+  configured: boolean;
+  status: MarketStatus;
+  reason?: string;
+  registry_url?: string;
+  /** 信任策略摘要（仅签名 / 允许未签名） */
+  trust?: string;
+  items: MarketItemDTO[];
+  fetched_at?: number;
+  cached: boolean;
+}
+
+/** POST /api/v1/market/install 入参。 */
+export interface MarketInstallRequestDTO {
+  id: string;
+  kind?: 'package' | 'skill';
 }
 
 /**
@@ -501,10 +579,21 @@ export const API_PATHS = {
   tools: '/api/v1/tools',
   toolsInjection: '/api/v1/tools/injection',
   toolsTiers: '/api/v1/tools/tiers',
+  /** 内置工具启停（服务端自身能力开关：内置工具不可安装/卸载） */
+  toolEnable: (name: string) => `/api/v1/tools/${name}/enable`,
+  toolDisable: (name: string) => `/api/v1/tools/${name}/disable`,
+  /** 技能库（.harness/skills 唯一真源的服务端通道，与 Agent 的 skill_* 工具同源） */
+  skills: '/api/v1/skills',
+  skill: (name: string) => `/api/v1/skills/${name}`,
+  /** 外部市场（远端 registry）：与 /packages（本地 zip）是两条独立链路 */
+  marketRegistry: '/api/v1/market/registry',
+  marketInstall: '/api/v1/market/install',
   /** 核心 SOP（agent-core）：GET 快照 / PUT 保存自定义 / DELETE 重置为出厂内置 */
   sopCore: '/api/v1/sop/core',
-  /** 生效预览（核心 SOP + 项目级条目 + token 合计） */
+  /** 生效预览（核心 SOP + 生效规则 + 项目级条目 + token 合计） */
   sopEffective: '/api/v1/sop/effective',
+  /** 原生 SOP 目录：GET 目录全集 + 启停状态 / PUT 保存逐条启停与规划模式 */
+  sopCatalog: '/api/v1/sop/catalog',
   maintenance: '/api/v1/settings/maintenance',
   /* B-4：厂商 / 配置 / 统计 / 日志 */
   providers: '/api/v1/providers',
@@ -1177,9 +1266,13 @@ export interface SOPEntry {
   tokens: number;
 }
 
-/** 生效预览：核心 SOP + 项目级条目 + token 合计。 */
+/** 生效预览：核心 SOP + 生效规则 + 项目级条目 + token 合计。 */
 export interface SOPEffective {
   core: SOPCore;
+  /** 本次上下文生效的工程规则行（`N. 【标题】：正文`，与真实注入逐字一致） */
+  rules: string[];
+  /** 生效规则 ID（与目录全集对比即可排查「为什么这条没出现」） */
+  active_ids: string[];
   entries: SOPEntry[];
   workspace: string;
   total_tokens: number;
@@ -1187,4 +1280,48 @@ export interface SOPEffective {
   /** 是否有条目因条数上限被截断（D10：必须可见） */
   truncated: boolean;
   entry_limit: number;
+}
+
+/* ===== 原生 SOP 目录（工程作业程序清单 + 逐条启停） ===== */
+
+/** 规划模式：standard 无门禁 / always_plan 生成计划后等确认 / always_proceed 自动推进。 */
+export type PlanMode = 'standard' | 'always_plan' | 'always_proceed';
+
+/** 一条规则在某个上下文下的具体形态（提示词里真实出现的措辞）。 */
+export interface SOPVariant {
+  /** 主进程 / 子进程 / Always Plan 等，仅用于界面对比 */
+  label: string;
+  /** 提示词里的真标题（渲染为【title】） */
+  title: string;
+  /** 正文（【】：之后的部分，不含序号） */
+  text: string;
+}
+
+/** 原生 SOP 目录条目（工程作业程序）。 */
+export interface SOPItem {
+  /** 稳定标识（启停开关的键）；一经发布不得改名，否则用户配置失效 */
+  id: string;
+  /** 界面标题（恒等于 variants[0].title，单一真源） */
+  name: string;
+  phase: number;
+  phase_label: string;
+  category: string;
+  category_label: string;
+  /** universal 主/子都用；main_only 仅主对话；sub_only 仅子对话 */
+  scope: 'universal' | 'main_only' | 'sub_only';
+  scope_label: string;
+  /** 硬规则：不可关闭（后端拒绝写入，界面应置灰开关） */
+  is_hard_rule: boolean;
+  description: string;
+  /** 关闭后的后果（界面必须如实告知） */
+  disable_effect: string;
+  variants: SOPVariant[];
+}
+
+/** 原生 SOP 数据字典 + 当前启停状态与规划模式。 */
+export interface SOPCatalog {
+  items: SOPItem[];
+  /** 用户已关闭的规则 ID（硬规则永不出现） */
+  disabled: string[];
+  plan_mode: PlanMode;
 }

@@ -8,7 +8,7 @@ import { useUI } from '../../stores/uiStore'
 import { Check, Clock, Copy, GitBranch, GitCompare, RotateCcw, RotateCw, Trash2, Zap, Sparkles } from 'lucide-react'
 import { ProcessDrawer, formatStepMs, formatStepTokens } from './ProcessDrawer'
 import { ReasoningCard } from './ReasoningCard'
-import { RunProgressInline, type RunPhase } from './LiveProgress'
+import { formatDuration, RunProgressInline, useLiveElapsed, type RunPhase } from './LiveProgress'
 import type { Message } from '../../types'
 
 interface TurnGroup {
@@ -33,8 +33,6 @@ interface MessageThreadProps {
   reasoning?: string
   /** 运行阶段：决定「加载中」文案（posting/connecting/waiting） */
   runPhase?: RunPhase
-  /** 运行开始时间戳：执行时长秒表基准 */
-  runStartedAt?: number
   actions: ThreadActions
   /** 传 false 隐藏复制按钮（子进程详情等浮窗对话） */
   showCopy?: boolean
@@ -47,7 +45,7 @@ interface MessageThreadProps {
 }
 
 export function MessageList() {
-  const { streaming, reasoning, fork, revertTo, reapply, deleteFrom, runPhase, runStartedAt } = useChat()
+  const { streaming, reasoning, fork, revertTo, reapply, deleteFrom, runPhase } = useChat()
   const currentId = useSessions((s) => s.currentId)
   const messages = useChat((s) => s.messagesOf(currentId))
 
@@ -58,7 +56,6 @@ export function MessageList() {
         streaming={streaming}
         reasoning={reasoning}
         runPhase={runPhase}
-        runStartedAt={runStartedAt}
         actions={{ fork, revertTo, reapply, deleteFrom }}
       />
     </div>
@@ -71,7 +68,6 @@ export function MessageThread({
   streaming = false,
   reasoning = '',
   runPhase = 'waiting',
-  runStartedAt = 0,
   actions,
   showCopy = true,
   scrollCls,
@@ -142,7 +138,6 @@ export function MessageThread({
               running={streaming}
               reasoning={reasoning}
               runPhase={runPhase}
-              runStartedAt={runStartedAt}
               actions={actions}
               showCopy={showCopy}
             />
@@ -169,7 +164,6 @@ export function MessageThread({
               running={streaming}
               reasoning={reasoning}
               runPhase={runPhase}
-              runStartedAt={runStartedAt}
               actions={actions}
               showCopy={showCopy}
             />
@@ -184,18 +178,26 @@ export function MessageThread({
  * 单轮对话块（参照桌面端双轨容器模型）：
  * 「第 N 轮」分隔条 → 用户提问 → 执行过程抽屉（N 个步骤）→ 最终交付答复
  */
-function TurnBlock({ turn, isLast, running, reasoning, runPhase, runStartedAt, actions, showCopy }: {
+function TurnBlock({ turn, isLast, running, reasoning, runPhase, actions, showCopy }: {
   turn: TurnGroup
   isLast: boolean
   running: boolean
   reasoning: string
   runPhase: RunPhase
-  runStartedAt: number
   actions: ThreadActions
   showCopy: boolean
 }) {
   const users = turn.items.filter((m) => m.role === 'user')
   const assistants = turn.items.filter((m) => m.role === 'assistant')
+  /**
+   * 本轮开始时刻 = 本轮 user 消息的 createdAt（对齐老版本 types.ts:888-890）。
+   *
+   * 🚨 铁律：绝不能换成 store 里的全局「运行开始时刻」。全局字段在停止 Run、
+   * 切换会话、resumeRun 时都会被重置为「此刻」，导致秒表从 0 重开；
+   * 而消息 createdAt 是服务端落库的不可变事实 —— 切走再切回、刷新页面，
+   * 读到的都是同一个值，秒表自然接着走，不需要任何额外状态同步。
+   */
+  const turnStartedAt = users[0]?.createdAt ?? assistants[0]?.createdAt ?? 0
   const hasTools = (m: Message) => (m.toolCalls?.length ?? 0) > 0
   const hasReasoning = (m: Message) => Boolean(m.reasoning?.trim())
   // 过程步骤的判据：有工具调用，或「只有思考过程、尚无正文」的纯思考轮。
@@ -257,21 +259,36 @@ function TurnBlock({ turn, isLast, running, reasoning, runPhase, runStartedAt, a
             // 只有「本轮的进行中答复」才带阶段与秒表：历史轮次给 undefined，
             // 避免给已完成的旧消息挂上一个永不停止的计时器。
             runPhase={active ? runPhase : undefined}
-            runStartedAt={active ? runStartedAt : undefined}
+            turnStartedAt={active ? turnStartedAt : undefined}
           />
         )}
 
         {/* 轮次底部指标栏 */}
-        <TurnFooterBar turn={turn} streaming={active} actions={actions} showCopy={showCopy} />
+        <TurnFooterBar
+          turn={turn}
+          streaming={active}
+          actions={actions}
+          showCopy={showCopy}
+          turnStartedAt={turnStartedAt}
+        />
       </div>
     </div>
   )
 }
 
 /** 轮次底部指标栏（对齐桌面端）：复制、分支、本轮改动、整轮耗时、Token 消耗 */
-function TurnFooterBar({ turn, streaming, actions, showCopy }: { turn: TurnGroup; streaming: boolean; actions: ThreadActions; showCopy: boolean }) {
+function TurnFooterBar({ turn, streaming, actions, showCopy, turnStartedAt }: {
+  turn: TurnGroup
+  streaming: boolean
+  actions: ThreadActions
+  showCopy: boolean
+  /** 本轮开始时刻（本轮 user 消息 createdAt）：运行中秒表的基准 */
+  turnStartedAt: number
+}) {
   const { toast, setPanel } = useUI()
   const [copied, setCopied] = useState(false)
+  // 运行中实时跳动（对齐老版本 MessageItem.tsx:1101-1115 的「正在执行... 21分5秒」）
+  const liveElapsed = useLiveElapsed(turnStartedAt, streaming)
   const items = turn.items
   const assistants = items.filter((m) => m.role === 'assistant')
   const lastAssistant = assistants[assistants.length - 1]
@@ -286,7 +303,10 @@ function TurnFooterBar({ turn, streaming, actions, showCopy }: { turn: TurnGroup
     .flatMap((m) => m.toolCalls ?? [])
     .filter((c) => (c.name === 'write_file' || c.name === 'edit_file') && c.status === 'ok')
 
-  if (!copyText && totalTokens === 0 && editFiles.length === 0) return null
+  // 🚨 运行中不能提前返回：`streaming` 时即便正文/tokens 都还是空（首字未到），
+  // 也必须渲染出底部的「正在执行... X秒」——这正是用户最需要看到进度的静默期。
+  // 老版本 MessageItem.tsx:1101 的 isRunningTurn 分支同样不受空内容影响。
+  if (!streaming && !copyText && totalTokens === 0 && editFiles.length === 0) return null
 
   const itemCls = 'inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md hover:bg-panel2 text-inkdim hover:text-ink transition-all shrink-0 cursor-pointer select-none active:scale-95'
 
@@ -330,12 +350,21 @@ function TurnFooterBar({ turn, streaming, actions, showCopy }: { turn: TurnGroup
         </button>
       )}
 
-      {totalMs > 0 && (
+      {/* 整轮耗时：运行中实时跳动，结束后显示静态总耗时（对齐老版本 1101-1147） */}
+      {streaming ? (
+        <span
+          className="inline-flex items-center gap-1 text-accent font-mono cursor-default select-none animate-pulse shrink-0 px-1.5 py-0.5"
+          title="整轮执行持续耗时：从发送消息起，持续跨越所有工具执行与计划步骤"
+        >
+          <Clock size={11} className="animate-spin" />
+          <span>正在执行... {formatDuration(liveElapsed) || '0.1s'}</span>
+        </span>
+      ) : totalMs > 0 ? (
         <span className="inline-flex items-center gap-1 font-mono text-inkfaint cursor-default select-none px-1.5 py-0.5" title="整轮执行总耗时（含全部步骤与工具执行）">
           <Clock size={11} className="opacity-75" />
           <span>{formatStepMs(totalMs)}</span>
         </span>
-      )}
+      ) : null}
 
       {totalTokens > 0 && (
         <span className="inline-flex items-center gap-1 font-mono text-inkfaint cursor-default select-none shrink-0 px-1.5 py-0.5" title={`本轮累计消耗 ${totalTokens} tokens（含全部步骤）`}>
@@ -357,12 +386,13 @@ function TurnFooterBar({ turn, streaming, actions, showCopy }: { turn: TurnGroup
   )
 }
 
-function MessageItem({ msg, actions, runPhase, runStartedAt }: {
+function MessageItem({ msg, actions, runPhase, turnStartedAt }: {
   msg: Message
   actions: ThreadActions
   /** 仅「本轮进行中的答复」传入；历史消息不传（否则会挂上永不停止的计时器） */
   runPhase?: RunPhase
-  runStartedAt?: number
+  /** 本轮开始时刻（本轮 user 消息 createdAt，不可变事实）：秒表基准 */
+  turnStartedAt?: number
 }) {
   if (msg.role === 'user') {
     const reverted = Boolean(msg.revertedAt)
@@ -453,7 +483,7 @@ function MessageItem({ msg, actions, runPhase, runStartedAt }: {
         // 阶段文案随 runPhase 推进，并把已等待时长打在文案里 —— 时间在动 = 程序活着。
         <RunProgressInline
           running={Boolean(msg.streaming)}
-          startedAt={runStartedAt ?? 0}
+          startedAt={turnStartedAt ?? 0}
           phase={runPhase ?? 'waiting'}
         />
       )}

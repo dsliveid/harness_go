@@ -15,7 +15,6 @@ export interface AppSettings {
   /** 能力槽位 → 'providerId/modelId' | ''（跟随全局；chat 槽禁止 NULL） */
   capabilityModels: Record<CapSlot, string>
   disabledTools: string[]
-  disabledSops: string[]
   proxyEnabled: boolean
   proxyUrl: string
 }
@@ -32,7 +31,6 @@ const initialSettings: AppSettings = {
   defaultProviderId: '',
   capabilityModels: { chat: '', vision: '', image: '', decision: '' },
   disabledTools: [],
-  disabledSops: [],
   proxyEnabled: false,
   proxyUrl: '',
 }

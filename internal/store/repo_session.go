@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"harness-go/internal/model"
 )
@@ -286,6 +287,11 @@ func (r *RunRepo) Get(ctx context.Context, id string) (*model.Run, error) {
 // Transition 状态迁移（唯一入口，保证状态机单点收口）。
 //
 // 只允许从"未完成态"迁移到新状态；终态不可再迁移。
+//
+// 幂等语义（2026-11 修复）：UPDATE 命中 0 行时回查当前状态，若**已是目标状态**则
+// 返回 nil。理由：停止链路存在两条并发收口路径 —— StopRun 同步收口 + 引擎 goroutine
+// 收尾。谁先落地都合法，后到者不该报 "非法迁移/不存在" 把真实成功伪装成失败
+// （调用方据此返回 500，用户看到的却是「停止失败」而实际已停）。
 func (r *RunRepo) Transition(ctx context.Context, id string, to model.RunStatus, stopReason, errCode, errMsg string) error {
 	if !to.Valid() {
 		return fmt.Errorf("store: 非法 Run 状态: %s", to)
@@ -311,6 +317,12 @@ func (r *RunRepo) Transition(ctx context.Context, id string, to model.RunStatus,
 		startedAt, endedAt, id)
 	if err != nil {
 		return fmt.Errorf("store: Run 状态迁移失败: %w", err)
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		// 幂等：已是目标状态视为成功（见函数注释）。
+		if cur, gErr := r.Get(ctx, id); gErr == nil && cur.Status == to {
+			return nil
+		}
 	}
 	return ensureAffected(res, "Run "+id)
 }
@@ -462,6 +474,35 @@ func (r *ToolEventRepo) Finish(ctx context.Context, id string, status model.Tool
 // ListByRun 按 Run 列出工具事件（UI 回放）。
 func (r *ToolEventRepo) ListByRun(ctx context.Context, runID string) ([]model.ToolEvent, error) {
 	return r.listWhere(ctx, "run_id=?", runID)
+}
+
+// FailOpenByRun 把一个 Run 下**未收口**的工具事件统一收口为 error 终态。
+//
+// 为什么必须有：引擎的 execTool 收尾（FinishToolEvent）与 Run 的终态迁移原本共用
+// 被取消的 ctx，取消后 SQL 直接不执行且错误被 `_ =` 吞掉 → tool_events 永久停在
+// pending/running。前端刷新回放（GET .../tool-events）照原样渲染成「执行中…」，
+// 而 Run 早已结束 —— 这就是「界面停了但命令还在进行中」的另一半根因。
+//
+// 幂等：仅更新未终态行，重复调用影响 0 行不报错。
+func (r *ToolEventRepo) FailOpenByRun(ctx context.Context, runID, reason string) (int, error) {
+	if strings.TrimSpace(runID) == "" {
+		return 0, errors.New("store: run_id 不能为空")
+	}
+	if reason == "" {
+		reason = "Run 已结束，工具调用未产出结果"
+	}
+	res, err := r.s.conn().ExecContext(ctx,
+		`UPDATE tool_events SET status=?, error=COALESCE(error, ?), ended_at=COALESCE(ended_at, ?)
+		 WHERE run_id=? AND status IN ('pending','approved','running')`,
+		string(model.ToolError), reason, NowMillis(), runID)
+	if err != nil {
+		return 0, fmt.Errorf("store: 收口未完成工具事件失败: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("store: 读取影响行数失败: %w", err)
+	}
+	return int(n), nil
 }
 
 // listWhere 按 where 条件查询工具事件（where 仅接受内部常量，参数一律占位符）。

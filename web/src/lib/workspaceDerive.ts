@@ -219,7 +219,7 @@ function deriveCommands(entries: CallEntry[]): CommandRun[] {
     const status: CommandRun['status'] =
       call.status === 'running' || call.status === 'pending'
         ? 'running'
-        : call.status === 'denied'
+        : call.status === 'denied' || call.status === 'cancelled'
           ? 'cancelled'
           : 'exited'
 

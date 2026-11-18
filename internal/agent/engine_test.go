@@ -31,7 +31,16 @@ type fakeSessionDB struct {
 	usageC     int64
 }
 
-func (f *fakeSessionDB) AddRunUsage(_ context.Context, _ string, promptTokens, completionTokens, _ int64, _ bool) error {
+// fakeSessionDB 的写入方法统一先过 ctx 门：ctx 已取消时直接失败、不写数据 ——
+// 模拟真实 database/sql 的行为。
+//
+// 为什么 fake 必须模仿这一点：此前 fake 完全忽略 ctx，于是「取消后收尾写不进去」
+// 这类真实缺陷在单测里永远不可见（绿着上线）。有了这条门，任何收尾路径若继续
+// 复用被取消的 req ctx，测试就会立刻失败（见 TestEngineCancelledByContext）。
+func (f *fakeSessionDB) AddRunUsage(ctx context.Context, _ string, promptTokens, completionTokens, _ int64, _ bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.usageP = promptTokens
@@ -39,7 +48,10 @@ func (f *fakeSessionDB) AddRunUsage(_ context.Context, _ string, promptTokens, c
 	return nil
 }
 
-func (f *fakeSessionDB) AppendMessage(_ context.Context, m *model.Message) error {
+func (f *fakeSessionDB) AppendMessage(ctx context.Context, m *model.Message) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.seq++
@@ -67,10 +79,18 @@ func (f *fakeSessionDB) GetRun(_ context.Context, _ string) (*model.Run, error) 
 	return &cp, nil
 }
 
-func (f *fakeSessionDB) TransitionRun(_ context.Context, _ string, to model.RunStatus, stopReason, errCode, errMsg string) error {
+func (f *fakeSessionDB) TransitionRun(ctx context.Context, _ string, to model.RunStatus, stopReason, errCode, errMsg string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := CheckTransition(f.run.Status, to); err != nil {
+		// 幂等（对齐 store.RunRepo.Transition）：已在目标状态视为成功。
+		// 停止链路有两条并发收口路径（StopRun 同步 / 引擎 goroutine），谁先落地都合法。
+		if f.run.Status == to {
+			return nil
+		}
 		return err
 	}
 	f.run.Status = to
@@ -80,7 +100,10 @@ func (f *fakeSessionDB) TransitionRun(_ context.Context, _ string, to model.RunS
 	return nil
 }
 
-func (f *fakeSessionDB) InsertToolEvent(_ context.Context, ev *model.ToolEvent) error {
+func (f *fakeSessionDB) InsertToolEvent(ctx context.Context, ev *model.ToolEvent) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	cp := *ev
@@ -88,7 +111,10 @@ func (f *fakeSessionDB) InsertToolEvent(_ context.Context, ev *model.ToolEvent) 
 	return nil
 }
 
-func (f *fakeSessionDB) FinishToolEvent(_ context.Context, id string, status model.ToolEventStatus, resultJSON, blob, errMsg string, exec ToolEventExec) error {
+func (f *fakeSessionDB) FinishToolEvent(ctx context.Context, id string, status model.ToolEventStatus, resultJSON, blob, errMsg string, exec ToolEventExec) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, ev := range f.toolEvents {
@@ -285,6 +311,11 @@ func TestEngineCompletesSimpleRun(t *testing.T) {
 }
 
 // 上下文取消 → cancelled（不是 failed）。
+//
+// 【2026-11 修复】此处曾只验证 DB 终态，但 DB 终态此前是靠**未被取消的** fake 实现的
+// （fakeSessionDB 忽略 ctx），真实 store 在 ctx 取消后 SQL 根本不执行 —— 测试绿着、
+// 线上永远 running。现 fake 的写方法在 cancelled ctx 下同样拒写，
+// 于是本测试真正锁死了「取消后仍能收口」这条不变量。
 func TestEngineCancelledByContext(t *testing.T) {
 	// 用一个永不返回的 provider：靠 ctx 取消打断
 	provider := &slowProvider{}
@@ -778,6 +809,66 @@ func TestEngineDangerCommandEscalation(t *testing.T) {
 	}
 	if len(sdb.toolEvents) != 1 || sdb.toolEvents[0].Status != model.ToolDenied {
 		t.Fatalf("高危命令应被审批拦截，得到 %+v", sdb.toolEvents)
+	}
+}
+
+// tool.started 事件必须携带 args —— 回归守卫。
+//
+// 为什么这事儿值得一条测试：命令类工具（run_command）的命令行是前端用 `{cmd, args[]}`
+// 拼出来的，后端**不下发** cmdline。事件里少了 args，前端 payload.args 恒为 `{}`，
+// 于是命令卡片在执行中只显示流式输出，用户看不到「当前跑的是什么命令」，
+// 折叠态也只剩一个 `run_command` 工具名。这个漏发曾在真实会话里发生（bus.go 的注释
+// 一直写着 payload 含 args，但 engine 侧从未填过），属于「注释与实现对不上」型缺陷，
+// 靠读注释无法发现，只能用测试钉住。
+func TestEngineToolStartedEventCarriesArgs(t *testing.T) {
+	toolArgs := `{"cmd":"go","args":["test","./..."],"dir":"internal"}`
+	provider := &fakeProvider{rounds: [][]llm.Chunk{
+		{{ToolCall: &llm.ToolCallDelta{Index: 0, ID: "call_cmd", Name: "run_command", ArgumentsDelta: toolArgs}}},
+		{{Delta: "跑完了"}},
+	}}
+	eng, _, bus, _ := newTestEngine(t, provider, func(d *Deps) {
+		d.Tools = &fakeTools{result: ToolRunResult{Status: model.ToolOK}}
+		d.Catalog = fakeCatalog{}
+		d.Gate = approval.NewGate(50 * time.Millisecond)
+	})
+
+	sub, err := bus.Subscribe("run-1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bus.Unsubscribe(sub)
+
+	req := baseRunRequest()
+	req.AccessMode = approval.ModeFull
+	if err := eng.Execute(context.Background(), req); err != nil {
+		t.Fatalf("Run 应完成: %v", err)
+	}
+
+	for {
+		ev, ok := <-sub.C()
+		if !ok {
+			t.Fatal("事件流提前关闭，未收到 tool.started")
+		}
+		if ev.Type != events.TypeToolStarted {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(ev.Payload, &payload); err != nil {
+			t.Fatalf("tool.started payload 非法 JSON: %v", err)
+		}
+		raw, exists := payload["args"]
+		if !exists {
+			t.Fatalf("tool.started payload 必须含 args（前端据此拼命令行），实际: %v", payload)
+		}
+		// args 是 json.RawMessage，反序列化后应还原成对象形态（而非被降级成字符串）
+		args, isObj := raw.(map[string]any)
+		if !isObj {
+			t.Fatalf("args 应是 JSON 对象形态，实际 %T: %v", raw, raw)
+		}
+		if args["cmd"] != "go" {
+			t.Fatalf("args.cmd 应为 go，实际 %v", args["cmd"])
+		}
+		return
 	}
 }
 

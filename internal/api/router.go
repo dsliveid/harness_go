@@ -151,6 +151,9 @@ func NewRouter(d Deps) http.Handler {
 	mux.HandleFunc("GET /api/v1/tools", h.listTools)
 	mux.HandleFunc("GET /api/v1/tools/injection", h.toolsInjection)
 	mux.HandleFunc("PATCH /api/v1/tools/tiers", h.patchToolTiers)
+	// 内置工具启停（服务端自身能力开关：内置工具不可安装/卸载，只能启停）
+	mux.HandleFunc("POST /api/v1/tools/{name}/enable", h.enableTool)
+	mux.HandleFunc("POST /api/v1/tools/{name}/disable", h.disableTool)
 
 	// 核心 SOP（agent-core）：出厂内置（embed）+ 运行时覆盖（data/sop）。
 	// 改完下一轮对话即生效，无需重启；重置 = 删除覆盖层回落出厂。
@@ -158,6 +161,10 @@ func NewRouter(d Deps) http.Handler {
 	mux.HandleFunc("PUT /api/v1/sop/core", h.putSOPCore)
 	mux.HandleFunc("DELETE /api/v1/sop/core", h.deleteSOPCore)
 	mux.HandleFunc("GET /api/v1/sop/effective", h.getSOPEffective)
+	// 原生 SOP 目录：工程作业程序清单（单一真源）+ 逐条启停（下一轮对话即生效）。
+	// 规则文案随二进制升级，开关随用户配置落 settings 表。
+	mux.HandleFunc("GET /api/v1/sop/catalog", h.getSOPCatalog)
+	mux.HandleFunc("PUT /api/v1/sop/catalog", h.putSOPCatalog)
 
 	// 阶段 E：外部插件与工具市场
 	mux.HandleFunc("GET /api/v1/mcp/servers", h.listMCPServers)
@@ -177,6 +184,19 @@ func NewRouter(d Deps) http.Handler {
 	mux.HandleFunc("POST /api/v1/packages/{id}/rollback", h.rollbackPackage)
 	mux.HandleFunc("POST /api/v1/packages/{id}/enable", h.enablePackage)
 	mux.HandleFunc("POST /api/v1/packages/{id}/disable", h.disablePackage)
+
+	// 技能库（.harness/skills 唯一真源的服务端通道）：
+	// 与 Agent 侧 skill_list / skill_read / skill_save 共用同一份文件，不是第二份数据。
+	mux.HandleFunc("GET /api/v1/skills", h.listSkills)
+	mux.HandleFunc("GET /api/v1/skills/{name}", h.getSkill)
+	mux.HandleFunc("POST /api/v1/skills", h.saveSkill)
+	mux.HandleFunc("DELETE /api/v1/skills/{name}", h.deleteSkill)
+
+	// 外部市场（远端 registry）：与 /packages（本地 zip）是两条独立链路。
+	// GET 永远先回 status（configured/disabled/unconfigured/error）+ reason，
+	// 未配置时界面据 reason 明示原因，绝不显示空列表冒充「市场为空」。
+	mux.HandleFunc("GET /api/v1/market/registry", h.getMarketRegistry)
+	mux.HandleFunc("POST /api/v1/market/install", h.installMarketItem)
 
 	// 设备（阶段 C：多端协同 HALO M5）——配对 / 列表 / 吊销 / 长连接
 	mux.HandleFunc("POST /api/v1/devices/pair-codes", h.createPairCode)

@@ -1044,6 +1044,183 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "503":
           $ref: "#/components/responses/ToolUnavailable"
+  /api/v1/tools/{name}/enable:
+    post:
+      tags: [tools]
+      summary: 启用系统内置工具（服务端自身能力开关，下一轮对话生效）
+      description: |
+        内置工具随程序发布、编译期注册，**不提供安装/卸载**，只有启用/停用两档。
+        停用的工具既不进入注入集合（模型看不到）也无法被调用（Resolve 报 ErrUnavailable）；
+        状态落主库 settings.tools.disabled，重启后保持。
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: 变更后的注册表快照
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ToolSnapshot" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "503":
+          $ref: "#/components/responses/ToolUnavailable"
+  /api/v1/tools/{name}/disable:
+    post:
+      tags: [tools]
+      summary: 停用系统内置工具（服务端自身能力开关，下一轮对话生效）
+      description: 语义同 enable，方向相反：停用 = 不注入 + 不可调用，但**保留注册**（可随时重新启用）。
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: 变更后的注册表快照
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ToolSnapshot" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "503":
+          $ref: "#/components/responses/ToolUnavailable"
+  # ===== 技能库（.harness/skills 唯一真源的服务端通道） =====
+  /api/v1/skills:
+    get:
+      tags: [skills]
+      summary: 列出技能库全部技能（与 Agent 的 skill_list 共用同一份文件）
+      description: |
+        技能的**唯一真源**是工作区下的 `.harness/skills/<name>/SKILL.md`
+        （相对路径与客户端完全一致）。本端点只是把它暴露成 HTTP，
+        不是第二份数据：界面装的技能 Agent 立刻可用，反之亦然。
+      responses:
+        "200":
+          description: 技能清单 + 技能库根目录
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/SkillView" }
+                  root: { type: string, description: 技能库绝对根（界面需明示落地位置） }
+                  dir: { type: string, description: 相对目录（恒为 .harness/skills） }
+        "503":
+          $ref: "#/components/responses/ToolUnavailable"
+    post:
+      tags: [skills]
+      summary: 沉淀/覆盖技能（写 .harness/skills/{name}/SKILL.md）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, description, body]
+              properties:
+                name: { type: string, description: 小写字母数字连字符，≤64 字符 }
+                description: { type: string }
+                body: { type: string }
+      responses:
+        "201":
+          description: 已写入的技能视图
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SkillView" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "503":
+          $ref: "#/components/responses/ToolUnavailable"
+  /api/v1/skills/{name}:
+    get:
+      tags: [skills]
+      summary: 读取单个技能（含 SKILL.md 全文）
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: 技能视图 + 全文
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  view: { $ref: "#/components/schemas/SkillView" }
+                  content: { type: string, description: SKILL.md 原文 }
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ToolUnavailable"
+    delete:
+      tags: [skills]
+      summary: 卸载技能（删除整个技能目录，含附属脚本）
+      description: 删目录而非只删 SKILL.md：技能可携带脚本，只删正文会留下孤儿文件。
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "204":
+          description: 已卸载
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ToolUnavailable"
+  # ===== 外部市场（远端 registry） =====
+  /api/v1/market/registry:
+    get:
+      tags: [market]
+      summary: 拉取外部市场索引（TTL 缓存；未配置时如实返回 status/reason）
+      description: |
+        本市场是**外部来源**：制品由远端 registry 提供，服务端负责
+        「拉索引 → 校验 sha256 → 验签 → 落盘安装」。
+        与 `/api/v1/packages`（只装服务端本地 zip）是两条独立链路。
+        status 取值：ready | disabled | unconfigured | error；非 ready 时 reason 说明原因，
+        前端必须据此明示，绝不显示空列表冒充「市场为空」。
+      responses:
+        "200":
+          description: 市场索引视图
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MarketRegistry" }
+        "503":
+          $ref: "#/components/responses/ToolUnavailable"
+  /api/v1/market/install:
+    post:
+      tags: [market]
+      summary: 下载并安装市场制品（sha256 完整性 + ed25519 验签双校验）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id]
+              properties:
+                id: { type: string, description: 与索引中的制品 id 一致 }
+                kind: { type: string, enum: [package, skill], description: 可选校验 }
+      responses:
+        "201":
+          description: 已安装的制品条目
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MarketItem" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ToolUnavailable"
   # ===== 核心 SOP（agent-core）：出厂内置 + 运行时覆盖 =====
   /api/v1/sop/core:
     get:
@@ -1112,6 +1289,62 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/SOPEffective" }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "503":
+          $ref: "#/components/responses/Unavailable"
+  # ===== 原生 SOP 目录（工程作业程序清单 + 逐条启停） =====
+  #
+  # 与 /sop/core 的分工（单一真源，不双写）：
+  #   /sop/core     人格与基础口径（用户可编辑正文，受 token 预算约束）
+  #   /sop/catalog  工程作业程序（**代码即真源**，只可逐条启停 + 切换规划模式）
+  /api/v1/sop/catalog:
+    get:
+      tags: [sop]
+      summary: 原生 SOP 数据字典（层级 / 分类 / 作用域 / 变体 / 启停状态 / 规划模式）
+      description: |
+        前端设置界面按此渲染逐条开关，规则文案不在前端硬编码（避免两端漂移）。
+
+        - `items[].is_hard_rule=true` 的规则不可关闭（后端拒绝写入，前端应置灰）；
+        - `items[].scope` 决定作用域：`main_only` 不进子 Run，`sub_only` 不进主 Run；
+        - `items[].variants[]` 给出同一规则在不同上下文（主 / 子 / Always Plan /
+          Always Proceed / 标准）下的真实措辞，便于界面对比。
+      responses:
+        "200":
+          description: 目录全集 + 当前启停状态
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SOPCatalog" }
+        "503":
+          $ref: "#/components/responses/Unavailable"
+    put:
+      tags: [sop]
+      summary: 保存逐条启停状态与规划模式（下一轮对话立即生效）
+      description: |
+        与 `PATCH /settings` 同一套校验口径：未知 ID / 重复 ID / 空 ID / 硬规则 ID
+        一律 400（绝不静默忽略）。校验不通过时**整个请求不落库**（原子语义）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [disabled]
+              properties:
+                disabled:
+                  type: array
+                  items: { type: string }
+                  description: 要关闭的规则 ID 列表（空数组 = 全部启用）
+                plan_mode:
+                  type: string
+                  enum: [standard, always_plan, always_proceed]
+                  description: 规划模式；缺省或空串表示不修改
+      responses:
+        "200":
+          description: 保存后的目录全集与状态
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SOPCatalog" }
         "400":
           $ref: "#/components/responses/BadRequest"
         "503":
@@ -2745,6 +2978,7 @@ components:
         namespace: { type: string }
         tier: { $ref: "#/components/schemas/ToolTier" }
         default_tier: { $ref: "#/components/schemas/ToolTier" }
+        enabled: { type: boolean, description: 是否启用（false = 已停用：不注入且不可调用），与 tier 正交 }
         cost_tokens: { type: integer }
         risk: { $ref: "#/components/schemas/Risk" }
         executor: { type: string }
@@ -2795,7 +3029,45 @@ components:
         overrides:
           type: object
           additionalProperties: { $ref: "#/components/schemas/ToolTier" }
+        disabled:
+          type: array
+          description: 已停用的工具名（升序），供 UI 直接渲染启停开关
+          items: { type: string }
         generated_at: { type: string, format: date-time }
+    SkillView:
+      type: object
+      properties:
+        name: { type: string }
+        description: { type: string }
+        origin: { type: string, enum: [builtin, local, market] }
+        path: { type: string, description: 相对工作区路径（.harness/skills/<name>/SKILL.md） }
+        size: { type: integer }
+        mod_time: { type: integer }
+    MarketItem:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        version: { type: string }
+        kind: { type: string, enum: [package, skill] }
+        description: { type: string }
+        author: { type: string }
+        size_bytes: { type: integer }
+        sha256: { type: string, description: 制品内容摘要（hex）；下载后必须逐字节匹配 }
+        download_url: { type: string, description: 可为相对路径（按索引地址解析） }
+    MarketRegistry:
+      type: object
+      properties:
+        configured: { type: boolean, description: 市场是否已配置 }
+        status: { type: string, enum: [ready, disabled, unconfigured, error] }
+        reason: { type: string, description: 非 ready 时的可读原因 }
+        registry_url: { type: string }
+        trust: { type: string, description: 信任策略摘要（仅签名 / 允许未签名） }
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/MarketItem" }
+        fetched_at: { type: integer }
+        cached: { type: boolean }
     ToolInjection:
       type: object
       properties:
@@ -3044,14 +3316,62 @@ components:
         tokens: { type: integer }
     SOPEffective:
       type: object
-      description: 生效预览（核心 SOP + 项目级条目 + token 合计）
+      description: 生效预览（核心 SOP + 生效规则 + 项目级条目 + token 合计）
       properties:
         core: { $ref: "#/components/schemas/SOPCore" }
+        rules:
+          type: array
+          items: { type: string }
+          description: 本次上下文生效的工程规则行（`N. 【标题】：正文`，与真实注入逐字一致）
+        active_ids:
+          type: array
+          items: { type: string }
+          description: 生效规则 ID（用于与目录全集对比，排查「为什么这条没出现」）
         entries:
           type: array
           items: { $ref: "#/components/schemas/SOPEntry" }
         workspace: { type: string, description: 会话绑定的工作区路径（空 = 未绑定） }
         total_tokens: { type: integer }
-        system_preview: { type: string, description: 最终系统提示预览（基础提示 + SOP 段） }
+        system_preview: { type: string, description: 最终系统提示预览（基础提示 + 规则段 + 条目段） }
         truncated: { type: boolean, description: 是否有条目因条数上限被截断（D10：必须可见） }
         entry_limit: { type: integer, description: 项目级条目条数上限 }
+    SOPVariant:
+      type: object
+      description: 一条规则在某个上下文下的具体形态（提示词里真实出现的措辞）
+      properties:
+        label: { type: string, description: "主进程 / 子进程 / Always Plan 等，仅用于界面对比" }
+        title: { type: string, description: 提示词里的真标题（渲染为【title】） }
+        text: { type: string, description: 正文（【】：之后的部分，不含序号） }
+    SOPItem:
+      type: object
+      description: 原生 SOP 目录条目（工程作业程序）
+      properties:
+        id: { type: string, description: 稳定标识（启停开关的键，一经发布不得改名） }
+        name: { type: string, description: 界面标题（恒等于 variants[0].title，单一真源） }
+        phase: { type: integer }
+        phase_label: { type: string }
+        category: { type: string }
+        category_label: { type: string }
+        scope: { type: string, enum: [universal, main_only, sub_only] }
+        scope_label: { type: string }
+        is_hard_rule: { type: boolean, description: 硬规则：不可关闭（后端拒绝写入） }
+        description: { type: string }
+        disable_effect: { type: string, description: 关闭后的后果（界面如实告知） }
+        variants:
+          type: array
+          items: { $ref: "#/components/schemas/SOPVariant" }
+    SOPCatalog:
+      type: object
+      description: 原生 SOP 数据字典 + 当前启停状态与规划模式
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/SOPItem" }
+        disabled:
+          type: array
+          items: { type: string }
+          description: 用户已关闭的规则 ID（硬规则永不出现）
+        plan_mode:
+          type: string
+          enum: [standard, always_plan, always_proceed]
+          description: 当前规划模式（决定方案先行规则渲染哪个变体）

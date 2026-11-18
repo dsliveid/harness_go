@@ -69,3 +69,36 @@ func (h *handlers) patchToolTiers(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, snap)
 }
+
+// ============ 系统内置工具启停（服务端自身能力开关） ============
+//
+// 为什么内置工具**不提供安装/卸载**：它们随程序发布，编译期即注册，
+// 没有独立的制品可装卸；服务端允许的能力管理只有「启用/停用」一档。
+// 客户端（PC / 移动）的内置工具才有「安装到本机」的语义（见 pluginStore）。
+
+// enableTool / disableTool 启用或停用单个内置工具（写入主库 settings.tools.disabled）。
+//
+//	POST /api/v1/tools/{name}/enable | /disable
+//
+// 停用后该工具既不进入注入集合（模型看不到）也无法被调用（Resolve 报 ErrUnavailable），
+// 下一轮对话生效，无需重启。
+func (h *handlers) enableTool(w http.ResponseWriter, r *http.Request) {
+	h.setToolEnabled(w, r, true)
+}
+
+func (h *handlers) disableTool(w http.ResponseWriter, r *http.Request) {
+	h.setToolEnabled(w, r, false)
+}
+
+func (h *handlers) setToolEnabled(w http.ResponseWriter, r *http.Request, enabled bool) {
+	if h.d.Tools == nil {
+		writeError(w, r, toolUnavailableErr())
+		return
+	}
+	snap, err := h.d.Tools.SetToolEnabled(r.Context(), r.PathValue("name"), enabled)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, snap)
+}

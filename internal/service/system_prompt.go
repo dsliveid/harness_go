@@ -6,6 +6,22 @@ import (
 	"strings"
 )
 
+// composeRulesSection 把原生 SOP 规则行追加到系统提示末尾（无规则时原样返回）。
+//
+// 为什么要独立成段而不再塞进 core 正文：core 是**可被用户覆盖**的私有调教区，
+// 规则清单是**代码真源**（只可逐条启停）。两段分开后，用户改 core 不会破坏规则，
+// 规则升级也不会覆盖用户调教成果。段标题里的编号仅供模型引用，不参与业务。
+func composeRulesSection(base string, rules []string) string {
+	if len(rules) == 0 {
+		return base
+	}
+	var sb strings.Builder
+	sb.WriteString(strings.TrimRight(base, "\n"))
+	sb.WriteString("\n\n## 工作规则（按序遵守，编号仅用于引用）\n")
+	sb.WriteString(strings.Join(rules, "\n"))
+	return sb.String()
+}
+
 // ComposeSystemBase 把「基础系统提示」与「本会话真实工作区事实」组装为最终 SystemBase。
 //
 // 背景（踩坑）：基础提示是启动期固定常量，与会话级 project_dir 完全解耦，

@@ -101,6 +101,20 @@ interface SessionState {
   select: (id: string) => void
   create: (projectId?: string) => string
   rename: (id: string, title: string) => void
+  /**
+   * 拉取单个会话并以服务端 title 回填本地列表。
+   *
+   * 存在意义（2026-11 缺陷：发任何消息对话名都还叫「新对话」）：
+   * 自动标题由**服务端**在首条消息时生成并落库（run_service.deriveSessionTitle），
+   * 而前端 POST /runs 的 202 回包只带 run_id/status，从不回传 title ——
+   * 本地 sessions 的 title 就一直停在乐观壳的「新对话」，直到用户刷新页面
+   * （重新 listSessions）才会突然变成正文前 24 字。中间这段时间用户看到的就是
+   * 「发了消息，标题还是新对话」。
+   *
+   * 因此发送成功后主动 GET 一次（只同步 title，不整段替换会话：避免覆盖本地
+   * 独有的 workspaceId 分组），失败静默不打扰用户（标题只是体验项）。
+   */
+  refreshTitle: (id: string) => Promise<void>
   remove: (id: string) => void
   archive: (id: string) => void
   unarchive: (id: string) => void
@@ -464,6 +478,19 @@ export const useSessions = create<SessionState>((set, get) => ({
   rename: (id, title) => {
     set((s) => ({ sessions: s.sessions.map((x) => (x.id === id ? { ...x, title } : x)) }))
     void api.renameSession(id, title).catch(() => useUI.getState().toast('error', '重命名失败'))
+  },
+  refreshTitle: async (id) => {
+    if (!id) return
+    try {
+      const remote = await api.getSession(id)
+      const title = (remote.title ?? '').trim()
+      if (!title) return
+      // 只回填 title，不整段 replace：服务端不认前端的 workspaceId 分组，
+      // 整段替换会让会话掉进「纯对话」（历史缺陷）。
+      set((s) => ({ sessions: s.sessions.map((x) => (x.id === id ? { ...x, title } : x)) }))
+    } catch {
+      /* 标题是体验项：拉取失败保持本地值，等下次 load() 对齐 */
+    }
   },
   remove: (id) => {
     set((s) => {

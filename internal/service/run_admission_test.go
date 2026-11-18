@@ -27,6 +27,7 @@ type runAdmissionEnv struct {
 	main     *store.MainStore
 	sessions *store.SessionStore
 	hub      *fakeHub
+	bus      *events.Bus
 	ctx      context.Context
 }
 
@@ -56,8 +57,10 @@ func newRunAdmissionEnv(t *testing.T) *runAdmissionEnv {
 	hub := &fakeHub{online: map[string]bool{}}
 	svc := NewRunService(RunServiceOptions{
 		Main: main, Engine: engine, Sessions: sessions, Hub: hub,
+		// 未选模型的 Run 不进引擎，需本层自己发终态事件（前端据此停转圈）
+		Events: bus,
 	})
-	return &runAdmissionEnv{svc: svc, main: main, sessions: sessions, hub: hub, ctx: ctx}
+	return &runAdmissionEnv{svc: svc, main: main, sessions: sessions, hub: hub, bus: bus, ctx: ctx}
 }
 
 // addDesktopWorkspace 插入一台桌面设备 + 其工作空间，返回 workspaceID。
@@ -88,7 +91,7 @@ func (e *runAdmissionEnv) countMessages(t *testing.T, sessionID string) int {
 		// 会话库文件尚未创建 = 零消息，符合预期。
 		return 0
 	}
-	msgs, err := sdb.Messages().List(e.ctx, 100, 0)
+	msgs, err := sdb.Messages().List(e.ctx, 0, 100)
 	if err != nil {
 		return 0
 	}

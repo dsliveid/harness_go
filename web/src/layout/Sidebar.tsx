@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
+import { createPortal } from 'react-dom'
 import {
   Plus, ChevronDown, ChevronRight, Pin, Folder,
   MoreHorizontal, MessageSquare, Sliders, Settings, Pencil,
@@ -255,6 +256,7 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
                           menuFor === p.id ? 'text-ink bg-panel3' : 'text-inkdim hover:text-ink'
                         )}
                         title="更多操作"
+                        data-menu-toggle
                         onClick={() => setMenuFor(menuFor === p.id ? null : p.id)}
                       >
                         <MoreHorizontal size={13} />
@@ -410,38 +412,75 @@ function NavRow({ icon, label, active, badge, onClick }: {
 }
 
 function Menu({ items, onClose }: { items: MenuItem[]; onClose: () => void }) {
-  const ref = useRef<HTMLDivElement>(null)
+  const anchor = useRef<HTMLSpanElement>(null)
+  const popRef = useRef<HTMLDivElement>(null)
+  const [pos, setPos] = useState<{ top: number; left: number } | null>(null)
+
+  // 【为何要 Portal + fixed 定位】侧栏会话/项目列表是 overflow-y-auto 滚动容器，原来的
+  // absolute 菜单会踩两个坑，表现就是用户看到的「下拉被遮盖」：
+  //   1) 行处于列表末尾时，菜单下沿超出滚动容器 → 直接被 overflow 裁掉，看起来「没出来」；
+  //   2) SessionRow 自身带 hover:-translate-y-[1px]（transform），行内 absolute 浮层会被
+  //      后续兄弟行的独立阴影/位移压住，视觉上就是「被遮住半截」。
+  //   → 与 WorkspaceSwitcher（侧栏工作空间下拉）同口径：菜单渲染到 body 并由视口 rect 夹取，
+  //     永不参与容器裁剪与层级竞争；下方空间不足时自动向上翻转，避免出视口。
+  useEffect(() => {
+    const r = anchor.current?.parentElement?.getBoundingClientRect()
+    if (!r) return
+    const width = 144 // w-36
+    const height = items.length * 30 + 10
+    // 右对齐所在行（与旧 absolute right-1 视觉一致），并夹在视口内
+    const left = Math.max(8, Math.min(r.right - width, window.innerWidth - width - 8))
+    const top = r.bottom + 2 + height > window.innerHeight - 8
+      ? Math.max(8, r.top - height - 2)
+      : r.bottom + 2
+    setPos({ top, left })
+  }, [items.length])
 
   useEffect(() => {
     const handleDown = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) {
-        onClose()
-      }
+      const t = e.target as HTMLElement
+      // 「⋯」开关按钮自身不做外部关闭：否则 mousedown 先关、click 又开，导致二次点击关不掉
+      if (t.closest?.('[data-menu-toggle]')) return
+      if (popRef.current && !popRef.current.contains(t)) onClose()
     }
+    // 滚动会让 portal 菜单与所在行脱位（fixed 不随祖先滚动）→ 直接关闭，不留悬空菜单
+    const handleScroll = () => onClose()
     window.addEventListener('mousedown', handleDown)
-    return () => window.removeEventListener('mousedown', handleDown)
+    window.addEventListener('scroll', handleScroll, true)
+    return () => {
+      window.removeEventListener('mousedown', handleDown)
+      window.removeEventListener('scroll', handleScroll, true)
+    }
   }, [onClose])
 
   return (
-    <div
-      ref={ref}
-      className="absolute right-1 top-7 z-30 w-36 rounded-xl border border-edge bg-panel shadow-modal py-1 fade-in"
-      onClick={(e) => e.stopPropagation()}
-    >
-      {items.map((it) => (
-        <button
-          key={it.label}
-          className={cn(
-            'w-full text-left px-2.5 py-1.5 text-[12px] flex items-center gap-2 hover:bg-panel2 transition-colors',
-            it.danger ? 'text-err hover:bg-err/10' : 'text-ink',
-          )}
-          onClick={() => { it.onClick(); onClose() }}
+    <>
+      {/* 行内隐形锚点：仅用于测量所在行的位置，不占布局、不参与遮挡 */}
+      <span ref={anchor} className="hidden" aria-hidden />
+      {pos && createPortal(
+        <div
+          ref={popRef}
+          className="fixed z-[45] w-36 rounded-xl border border-edge bg-panel shadow-modal py-1 fade-in"
+          style={{ top: pos.top, left: pos.left }}
+          onClick={(e) => e.stopPropagation()}
         >
-          {it.icon && <span className="shrink-0">{it.icon}</span>}
-          <span>{it.label}</span>
-        </button>
-      ))}
-    </div>
+          {items.map((it) => (
+            <button
+              key={it.label}
+              className={cn(
+                'w-full text-left px-2.5 py-1.5 text-[12px] flex items-center gap-2 hover:bg-panel2 transition-colors',
+                it.danger ? 'text-err hover:bg-err/10' : 'text-ink',
+              )}
+              onClick={() => { it.onClick(); onClose() }}
+            >
+              {it.icon && <span className="shrink-0">{it.icon}</span>}
+              <span>{it.label}</span>
+            </button>
+          ))}
+        </div>,
+        document.body,
+      )}
+    </>
   )
 }
 
@@ -488,6 +527,7 @@ function SessionRow({ s, activeId, onSelect, menuOpen, onMenu, items, onClose }:
           menuOpen ? 'text-ink bg-panel3' : 'text-inkfaint hover:text-ink',
         )}
         title="更多操作"
+        data-menu-toggle
         onClick={(e) => { e.stopPropagation(); onMenu() }}
       >
         <MoreHorizontal size={13} />

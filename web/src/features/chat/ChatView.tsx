@@ -3,15 +3,12 @@ import { Composer } from './Composer'
 import { ApprovalBar } from './ApprovalBar'
 import { SideRail } from './SideRail'
 import { SessionLeaseBar } from './SessionLeaseBar'
-import { LiveProgressBar } from './LiveProgress'
 import { useChat } from '../../stores/chatStore'
 import { useUI } from '../../stores/uiStore'
 import { Button } from '../../components/ui'
 
 export function ChatView() {
-  const { lastError, runStatus, retry, approval, streaming, runPhase, runStartedAt } = useChat()
-  // 步数用 selector 单独订阅（返回原始值，引用稳定）：避免 messages 变化时整页重渲
-  const stepCount = useChat((s) => s.currentStepCount())
+  const { lastError, runStatus, retry, approval } = useChat()
 
   return (
     <div className="flex flex-col h-full min-w-0">
@@ -37,12 +34,6 @@ export function ChatView() {
       </div>
 
       <ApprovalBar />
-      {/*
-        常驻执行时长条（2026-11）：「对话过程中下方始终显示执行时长」。
-        刻意放在消息流**之外**、输入框之上：消息流可滚动，用户上翻历史时
-        写在末尾的耗时会滚出视野，做不到「始终可见」。输入框区域是固定可见区。
-      */}
-      <LiveProgressBar running={streaming} startedAt={runStartedAt} phase={runPhase} stepCount={stepCount} />
       <Composer />
     </div>
   )

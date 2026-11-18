@@ -196,6 +196,28 @@ type MCPConfig struct {
 	AllowUnsigned bool     `yaml:"allow_unsigned"` // 允许安装未签名包（默认拒绝）
 }
 
+// MarketConfig 外部市场（远程 registry）参数。
+//
+// 与 MCPConfig 的分工（刻意分成两段，语义不同不可合并）：
+//   - MCP 段管「连接托管」：MCP Server 建连、stdio 放行、工具包信任根；
+//   - Market 段管「制品下载」：从远端 registry 拉索引并下载制品（工具包 / 技能）。
+// 两者共用同一套 ed25519 信任语义（internal/market），但开关独立：
+// 关闭市场不影响已装工具包运行，反之亦然。
+//
+// 🚨 安全铁律：服务端会**从远端 URL 下载并落盘执行**制品，因此
+//   - 必须 sha256 完整性校验（索引里声明的 digest 与实际下载内容比对）；
+//   - 必须 ed25519 验签（复用 internal/market.Open，信任根为 TrustedKeys）；
+//   - TrustedKeys 为空且 AllowUnsigned=false → 一律拒绝（无法证明来源）；
+//   - RegistryURL 为空 → 市场明确标记「未配置」，绝不返回假制品列表。
+type MarketConfig struct {
+	Enabled       bool     `yaml:"enabled"`         // 外部市场总开关（关闭时相关端点返回 unavailable）
+	RegistryURL   string   `yaml:"registry_url"`    // 索引地址（JSON）；空 = 未配置
+	TrustedKeys   []string `yaml:"trusted_keys"`    // 受信公钥（64 位 hex ed25519）；空则签名包一律硬拒
+	AllowUnsigned bool     `yaml:"allow_unsigned"`  // 允许安装未签名制品（默认拒绝）
+	CacheTTLSec   int      `yaml:"cache_ttl_sec"`   // 索引缓存秒数（避免每次开弹窗打远端），默认 300
+	TimeoutSec    int      `yaml:"timeout_sec"`     // 拉取/下载超时秒数，默认 30
+}
+
 // LogConfig 日志（文本运维日志 + 天分片审计日志库族）。
 //
 // 两套数据分层（见 docs/日志与审计查询方案.md）：
@@ -302,6 +324,7 @@ type Config struct {
 	Budget     BudgetConfig     `yaml:"budget"`
 	SOP        SOPConfig        `yaml:"sop"`
 	MCP        MCPConfig        `yaml:"mcp"`
+	Market     MarketConfig     `yaml:"market"`
 	Log        LogConfig        `yaml:"log"`
 
 	// ConfigFile 实际加载的配置文件路径（空 = 未使用文件）

@@ -25,18 +25,17 @@ let pendingReasoning = ''
 let flushTimer: ReturnType<typeof setTimeout> | null = null
 let streamingMsgId: string | null = null
 let currentRunId: string | null = null
+/**
+ * 本轮是否为「未选择模型」的纯保存发送（2026-11）。
+ *
+ * 语义：消息正常上屏并落库，但本轮不产生回复。收口时必须把它上屏的
+ * 空 assistant 气泡摘掉，否则用户会永远看到一个空白转圈气泡
+ * ——「发送成功但没有回复」必须表现为「没有气泡」，而不是「空回复」。
+ */
+let noModelRun = false
 /** 当前被跟踪 Run 所属会话（切会话后仍要继续跟踪原 Run，故与 currentId 分开记） */
 let currentRunSessionId: string | null = null
 let stepStartAt = 0
-/**
- * 本轮 Run 的发起时刻（毫秒）：执行时长秒表的唯一基准。
- *
- * 为什么用模块级变量 + store 双写：秒表要从「用户按下发送」那一刻起算，
- * 而不是从「服务端返回 run_id」或「首字节到达」起算 —— 后者会把用户最在意的
- * 静默期（POST 同步阻塞 + TTFT）整段排除在计时之外，看起来「只跑了 2 秒」，
- * 与用户实际体感（等了 15 秒）严重不符。
- */
-let runStartedAtMs = 0
 /** 每会话最近一次消息级回滚的事件 id（real 模式 reapply 依据；S10 语义，刷新后从服务端 rollbacks 列表不可得时降级为不可重放） */
 const lastRollbackBySession: Record<string, string> = {}
 
@@ -54,6 +53,40 @@ function syncWorkspaceFromMessages() {
   const sessionId = useSessions.getState().currentId
   const msgs = useChat.getState().messages.filter((m) => !sessionId || m.sessionId === sessionId)
   useWorkspace.getState().syncFromMessages(msgs)
+}
+
+/**
+ * 把某会话里「进行中」的工具卡片就地收口为 cancelled。
+ *
+ * 为什么需要（2026-11 缺陷）：工具卡片状态有两条来源 ——
+ *   ① SSE `tool.result`（实时路径）；
+ *   ② 历史回灌 `toUiMessages`：只有存在对应 tool 消息时才判终态，否则一律 `pending`。
+ * 用户在命令执行中点了「停止」/ 进程崩溃时 tool 消息不会落库，于是刷新后
+ * 第 ② 条路径把卡片渲染成「等待/执行中」，而服务端 Run 早已结束 —— 用户以为命令还在跑。
+ *
+ * 判据是服务端权威事实：该会话**没有进行中的 Run** ⇒ 没有任何工具可以还在跑。
+ */
+function settleStaleToolCalls(sessionId: string) {
+  const live = (s: ToolCall['status']) => s === 'pending' || s === 'running'
+  const has = useChat.getState().messages.some(
+    (m) => m.sessionId === sessionId && m.toolCalls?.some((c) => live(c.status)),
+  )
+  if (!has) return
+  useChat.setState((s) => ({
+    messages: s.messages.map((m) =>
+      m.sessionId !== sessionId || !m.toolCalls?.some((c) => live(c.status))
+        ? m
+        : {
+            ...m,
+            toolCalls: m.toolCalls.map((c) =>
+              live(c.status)
+                ? { ...c, status: 'cancelled' as ToolCall['status'], result: c.result ?? '已停止（无进行中的运行）' }
+                : c,
+            ),
+          },
+    ),
+  }))
+  syncWorkspaceFromMessages()
 }
 
 /** 单会话 token 账本条目（inputs / outputs / cached）。 */
@@ -126,8 +159,6 @@ interface ChatState {
    * 而不是对着一个永不变化的「思考中」怀疑卡死。
    */
   runPhase: RunPhase
-  /** 当前 Run 的发起时刻（毫秒，0 = 空闲）。执行时长秒表基准，见 LiveProgress。 */
-  runStartedAt: number
   // 说明：上下文「智能压缩」交互链路已整体下线（后端无压缩器 / 无压缩记录表 / 无压缩接口，
   // 保留入口即静默失败）。此处不再持有任何压缩状态与方法，真实 token 水位仅由 tokensIn/tokensOut/cachedTokens 承载。
   /** 推送一条数据权限审批（不阻塞 Run） */
@@ -147,8 +178,6 @@ interface ChatState {
   reapply: (msgId: string) => void
   deleteFrom: (msgId: string) => void
   messagesOf: (sessionId: string) => Message[]
-  /** 当前 Run 已执行步数（用于进度条「第 N 步」） */
-  currentStepCount: () => number
   /** 以 DB 为准重拉某会话的消息快照（real 模式；断线重连/resync 时对齐） */
   reloadMessages: (sessionId: string) => Promise<void>
   /**
@@ -277,38 +306,49 @@ export const useChat = create<ChatState>((set, get) => {
       }
     }
     set((s) => ({
-      messages: s.messages.map((m) =>
-        m.id === id
-          ? {
-              ...m,
-              streaming: false,
-              durationMs: nowSettle - stepStartAt,
-              ...(opts.usage
-                ? {
-                    tokens: opts.usage.tokensOut + opts.usage.tokensIn,
-                    promptTokens: opts.usage.tokensIn,
-                    cachedTokens: opts.usage.cachedTokens,
-                  }
-                : {}),
-            }
-          : m,
-      ),
+      messages: s.messages
+        .map((m) =>
+          m.id === id
+            ? {
+                ...m,
+                streaming: false,
+                durationMs: nowSettle - stepStartAt,
+                ...(opts.usage
+                  ? {
+                      tokens: opts.usage.tokensOut + opts.usage.tokensIn,
+                      promptTokens: opts.usage.tokensIn,
+                      cachedTokens: opts.usage.cachedTokens,
+                    }
+                  : {}),
+              }
+            : m,
+        )
+        // 未选择模型的纯保存发送：本轮没有回复，把乐观上屏的空 assistant 气泡摘掉。
+        // 只认「确实为空」：万一服务端/历史回灌了正文（不该发生），保留内容更安全。
+        .filter((m) => !(noModelRun && m.id === id && !m.content && !(m.toolCalls?.length ?? 0))),
       streaming: false,
       runStatus,
       reasoning: '',
       approval: null,
-      // 收口必须清掉阶段与秒表基准：否则进度条会在 Run 结束后继续计时（假运行态）
+      // 收口清掉阶段：否则「加载中」文案会在 Run 结束后继续显示（假运行态）
       runPhase: 'idle' as RunPhase,
-      runStartedAt: 0,
       ...(opts.error ? { lastError: opts.error } : {}),
       ...usagePatch,
     }))
     if (opts.toast) useUI.getState().toast('warn', opts.toast)
+    // 未选模型：消息已保存（用户消息即刻落库可见），明确告知「本轮无回复」，
+    // 避免用户对着空对话以为是发送失败。
+    // 仅在成功收口时提示：失败/取消已各自有错误提示，再叠一条「已保存」会自相矛盾。
+    if (noModelRun) {
+      noModelRun = false
+      if (runStatus === 'completed') {
+        useUI.getState().toast('info', '消息已保存；当前会话未选择模型，本轮不会产生回复')
+      }
+    }
     streamingMsgId = null
     currentRunId = null
     currentRunSessionId = null
     handle = null
-    runStartedAtMs = 0
     // 订阅结束：如实回到空闲态（顶栏不再残留「已连接」假象）
     useSse.getState().detachRun()
     // 排队输入继续依次执行（失败与成功同语义：不因一次结束阻塞后续）
@@ -491,7 +531,6 @@ export const useChat = create<ChatState>((set, get) => {
 
   const startRun = (input: string) => {
     const sessionId = useSessions.getState().currentId
-    // 没有「默认模型」的隐式回退：会话未选择模型时直接拦截提示（避免静默落到 fake 回显模型）
     const session = useSessions.getState().sessions.find((s) => s.id === sessionId)
     // 离线守卫（口径 1，2026-11）：只要归属执行面离线，**任何**发起新 Run 的入口一律拒绝
     // —— send / retry / editResend / fork / 待执行队列 全都汇聚到本函数，故在此统一拦截。
@@ -511,10 +550,13 @@ export const useChat = create<ChatState>((set, get) => {
       )
       return
     }
-    if (!session?.modelRef) {
-      useUI.getState().toast('warn', '请先选择模型')
-      return
-    }
+    // 未选择模型**不再拦截发送**（2026-11 口径）：
+    // 消息照常上屏 + 落库（刷新后仍在），只是本轮不产生回复。
+    // 服务端 CreateRunWithSystem 对这一情形直接建 completed 的 Run 并发终态事件，
+    // 前端由 settleRun 收口并把空 assistant 气泡摘掉（见 noModelRun 标记）。
+    // 🚨 仍不做「默认模型」隐式回退：旧逻辑会静默落到 default/fake 回显模型，
+    // 用户以为在聊天其实是在跟假模型对答。
+    const noModel = !session?.modelRef
     // 发送新消息将覆盖撤回边界之后的历史（对齐桌面端）
     if (get().messages.some((m) => m.sessionId === sessionId && m.revertedAt)) {
       set((s) => ({ messages: s.messages.filter((m) => !(m.sessionId === sessionId && m.revertedAt)) }))
@@ -536,12 +578,11 @@ export const useChat = create<ChatState>((set, get) => {
     streamingMsgId = assistantMsg.id
     currentRunId = runId
     currentRunSessionId = sessionId
+    // 未选模型：本轮只是把消息保存下来（不产生回复），收口时据此摘掉空 reply 气泡。
+    noModelRun = noModel
     stepStartAt = now
     pendingText = ''
     pendingReasoning = ''
-    // 秒表基准 = 用户按下发送这一刻（now），不是服务端返回 run_id 之后：
-    // POST 同步阻塞是同一次等待的一部分，必须计入执行时长。
-    runStartedAtMs = now
     set((s) => ({
       messages: [...s.messages, userMsg, assistantMsg],
       streaming: true,
@@ -550,8 +591,9 @@ export const useChat = create<ChatState>((set, get) => {
       lastError: null,
       approval: null,
       // 三阶段推进：posting →（拿到 run_id）connecting →（SSE open）waiting
+      // 注意：**不再**在这里记「运行开始时刻」——执行时长一律以本轮 user 消息的
+      // createdAt 为基准（见 LiveProgress 的计时基准铁律），避免切对话后时长重开。
       runPhase: 'posting' as RunPhase,
-      runStartedAt: now,
     }))
 
     const onStreamEvent = makeStreamEventHandler(sessionId)
@@ -560,8 +602,8 @@ export const useChat = create<ChatState>((set, get) => {
     cancelPending = false
     // 订阅开始：顶栏如实进入「连接中」，此后由 SseClient 状态机接管
     useSse.getState().attachRun(runId)
-    // 模型引用：startRun 入口已保证会话已选模型
-    const modelRef = session.modelRef || undefined
+    // 模型引用：可能为空（未选择模型 → 服务端只保存消息、本轮不回复）
+    const modelRef = session?.modelRef || undefined
     void api
       .startRun({
         sessionId,
@@ -587,8 +629,22 @@ export const useChat = create<ChatState>((set, get) => {
         onSseEventSeq: (seq) => useSse.getState().noteEvent(seq),
       })
       .then((h) => {
+        // 收口竞态守卫：终态可能在本次回调之前就已到达（settleRun 已清指针）。
+        // 此时只回填 id 会留下指向已结束 Run 的幽灵句柄；SSE 侧由服务端
+        // CloseRun → resync 自行收尾，这里直接放弃装配即可（**不要**调 h.stop()，
+        // 对已终态 Run 调停止端点只会换来一次无意义的 409 拒绝）。
+        if (currentRunId === null) {
+          // 这轮已收口：期间排队的「停止」意图一并作废，别漏给下一次正常对话
+          cancelPending = false
+          return
+        }
         handle = h
         currentRunId = h.runId
+        // 自动标题回填（2026-11 缺陷：发任何消息对话名仍叫「新对话」）：
+        // 服务端在创建 Run 前已用首条消息正文生成标题并落库，但 202 回包只有
+        // run_id/status，不带 title —— 不主动 GET 一次，本地就永远停在乐观壳的
+        // 「新对话」，直到用户刷新页面才「突然」变成正文。失败静默，不打扰用户。
+        void useSessions.getState().refreshTitle(sessionId)
         // POST 已返回（run_id 到手）、SSE 已开始建连 → 静默期进入第二段。
         // 只从 posting 推进，不覆盖已到 waiting 的状态（SSE 若已 open，onSseState 会先接管）。
         if (get().runPhase === 'posting') set({ runPhase: 'connecting' as RunPhase })
@@ -596,7 +652,9 @@ export const useChat = create<ChatState>((set, get) => {
         if (useSse.getState().runId && useSse.getState().runId !== h.runId) useSse.getState().retargetRun(h.runId)
         if (cancelPending) {
           cancelPending = false
-          h.stop()
+          // 走完整 stop() 而不是只 h.stop()：本地状态（进行中的工具卡片、流式消息、
+          // runPhase）必须与服务端同步收口，否则「点了停止→界面仍显示执行中」。
+          get().stop()
         }
       })
       .catch((err: unknown) => {
@@ -620,25 +678,11 @@ export const useChat = create<ChatState>((set, get) => {
     cachedTokens: 0,
     lastError: null,
     runPhase: 'idle' as RunPhase,
-    runStartedAt: 0,
     draft: '',
 
     setDraft: (text) => set({ draft: text }),
 
     messagesOf: (sessionId) => get().messages.filter((m) => m.sessionId === sessionId && !m.reverted),
-
-    /**
-     * 当前 Run 已执行的步数（会话内 assistant 消息条数）。
-     *
-     * 用途：进度条上的「第 N 步」。服务端每个 step 都会追加一条 assistant 消息
-     * （chatStore 的 'step' 分支），所以这个计数天然与真实执行步数对齐，
-     * 不需要新增状态字段，也不会与 messages 产生两份真相。
-     */
-    currentStepCount: () => {
-      const sid = useSessions.getState().currentId
-      if (!sid) return 0
-      return get().messages.filter((m) => m.sessionId === sid && m.role === 'assistant').length
-    },
 
     // 以 DB 为准重拉消息快照：断线重连（resync）后覆盖本地流式态
     reloadMessages: async (sessionId) => {
@@ -696,13 +740,14 @@ export const useChat = create<ChatState>((set, get) => {
         flush()
         set({
           streaming: false, runStatus: 'completed', reasoning: '', approval: null,
-          runPhase: 'idle' as RunPhase, runStartedAt: 0,
+          runPhase: 'idle' as RunPhase,
         })
         streamingMsgId = null
         currentRunId = null
         currentRunSessionId = null
         handle = null
-        runStartedAtMs = 0
+        // 切换会话即放弃上一轮的收口语义标记（未选模型的空 reply 摘壳已无对象）
+        noModelRun = false
         useSse.getState().detachRun()
       }
       let active: ActiveRunDTO | null = null
@@ -711,7 +756,13 @@ export const useChat = create<ChatState>((set, get) => {
       } catch {
         return // 查询失败不打扰用户：保持空闲态，绝不展示假运行
       }
-      if (!active?.run_id) return
+      if (!active?.run_id) {
+        // 服务端已无进行中 Run，但历史回灌里仍有 pending 的工具卡片（停止/崩溃时
+        // tool 消息没落库 → toUiMessages 只能标 pending）→ 卡片会永远显示「等待/执行中」。
+        // 权威事实是「该会话没有在跑的 Run」，故就地收口为 cancelled。
+        settleStaleToolCalls(sessionId)
+        return
+      }
       // 查询期间用户可能已自行发起新对话（同样的会话）——此时本地是更新的真相，不覆盖
       if (get().streaming && currentRunId && currentRunSessionId === sessionId) return
 
@@ -738,18 +789,15 @@ export const useChat = create<ChatState>((set, get) => {
       stepStartAt = now
       pendingText = ''
       pendingReasoning = ''
-      // 刷新恢复：Run 已在服务端跑了一段时间，但前端拿不到服务端起始时刻
-      // （ActiveRunDTO 无 createdAt），故以「恢复这一刻」为基准诚实计时，
-      // 绝不编造一个更早的时间让时长看起来更完整。
-      runStartedAtMs = now
       set((s) => ({
         streaming: true,
         runStatus: active?.status === 'waiting_approval' ? 'waiting_approval' : 'running',
         reasoning: '',
         lastError: null,
-        // 恢复的 Run 早已过了 POST/建连阶段，直接进「等模型输出」
+        // 恢复的 Run 早已过了 POST/建连阶段，直接进「等模型输出」。
+        // 注意：执行时长**不在这里记时**——视图层一律以本轮 user 消息的
+        // createdAt 为基准，所以刷新恢复后时长依然接着走，不会从 0 重开。
         runPhase: 'waiting' as RunPhase,
-        runStartedAt: now,
         messages: s.messages.map((m) => (m.id === streamingMsgId ? { ...m, streaming: true } : m)),
       }))
       // 顶栏如实进入「连接中」，此后由 SseClient 状态机接管
@@ -827,11 +875,14 @@ export const useChat = create<ChatState>((set, get) => {
         if (get().streaming) cancelPending = true
         return
       }
+      // 主动停止：清掉「未选模型」标记，避免污染下一次正常对话的收口判定
+      noModelRun = false
       // 服务端 Run 真实停止（打 stop 端点）
       handle.stop()
       handle = null
       flush()
       const id = streamingMsgId
+      const stoppedRunId = currentRunId
       streamingMsgId = null
       currentRunId = null
       currentRunSessionId = null
@@ -842,14 +893,33 @@ export const useChat = create<ChatState>((set, get) => {
         runStatus: 'cancelled',
         approval: null,
         reasoning: '',
-        // 主动停止同样要归零阶段与秒表（否则进度条会一直转）
+        // 主动停止归零阶段：否则「加载中」文案会一直留着
         runPhase: 'idle' as RunPhase,
-        runStartedAt: 0,
-        messages: s.messages.map((m) =>
-          m.id === id ? { ...m, streaming: false, durationMs: Date.now() - stepStartAt } : m,
-        ),
+        messages: s.messages.map((m) => {
+          // ① 结算流式消息（停转圈 + 记耗时）
+          const settled =
+            m.id === id ? { ...m, streaming: false, durationMs: Date.now() - stepStartAt } : m
+          // ② 收口「进行中」的工具卡片（2026-11 修复）：
+          //    停止后 SSE 已断开，绝不会再收到 tool.result —— 后端已把 tool_events 收口为
+          //    error（RunService.StopRun → FailOpenByRun），前端必须同口径落定，
+          //    否则卡片永远显示「执行中…」，用户以为命令还在跑。
+          if (!settled.toolCalls?.length) return settled
+          // 归属判定必须是「或」：本地乐观消息壳的 runId 是 `run-<ts>`，服务端真实 runId
+          // 回填在 currentRunId 与后续 step 消息上，两者并存 → 只判其一会漏掉另一半。
+          const mine = settled.id === id || (Boolean(stoppedRunId) && settled.runId === stoppedRunId)
+          if (!mine) return settled
+          return {
+            ...settled,
+            toolCalls: settled.toolCalls.map((c) =>
+              c.status === 'pending' || c.status === 'running'
+                ? { ...c, status: 'cancelled' as ToolCall['status'], result: c.result ?? '已停止（用户中断）' }
+                : c,
+            ),
+          }
+        }),
       }))
-      runStartedAtMs = 0
+      // 命令行面板与工具卡片同源，同步收口一次
+      syncWorkspaceFromMessages()
       useUI.getState().toast('info', '已停止本次运行（Run 标记为 cancelled）')
     },
 

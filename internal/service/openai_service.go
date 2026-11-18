@@ -212,13 +212,26 @@ func (s *OpenAICompatService) resolveSession(ctx context.Context, req *OpenAICha
 	return sess.ID, lastUser, system, nil
 }
 
+// openAICompatModelRef OpenAI 兼容端点的模型口径。
+//
+// 为什么这里要把空 model 折算为 "default"：该端点是对外协议（GET /v1/models
+// 明确返出一个 ID="default" 的模型，客户端不传 model 时语义就是「默认模型」）。
+// 与 Web 界面「未选择模型 = 只保存不回复」的口径**故意不同**：界面是人的显式
+// 选择空值，协议侧是程序调用缺省，混为一谈会让 SDK 调用拿到空回复。
+func openAICompatModelRef(model string) string {
+	if strings.TrimSpace(model) == "" {
+		return "default"
+	}
+	return model
+}
+
 // Chat 非流式：同步执行到终态，返回 OpenAI 形状响应。
 func (s *OpenAICompatService) Chat(ctx context.Context, req OpenAIChatRequest, sessionID string) (*OpenAIChatResponse, error) {
 	sid, input, system, err := s.resolveSession(ctx, &req, sessionID)
 	if err != nil {
 		return nil, err
 	}
-	run, err := s.runs.CreateRunWithSystem(ctx, sid, input, req.Model, "", system)
+	run, err := s.runs.CreateRunWithSystem(ctx, sid, input, openAICompatModelRef(req.Model), "", system)
 	if err != nil {
 		return nil, err
 	}
@@ -255,7 +268,7 @@ func (s *OpenAICompatService) ChatStream(ctx context.Context, req OpenAIChatRequ
 	if err != nil {
 		return err
 	}
-	run, err := s.runs.CreateRunWithSystem(ctx, sid, input, req.Model, "", system)
+	run, err := s.runs.CreateRunWithSystem(ctx, sid, input, openAICompatModelRef(req.Model), "", system)
 	if err != nil {
 		return err
 	}
