@@ -9,18 +9,18 @@ import (
 	"harness-go/pkg/toolapi"
 )
 
-// TestTodoRoundTrip 写读往返 + 状态图标。
+// TestTodoRoundTrip 写读往返 + 状态图标（单工具：传 items 写，不传则读）。
 func TestTodoRoundTrip(t *testing.T) {
 	h := plugintest.New(t)
 	ctx := context.Background()
 
-	// 读：空清单
-	res, _ := invokeRead(ctx, h, &toolapi.Call{})
+	// 读：空清单（不传 items）
+	res, _ := invoke(ctx, h, &toolapi.Call{})
 	if !strings.Contains(res.Content, "无任务清单") {
 		t.Fatalf("空清单口径错误: %q", res.Content)
 	}
-	// 写
-	res, err := invokeWrite(ctx, h, &toolapi.Call{Args: []byte(
+	// 写（传 items）
+	res, err := invoke(ctx, h, &toolapi.Call{Args: []byte(
 		`{"items":[{"content":"实现 fs 插件","status":"done"},{"content":"写测试","status":"in_progress"},{"content":"收尾","status":"pending"}]}`)})
 	if err != nil {
 		t.Fatal(err)
@@ -34,8 +34,8 @@ func TestTodoRoundTrip(t *testing.T) {
 	if err != nil || !strings.Contains(string(data), "in_progress") {
 		t.Fatalf("落盘错误: %v", err)
 	}
-	// 再读
-	res, _ = invokeRead(ctx, h, &toolapi.Call{})
+	// 再读（不传 items）
+	res, _ = invoke(ctx, h, &toolapi.Call{})
 	if !strings.Contains(res.Content, "3. ○ 收尾") {
 		t.Fatalf("回读错误: %q", res.Content)
 	}
@@ -44,15 +44,44 @@ func TestTodoRoundTrip(t *testing.T) {
 // TestTodoValidation 非法状态拒绝。
 func TestTodoValidation(t *testing.T) {
 	h := plugintest.New(t)
-	res, _ := invokeWrite(context.Background(), h, &toolapi.Call{Args: []byte(
+	ctx := context.Background()
+	res, _ := invoke(ctx, h, &toolapi.Call{Args: []byte(
 		`{"items":[{"content":"x","status":"doing"}]}`)})
 	if !res.IsError || !strings.Contains(res.Content, "状态非法") {
 		t.Fatalf("非法状态必须拒绝: %q", res.Content)
 	}
 	// 空内容
-	res, _ = invokeWrite(context.Background(), h, &toolapi.Call{Args: []byte(
+	res, _ = invoke(ctx, h, &toolapi.Call{Args: []byte(
 		`{"items":[{"content":"  ","status":"done"}]}`)})
 	if !res.IsError {
 		t.Fatal("空内容必须拒绝")
+	}
+}
+
+// TestTodoEmptyItemsRejected 显式传空数组必须拒绝（与"不传 items 表示读取"区分）。
+//
+// 这是合并成单工具后最容易搞错的一处：JSON 里 `[]` 与缺省在 Go 解码后
+// 分别是「非 nil 空切片」与「nil 切片」。若两者都当成读取，模型想"清空清单"
+// 时会静默变成"读了一遍"，行为与意图不符且无从察觉。
+func TestTodoEmptyItemsRejected(t *testing.T) {
+	h := plugintest.New(t)
+	res, _ := invoke(context.Background(), h, &toolapi.Call{Args: []byte(`{"items":[]}`)})
+	if !res.IsError || !strings.Contains(res.Content, "items 不能为空") {
+		t.Fatalf("显式空数组必须拒绝（不能当成读取）: isError=%v %q", res.IsError, res.Content)
+	}
+}
+
+// TestManifestDeclaresSingleTool 清单必须只声明一个 todo 工具。
+//
+// 提示词里教模型调用的名字就是 `todo`；manifest 若仍是 todo_write/todo_read，
+// 模型按提示词调用会拿到「工具未注册」的软失败（本包正是为此归一）。
+func TestManifestDeclaresSingleTool(t *testing.T) {
+	tools := Manifest().Tools
+	if len(tools) != 1 || tools[0].Name != "todo" {
+		names := make([]string, 0, len(tools))
+		for _, s := range tools {
+			names = append(names, s.Name)
+		}
+		t.Fatalf("manifest 必须只声明 todo 一个工具，实际: %v", names)
 	}
 }

@@ -96,7 +96,7 @@ export function SidePanel() {
 function TaskListPanel({ mode }: { mode: 'todo' | 'plan' }) {
   const { todos, toggleTodo, plans } = useWorkspace()
   const activePlan = plans.find((p) => p.active)
-  // 清单来自 agent 的 todo_write 工具调用（后端唯一真源），
+  // 清单来自 agent 的 todo 工具调用（后端唯一真源），
   // 本地勾选没有任何回写端点，下一次工具事件派生即被覆盖 → 只读展示，不做假交互。
 
   if (mode === 'todo') {
@@ -104,7 +104,7 @@ function TaskListPanel({ mode }: { mode: 'todo' | 'plan' }) {
       return (
         <div className="py-6 text-center text-[12px] text-inkfaint">
           本轮对话暂无任务清单
-          <div className="mt-1 text-[11px]">agent 调用 todo_write 写入清单后，此处会实时出现</div>
+          <div className="mt-1 text-[11px]">agent 调用 todo 写入清单后，此处会实时出现</div>
         </div>
       )
     }
@@ -124,7 +124,7 @@ function TaskListPanel({ mode }: { mode: 'todo' | 'plan' }) {
                 'w-full flex items-start gap-2 rounded-lg border border-edge px-2.5 py-2 text-left transition-colors',
                 'w-full flex items-start gap-2 rounded-lg border border-edge px-2.5 py-2 text-left transition-colors cursor-default',
               )}
-              title="状态以 agent 的 todo_write 为准（服务端无单项回写端点）"
+              title="状态以 agent 的 todo 为准（服务端无单项回写端点）"
             >
               {t.status === 'done'
                 ? <Check size={13} className="mt-0.5 text-ok shrink-0" />
@@ -147,7 +147,7 @@ function TaskListPanel({ mode }: { mode: 'todo' | 'plan' }) {
     return (
       <div className="py-6 text-center text-[12px] text-inkfaint">
         当前没有进行中的方案
-        <div className="mt-1 text-[11px]">agent 调用 plan_set 登记计划后，此处会实时出现</div>
+        <div className="mt-1 text-[11px]">agent 调用 create_plan 登记计划后，此处会实时出现</div>
       </div>
     )
   }

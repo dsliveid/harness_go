@@ -1,4 +1,4 @@
-﻿/**
+/**
  * harness-go API 类型与路径常量 —— **由 `api/openapi.yaml` 人工对齐生成**。
  *
  * 契约铁律（docs/protocols.md §3）：
@@ -385,7 +385,7 @@ export interface SkillListResponseDTO {
   dir: string;
 }
 
-/** POST /api/v1/skills 入参（与 Agent 的 skill_save 工具同形）。 */
+/** POST /api/v1/skills 入参（与 Agent 的 save_skill 工具同形）。 */
 export interface SkillSaveRequestDTO {
   name: string;
   description: string;

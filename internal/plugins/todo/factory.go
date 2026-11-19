@@ -28,8 +28,7 @@ func Factory() toolapi.Factory {
 			M:    Manifest(),
 			Host: host,
 			Invokes: map[string]pluginkit.InvokeFunc{
-				"todo_write": invokeWrite,
-				"todo_read":  invokeRead,
+				"todo": invoke,
 			},
 		}, nil
 	}}

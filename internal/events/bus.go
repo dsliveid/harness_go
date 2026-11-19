@@ -22,7 +22,7 @@ type Type string
 
 const (
 	// Run 生命周期
-	TypeRunStatus Type = "run.status" // payload: {status, stop_reason, error_code}
+	TypeRunStatus Type = "run.status" // payload: {status, stop_reason, error_code, input_tokens, output_tokens, cached_tokens, is_estimated}
 
 	// 消息
 	TypeMessageStart Type = "message.start" // payload: {message_id, role, seq}
@@ -31,7 +31,11 @@ const (
 	// payload: {message_id, delta}；与 delta 同语义「不落库、仅预览」，
 	// 最终完整文本随 message.end 的 reasoning 字段与 DB 快照下发。
 	TypeMessageReasoning Type = "message.reasoning"
-	TypeMessageEnd       Type = "message.end" // payload: {message_id, content, token_count, reasoning}
+	// payload: {message_id, content, token_count, reasoning,
+	//           prompt_tokens, cached_tokens, completion_tokens, duration_ms}
+	// 后四项为步级用量（2026-11 新增，向后兼容）：token_count = 输入 + 输出；
+	// 前端底部指标栏的「本轮 token / 缓存命中率 / 步耗时」直接消费它们。
+	TypeMessageEnd Type = "message.end"
 	// TypeMessageAppended 运行中引导消息已落库（需求 §4.2 引导：引擎轮次边界回灌上下文）。
 	// payload: {message_id, role, content, seq}；前端以 reloadMessages/POST 响应对齐，不驱动流式 UI。
 	TypeMessageAppended Type = "message.appended"
@@ -39,7 +43,10 @@ const (
 	// 工具
 	TypeToolStarted  Type = "tool.started"  // payload: {tool_event_id, tool_name, args, risk}
 	TypeToolProgress Type = "tool.progress" // payload: {tool_event_id, chunk}
-	TypeToolResult   Type = "tool.result"   // payload: {tool_event_id, status, result, truncated}
+	// payload: {tool_event_id, status, result, error, duration_ms, executor, device_id, source_trust}
+	// duration_ms（2026-11 新增）：工具执行耗时，与 tool_events 的 ended_at - started_at 同源。
+	// 缺它时前端工具卡片的耗时徽标在实时流里永远不出现（只有刷新后查历史才有值）。
+	TypeToolResult Type = "tool.result"
 
 	// 审批
 	TypeApprovalRequest  Type = "approval.request"  // payload: {approval_id, tool_event_id, tool_name, risk}

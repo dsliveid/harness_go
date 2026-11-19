@@ -46,6 +46,48 @@ type Entry struct {
 	Mode    fs.FileMode `json:"mode"`
 }
 
+// ToolCatalogHost 可选的「工具目录」能力（由 Host 额外实现）。
+//
+// # 为什么需要它
+//
+// 提示词把工具分成三档注入（core 全量 / deferred 只给名字 / on_demand 零注入）。
+// 后两档的模型**看不到 schema**，而索引段又明确写着「可按需调用的工具」——
+// 若没有任何取 schema 的手段，这句话就是空头承诺：模型只能盲猜参数。
+//
+// 本端口为 lookup_tool 提供**唯一的 schema 真源**（直接读注册表，不另建副本），
+// 让 deferred / on_demand 真正"可自举"。
+//
+// 🚨 刻意保持**可选**（与 ContextWorkspace 同一手法）：只实现 Host 的桩
+// （测试、第三方）依旧编译通过；断言失败时 lookup_tool 返回明确的
+// "能力未接线"，而不是崩溃或假装成功（渐进增强，非硬切换）。
+type ToolCatalogHost interface {
+	// ToolSpecs 返回全部已注册工具规格（含 tier / risk / schema）。
+	ToolSpecs() []Spec
+}
+
+// MemoryIndexer 可选的「记忆索引同步」能力（由 Host 额外实现）。
+//
+// # 为什么写侧插件需要它
+//
+// 记忆的文件是唯一真源，检索索引由内核维护。改造前索引只在**进程启动时**
+// 同步一次，于是会话中新写的记忆要等重启才能被召回 —— "边读边记"在
+// 单次对话内实际不生效，而使用者只会觉得"记了却没记住"。
+//
+// 本端口让写侧在落盘成功后立刻把这一条推进索引。
+//
+// 🚨 铁律：只同步**索引**（可见性），绝不触发**注入**。
+// 注入快照在 Run 边界冻结，本轮不会因新写入而改变 —— 否则会把模型刚写的
+// 内容再喂回给它（自我重复），且 MemoryCore 变动会击穿 provider 前缀缓存。
+//
+// 刻意保持可选（与 ContextWorkspace / ToolCatalogHost 同一手法）：
+// 未实现时写侧应回落到"仅落盘"并如实告知回执，绝不假装已进索引。
+type MemoryIndexer interface {
+	// IndexMemoryFile 把一个已落盘的记忆文件推进检索索引。
+	// layer 为记忆层目录名（core / project / notes / archive），fileName 为文件名。
+	// 返回 (是否已进索引, 说明信息)。
+	IndexMemoryFile(ctx context.Context, layer, fileName string) (bool, string)
+}
+
 // Workspace 工作区文件访问（所有路径均为相对工作区根，越界即拒绝）。
 type Workspace interface {
 	// Root 返回工作区绝对根路径（只读，插件不得据此绕过沙箱）。

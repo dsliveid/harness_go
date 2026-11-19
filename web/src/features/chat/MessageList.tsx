@@ -296,8 +296,17 @@ function TurnFooterBar({ turn, streaming, actions, showCopy, turnStartedAt }: {
   const totalTokens = items.reduce((a, m) => a + (m.tokens ?? 0), 0)
   const totalPrompt = items.reduce((a, m) => a + (m.promptTokens ?? 0), 0)
   const totalCached = items.reduce((a, m) => a + (m.cachedTokens ?? 0), 0)
-  const rateBase = totalPrompt > 0 ? totalPrompt : totalTokens
-  const cacheRate = rateBase > 0 ? Math.round((totalCached / rateBase) * 1000) / 10 : 0
+  // 缓存命中率分母**只认输入 token**（Provider usage 语义：cached 是 prompt 的子集）。
+  // 无输入用量时不得退化为「总 tokens」当分母——那会把输出也算进分母，
+  // 命中率被系统性低估（如 100 输入全命中 + 900 输出会显示 10% 而非 100%）。
+  const hasPromptUsage = totalPrompt > 0
+  // 是否「上游确实汇报过缓存用量」：cachedTokens 为 undefined 表示该端点根本不返回
+  // 缓存明细。此时强行展示「0.0% 缓存」会让用户误以为「缓存完全没命中」，
+  // 而事实是「无此能力」——两种语义必须区分开（原型 mock 恒有该字段）。
+  const hasCacheInfo = items.some((m) => m.cachedTokens !== undefined)
+  const cacheRate = hasPromptUsage ? Math.round((totalCached / totalPrompt) * 1000) / 10 : 0
+  // 输出 token 只能由「总量 − 输入」推算，且输入未知时不可推算（否则显示成总量）
+  const totalOutput = hasPromptUsage ? Math.max(0, totalTokens - totalPrompt) : 0
   const totalMs = items.reduce((a, m) => a + (m.durationMs ?? 0), 0)
   const editFiles = items
     .flatMap((m) => m.toolCalls ?? [])
@@ -360,23 +369,41 @@ function TurnFooterBar({ turn, streaming, actions, showCopy, turnStartedAt }: {
           <span>正在执行... {formatDuration(liveElapsed) || '0.1s'}</span>
         </span>
       ) : totalMs > 0 ? (
-        <span className="inline-flex items-center gap-1 font-mono text-inkfaint cursor-default select-none px-1.5 py-0.5" title="整轮执行总耗时（含全部步骤与工具执行）">
+        <span
+          className="inline-flex items-center gap-1 font-mono text-inkfaint cursor-default select-none px-1.5 py-0.5"
+          title="本轮模型调用累计耗时（各步耗时之和，不含工具执行时间；服务端计时，刷新后仍可复现）"
+        >
           <Clock size={11} className="opacity-75" />
           <span>{formatStepMs(totalMs)}</span>
         </span>
       ) : null}
 
       {totalTokens > 0 && (
-        <span className="inline-flex items-center gap-1 font-mono text-inkfaint cursor-default select-none shrink-0 px-1.5 py-0.5" title={`本轮累计消耗 ${totalTokens} tokens（含全部步骤）`}>
+        <span
+          className="inline-flex items-center gap-1 font-mono text-inkfaint cursor-default select-none shrink-0 px-1.5 py-0.5"
+          title={[
+            `本轮累计消耗 ${totalTokens.toLocaleString('zh-CN')} tokens（含全部步骤）`,
+            ...(hasPromptUsage
+              ? [`输入: ${totalPrompt.toLocaleString('zh-CN')} · 输出: ${totalOutput.toLocaleString('zh-CN')}`]
+              : []),
+            ...(hasCacheInfo && hasPromptUsage
+              ? [`缓存命中: ${totalCached.toLocaleString('zh-CN')}（${cacheRate.toFixed(1)}%）`]
+              : []),
+            ...(totalMs > 0 ? [`模型调用累计耗时: ${formatStepMs(totalMs)}`] : []),
+          ].join('\n')}
+        >
           <Zap size={11} className="text-amber-400" />
           <span>{formatStepTokens(totalTokens)}</span>
         </span>
       )}
 
-      {totalCached > 0 && (
+      {/* 缓存命中率：**只要上游汇报过缓存用量就展示**（含 0%）。
+          旧实现在 totalCached === 0 时整块隐藏，导致「缓存确实没命中」与
+          「本端点不提供缓存明细」两种语义无法区分，用户以为功能没做。 */}
+      {hasCacheInfo && hasPromptUsage && (
         <span
           className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-accent2/10 text-accent2 font-medium select-none cursor-default shrink-0 text-[11px]"
-          title={`本轮累计消耗 ${totalTokens.toLocaleString()} tokens（含全部步骤）\n输入: ${totalPrompt.toLocaleString()}（缓存命中: ${totalCached.toLocaleString()} · ${cacheRate.toFixed(1)}%）· 输出: ${(totalTokens - totalPrompt).toLocaleString()}`}
+          title={`缓存命中率 = 缓存命中 tokens / 输入 tokens\n本轮命中 ${totalCached.toLocaleString('zh-CN')} / 输入 ${totalPrompt.toLocaleString('zh-CN')}，输出 ${totalOutput.toLocaleString('zh-CN')}`}
         >
           <Zap size={10} />
           <span>{cacheRate.toFixed(1)}% 缓存</span>

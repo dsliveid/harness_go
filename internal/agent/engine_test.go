@@ -310,6 +310,102 @@ func TestEngineCompletesSimpleRun(t *testing.T) {
 	}
 }
 
+// 步级用量贯通不变量（2026-11）：
+// 前端底部指标栏（本轮 token / 缓存命中率 / 步耗时）依赖三处同源数据，
+// 任一处缺失都会让整条指标栏不渲染。本测试一次性锁死三者：
+//  1. message.end 事件带 token_count / prompt_tokens / cached_tokens / duration_ms；
+//  2. assistant 消息落库带 TokenCount（输入+输出）与 usage_json（四元组）；
+//  3. run.status 终态带 cached_tokens（会话账本缓存命中率的分子）。
+func TestEnginePublishesUsageMetrics(t *testing.T) {
+	provider := &fakeProvider{rounds: [][]llm.Chunk{{
+		{Delta: "好"},
+		{Usage: &llm.Usage{PromptTokens: 100, CompletionTokens: 20, TotalTokens: 120, CachedTokens: 64}},
+	}}}
+	eng, sdb, bus, _ := newTestEngine(t, provider)
+
+	sub, err := bus.Subscribe("run-1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer bus.Unsubscribe(sub)
+
+	if err := eng.Execute(context.Background(), baseRunRequest()); err != nil {
+		t.Fatalf("Run 应完成: %v", err)
+	}
+
+	// ① 落库：TokenCount = 输入 + 输出；usage_json 含四元组
+	if len(sdb.messages) != 1 {
+		t.Fatalf("应落 1 条消息，得到 %d", len(sdb.messages))
+	}
+	msg := sdb.messages[0]
+	if msg.TokenCount != 120 {
+		t.Fatalf("消息 TokenCount 应为 输入+输出=120，得到 %d", msg.TokenCount)
+	}
+	if len(msg.UsageJSON) == 0 {
+		t.Fatal("消息 usage_json 不得为空（否则刷新后指标栏整条消失）")
+	}
+	var saved struct {
+		PromptTokens     int64 `json:"prompt_tokens"`
+		CompletionTokens int64 `json:"completion_tokens"`
+		CachedTokens     int64 `json:"cached_tokens"`
+	}
+	if err := json.Unmarshal(msg.UsageJSON, &saved); err != nil {
+		t.Fatalf("usage_json 解析失败: %v", err)
+	}
+	if saved.PromptTokens != 100 || saved.CompletionTokens != 20 || saved.CachedTokens != 64 {
+		t.Fatalf("usage_json 四元组错误: %+v", saved)
+	}
+
+	// ② 事件：message.end 带步级用量；run.status 终态带 cached_tokens
+	var endPayload, statusPayload map[string]any
+	for {
+		ev, ok := <-sub.C()
+		if !ok {
+			break
+		}
+		switch ev.Type {
+		case events.TypeMessageEnd:
+			if err := json.Unmarshal(ev.Payload, &endPayload); err != nil {
+				t.Fatalf("message.end payload 解析失败: %v", err)
+			}
+		case events.TypeRunStatus:
+			var p map[string]any
+			if err := json.Unmarshal(ev.Payload, &p); err != nil {
+				t.Fatalf("run.status payload 解析失败: %v", err)
+			}
+			if p["status"] == string(model.RunCompleted) {
+				statusPayload = p
+			}
+		}
+	}
+	if endPayload == nil {
+		t.Fatal("未收到 message.end")
+	}
+	if got, _ := endPayload["token_count"].(float64); int(got) != 120 {
+		t.Fatalf("message.end token_count 应为 120，得到 %v", endPayload["token_count"])
+	}
+	if got, _ := endPayload["prompt_tokens"].(float64); int(got) != 100 {
+		t.Fatalf("message.end prompt_tokens 应为 100，得到 %v", endPayload["prompt_tokens"])
+	}
+	// cached_tokens 是缓存命中率的分子：缺它前端命中数恒 0
+	if got, _ := endPayload["cached_tokens"].(float64); int(got) != 64 {
+		t.Fatalf("message.end cached_tokens 应为 64，得到 %v", endPayload["cached_tokens"])
+	}
+	if _, ok := endPayload["duration_ms"]; !ok {
+		t.Fatal("message.end 应携带 duration_ms（否则步耗时退化为前端本地计时，刷新即丢）")
+	}
+
+	if statusPayload == nil {
+		t.Fatal("未收到终态 run.status")
+	}
+	if got, _ := statusPayload["cached_tokens"].(float64); int(got) != 64 {
+		t.Fatalf("run.status 终态 cached_tokens 应为 64，得到 %v", statusPayload["cached_tokens"])
+	}
+	if got, _ := statusPayload["input_tokens"].(float64); int(got) != 100 {
+		t.Fatalf("run.status 终态 input_tokens 应为 100，得到 %v", statusPayload["input_tokens"])
+	}
+}
+
 // 上下文取消 → cancelled（不是 failed）。
 //
 // 【2026-11 修复】此处曾只验证 DB 终态，但 DB 终态此前是靠**未被取消的** fake 实现的

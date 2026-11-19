@@ -27,9 +27,9 @@ func Factory() toolapi.Factory {
 			M:    Manifest(),
 			Host: host,
 			Invokes: map[string]pluginkit.InvokeFunc{
-				"skill_list": invokeList,
-				"skill_read": invokeRead,
-				"skill_save": invokeSave,
+				"list_skills": listSkills,
+				"run_skill":   runSkill,
+				"save_skill":  saveSkill,
 			},
 		}, nil
 	}}

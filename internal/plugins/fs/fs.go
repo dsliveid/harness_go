@@ -23,12 +23,12 @@ const (
 	maxReadBytes = 512 << 10
 )
 
-// invokeReadFile 读取文件（行号标注 + offset/limit 分段）。
+// invokeReadFile 读取文件（行号标注 + offset_line/max_lines 分段）。
 func invokeReadFile(ctx context.Context, host toolapi.Host, call *toolapi.Call) (*toolapi.Result, error) {
 	var args struct {
-		Path   string `json:"path"`
-		Offset int    `json:"offset"`
-		Limit  int    `json:"limit"`
+		Path      string `json:"path"`
+		OffsetLine int   `json:"offset_line"`
+		MaxLines   int   `json:"max_lines"`
 	}
 	if err := pluginkit.DecodeArgs(call.Args, &args); err != nil {
 		return pluginkit.ErrorResult("read_file: %v", err), nil
@@ -45,11 +45,11 @@ func invokeReadFile(ctx context.Context, host toolapi.Host, call *toolapi.Call) 
 	}
 	text := strings.ReplaceAll(string(data), "\r\n", "\n")
 	lines := strings.Split(text, "\n")
-	offset := args.Offset
+	offset := args.OffsetLine
 	if offset < 1 {
 		offset = 1
 	}
-	limit := args.Limit
+	limit := args.MaxLines
 	if limit <= 0 {
 		limit = defaultReadLimit
 	}
@@ -187,12 +187,13 @@ func invokeWriteFile(ctx context.Context, host toolapi.Host, call *toolapi.Call)
 	return res, nil
 }
 
-// invokeEditFile 精确替换编辑（old_string 唯一命中语义）。
+// invokeEditFile 精确替换编辑（old_string 唯一命中；replace_all=true 时全量替换）。
 func invokeEditFile(ctx context.Context, host toolapi.Host, call *toolapi.Call) (*toolapi.Result, error) {
 	var args struct {
-		Path      string `json:"path"`
-		OldString string `json:"old_string"`
-		NewString string `json:"new_string"`
+		Path       string `json:"path"`
+		OldString  string `json:"old_string"`
+		NewString  string `json:"new_string"`
+		ReplaceAll bool   `json:"replace_all"`
 	}
 	if err := pluginkit.DecodeArgs(call.Args, &args); err != nil {
 		return pluginkit.ErrorResult("edit_file: %v", err), nil
@@ -210,14 +211,25 @@ func invokeEditFile(ctx context.Context, host toolapi.Host, call *toolapi.Call) 
 	}
 	text := strings.ReplaceAll(string(data), "\r\n", "\n")
 	count := strings.Count(text, args.OldString)
-	switch count {
-	case 0:
+	switch {
+	case count == 0:
 		return pluginkit.ErrorResult("edit_file: old_string 在 %s 中未命中（先 read_file 确认原文）", args.Path), nil
-	case 1:
+	case count == 1:
+		// 唯一命中：这两条路径行为等价，直接走单次替换。
+	case args.ReplaceAll:
+		// 显式要求全量替换：不再要求唯一性。
+		// 这是"唯一命中"约束的唯一合法出口——缺了它，批量替换只能靠模型
+		// 手动重复调用 N 次，既慢又容易漏（且每次都要求唯一，直接死循环）。
 	default:
-		return pluginkit.ErrorResult("edit_file: old_string 在 %s 中命中 %d 次，必须唯一（扩大上下文或改用 write_file）", args.Path, count), nil
+		return pluginkit.ErrorResult("edit_file: old_string 在 %s 中命中 %d 次，必须唯一"+
+			"（扩大上下文，或传 replace_all=true 全量替换）", args.Path, count), nil
 	}
-	newText := strings.Replace(text, args.OldString, args.NewString, 1)
+	var newText string
+	if args.ReplaceAll {
+		newText = strings.ReplaceAll(text, args.OldString, args.NewString)
+	} else {
+		newText = strings.Replace(text, args.OldString, args.NewString, 1)
+	}
 	before, eRes := anchorSnapshots(ctx, host, "edit_file", args.Path)
 	if eRes != nil {
 		return eRes, nil
@@ -335,13 +347,15 @@ func skipGlobDir(name string) bool {
 	return false
 }
 
-// invokeGrep 全文检索。
+// invokeGrep 全文检索（支持文件名过滤与上下文行）。
 func invokeGrep(ctx context.Context, host toolapi.Host, call *toolapi.Call) (*toolapi.Result, error) {
 	var args struct {
-		Pattern    string `json:"pattern"`
-		Path       string `json:"path"`
-		Literal    bool   `json:"literal"`
-		MaxResults int    `json:"max_results"`
+		Pattern      string `json:"pattern"`
+		Path         string `json:"path"`
+		Literal      bool   `json:"literal"`
+		MaxResults   int    `json:"max_results"`
+		Include      string `json:"include"`
+		ContextLines int    `json:"context_lines"`
 	}
 	if err := pluginkit.DecodeArgs(call.Args, &args); err != nil {
 		return pluginkit.ErrorResult("grep: %v", err), nil
@@ -352,6 +366,24 @@ func invokeGrep(ctx context.Context, host toolapi.Host, call *toolapi.Call) (*to
 	maxHits := args.MaxResults
 	if maxHits <= 0 {
 		maxHits = defaultGrepHits
+	}
+	// context_lines 硬性夹在 0~5：上下文是"看清一行周围"，不是"把整个文件搬进上下文"。
+	// 上限写死而非交给调用方，避免一次 grep 把预算吃光。
+	ctxLines := args.ContextLines
+	if ctxLines < 0 {
+		ctxLines = 0
+	}
+	if ctxLines > 5 {
+		ctxLines = 5
+	}
+	// include 用 globsyntax 编译（与 glob 工具同一套语法，避免"两处 glob 规则漂移"）。
+	var includePat *globsyntax.Pattern
+	if inc := strings.TrimSpace(args.Include); inc != "" {
+		pat, cerr := globsyntax.Compile(inc)
+		if cerr != nil {
+			return pluginkit.ErrorResult("grep: include 模式语法错误: %v（支持的写法：* / ** / ? / {a,b} / [abc]）", cerr), nil
+		}
+		includePat = pat
 	}
 	expr := args.Pattern
 	if args.Literal {
@@ -382,7 +414,9 @@ func invokeGrep(ctx context.Context, host toolapi.Host, call *toolapi.Call) (*to
 		}
 		name := d.Name()
 		if d.IsDir() {
-			if name == ".git" || name == "node_modules" || name == "data" {
+			// 与 glob 侧共用同一张跳过表：两处各写一套必然漂移
+			// （曾出现 grep 跳过 node_modules 而 glob 不跳的情形）。
+			if name == "data" || skipGlobDir(name) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -390,21 +424,28 @@ func invokeGrep(ctx context.Context, host toolapi.Host, call *toolapi.Call) (*to
 		if isSkippableExt(filepath.Ext(name)) {
 			return nil
 		}
+		rel, rerr := filepath.Rel(root, path)
+		if rerr != nil {
+			return nil
+		}
+		relSlash := filepath.ToSlash(rel)
+		// include 过滤：按相对路径匹配（支持 **/*.go 这类跨目录写法）。
+		if includePat != nil && !includePat.Match(relSlash) {
+			return nil
+		}
 		data, rerr := os.ReadFile(path)
 		if rerr != nil || len(data) > 2<<20 || isBinary(data) {
 			return nil
 		}
 		scanned++
-		rel, rerr := filepath.Rel(root, path)
-		if rerr != nil {
-			return nil
-		}
-		for i, line := range strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n") {
-			if re.MatchString(line) {
-				hits = append(hits, fmt.Sprintf("%s:%d: %s", filepath.ToSlash(rel), i+1, pluginkit.FirstLine(line, 200)))
-				if len(hits) >= maxHits {
-					break
-				}
+		lines := strings.Split(strings.ReplaceAll(string(data), "\r\n", "\n"), "\n")
+		for i, line := range lines {
+			if !re.MatchString(line) {
+				continue
+			}
+			hits = append(hits, formatGrepHit(relSlash, i, lines, ctxLines))
+			if len(hits) >= maxHits {
+				break
 			}
 		}
 		return nil
@@ -417,6 +458,35 @@ func invokeGrep(ctx context.Context, host toolapi.Host, call *toolapi.Call) (*to
 		truncated = fmt.Sprintf("\n…[达到上限 %d 条]", maxHits)
 	}
 	return pluginkit.TextResult("命中 %d 条：\n%s%s", len(hits), strings.Join(hits, "\n"), truncated), nil
+}
+
+// formatGrepHit 渲染一条命中；ctxLines>0 时附上前后文并标注命中行。
+//
+// 输出形态刻意保持 `path:line: 内容` 的既有契约（前端与模型都依赖），
+// 上下文行以 `  ` 前缀缩进区分，命中行以 `>` 标记，保证机器与人都能读。
+func formatGrepHit(rel string, lineIdx int, lines []string, ctxLines int) string {
+	head := fmt.Sprintf("%s:%d: %s", rel, lineIdx+1, pluginkit.FirstLine(lines[lineIdx], 200))
+	if ctxLines == 0 {
+		return head
+	}
+	var b strings.Builder
+	b.WriteString(head)
+	start := lineIdx - ctxLines
+	if start < 0 {
+		start = 0
+	}
+	end := lineIdx + ctxLines
+	if end >= len(lines) {
+		end = len(lines) - 1
+	}
+	for i := start; i <= end; i++ {
+		prefix := "  "
+		if i == lineIdx {
+			prefix = "> "
+		}
+		b.WriteString(fmt.Sprintf("\n  %s%d| %s", prefix, i+1, pluginkit.FirstLine(lines[i], 200)))
+	}
+	return b.String()
 }
 
 // workspaceRootFor 返回本次调用的生效执行根。

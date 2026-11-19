@@ -1,0 +1,18 @@
+{
+  "id": "toolcatalog",
+  "name": "工具发现",
+  "description": "按名查询任意已注册工具（含 deferred / on_demand 档）的完整参数规范，让按需工具真正可自举",
+  "version": "1.0.0",
+  "kind": "builtin",
+  "default_tier": "core",
+  "protocol_version": 1,
+  "tools": [
+    {
+      "name": "lookup_tool",
+      "description": "查询工具的完整参数规范。系统提示里的「可按需调用的工具」只给了名称与一行描述，调用它们前先用本工具取到参数 Schema；省略 name 可列出全部可用工具名录（按注入档位分组）。",
+      "schema_json": {"type":"object","properties":{"name":{"type":"string","description":"工具名（须与名录完全一致）；省略则列出全部工具名录"}}},
+      "tier": "core",
+      "risk": "readonly"
+    }
+  ]
+}

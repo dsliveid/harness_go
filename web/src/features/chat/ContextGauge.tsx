@@ -155,7 +155,7 @@ export function ContextGauge() {
             <Row label="剩余可用空间:" value={`${remaining.toLocaleString('zh-CN')} tokens`} />
             <Row label="累计输入:" value={`${formatTokens(tokensIn)} tokens`} />
             <Row label="累计输出:" value={`${formatTokens(tokensOut)} tokens`} />
-            {cacheRate > 0 && <Row label="缓存命中:" value={`${formatTokens(cachedTokens)} · ${cacheRate.toFixed(1)}%`} tone="accent2" />}
+            {tokensIn > 0 && <Row label="缓存命中:" value={`${formatTokens(cachedTokens)} · ${cacheRate.toFixed(1)}%`} tone="accent2" />}
           </div>
 
           <div className="mt-2.5 pt-2 border-t border-edge/40 text-[10px] text-inkfaint leading-relaxed">

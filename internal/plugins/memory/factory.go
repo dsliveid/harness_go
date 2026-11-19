@@ -38,8 +38,8 @@ func Factory() toolapi.Factory {
 			M:    Manifest(),
 			Host: host,
 			Invokes: map[string]pluginkit.InvokeFunc{
-				"memory_write": invokeWrite,
-				"memory_list":  invokeList,
+				"record_memory": recordMemory,
+				"read_memory":   readMemory,
 			},
 		}, nil
 	}}

@@ -24,27 +24,27 @@ export const toolList: ToolInfo[] = [
   { group: 'file', name: 'write_file', title: '写入文件', risk: 'write', category: 'builtin', description: '新建文件或整体覆盖写入完整内容；仅用于新文件。' },
   { group: 'file', name: 'edit_file', title: '编辑文件', risk: 'write', category: 'builtin', description: '基于精确原文的最小化替换修改文件。' },
   { group: 'file', name: 'run_command', title: '执行命令', risk: 'danger', category: 'builtin', description: '在工作区目录执行 shell 命令（构建、测试、git 等），禁止破坏性命令。' },
+  { group: 'file', name: 'lookup_tool', title: '查询工具规范', risk: 'readonly', category: 'builtin', description: '按名查询任意工具的完整参数规范（含按需/手动档）；省略 name 列出全部工具名录。' },
   // ---------- 网络与图片 ----------
-  { group: 'net', name: 'web_fetch', title: '网页抓取', risk: 'readonly', category: 'builtin', description: '通过 HTTP/HTTPS 抓取网页并清洗为纯文本（私有网段默认拦截，正文上限 32KB）。' },
+  { group: 'net', name: 'fetch_web_page', title: '网页抓取', risk: 'readonly', category: 'builtin', description: '通过 HTTP/HTTPS 抓取网页并清洗为纯文本（私有网段默认拦截，正文上限 32KB）。' },
   { group: 'net', name: 'save_image', title: '图片落盘', risk: 'write', category: 'builtin', description: '把 base64 图片数据写入工作区（PNG/JPEG/GIF/WebP 魔数校验，非法即拒）。' },
   { group: 'net', name: 'read_image_meta', title: '图片元信息', risk: 'readonly', category: 'builtin', description: '读取工作区图片的格式 / 宽高 / 大小，不经像素识别。' },
   // ---------- 任务与计划 ----------
-  { group: 'plan', name: 'todo_write', title: '更新任务清单', risk: 'write', category: 'builtin', description: '整体覆写任务清单（每项含内容与状态 pending|in_progress|done）。' },
-  { group: 'plan', name: 'todo_read', title: '读取任务清单', risk: 'readonly', category: 'builtin', description: '读取当前任务清单。' },
-  { group: 'plan', name: 'plan_set', title: '设置执行计划', risk: 'write', category: 'builtin', description: '设置 / 更新执行计划（标题 + 步骤列表，步骤可标记完成）。' },
-  { group: 'plan', name: 'plan_get', title: '读取执行计划', risk: 'readonly', category: 'builtin', description: '读取当前执行计划。' },
+  { group: 'plan', name: 'todo', title: '维护任务清单', risk: 'write', category: 'builtin', description: '整体覆写任务清单（每项含内容与状态 pending|in_progress|done）。' },
+  { group: 'plan', name: 'create_plan', title: '创建执行计划', risk: 'write', category: 'builtin', description: '设置 / 更新执行计划（标题 + 步骤列表，步骤可标记完成）。' },
+  { group: 'plan', name: 'read_plan', title: '读取执行计划', risk: 'readonly', category: 'builtin', description: '读取当前执行计划。' },
   // ---------- 长期记忆 ----------
-  { group: 'memory', name: 'memory_write', title: '记录记忆', risk: 'write', category: 'builtin', description: '写入一条记忆（core / notes / archive 三层，启动时同步进检索索引）。' },
-  { group: 'memory', name: 'memory_list', title: '列出记忆', risk: 'readonly', category: 'builtin', description: '列出工作区 .harness/memory/ 下已沉淀的记忆文件。' },
+  { group: 'memory', name: 'record_memory', title: '记录记忆', risk: 'write', category: 'builtin', description: '写入一条记忆（core / notes / archive 三层，启动时同步进检索索引）。' },
+  { group: 'memory', name: 'read_memory', title: '检索记忆', risk: 'readonly', category: 'builtin', description: '列出工作区 .harness/memory/ 下已沉淀的记忆文件。' },
   // ---------- 子 Agent 与协作者 ----------
   { group: 'agent', name: 'spawn_subagent', title: '派生子 Agent', risk: 'write', category: 'builtin', description: '派生子代理执行独立子任务并阻塞等待结果（深度上限 2，禁递归；同会话在途上限 4）。' },
   { group: 'agent', name: 'ask_collaborator', title: '征询协作者', risk: 'write', category: 'builtin', description: '向指定常驻角色发起单次征询（无批量派发 / 等待 / 列举能力）。' },
   // ---------- 决策记录 ----------
   { group: 'decision', name: 'decision_record', title: '记录决策', risk: 'write', category: 'builtin', description: '记录一条关键决策。' },
   { group: 'decision', name: 'decision_list', title: '决策历史', risk: 'readonly', category: 'builtin', description: '列出历史决策（最近在前，默认 20 条）。' },
-  { group: 'skill', name: 'skill_list', title: '查询技能库', risk: 'readonly', category: 'skill', description: '列出全部技能（名称 + 描述首行）。' },
-  { group: 'skill', name: 'skill_read', title: '读取技能', risk: 'readonly', category: 'skill', description: '读取技能全文（.harness/skills/<name>/SKILL.md 正文）。' },
-  { group: 'skill', name: 'skill_save', title: '沉淀技能', risk: 'write', category: 'skill', description: '沉淀 / 更新技能（写 .harness/skills/<name>/SKILL.md：标题行 + 正文步骤）。' },
+  { group: 'skill', name: 'list_skills', title: '查询技能库', risk: 'readonly', category: 'skill', description: '列出全部技能（名称 + 描述首行）。' },
+  { group: 'skill', name: 'run_skill', title: '读取技能', risk: 'readonly', category: 'skill', description: '读取技能全文（.harness/skills/<name>/SKILL.md 正文）。' },
+  { group: 'skill', name: 'save_skill', title: '沉淀技能', risk: 'write', category: 'skill', description: '沉淀 / 更新技能（写 .harness/skills/<name>/SKILL.md：标题行 + 正文步骤）。' },
 ]
 
 // ---------------- 系统内置工具的可安装性（供「插件市场 → 工具」展示与客户端自装） ----------------
@@ -82,7 +82,7 @@ export const toolInstallOverrides: Record<string, {
   browser_text: { mode: '按需下发', deps: ['chromium'], platforms: { windows: true, linux: true, mobile: false }, note: '无头打开 URL 取渲染后文本快照（一期仅文本，不含点击/截图）；仅 PC 端可安装。' },
   save_image: { mode: '按需下发', deps: ['fs_write'], platforms: { windows: true, linux: true, mobile: true }, note: '仅落盘校验（魔数 + 尺寸），不生成图片。' },
   read_image_meta: { mode: '按需下发', deps: ['fs_read'], platforms: { windows: true, linux: true, mobile: true }, note: '只读元信息，不经像素识别。' },
-  skill_save: { platforms: { windows: true, linux: true, mobile: false }, note: '技能沉淀需本地文件写入与脚本运行时，移动端仅支持安装现成技能。' },
+  save_skill: { platforms: { windows: true, linux: true, mobile: false }, note: '技能沉淀需本地文件写入与脚本运行时，移动端仅支持安装现成技能。' },
 }
 
 export function toolInstallInfo(name: string, group: ToolGroup): ToolInstallMeta {

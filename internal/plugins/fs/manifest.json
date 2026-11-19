@@ -1,7 +1,7 @@
 {
   "id": "fs",
   "name": "文件操作",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "kind": "builtin",
   "description": "工作区文件的读取、写入（带 diff）、精确编辑、目录列举、通配与全文检索",
   "default_tier": "core",
@@ -10,50 +10,50 @@
   "tools": [
     {
       "name": "read_file",
-      "description": "读取工作区内文本文件内容（按行号标注；支持 offset/limit 分段读取大文件）",
-      "schema_json": {"type":"object","properties":{"path":{"type":"string","description":"工作区相对路径"},"offset":{"type":"integer","description":"起始行（1 起，默认 1）"},"limit":{"type":"integer","description":"最多读取行数（默认 2000）"}},"required":["path"]},
+      "description": "读取工作区内文本文件的局部或全部内容（带行号）。修改文件前必须先用它确认精确原文。支持配合 offset_line 与 max_lines 定向阅读目标区域。",
+      "schema_json": {"type":"object","properties":{"path":{"type":"string","description":"相对于工作区的文件路径"},"offset_line":{"type":"integer","description":"起始行（1 开始，默认 1）"},"max_lines":{"type":"integer","description":"读取最大行数（默认 500，可按需指定至 1000 行）"}},"required":["path"]},
       "tier": "core",
       "risk": "readonly"
     },
     {
       "name": "list_dir",
-      "description": "列出目录条目（名称/类型/大小/修改时间）",
-      "schema_json": {"type":"object","properties":{"path":{"type":"string","description":"目录相对路径，默认工作区根"}}},
+      "description": "列出目录下的文件与子目录（含大小）。",
+      "schema_json": {"type":"object","properties":{"path":{"type":"string","description":"相对于工作区的目录路径，默认根目录"}}},
       "tier": "core",
       "risk": "readonly"
     },
     {
       "name": "write_file",
-      "description": "写入（创建或覆盖）工作区文件；返回与旧内容的统一 diff",
-      "schema_json": {"type":"object","properties":{"path":{"type":"string","description":"工作区相对路径"},"content":{"type":"string","description":"完整文件内容"}},"required":["path","content"]},
+      "description": "新建文件或整体覆盖写入完整内容，返回 diff。仅用于新文件，修改已有文件请用 edit_file。",
+      "schema_json": {"type":"object","properties":{"path":{"type":"string","description":"相对于工作区的文件路径"},"content":{"type":"string","description":"完整文件内容"}},"required":["path","content"]},
       "tier": "core",
       "risk": "write"
     },
     {
       "name": "edit_file",
-      "description": "精确字符串替换编辑：old_string 必须在文件中唯一命中，替换为 new_string；返回 diff",
-      "schema_json": {"type":"object","properties":{"path":{"type":"string","description":"工作区相对路径"},"old_string":{"type":"string","description":"待替换原文（必须唯一命中）"},"new_string":{"type":"string","description":"替换后的文本（可为空串表示删除）"}},"required":["path","old_string","new_string"]},
+      "description": "用精确原文替换的方式修改文件（old_string 必须与文件内容逐字符一致），返回 diff。默认要求 old_string 唯一命中；批量替换请传 replace_all=true。",
+      "schema_json": {"type":"object","properties":{"path":{"type":"string","description":"相对于工作区的文件路径"},"old_string":{"type":"string","description":"要替换的精确原文（修改前必须先 read_file 确认）"},"new_string":{"type":"string","description":"替换后的文本"},"replace_all":{"type":"boolean","description":"替换全部出现（默认 false，false 时要求唯一匹配）"}},"required":["path","old_string","new_string"]},
       "tier": "core",
       "risk": "write"
     },
     {
       "name": "glob",
-      "description": "按 glob 模式（如 **/*.go、docs/*.md）匹配工作区文件，返回相对路径列表",
-      "schema_json": {"type":"object","properties":{"pattern":{"type":"string","description":"glob 模式（支持 ** 跨目录）"},"limit":{"type":"integer","description":"最多返回条数（默认 200）"}},"required":["pattern"]},
+      "description": "按 glob 模式（支持 ** 与 *）查找文件，返回相对路径列表。",
+      "schema_json": {"type":"object","properties":{"pattern":{"type":"string","description":"glob 模式，如 src/**/*.rs、*.json；支持 ** 与 *"},"path":{"type":"string","description":"搜索起始目录，默认工作区根目录"}},"required":["pattern"]},
       "tier": "core",
       "risk": "readonly"
     },
     {
       "name": "grep",
-      "description": "全文检索：按正则（默认）或字面量在文本文件中搜索，输出 path:line: 内容",
-      "schema_json": {"type":"object","properties":{"pattern":{"type":"string","description":"搜索模式"},"path":{"type":"string","description":"限定目录（默认工作区根）"},"literal":{"type":"boolean","description":"true=字面量搜索（默认 false=正则）"},"max_results":{"type":"integer","description":"最多命中数（默认 100）"}},"required":["pattern"]},
+      "description": "在工作区文件内容中按正则搜索，返回 `路径:行号: 内容` 列表。支持 include 限定文件、context_lines 查看匹配行周边。",
+      "schema_json": {"type":"object","properties":{"pattern":{"type":"string","description":"正则表达式"},"path":{"type":"string","description":"搜索起始目录，默认工作区根目录"},"include":{"type":"string","description":"文件名过滤 glob，如 *.go 或 src/**/*.ts"},"context_lines":{"type":"integer","description":"匹配行前后额外展示的上下文行数（0~5，默认 0）"},"literal":{"type":"boolean","description":"true=字面量搜索（默认 false=正则）"},"max_results":{"type":"integer","description":"最多命中数（默认 100）"}},"required":["pattern"]},
       "tier": "core",
       "risk": "readonly"
     },
     {
       "name": "file_outline",
-      "description": "提取文件结构大纲（Markdown 标题 / Go 函数与类型 / 通用缩进层级），用于快速了解文件而不读全文",
-      "schema_json": {"type":"object","properties":{"path":{"type":"string","description":"工作区相对路径"}},"required":["path"]},
+      "description": "提取代码文件的结构骨架与大纲（包含类、结构体、接口、枚举、函数签名及起始行号），过滤具体实现细节。在深入阅读代码前优先用它获取全局地图。",
+      "schema_json": {"type":"object","properties":{"path":{"type":"string","description":"相对于工作区的文件路径"}},"required":["path"]},
       "tier": "deferred",
       "risk": "readonly"
     }

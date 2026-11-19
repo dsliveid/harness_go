@@ -1,4 +1,4 @@
-﻿/**
+/**
  * 统一数据访问层。
  *
  * 存在意义：让 UI 只依赖一层「同签名」的 ApiClient，不直接拼 HTTP 细节。
@@ -130,7 +130,7 @@ export type StreamEvent =
   | { type: 'tool_start'; call: ToolCall }
   | { type: 'tool_result'; callId: string; result: string; durationMs: number; diff?: FileDiff; skipped?: boolean; failed?: boolean }
   | { type: 'tool_progress'; callId: string; chunk: string }
-  | { type: 'step'; tokens?: number; promptTokens?: number; cachedTokens?: number; reasoning?: string }
+  | { type: 'step'; tokens?: number; promptTokens?: number; cachedTokens?: number; durationMs?: number; reasoning?: string }
   | { type: 'approval'; approval: Approval }
   | { type: 'done'; tokensIn: number; tokensOut: number; cachedTokens?: number }
   | { type: 'error'; code: string; message: string }
@@ -394,7 +394,7 @@ export interface ApiClient {
   listSkills(): Promise<SkillListResponseDTO>
   /** 技能库：读取单个技能全文 */
   getSkill(name: string): Promise<SkillDetailResponseDTO>
-  /** 技能库：沉淀/覆盖技能（与 Agent 的 skill_save 同源） */
+  /** 技能库：沉淀/覆盖技能（与 Agent 的 save_skill 同源） */
   saveSkill(req: SkillSaveRequestDTO): Promise<SkillView>
   /** 技能库：卸载技能（删除整个技能目录） */
   deleteSkill(name: string): Promise<void>
@@ -837,11 +837,36 @@ export function toUiMessages(list: ApiMessage[], sessionId: string): Message[] {
         : undefined,
       createdAt: m.created_at,
       tokens: m.token_count || undefined,
+      // 消息级用量（历史回放路径）：promptTokens 是缓存命中率分母，
+      // cachedTokens 是分子，durationMs 是步耗时。三者缺任一都会让
+      // TurnFooterBar 的对应徽标消失（服务端此前从不写这两列，导致
+      // 刷新后旧对话底部指标栏整条不见）。
+      ...parseMessageUsage(m.usage),
       // 服务端消息级回滚（S10）置灰的消息：保留可见、上下文组装已排除（hidden）
       ...(m.hidden ? { reverted: true, revertedAt: m.created_at } : {}),
     })
   }
   return out
+}
+
+/**
+ * 从 DB 的 `usage`（null: usage_json）解析消息级用量。
+ *
+ * 服务端写入四元组 `{prompt_tokens, completion_tokens, cached_tokens, duration_ms}`。
+ * 解析失败或字段缺失一律返回空对象 —— **绝不伪造 0**：前端据此决定是否渲染
+ * token/缓存/耗时徽标，把「没有数据」画成「0 tokens」会直接误导用户。
+ */
+function parseMessageUsage(raw: Record<string, unknown> | undefined): {
+  promptTokens?: number
+  cachedTokens?: number
+  durationMs?: number
+} {
+  if (!raw) return {}
+  return {
+    promptTokens: optionalNumber(raw.prompt_tokens),
+    cachedTokens: optionalNumber(raw.cached_tokens),
+    durationMs: optionalNumber(raw.duration_ms),
+  }
 }
 
 /** tool_calls 里 arguments 可能是 JSON 原文串（OpenAI 兼容格式），解析失败按空对象处理。 */
@@ -930,6 +955,19 @@ function parseArgsField(v: unknown): Record<string, unknown> {
   }
 }
 
+/**
+ * 把「可能缺失、可能是 null、可能不是数字」的字段归一成 number | undefined。
+ *
+ * 为什么不用 `Number(x)`：`Number(undefined)` 得 NaN、`Number(null)` 得 0，
+ * 前者会把 undefined 混进 UI 判断、后者会把「字段不存在」伪装成「真实值为 0」
+ * （指标栏就会展示「0 tokens / 0% 缓存 / 0ms」，与「没有数据」完全混淆）。
+ */
+function optionalNumber(v: unknown): number | undefined {
+  if (v === null || v === undefined || v === '') return undefined
+  const n = Number(v)
+  return Number.isFinite(n) ? n : undefined
+}
+
 /** SSE data（即 events.Event.payload）→ UI 流式事件 */
 function mapSseToStreamEvent(type: string, data: string): StreamEvent | null {
   let payload: Record<string, unknown> = {}
@@ -951,6 +989,13 @@ function mapSseToStreamEvent(type: string, data: string): StreamEvent | null {
       return {
         type: 'step',
         tokens: Number(payload.token_count ?? 0),
+        // 步级用量：token_count 是输入+输出总量，prompt_tokens 是缓存命中率分母。
+        // 服务端未下发时一律 undefined（不写 0）——否则「上游没回 usage」会被
+        // 渲染成「真实测得 0 tokens」，与「不存在」混淆。
+        promptTokens: optionalNumber(payload.prompt_tokens),
+        cachedTokens: optionalNumber(payload.cached_tokens),
+        // 步耗时以服务端为准（startedAt→流读完），前端本地计时只在缺失时兜底
+        durationMs: optionalNumber(payload.duration_ms),
         // 终值以 message.end 为准（delta 只是预览，可能因重连缺失）
         reasoning: typeof payload.reasoning === 'string' ? payload.reasoning : undefined,
       }
@@ -990,7 +1035,10 @@ function mapSseToStreamEvent(type: string, data: string): StreamEvent | null {
         // 失败/超时事件不带 result，只带 error：如实把错误文案作为结果呈现
         result: shown || String(payload.error ?? ''),
         diff: extractFileDiff(raw),
-        durationMs: 0,
+        // duration_ms 由服务端下发（与 tool_events 的 ended_at - started_at 同源）。
+        // 缺失时给 0：chatStore 用 `e.durationMs === 0` 表示「未知」并保留已有值，
+        // 不能因此丢弃 result / diff（历史缺陷，勿回退）。
+        durationMs: optionalNumber(payload.duration_ms) ?? 0,
         skipped: status === 'denied' ? true : undefined,
         failed: status === 'error' || status === 'timeout' ? true : undefined,
       }
@@ -1027,6 +1075,9 @@ function mapSseToStreamEvent(type: string, data: string): StreamEvent | null {
           type: 'done',
           tokensIn: Number(payload.input_tokens ?? 0),
           tokensOut: Number(payload.output_tokens ?? 0),
+          // cached_tokens 是会话账本缓存命中率的分子：此前不下发 → 前端恒 undefined
+          // → Composer / ContextGauge 的「缓存命中」整行永不渲染。
+          cachedTokens: optionalNumber(payload.cached_tokens),
         }
       }
       if (status === 'failed' || status === 'cancelled') {

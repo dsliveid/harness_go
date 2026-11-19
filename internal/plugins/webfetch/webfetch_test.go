@@ -92,7 +92,7 @@ func TestSchemeRejected(t *testing.T) {
 		"example.com/no-scheme",
 	} {
 		t.Run(raw, func(t *testing.T) {
-			res, err := invokeFetch(context.Background(), nil, &toolapi.Call{
+			res, err := fetchWebPage(context.Background(), nil, &toolapi.Call{
 				Args: []byte(`{"url":"` + strings.ReplaceAll(raw, `"`, `\"`) + `"}`),
 			})
 			if err != nil {
@@ -110,7 +110,7 @@ func TestSchemeRejected(t *testing.T) {
 
 // TestSchemeAllowedNotRejectedByScheme 检查 http/https 不会被 scheme 校验误杀（改为被 SSRF 拦截）。
 func TestSchemeAllowedNotRejectedByScheme(t *testing.T) {
-	res, _ := invokeFetch(context.Background(), nil, &toolapi.Call{Args: []byte(`{"url":"http://127.0.0.1:1/x"}`)})
+	res, _ := fetchWebPage(context.Background(), nil, &toolapi.Call{Args: []byte(`{"url":"http://127.0.0.1:1/x"}`)})
 	if res == nil || !res.IsError {
 		t.Fatalf("环回地址必须拦截: %+v", res)
 	}
@@ -156,8 +156,8 @@ func TestGuardPrivateHostBlocks(t *testing.T) {
 	}
 }
 
-// TestInvokeFetchBlocksPrivateHosts 走完整 invokeFetch，断言 IsError 且含拦截原因。
-func TestInvokeFetchBlocksPrivateHosts(t *testing.T) {
+// TestFetchWebPageBlocksPrivateHosts 走完整 fetchWebPage，断言 IsError 且含拦截原因。
+func TestFetchWebPageBlocksPrivateHosts(t *testing.T) {
 	urls := []string{
 		"http://127.0.0.1/admin",
 		"http://localhost:8080/health",
@@ -171,7 +171,7 @@ func TestInvokeFetchBlocksPrivateHosts(t *testing.T) {
 	}
 	for _, u := range urls {
 		t.Run(u, func(t *testing.T) {
-			res, err := invokeFetch(context.Background(), nil, &toolapi.Call{
+			res, err := fetchWebPage(context.Background(), nil, &toolapi.Call{
 				Args: []byte(`{"url":"` + u + `"}`),
 			})
 			if err != nil {
@@ -542,7 +542,7 @@ func TestNewHTTPClientSecurityParams(t *testing.T) {
 
 // TestDecodeArgsInvalidJSON 参数非法 JSON → 错误结果。
 func TestDecodeArgsInvalidJSON(t *testing.T) {
-	res, err := invokeFetch(context.Background(), nil, &toolapi.Call{Args: []byte(`{"url":`)})
+	res, err := fetchWebPage(context.Background(), nil, &toolapi.Call{Args: []byte(`{"url":`)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -564,7 +564,7 @@ func TestFactoryProducesPlugin(t *testing.T) {
 	if p == nil {
 		t.Fatal("工厂返回空插件")
 	}
-	if got := f.Manifest().Tools[0].Name; got != "web_fetch" {
+	if got := f.Manifest().Tools[0].Name; got != "fetch_web_page" {
 		t.Fatalf("工具名异常: %q", got)
 	}
 }
@@ -577,10 +577,10 @@ func TestManifestDeclaresFetchTool(t *testing.T) {
 	}
 	found := false
 	for _, tl := range m.Tools {
-		if tl.Name == "web_fetch" {
+		if tl.Name == "fetch_web_page" {
 			found = true
 			if tl.Risk != "readonly" {
-				t.Fatalf("web_fetch 风险档应为 readonly, got %q", tl.Risk)
+				t.Fatalf("fetch_web_page 风险档应为 readonly, got %q", tl.Risk)
 			}
 		}
 	}

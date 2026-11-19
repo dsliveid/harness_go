@@ -46,6 +46,7 @@ import (
 	"harness-go/internal/secret"
 	"harness-go/internal/service"
 	"harness-go/internal/snapshot"
+	"harness-go/internal/sop"
 	"harness-go/internal/store"
 	"harness-go/internal/tokenizer"
 	"harness-go/internal/tools"
@@ -65,28 +66,18 @@ var (
 
 // defaultSystemBase 默认系统提示兜底。
 //
-// 注意：Agent 真正的「出厂内置 SOP」已外化到 internal/sop/builtin/agent-core.md
-// （go:embed），运行期由 SOPService.CoreText() 提供，可被 data/sop/agent-core.md
-// 覆盖并**热生效**。本常量仅在 SOP 服务未装配时作为兜底（测试/降级路径），
-// 内容与 agent-core.md 保持一致，避免两条路径行为分叉。
+// # 为什么这里不再内联一份文本
 //
-// 这里只写**与运行时无关**的角色与规则。会话是否绑定工作区属于运行时事实，
-// 由 service.ComposeSystemBase 按会话注入——不要在此断言「运行在用户的工作区内」，
-// 否则未绑定工作区的纯对话会话会出现「顶栏说未绑定、模型却自称在工作区内」的自相矛盾。
-const defaultSystemBase = `你是 harness-go 的编码 Agent，运行在用户的本地工作区中。
-
-## 角色定位
-谨慎、专业的工程实现者：先查清事实再动手，改动最小且可验证，交付前必自检。
-
-## 基础口径
-1. 修改文件前先读取确认内容（用 read_file 核对原文），不要凭猜测改动。
-2. 危险操作（删除、覆盖、执行命令）需用户确认。
-3. 回答简洁：先给结论，再给细节。
-
-## 规范分层（不要混淆两处真源）
-- 本文件只承载**人格与基础口径**，可通过界面「Agent SOP → 核心 SOP」调教，保存后下一轮对话即刻生效。
-- 具体工程作业程序（意图门禁、方案先行、协同拆分、精益研读、边读边记、安全红线等）由 internal/sop/catalog.go 作为代码真源统一注入，可在界面逐条启停，**不要在此重复声明**。
-`
+// 改造前本文件有一份与 internal/sop/builtin/agent-core.md **逐字重复**的
+// 常量副本，靠人工保持一致。后果是典型的双真源漂移：改一处漏一处，
+// 两条路径行为分叉，而且**没有任何测试能发现**（文本没有编译器守护）。
+//
+// 现在直接引用 sop.BuiltinCoreText()：出厂正文只有 embed 那一个真源，
+// 本常量退化为"给调用方一个语义明确的名字"，不再持有内容。
+//
+// 运行期顺序不变：SOPService.CoreText() 优先（可被 data/sop/agent-core.md
+// 覆盖并热生效），仅在 SOP 服务未装配的测试/降级路径才落到本兜底。
+var defaultSystemBase = sop.BuiltinCoreText()
 
 func main() {
 	// 离线救命通道：reset-password 子命令必须在 run() 之前分流。
@@ -265,6 +256,13 @@ func run() error {
 	// Host 受控能力注入（F）：命令执行 / 模型调用 / 事件 / 嵌套 Run。
 	// ChildRunner 依赖引擎（引擎又依赖工具注册表），构造后经 SetChildRunner 后置注入。
 	toolHost := hostimpl.New(hostimpl.Options{WorkDir: workDir})
+	// lookup_tool 的 schema 真源：**惰性读注册表**，不拷贝快照。
+	//
+	// 为什么用闭包而不是当场取一份切片：
+	//   - 插件是逐个注册的，注册期间取快照会拿到"只注册了一半"的集合；
+	//   - 用户在前端改 tier / 启停工具后，注册表会变，快照不会。
+	// 惰性求值让 lookup_tool 永远看到**当前**真实注册表，天然随改随生效。
+	toolHost.SetToolSpecs(toolReg.Specs)
 	pluginOK, pluginFail := registerBuiltins(ctx, toolReg, toolHost, nil, logger)
 	toolRouter := router.New(router.Options{
 		Executor: toolapi.ExecutorServer,
@@ -457,8 +455,21 @@ func run() error {
 	if imgProvider := buildImageProvider(logger); imgProvider != nil {
 		toolHost.SetImages(imgProvider)
 	}
-	syncMemoryFiles(ctx, workDir, mainStore, func(msg string, args ...any) {
+	// 记忆文件 → 检索索引：启动期全量同步一次。
+	//
+	// ⚠️ 这只是"兜底对齐"，不是唯一同步时机 —— 写后同步（record_memory 成功
+	// 即同步该条）才是保证"刚记的下一轮就能召回"的关键路径。启动期同步负责
+	// 覆盖"用户手工编辑/删除过记忆文件"这类索引手工修复场景。
+	memSyncer := &MemorySyncer{WorkDir: workDir, Store: mainStore, Log: func(msg string, args ...any) {
 		logger.Info(msg, args...)
+	}}
+	memSyncer.SyncAll(ctx)
+	// 写后同步接线：record_memory 落盘成功后立刻推进索引（只同步索引，不触发注入）。
+	toolHost.SetMemoryIndexer(func(ctx context.Context, layer, fileName string) (bool, string) {
+		if memSyncer.SyncFile(ctx, layer, fileName) {
+			return true, "已进索引"
+		}
+		return false, "索引未变更（内容与索引一致）"
 	})
 
 	// ⑨ 认证：账号引导 + 令牌（明文仅出现一次）

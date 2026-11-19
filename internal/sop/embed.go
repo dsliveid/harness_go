@@ -15,3 +15,15 @@ import _ "embed"
 //
 //go:embed builtin/agent-core.md
 var builtinCore string
+
+// BuiltinCoreText 返回出厂核心 SOP 正文（只读副本）。
+//
+// # 为什么必须导出
+//
+// 改造前这段文本在 cmd/harness-go/main.go 里还有一份逐字重复的
+// `defaultSystemBase` 常量，用于「SOP 服务未装配」的兜底路径。两份文本
+// 靠人工保持一致 —— 改一处漏一处就是行为分叉，且**任何测试都看不出来**。
+//
+// 导出处唯一真源后，兜底路径改为引用本函数，重复真源被物理消除（阶段 5）。
+// 调用方只读：返回字符串值，修改它不会影响本包的 embed 内容。
+func BuiltinCoreText() string { return builtinCore }

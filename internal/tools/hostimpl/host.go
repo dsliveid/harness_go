@@ -43,6 +43,11 @@ type Options struct {
 	Snapshots toolapi.SnapshotStore
 	// Bundles 会话导出包（G：session-bundle；SetBundles 注入）。
 	Bundles toolapi.BundleStore
+	// ToolSpecsFn 工具规格读取源（lookup_tool 的 schema 真源；SetToolSpecs 注入）。
+	// 接 registry.Specs —— 直接读注册表，不另建副本。
+	ToolSpecsFn func() []toolapi.Spec
+	// MemoryIndexFn 记忆写后索引同步（memory 插件的 IndexMemoryer 端口；SetMemoryIndexer 注入）。
+	MemoryIndexFn func(ctx context.Context, layer, fileName string) (bool, string)
 	// Images 图像能力（D：generate_image / recognize_image；SetImages 注入）。
 	// 为可选能力：未注入时 Images() 返回 nil，插件据此返回「图像能力未启用」的诚实错误。
 	Images toolapi.ImageProvider
@@ -161,6 +166,9 @@ func (h *Host) Snapshots() toolapi.SnapshotStore {
 // SetSnapshots 后置注入快照存储（阶段 G）。
 func (h *Host) SetSnapshots(st toolapi.SnapshotStore) { h.opts.Snapshots = st }
 
+// SetBundles 后置注入会话导出包（阶段 G）。
+func (h *Host) SetBundles(st toolapi.BundleStore) { h.opts.Bundles = st }
+
 // Bundles 实现 toolapi.Host（阶段 G 填实；未注入时诚实报错）。
 func (h *Host) Bundles() toolapi.BundleStore {
 	if h.opts.Bundles == nil {
@@ -169,8 +177,39 @@ func (h *Host) Bundles() toolapi.BundleStore {
 	return h.opts.Bundles
 }
 
-// SetBundles 后置注入会话导出包服务（阶段 G）。
-func (h *Host) SetBundles(b toolapi.BundleStore) { h.opts.Bundles = b }
+// ToolSpecs 实现 toolapi.ToolCatalogHost：返回全部已注册工具规格。
+//
+// 这是 lookup_tool 的**唯一 schema 真源**——直接读注册表快照，不另建副本，
+// 避免"目录与注册表各存一份、逐步漂移"。
+//
+// 未注入时返回 nil：lookup_tool 会据此如实报「注册表为空」，
+// 而不是伪造一份空目录让调用方以为"工具本来就没有"。
+func (h *Host) ToolSpecs() []toolapi.Spec {
+	if h.opts.ToolSpecsFn == nil {
+		return nil
+	}
+	return h.opts.ToolSpecsFn()
+}
+
+// SetToolSpecs 后置注入工具规格读取源（装配点接 registry.Specs）。
+func (h *Host) SetToolSpecs(fn func() []toolapi.Spec) { h.opts.ToolSpecsFn = fn }
+
+// IndexMemoryFile 实现 toolapi.MemoryIndexer：写后同步单条记忆进检索索引。
+//
+// 只同步索引、不碰注入：注入快照在 Run 边界冻结（见 toolapi.MemoryIndexer 注释）。
+func (h *Host) IndexMemoryFile(ctx context.Context, layer, fileName string) (bool, string) {
+	if h.opts.MemoryIndexFn == nil {
+		// 未接线：如实告知"仅落盘"，绝不假装已进索引。
+		return false, "索引同步能力未接线（本条已落盘，将在下次启动时同步）"
+	}
+	ok, msg := h.opts.MemoryIndexFn(ctx, layer, fileName)
+	return ok, msg
+}
+
+// SetMemoryIndexer 后置注入记忆索引同步器（装配点接 MemorySyncer）。
+func (h *Host) SetMemoryIndexer(fn func(ctx context.Context, layer, fileName string) (bool, string)) {
+	h.opts.MemoryIndexFn = fn
+}
 
 // ============ Workspace（沙箱实现） ============
 

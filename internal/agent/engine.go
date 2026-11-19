@@ -597,6 +597,15 @@ func (e *Engine) loop(ctx context.Context, sdb SessionDB, req RunRequest, usage 
 			Reasoning: out.reasoning,
 			CreatedAt: e.deps.Now(),
 		}
+		// 消息级用量落库（`messages.token_count` / `messages.usage_json`）。
+		//
+		// 🚨 历史悠久缺陷（2026-11 修复）：这两列从建表起就**从未被写入过**，
+		// 导致「历史回放」路径上 token 用量与耗时全为空 —— 前端 TurnFooterBar
+		// 因 totalTokens===0 直接 return null，用户看到的是「旧对话底部指标栏
+		// 整条消失」，只有刚刚流式结束的那一轮有数字，刷新即丢。
+		// TokenCount 口径 = 输入 + 输出（整条消息总量），与前端 `tokens` 语义一致。
+		assistantMsg.TokenCount = int(out.promptTokens + out.completionTokens)
+		assistantMsg.UsageJSON = messageUsageJSON(out)
 		if len(out.toolCalls) > 0 {
 			// 绝不能「marshal 失败就什么都不写」：那会让 assistant 消息丢掉 tool_calls 声明，
 			// 而后续 tool 结果照常落库 → 历史里出现孤儿 tool 消息 → 上游每次重放都 400。
@@ -614,6 +623,14 @@ func (e *Engine) loop(ctx context.Context, sdb SessionDB, req RunRequest, usage 
 			"content":    out.content,
 			"seq":        assistantMsg.Seq,
 			"reasoning":  out.reasoning,
+			// 步级用量（协议向后兼容：仅新增字段，不改既有形状）。
+			// 前端 TurnFooterBar 的「本轮 token / 缓存命中率 / 步耗时」全靠这几项：
+			// 缺它们时前端只能取 0 → 指标栏整条不渲染（用户反馈的「没有按原型显示」）。
+			"token_count":       assistantMsg.TokenCount,
+			"prompt_tokens":     out.promptTokens,
+			"cached_tokens":     out.cachedTokens,
+			"completion_tokens": out.completionTokens,
+			"duration_ms":       out.durationMs,
 		})
 
 		if len(out.toolCalls) == 0 {
@@ -706,6 +723,33 @@ type streamOutcome struct {
 	// OpenAI 兼容端点与 UI 的 usage 以此为准）。
 	promptTokens     int64
 	completionTokens int64
+	// durationMs 本轮流式调用耗时（startedAt → 返回时刻），与审计 trace 的
+	// DurationMs 同源。随 message.end 下发、随 usage_json 落库：
+	// 前端原先只能用本地计时器（刷新即丢），历史回放时整轮耗时/步耗时全为空。
+	durationMs int64
+}
+
+// messageUsageJSON 组装 assistant 消息 usage_json 的载荷。
+//
+// 只写四元组（prompt_tokens / completion_tokens / cached_tokens / duration_ms），
+// **不写 Provider 原始 usage 整包**：不同端点的 usage 形状不一致（有的带
+// prompt_tokens_details、有的只给 total），落库后回放解析会各自漂移。
+// 无任何用量（上游未回 usage）时返回 nil —— 让 DB 留空，前端据此降级为不展示，
+// 绝不用 0 冒充「真实测得 0」。
+func messageUsageJSON(out streamOutcome) json.RawMessage {
+	if out.promptTokens == 0 && out.completionTokens == 0 && out.cachedTokens == 0 {
+		return nil
+	}
+	raw, err := json.Marshal(map[string]int64{
+		"prompt_tokens":     out.promptTokens,
+		"completion_tokens": out.completionTokens,
+		"cached_tokens":     out.cachedTokens,
+		"duration_ms":       out.durationMs,
+	})
+	if err != nil {
+		return nil
+	}
+	return raw
 }
 
 // streamOnce 执行一轮模型调用并消费流。
@@ -811,6 +855,12 @@ func (e *Engine) streamOnce(ctx context.Context, req RunRequest, provider llm.Pr
 	out.content = content.String()
 	out.reasoning = reasoning.String()
 	out.messageID = msgID
+	// 本轮耗时：与审计 trace 的 duration 同源（streamOnce 入口 startedAt → 此刻）。
+	// 必须记在「流读完」这个点，而不是工具执行之后 —— 否则会把工具耗时算进
+	// 模型调用耗时，前端步耗时与审计日志对不上。
+	if d := e.now() - startedAt; d > 0 {
+		out.durationMs = d
+	}
 	// 按 index 排序输出，保证多工具调用的稳定顺序
 	indexes := make([]int, 0, len(accs))
 	for i := range accs {
@@ -855,6 +905,18 @@ func (e *Engine) approvalRules(ctx context.Context, sdb SessionDB, req RunReques
 	}
 	rules, _ := sdb.ApprovalRules(ctx)
 	return rules
+}
+
+// toolDurationMs 工具执行耗时（毫秒，非负）。
+//
+// 口径必须与 tool_events 落库的 ended_at - started_at 完全一致，否则「实时流
+// 看到的耗时」与「刷新后历史查到的耗时」会打架。store 层 Finish 用同一时钟取
+// ended_at，这里直接用同一时基做减法即可（负数一律归零，时钟回拨不产生负耗时）。
+func (e *Engine) toolDurationMs(startedAt int64) int64 {
+	if d := e.deps.Now() - startedAt; d > 0 {
+		return d
+	}
+	return 0
 }
 
 // execTool 执行单次工具调用（含审批）。返回的 cancelled 表示被中断。
@@ -929,6 +991,7 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 			"tool_name":     tc.Name,
 			"status":        string(model.ToolDenied),
 			"result":        reason,
+			"duration_ms":   e.toolDurationMs(startedAt),
 		})
 		return toolMessage(tc, reason), false
 	}
@@ -1027,6 +1090,7 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 			"tool_event_id": eventID,
 			"status":        string(model.ToolDenied),
 			"error":         reason,
+			"duration_ms":   e.toolDurationMs(startedAt),
 		})
 		return toolMessage(tc, "denied: "+reason), false
 	}
@@ -1042,6 +1106,7 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 			"tool_event_id": eventID,
 			"status":        string(model.ToolError),
 			"error":         msg,
+			"duration_ms":   e.toolDurationMs(startedAt),
 		})
 		return toolMessage(tc, msg), false
 	}
@@ -1066,6 +1131,7 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 			"tool_event_id": eventID,
 			"status":        string(model.ToolError),
 			"error":         errText,
+			"duration_ms":   e.toolDurationMs(startedAt),
 		})
 		return toolMessage(tc, "工具执行失败: "+errText), false
 	}
@@ -1090,6 +1156,11 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 		"result":        result.ResultJSON,
 		"error":         result.Error,
 		"session_id":    req.SessionID,
+		// duration_ms 工具执行耗时（ended_at - started_at，与 tool_events 落库同源）。
+		// 此前不下发，前端 mapSseToStreamEvent 只能写死 0 → 工具卡片的
+		// 「xx ms」徽标在实时流里永不出现（原型 ToolCard 是显示的），
+		// 只有刷新后从 tool-events 历史查才有值。此处按同一口径补齐。
+		"duration_ms": e.toolDurationMs(startedAt),
 		// 新增字段（协议向后兼容，仅新增不改形状）：前端可据此显示「端侧执行」徽标
 		"executor":     string(execInfo.Executor),
 		"device_id":    execInfo.DeviceID,
@@ -1146,9 +1217,9 @@ func (e *Engine) tryCompact(
 	// 让压缩对用户与前端**可见**：否则用户只看到"突然变快了"，
 	// 而模型却"忘掉了"部分历史，排障时无从下手。
 	e.publish(req.RunID, events.TypeError, map[string]any{
-		"scope":             "compaction",
-		"code":              "agent.context_compacted",
-		"message":           fmt.Sprintf("上下文已达水位，已将第 %d–%d 条消息（%d 条）折叠为摘要，估算节省 %d tokens",
+		"scope": "compaction",
+		"code":  "agent.context_compacted",
+		"message": fmt.Sprintf("上下文已达水位，已将第 %d–%d 条消息（%d 条）折叠为摘要，估算节省 %d tokens",
 			res.StartSeq, res.EndSeq, res.ReplacedMessages, res.SavedTokens),
 		"start_seq":         res.StartSeq,
 		"end_seq":           res.EndSeq,
@@ -1287,6 +1358,13 @@ func (e *Engine) publishStatus(runID, sessionID string, status model.RunStatus, 
 	if usage != nil {
 		payload["input_tokens"] = usage.prompt
 		payload["output_tokens"] = usage.completion
+		// cached_tokens 必须下发：前端会话账本（usageBySession）的缓存命中率
+		// 分母是输入、分子是它。此前只给 input/output，前端 `e.cachedTokens` 恒
+		// undefined → 累计命中数恒 0 → Composer 与 ContextGauge 的「缓存命中」
+		// 一行永远不渲染（不是命中率为 0，而是整行消失）。
+		payload["cached_tokens"] = usage.cached
+		// is_estimated 一并透出：让 UI 能如实标注「估算值」而不是伪装成真实测量。
+		payload["is_estimated"] = usage.estimated
 	}
 	e.publish(runID, events.TypeRunStatus, payload)
 }

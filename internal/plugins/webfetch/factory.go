@@ -28,7 +28,7 @@ func Factory() toolapi.Factory {
 			M:    Manifest(),
 			Host: host,
 			Invokes: map[string]pluginkit.InvokeFunc{
-				"web_fetch": invokeFetch,
+				"fetch_web_page": fetchWebPage,
 			},
 		}, nil
 	}}

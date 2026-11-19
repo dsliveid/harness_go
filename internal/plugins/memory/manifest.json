@@ -1,23 +1,23 @@
 {
   "id": "memory",
   "name": "记忆",
-  "description": "记忆写侧：把结论沉淀为工作区记忆文件（.harness/memory/），启动时同步进检索索引（memory_l0/l2/l3），供 D-3 检索召回",
-  "version": "1.0.0",
+  "description": "长期认知记忆：把结论沉淀为工作区记忆文件（.harness/memory/），并支持按主题检索已有记忆",
+  "version": "2.0.0",
   "kind": "builtin",
   "default_tier": "on_demand",
   "protocol_version": 1,
   "tools": [
     {
-      "name": "memory_write",
-      "description": "写入一条记忆（layer: core=核心约束 / notes=情景结论 / archive=档案事实；标题一行 + 正文）",
-      "schema_json": {"type":"object","properties":{"layer":{"type":"string","enum":["core","notes","archive"],"description":"记忆层"},"title":{"type":"string","description":"一行标题"},"body":{"type":"string","description":"正文"},"importance":{"type":"number","description":"重要性 0~1（默认 0.5）"}},"required":["layer","title","body"]},
+      "name": "record_memory",
+      "description": "沉淀一条长期记忆（核心约束 / 情景结论 / 档案事实）。阅读分析核心代码后，在任务交付前用它记录高价值事实，避免后续重复勘察。",
+      "schema_json": {"type":"object","properties":{"layer":{"type":"string","enum":["core","notes","archive"],"description":"记忆层：core=核心约束与项目身份 / notes=情景结论与避坑 / archive=档案事实"},"title":{"type":"string","description":"一行标题（决定文件名，可据此检索）"},"body":{"type":"string","description":"正文"},"importance":{"type":"number","description":"重要性 0~1（默认 0.5）"}},"required":["layer","title","body"]},
       "tier": "on_demand",
       "risk": "write"
     },
     {
-      "name": "memory_list",
-      "description": "列出工作区记忆文件",
-      "schema_json": {"type":"object","properties":{"layer":{"type":"string","enum":["core","notes","archive"]}}},
+      "name": "read_memory",
+      "description": "检索长期记忆：给出 query 时按关键词匹配标题与正文并返回命中内容；不传 query 时列出全部记忆文件。",
+      "schema_json": {"type":"object","properties":{"query":{"type":"string","description":"检索关键词（匹配标题与正文；省略则列出全部记忆文件）"},"layer":{"type":"string","enum":["core","notes","archive"],"description":"限定记忆层（省略则搜索全部层）"}}},
       "tier": "on_demand",
       "risk": "readonly"
     }

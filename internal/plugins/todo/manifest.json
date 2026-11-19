@@ -2,24 +2,17 @@
   "id": "todo",
   "name": "任务清单",
   "description": "维护当前任务清单（待办项状态机：待办/进行中/完成），跨轮次跟踪工作进度",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "kind": "builtin",
   "default_tier": "core",
   "protocol_version": 1,
   "tools": [
     {
-      "name": "todo_write",
-      "description": "整体覆写任务清单（每项含内容与状态 pending|in_progress|done）",
-      "schema_json": {"type":"object","properties":{"items":{"type":"array","items":{"type":"object","properties":{"content":{"type":"string"},"status":{"type":"string","enum":["pending","in_progress","done"]}},"required":["content","status"]}}},"required":["items"]},
+      "name": "todo",
+      "description": "维护任务清单。传 items 即整体覆写（每项含内容与状态 pending|in_progress|done）；不传 items 即读取当前清单。",
+      "schema_json": {"type":"object","properties":{"items":{"type":"array","description":"要写入的完整清单；省略此参数表示读取当前清单","items":{"type":"object","properties":{"content":{"type":"string","description":"任务描述"},"status":{"type":"string","enum":["pending","in_progress","done"],"description":"任务状态"}},"required":["content","status"]}}},"required":[]},
       "tier": "core",
       "risk": "write"
-    },
-    {
-      "name": "todo_read",
-      "description": "读取当前任务清单",
-      "schema_json": {"type":"object","properties":{}},
-      "tier": "core",
-      "risk": "readonly"
     }
   ]
 }

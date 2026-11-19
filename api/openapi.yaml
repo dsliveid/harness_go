@@ -2920,7 +2920,14 @@ components:
         tool_call_id: { type: string }
         attachments: { type: array, items: { type: object, additionalProperties: true } }
         token_count: { type: integer }
-        usage: { type: object, additionalProperties: true }
+        usage:
+          type: object
+          description: |
+            消息级用量。服务端写入四元组：
+            `{prompt_tokens, completion_tokens, cached_tokens, duration_ms}`（均为整数）。
+            无用量（上游未回 usage）时该字段缺省 —— 前端据此**不展示**指标，
+            绝不以 0 冒充「真实测得 0」。
+          additionalProperties: true
         created_at: { type: integer, format: int64 }
     RunStatus:
       type: string

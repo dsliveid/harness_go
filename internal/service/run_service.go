@@ -562,7 +562,12 @@ func (s *RunService) CreateRunWithSystem(ctx context.Context, sessionID, userInp
 		AccessMode:      approval.AccessMode(normalizeAccessMode(sess.AccessMode)),
 		SystemBase:      system,
 		SOP:             s.currentSOP(sess.ProjectDir),
-		ProjectSummary:  "",
+		// 项目约束摘要：从会话工作区的 .harness/memory/ 读取大盘与规约。
+		//
+		// 改造前这里硬编码空串，导致 prompt 里「## 项目约束」的渲染逻辑
+		// 永远不执行（死分支）。记忆有两条互补通道，这里是"始终该知道的背景"，
+		// 与 memory.Store 的"按相关性召回的命中"是不同用途，不能互相替代。
+		ProjectSummary:  sop.LoadProjectSummary(sess.ProjectDir),
 		Tools:           s.filterTools(s.currentTools(), toolPolicy),
 		ActiveTools:     s.selectTools(ctx, userInput),
 		MemoryCore:      memCore,

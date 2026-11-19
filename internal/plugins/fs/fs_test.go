@@ -43,13 +43,13 @@ func TestReadFileOffsetLimit(t *testing.T) {
 		b.WriteString(strings.Repeat("L", i) + "\n")
 	}
 	_ = h.Seed("a.txt", b.String())
-	res, _ := invokeReadFile(t.Context(), h, call(t, `{"path":"a.txt","offset":8,"limit":2}`))
+	res, _ := invokeReadFile(t.Context(), h, call(t, `{"path":"a.txt","offset_line":8,"max_lines":2}`))
 	c := contentOf(t, res)
 	if !strings.Contains(c, "     8\tLLLLLLLL") || !strings.Contains(c, "     9\tLLLLLLLLL") {
 		t.Fatalf("分段读取错误: %q", c)
 	}
 	if strings.Contains(c, "    10\t") {
-		t.Fatalf("limit=2 不应读到第 10 行: %q", c)
+		t.Fatalf("max_lines=2 不应读到第 10 行: %q", c)
 	}
 	if !strings.Contains(c, "已读 8-9") {
 		t.Fatalf("应标注续读信息: %q", c)

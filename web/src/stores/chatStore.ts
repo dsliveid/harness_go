@@ -1,4 +1,4 @@
-﻿import { create } from 'zustand'
+import { create } from 'zustand'
 import type {
   Approval, DataScope, Message, Run, ToolCall,
 } from '../types'
@@ -36,6 +36,15 @@ let noModelRun = false
 /** 当前被跟踪 Run 所属会话（切会话后仍要继续跟踪原 Run，故与 currentId 分开记） */
 let currentRunSessionId: string | null = null
 let stepStartAt = 0
+/**
+ * 本 Run 是否已收到过**服务端下发的步级用量**（message.end 的 token/prompt/cached）。
+ *
+ * 存在原因：`step`（message.end）会把当前步结算并再开一条新的空 assistant 消息，
+ * 于是 Run 结束时 settleRun 结算的是那条「末步空消息」。若此时再用「整轮合计」
+ * 兜底填充，轮次指标栏就会出现「各步之和 + 整轮合计」的重复计数（缓存率甚至 >100%）。
+ * 只有整轮**从未**收到过步级用量（旧后端 / 上游不回 usage）时才允许轮级兜底。
+ */
+let sawStepUsage = false
 /** 每会话最近一次消息级回滚的事件 id（real 模式 reapply 依据；S10 语义，刷新后从服务端 rollbacks 列表不可得时降级为不可重放） */
 const lastRollbackBySession: Record<string, string> = {}
 
@@ -307,22 +316,32 @@ export const useChat = create<ChatState>((set, get) => {
     }
     set((s) => ({
       messages: s.messages
-        .map((m) =>
-          m.id === id
-            ? {
-                ...m,
-                streaming: false,
-                durationMs: nowSettle - stepStartAt,
-                ...(opts.usage
-                  ? {
-                      tokens: opts.usage.tokensOut + opts.usage.tokensIn,
-                      promptTokens: opts.usage.tokensIn,
-                      cachedTokens: opts.usage.cachedTokens,
-                    }
-                  : {}),
-              }
-            : m,
-        )
+        .map((m) => {
+          if (m.id !== id) return m
+          // 末步空壳（message.end 之后新开的 assistant 壳，内容/工具都为空）
+          // 不是一次真实步骤：绝不能给它记耗时或用量，否则整轮耗时会被
+          // 「末步到 Run 结束的零头」虚增，token 也会重复计数。
+          const isRealStep = Boolean(m.content.trim()) || (m.toolCalls?.length ?? 0) > 0 || m.tokens !== undefined
+          return {
+            ...m,
+            streaming: false,
+            durationMs: m.durationMs ?? (isRealStep ? nowSettle - stepStartAt : undefined),
+            // 🚨 绝不用「本轮合计」覆盖消息级用量（重复计数，勿回退）：
+            // 每一步的 message.end 已各自下发该步的 token/prompt/cached，
+            // 轮次底部指标栏是对各步求和。若这里再把这**整轮合计**写到
+            // 末步消息上，多步轮次会变成「各步之和 + 整轮合计」，
+            // token 量与缓存命中率双双虚高（缓存率甚至可能 >100%）。
+            // 仅当整轮**从未**收到步级用量（旧后端 / 上游不回 usage）时，
+            // 才用轮级合计给这条末步消息兜底。
+            ...(opts.usage && isRealStep && !sawStepUsage && !m.tokens
+              ? {
+                  tokens: opts.usage.tokensOut + opts.usage.tokensIn,
+                  promptTokens: opts.usage.tokensIn,
+                  cachedTokens: opts.usage.cachedTokens,
+                }
+              : {}),
+          }
+        })
         // 未选择模型的纯保存发送：本轮没有回复，把乐观上屏的空 assistant 气泡摘掉。
         // 只认「确实为空」：万一服务端/历史回灌了正文（不该发生），保留内容更安全。
         .filter((m) => !(noModelRun && m.id === id && !m.content && !(m.toolCalls?.length ?? 0))),
@@ -386,7 +405,7 @@ export const useChat = create<ChatState>((set, get) => {
                   : m,
               ),
             }))
-            // 工具调用一起来就刷新运行态：todo_write / plan_set 的 args 此刻已完整，
+            // 工具调用一起来就刷新运行态：todo / create_plan 的 args 此刻已完整，
             // 右侧清单随之即时出现，不用等整轮跑完
             syncWorkspaceFromMessages()
             break
@@ -422,6 +441,11 @@ export const useChat = create<ChatState>((set, get) => {
           case 'step': {
             // 结算当前步（耗时 + tokens），开启同轮新步骤
             flush()
+            // 记录「本轮确实收到过服务端用量」：settleRun 据此决定是否允许轮级兜底，
+            // 避免「各步之和 + 整轮合计」的重复计数。
+            if (e.tokens !== undefined || e.promptTokens !== undefined || e.cachedTokens !== undefined) {
+              sawStepUsage = true
+            }
             const now2 = Date.now()
             const prevId = streamingMsgId
             const sessionMsgs2 = get().messages.filter((m) => m.sessionId === sessionId)
@@ -442,7 +466,10 @@ export const useChat = create<ChatState>((set, get) => {
                     ? {
                         ...m,
                         streaming: false,
-                        durationMs: now2 - stepStartAt,
+                        // 步耗时优先用服务端下发的 duration_ms（startedAt→流读完，
+                        // 与审计日志同源，刷新后从 usage_json 回放也能复现）；
+                        // 仅当服务端未下发时才回退本地计时（旧后端兼容）。
+                        durationMs: e.durationMs ?? now2 - stepStartAt,
                         tokens: e.tokens ?? m.tokens,
                         promptTokens: e.promptTokens ?? m.promptTokens,
                         cachedTokens: e.cachedTokens ?? m.cachedTokens,
@@ -580,6 +607,8 @@ export const useChat = create<ChatState>((set, get) => {
     currentRunSessionId = sessionId
     // 未选模型：本轮只是把消息保存下来（不产生回复），收口时据此摘掉空 reply 气泡。
     noModelRun = noModel
+    // 新一轮开始：清空「是否收到过步级用量」标记（每轮独立判定）
+    sawStepUsage = false
     stepStartAt = now
     pendingText = ''
     pendingReasoning = ''
@@ -786,6 +815,8 @@ export const useChat = create<ChatState>((set, get) => {
       }
       currentRunId = runId
       currentRunSessionId = sessionId
+      // 接回在跑的 Run：同样是新一轮跟踪，重置步级用量标记
+      sawStepUsage = false
       stepStartAt = now
       pendingText = ''
       pendingReasoning = ''

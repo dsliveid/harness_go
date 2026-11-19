@@ -152,7 +152,7 @@ interface PluginState {
   rollbackServerPackage: (id: string) => Promise<void>
   /** 拉取服务端技能库真源（.harness/skills） */
   loadSkills: () => Promise<void>
-  /** 安装/覆盖技能到服务端技能库（与 Agent 的 skill_save 同源） */
+  /** 安装/覆盖技能到服务端技能库（与 Agent 的 save_skill 同源） */
   installSkill: (name: string, description: string, body: string) => Promise<void>
   /** 从服务端技能库卸载技能（删整个技能目录） */
   uninstallSkill: (name: string) => Promise<void>
@@ -393,7 +393,7 @@ export const usePlugins = create<PluginState>((set, get) => ({
   /**
    * 拉取服务端技能库真源（.harness/skills）。
    *
-   * 为什么单独一个方法：技能库随时可能被 Agent（skill_save 工具）改写，
+   * 为什么单独一个方法：技能库随时可能被 Agent（save_skill 工具）改写，
    * 界面打开技能页时必须以磁盘真值刷新，不能复用 loadRemoteCapabilities 的旧快照。
    */
   loadSkills: async () => {
@@ -428,8 +428,8 @@ export const usePlugins = create<PluginState>((set, get) => ({
   /**
    * 安装/覆盖技能到服务端技能库。
    *
-   * 与 Agent 的 skill_save 写同一份 `.harness/skills/<name>/SKILL.md`：
-   * 界面装的技能，Agent 下一轮就能 skill_read 到；反之亦然。
+   * 与 Agent 的 save_skill 写同一份 `.harness/skills/<name>/SKILL.md`：
+   * 界面装的技能，Agent 下一轮就能 run_skill 到；反之亦然。
    */
   installSkill: async (name, description, body) => {
     await api.saveSkill({ name, description, body })
@@ -509,7 +509,7 @@ export const usePlugins = create<PluginState>((set, get) => ({
   /**
    * 安装拓展（方案 A：按 kind 复用**已有真实链路**，不再只改内存）。
    *
-   *   - kind=skill → 写服务端技能库 .harness/skills/<name>/SKILL.md（与 skill_save 同源）
+   *   - kind=skill → 写服务端技能库 .harness/skills/<name>/SKILL.md（与 save_skill 同源）
    *   - kind=tool  → 走工具包 zip 安装（服务端本地路径，见 /packages/install）
    *   - kind=mcp   → MCP Server 由配置托管，拓展只登记状态，不自动建连
    *

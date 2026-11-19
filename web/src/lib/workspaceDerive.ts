@@ -9,8 +9,8 @@ import { buildCommandLine } from './commandLine'
  * 为什么是派生而不是拉接口：后端 REST 层**没有** todo / plan / subagent / command
  * 的专用端点（`internal/api/router.go` 全部路由已核对）。这四类数据的唯一真源
  * 是 agent 工具调用的产物：
- *   - `todo_write`（internal/plugins/todo）   → 任务清单（整体覆写语义）
- *   - `plan_set`  （internal/plugins/plan）   → 执行计划（标题 + 步骤）
+ *   - `todo`（internal/plugins/todo）   → 任务清单（整体覆写语义）
+ *   - `create_plan`（internal/plugins/plan）   → 执行计划（标题 + 步骤）
  *   - `spawn_subagent`（internal/plugins/subagent）→ 子代理（阻塞等待子 Run 终态）
  *   - `run_command`（internal/plugins/command）→ 命令行（增量输出走 tool.progress）
  * 这些调用及其 args/status 已经由 SSE 实时落进 `chatStore.messages[].toolCalls`，
@@ -23,8 +23,8 @@ import { buildCommandLine } from './commandLine'
 
 /** 后端工具名常量（与各插件 manifest.json 里的 tools[].name 逐字对齐） */
 const TOOL = {
-  todoWrite: 'todo_write',
-  planSet: 'plan_set',
+  todoWrite: 'todo',
+  planSet: 'create_plan',
   spawnSubagent: 'spawn_subagent',
   runCommand: 'run_command',
 } as const
@@ -78,9 +78,9 @@ function isRejected(call: ToolCall): boolean {
 }
 
 /**
- * 任务清单：取**最后一次**未被拒/未出错的 `todo_write`。
+ * 任务清单：取**最后一次**未被拒/未出错的 `todo`。
  *
- * 依据后端语义：`todo_write` 是整体覆写（`internal/plugins/todo/todo.go`），
+ * 依据后端语义：`todo` 是整体覆写（`internal/plugins/todo/todo.go`），
  * 所以只有最后一次有意义，逐次累加会得到一份错误的合并清单。
  * 运行中（status=running）也采信——args 在 tool.started 时已完整下发，
  * 这样清单能随 agent 写入即刻刷新，而不是等整轮结束才出现。
@@ -110,7 +110,7 @@ function deriveTodos(entries: CallEntry[]): TodoItem[] {
 }
 
 /**
- * 执行计划：取最后一次未被拒的 `plan_set`。
+ * 执行计划：取最后一次未被拒的 `create_plan`。
  *
  * 同样按「整体覆写」处理（plan.go 是写文件覆盖）。步骤的完成态来自 args.steps[].done，
  * 后端只有布尔 done，UI 的三态中 `in_progress` 后端不提供 → 一律不臆造，只映射 done/pending。

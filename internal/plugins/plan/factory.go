@@ -27,8 +27,10 @@ func Factory() toolapi.Factory {
 			M:    Manifest(),
 			Host: host,
 			Invokes: map[string]pluginkit.InvokeFunc{
-				"plan_set": invokeSet,
-				"plan_get": invokeGet,
+				"create_plan": createPlan,
+				"update_plan": updatePlan,
+				"read_plan":   readPlan,
+				"list_plans":  listPlans,
 			},
 		}, nil
 	}}

@@ -2,7 +2,7 @@
   "id": "subagent",
   "name": "子代理",
   "description": "派生嵌套 Run 处理独立子任务（真实 Run 落库可观测；禁递归：子不能再派生）",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "kind": "builtin",
   "default_tier": "on_demand",
   "protocol_version": 1,
@@ -10,8 +10,36 @@
   "tools": [
     {
       "name": "spawn_subagent",
-      "description": "派生子代理执行独立子任务并等待结果（阻塞至子 Run 终态；深度上限 2，禁递归；同会话在途上限 4）",
-      "schema_json": {"type":"object","properties":{"task":{"type":"string","description":"子任务描述（应自包含：子代理看不到父对话）"},"model_ref":{"type":"string","description":"可选模型（默认继承会话配置）"}},"required":["task"]},
+      "description": "派生子代理执行独立子任务。默认阻塞至子 Run 结束并返回结果；传 wait=false 则立即返回 subagent_id，供后续 get_subagent_status / wait_subagents / stop_subagent 使用。",
+      "schema_json": {"type":"object","properties":{"task":{"type":"string","description":"子任务描述（应自包含：子代理看不到父对话）"},"model_ref":{"type":"string","description":"可选模型（默认继承会话配置）"},"role":{"type":"string","description":"子任务角色定位，例如：技术调研 / 单元测试 / 独立排查"},"wait":{"type":"boolean","description":"是否阻塞等待结果（默认 true）。false 时立即返回 subagent_id 供并行管理"}},"required":["task"]},
+      "tier": "on_demand",
+      "risk": "write"
+    },
+    {
+      "name": "get_subagent_status",
+      "description": "查询子代理当前状态（running / completed / failed / cancelled）与结果摘要。",
+      "schema_json": {"type":"object","properties":{"subagent_id":{"type":"string","description":"spawn_subagent 返回的子代理 ID"}},"required":["subagent_id"]},
+      "tier": "on_demand",
+      "risk": "readonly"
+    },
+    {
+      "name": "wait_subagents",
+      "description": "等待一个或多个子代理执行完毕，并汇总它们的执行结论。派生多个子任务后应调用本工具等待汇聚；若提示仍有子代理在运行，必须再次调用直到全部结束，严禁提前输出最终结论。",
+      "schema_json": {"type":"object","properties":{"subagent_ids":{"type":"array","description":"要等待的子代理 ID 列表（省略则等待全部在途子代理）","items":{"type":"string"}},"timeout_secs":{"type":"integer","description":"最大等待秒数（默认 600）"}}},
+      "tier": "on_demand",
+      "risk": "readonly"
+    },
+    {
+      "name": "reject_subagent",
+      "description": "验收不通过时驳回子任务并要求返工：带上具体缺陷与整改要求重新派发同一子任务。自检发现子任务交付有缺陷时，应打回而非自己动手改它的代码。",
+      "schema_json": {"type":"object","properties":{"subagent_id":{"type":"string","description":"被驳回的子代理 ID"},"feedback":{"type":"string","description":"具体整改要求与打回原因（缺陷文件、错误现象、改进标准）"},"task":{"type":"string","description":"可选：原任务描述（省略则从派发记录中查找）"}},"required":["subagent_id","feedback"]},
+      "tier": "on_demand",
+      "risk": "write"
+    },
+    {
+      "name": "stop_subagent",
+      "description": "停止指定的正在运行的子代理。",
+      "schema_json": {"type":"object","properties":{"subagent_id":{"type":"string","description":"要停止的子代理 ID"}},"required":["subagent_id"]},
       "tier": "on_demand",
       "risk": "write"
     }

@@ -119,53 +119,102 @@ var commandEnvWhitelist = []string{
 	"SYSTEMROOT", "COMSPEC", "WINDIR", "APPDATA", "LOCALAPPDATA", "PROGRAMFILES",
 }
 
-// ============ 记忆文件 → 检索索引同步（启动期） ============
+// ============ 记忆文件 → 检索索引同步 ============
 
 // memoryKindByLayer 记忆层目录 → retrieval.Kind。
+//
+// ⚠️ 必须与 memory.Layer 的四个层一一对应（L0/L1/L2/L3）。
+// 改造前这里只有 core/notes/archive 三项，**缺 L1（项目层）**，
+// 于是 memory.Store.Recall 里那段 L1 三行摘要逻辑永远空跑 ——
+// 设计文档宣称的"四层记忆"实际只有三层在跑，且没有任何报错。
+//
+// 现在补齐 project → memory_l1。记忆插件侧的层目录名仍是 core/notes/archive
+// （它的 LayerCore/LayerNotes/LayerArchive 是写侧三分类），
+// 因此 L1 的来源是**目录可选的 project 子目录**：存在即同步，不存在即跳过
+// （不建空目录、不伪造内容 —— 宁可没有，也不能让模型读到假的项目记忆）。
 var memoryKindByLayer = map[string]string{
 	"core":    "memory_l0",
+	"project": "memory_l1",
 	"notes":   "memory_l2",
 	"archive": "memory_l3",
 }
 
-// syncMemoryFiles 把工作区记忆文件（memory 插件写侧产物）同步进主库检索索引。
+// MemorySyncer 把工作区记忆文件同步进检索索引（文件是真源，索引可重建）。
 //
-// 文件是唯一真源、索引可重建（工程避坑清单同款口径）；UpsertDoc 幂等，
-// 同内容只刷新 last_ref_at，不重写 FTS5。
-func syncMemoryFiles(ctx context.Context, workDir string, mainStore interface {
-	UpsertMemoryDoc(ctx context.Context, kind, key, title, body string, importance float64) (bool, error)
-}, log func(msg string, args ...any)) {
-	base := filepath.Join(workDir, ".harness", "memory")
-	for layer, kind := range memoryKindByLayer {
-		dir := filepath.Join(base, layer)
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			continue // 层目录不存在是正常态
-		}
-		n := 0
-		for _, e := range entries {
-			if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
-				continue
-			}
-			data, rerr := os.ReadFile(filepath.Join(dir, e.Name()))
-			if rerr != nil {
-				continue
-			}
-			title, body, importance := parseMemoryDoc(string(data))
-			key := layer + "/" + e.Name()
-			changed, uerr := mainStore.UpsertMemoryDoc(ctx, kind, key, title, body, importance)
-			if uerr != nil {
-				log("记忆文件同步失败", "file", key, "err", uerr)
-				continue
-			}
-			if changed {
-				n++
-			}
-		}
+// 抽成独立类型而不是散在装配点，是为了让**写后同步**（memory 插件写入成功后
+// 立刻同步这一条）与**启动期全量同步**共用同一段逻辑：
+// 两条路径若各写一份，解析规则（标题/正文/重要性）迟早漂移。
+type MemorySyncer struct {
+	// WorkDir 工作区根（进程级默认根）。
+	WorkDir string
+	// Store 主库记忆 upsert 入口。
+	Store interface {
+		UpsertMemoryDoc(ctx context.Context, kind, key, title, body string, importance float64) (bool, error)
+	}
+	// Log 日志（可为 nil）。
+	Log func(msg string, args ...any)
+}
+
+func (s *MemorySyncer) log(msg string, args ...any) {
+	if s.Log != nil {
+		s.Log(msg, args...)
+	}
+}
+
+// SyncAll 全量同步全部层（启动期调用一次）。
+func (s *MemorySyncer) SyncAll(ctx context.Context) {
+	for layer := range memoryKindByLayer {
+		n := s.SyncLayer(ctx, layer)
 		if n > 0 {
-			log("记忆文件已同步进检索索引", "layer", layer, "changed", n)
+			s.log("记忆文件已同步进检索索引", "layer", layer, "changed", n)
 		}
 	}
+}
+
+// SyncLayer 同步单个层目录，返回变更条数。
+func (s *MemorySyncer) SyncLayer(ctx context.Context, layer string) int {
+	if _, ok := memoryKindByLayer[layer]; !ok {
+		return 0
+	}
+	dir := filepath.Join(s.WorkDir, ".harness", "memory", layer)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return 0 // 层目录不存在是正常态
+	}
+	n := 0
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		if s.SyncFile(ctx, layer, e.Name()) {
+			n++
+		}
+	}
+	return n
+}
+
+// SyncFile 同步单个记忆文件（写后同步走这里）。
+//
+// 只影响**索引可见性**，不触发任何注入 —— 注入快照由 Run 边界冻结，
+// 两者是彼此独立的轴（详见 record_memory 的回执文案）。
+func (s *MemorySyncer) SyncFile(ctx context.Context, layer, fileName string) bool {
+	kind, ok := memoryKindByLayer[layer]
+	if !ok {
+		return false
+	}
+	path := filepath.Join(s.WorkDir, ".harness", "memory", layer, fileName)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	title, body, importance := parseMemoryDoc(string(data))
+	key := layer + "/" + fileName
+	changed, uerr := s.Store.UpsertMemoryDoc(ctx, kind, key, title, body, importance)
+	if uerr != nil {
+		s.log("记忆文件同步失败", "file", key, "err", uerr)
+		return false
+	}
+	return changed
 }
 
 // parseMemoryDoc 拆标题/正文/重要性（memory 插件的落盘格式）。

@@ -34,6 +34,7 @@ import (
 	"harness-go/internal/plugins/sop"
 	"harness-go/internal/plugins/subagent"
 	"harness-go/internal/plugins/todo"
+	"harness-go/internal/plugins/toolcatalog"
 	"harness-go/internal/plugins/webfetch"
 	"harness-go/internal/tools/registry"
 	"harness-go/pkg/toolapi"
@@ -46,6 +47,9 @@ var builtinFactories = []toolapi.Factory{
 	fs.Factory(),
 	command.Factory(),
 	todo.Factory(),
+	// toolcatalog 必须在 core 档：lookup_tool 是三档工具的**自举入口**，
+	// 若连它自己都不可见，deferred / on_demand 就永远是"看得见摸不着"。
+	toolcatalog.Factory(),
 	// —— deferred 档 ——
 	plan.Factory(),
 	decision.Factory(),

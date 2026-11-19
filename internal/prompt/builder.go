@@ -96,6 +96,12 @@ type BuildResult struct {
 	// 读取侧却悄悄丢弃，同一系统两套矛盾策略且丢弃不可见。现在一律留下痕迹：
 	// >0 时上层应记录告警，前端 /sop/effective 也会显示 truncated。
 	SOPOverflow int
+	// DeferredOverflow 因索引条数上限被丢弃的 deferred 工具条数。
+	//
+	// 与 SOPOverflow 同口径（绝不静默丢弃）。>0 说明索引段没列全，
+	// 模型对这部分工具"连名字都看不到"——但它们仍可经 lookup_tool 查到
+	// （宽进严出：只影响注入深度，不影响可调用性）。
+	DeferredOverflow int
 }
 
 // Limits 预算与注入限制。
@@ -146,8 +152,15 @@ func (b *Builder) Build(in Input) BuildResult {
 	// 本函数只影响「注入深度」，绝不影响「能否调用」。
 	deferred, promoted := promoteActive(deferred, in.ActiveTools)
 
-	// deferred 索引截断（超出上限只保留前 N 条，并计入结果便于告警）
+	// deferred 索引截断（超出上限只保留前 N 条，并计入结果便于告警）。
+	//
+	// 铁律：绝不静默丢弃 —— 与下面 SOP 截断同口径。
+	// 改造前这里是 `deferred = deferred[:Max]`，被丢掉多少完全不可见，
+	// 而相邻的 SOP 截断却专门维护了 SOPOverflow 字段。同一函数内两套相反
+	// 策略，属自相矛盾：一处丢弃留痕、一处丢弃无声。
+	deferredOverflow := 0
 	if len(deferred) > b.limits.MaxDeferredIndex {
+		deferredOverflow = len(deferred) - b.limits.MaxDeferredIndex
 		deferred = deferred[:b.limits.MaxDeferredIndex]
 	}
 	// SOP 条数上限二次校验（防调用方绕过写入侧校验）。
@@ -230,6 +243,7 @@ func (b *Builder) Build(in Input) BuildResult {
 		OverBudget:      overBudget,
 		DroppedHistory:  dropped,
 		SOPOverflow:     sopOverflow,
+		DeferredOverflow: deferredOverflow,
 	}
 }
 
@@ -257,8 +271,14 @@ func (b *Builder) buildSystem(in Input, sop []string, deferred []ToolRef) string
 		sb.WriteString("\n")
 	}
 	if len(deferred) > 0 {
-		// 只放名称 + 一行描述：约 18 token/条，模型可据此判断是否需要按需加载
-		sb.WriteString("\n## 可按需调用的工具（需要时请显式加载）\n")
+		// 只放名称 + 一行描述：约 18 token/条，模型可据此判断是否需要按需加载。
+		//
+		// 文案必须点明「用 lookup_tool 取完整规范」：改造前这里写的是
+		// 「需要时请显式加载」，但全仓并不存在任何"显式加载"的工具 ——
+		// 那句话是空头承诺，模型只能盲猜参数。现在 lookup_tool 补上了这一环，
+		// 文案必须同步指明入口，否则模型仍然不知道该怎么加载。
+		sb.WriteString("\n## 可按需调用的工具\n")
+		sb.WriteString("以下工具未注入完整参数规范。需要调用时，先用 `lookup_tool` 传其 name 取到 Schema 再调用。\n")
 		for _, t := range deferred {
 			sb.WriteString(fmt.Sprintf("- %s — %s\n", t.Name, firstLine(t.Description)))
 		}

@@ -218,7 +218,10 @@ export function Composer() {
               <Coins size={12} className="text-amber-400 shrink-0" />
               <span className="font-medium text-inkdim">{fmtTokens(total)}</span>
               <span className="hidden sm:inline text-[10px] text-inkfaint">tokens</span>
-              {cacheRate > 0 && (
+              {/* 缓存命中率：输入用量存在即展示（含 0%）。
+                  旧实现只在 cacheRate > 0 时渲染，导致「缓存确实没命中」与
+                  「端点不提供缓存明细」无法区分，用户以为功能没做。 */}
+              {tokensIn > 0 && (
                 <span className="ml-0.5 inline-flex items-center gap-0.5 rounded bg-accent2/10 px-1 py-[0.5px] text-[10px] font-medium text-accent2">
                   <Zap size={9} className="shrink-0" />
                   {cacheRate.toFixed(1)}%

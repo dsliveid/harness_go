@@ -24,45 +24,45 @@ const (
 	maxRedirects    = 5     // 重定向跳数上限
 )
 
-// invokeFetch 抓取 URL 并提取正文文本。
-func invokeFetch(ctx context.Context, host toolapi.Host, call *toolapi.Call) (*toolapi.Result, error) {
+// fetchWebPage 抓取 URL 并提取正文文本。
+func fetchWebPage(ctx context.Context, host toolapi.Host, call *toolapi.Call) (*toolapi.Result, error) {
 	var args struct {
 		URL      string `json:"url"`
 		MaxChars int    `json:"max_chars"`
 	}
 	if err := pluginkit.DecodeArgs(call.Args, &args); err != nil {
-		return pluginkit.ErrorResult("web_fetch: %v", err), nil
+		return pluginkit.ErrorResult("fetch_web_page: %v", err), nil
 	}
 	u, err := url.Parse(strings.TrimSpace(args.URL))
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
-		return pluginkit.ErrorResult("web_fetch: URL 非法（仅 http/https）: %q", args.URL), nil
+		return pluginkit.ErrorResult("fetch_web_page: URL 非法（仅 http/https）: %q", args.URL), nil
 	}
 	if err := guardPrivateHost(u.Hostname()); err != nil {
-		return pluginkit.ErrorResult("web_fetch: %v", err), nil
+		return pluginkit.ErrorResult("fetch_web_page: %v", err), nil
 	}
 	maxChars := clampMaxChars(args.MaxChars)
 
 	client := newHTTPClient()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return pluginkit.ErrorResult("web_fetch: 构造请求失败: %v", err), nil
+		return pluginkit.ErrorResult("fetch_web_page: 构造请求失败: %v", err), nil
 	}
 	req.Header.Set("User-Agent", "harness-go-webfetch/1.0")
 	resp, err := client.Do(req)
 	if err != nil {
-		return pluginkit.ErrorResult("web_fetch: 请求失败: %v", err), nil
+		return pluginkit.ErrorResult("fetch_web_page: 请求失败: %v", err), nil
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return pluginkit.ErrorResult("web_fetch: HTTP %d %s", resp.StatusCode, http.StatusText(resp.StatusCode)), nil
+		return pluginkit.ErrorResult("fetch_web_page: HTTP %d %s", resp.StatusCode, http.StatusText(resp.StatusCode)), nil
 	}
 	ct := resp.Header.Get("Content-Type")
 	if !isTextType(ct) {
-		return pluginkit.ErrorResult("web_fetch: 不支持的类型 %q（仅文本/HTML）", ct), nil
+		return pluginkit.ErrorResult("fetch_web_page: 不支持的类型 %q（仅文本/HTML）", ct), nil
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes+1))
 	if err != nil {
-		return pluginkit.ErrorResult("web_fetch: 读取失败: %v", err), nil
+		return pluginkit.ErrorResult("fetch_web_page: 读取失败: %v", err), nil
 	}
 	return buildResult(string(body), ct, args.URL, resp.StatusCode, maxChars), nil
 }
@@ -70,17 +70,17 @@ func invokeFetch(ctx context.Context, host toolapi.Host, call *toolapi.Call) (*t
 // buildResult 把响应体转换为工具结果：状态码 → 类型 → 体积上限 → 正文提取 → 字符截断。
 func buildResult(body, ct, srcURL string, status, maxChars int) *toolapi.Result {
 	if status != http.StatusOK {
-		return pluginkit.ErrorResult("web_fetch: HTTP %d %s", status, http.StatusText(status))
+		return pluginkit.ErrorResult("fetch_web_page: HTTP %d %s", status, http.StatusText(status))
 	}
 	if !isTextType(ct) {
-		return pluginkit.ErrorResult("web_fetch: 不支持的类型 %q（仅文本/HTML）", ct)
+		return pluginkit.ErrorResult("fetch_web_page: 不支持的类型 %q（仅文本/HTML）", ct)
 	}
 	if len(body) > maxBodyBytes {
 		body = body[:maxBodyBytes]
 	}
 	text := extractText(body, ct)
 	if text == "" {
-		return pluginkit.ErrorResult("web_fetch: 页面无可提取文本")
+		return pluginkit.ErrorResult("fetch_web_page: 页面无可提取文本")
 	}
 	return pluginkit.TextResult("%s\n\n[来源 %s，状态 %d，原文 %d 字节]",
 		pluginkit.TruncateRunes(text, maxChars), srcURL, status, len(body))

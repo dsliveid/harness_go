@@ -1,4 +1,4 @@
-﻿import { useEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Search, X, Download, Trash2, Sparkles, Cpu } from 'lucide-react'
 import { usePlugins } from '../../stores/pluginStore'
 import { useUI } from '../../stores/uiStore'
@@ -789,7 +789,7 @@ export function SkillsPane({ client }: { client: DeviceNode }) {
               <>
                 技能真源是 <code className="font-mono bg-panel2 px-1 rounded">{skillDir}/&lt;name&gt;/SKILL.md</code>
                 {skillRoot ? <span className="text-inkfaint">（根：{skillRoot}）</span> : null}。
-                与 Agent 的 skill_list / skill_save <span className="text-inkdim">读写同一份文件</span>：
+                与 Agent 的 list_skills / save_skill <span className="text-inkdim">读写同一份文件</span>：
                 界面装的技能 Agent 立刻可用，Agent 沉淀的技能这里立刻可见。
                 目录不存在时视为空库（全新部署的正常状态）。
               </>
@@ -811,7 +811,7 @@ export function SkillsPane({ client }: { client: DeviceNode }) {
               </div>
               {skillViews.length === 0 ? (
                 <div className="text-[11px] text-inkfaint">
-                  技能库为空。可在会话中让 Agent 用 skill_save 沉淀，或从「市场」页签安装。
+                  技能库为空。可在会话中让 Agent 用 save_skill 沉淀，或从「市场」页签安装。
                 </div>
               ) : (
                 <div className="space-y-1.5">

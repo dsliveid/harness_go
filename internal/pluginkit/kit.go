@@ -15,17 +15,6 @@ import (
 	"harness-go/pkg/toolapi"
 )
 
-// DecodeArgs 把调用参数解码到结构体（非法 JSON / 字段缺失由调用方校验语义）。
-func DecodeArgs(raw json.RawMessage, v any) error {
-	if len(raw) == 0 {
-		return nil // 空参数合法（全默认值工具）
-	}
-	if err := json.Unmarshal(raw, v); err != nil {
-		return fmt.Errorf("%w: 参数解析失败: %v", toolapi.ErrInvalidArgs, err)
-	}
-	return nil
-}
-
 // TextResult 构造纯文本成功结果。
 func TextResult(format string, args ...any) *toolapi.Result {
 	return &toolapi.Result{Content: fmt.Sprintf(format, args...)}

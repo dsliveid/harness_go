@@ -43,9 +43,9 @@ func (nilSpawnHost) Spawn() toolapi.ChildRunner { return nil }
 // TestSpawnSubagentNilSpawn Spawn() 为 nil 时必须显式报「嵌套 Run 能力未接线」。
 func TestSpawnSubagentNilSpawn(t *testing.T) {
 	h := nilSpawnHost{plugintest.New(t)}
-	res, err := invokeSpawn(context.Background(), h, &toolapi.Call{Args: []byte(`{"task":"做点事"}`)})
+	res, err := spawnSubagent(context.Background(), h, &toolapi.Call{Args: []byte(`{"task":"做点事"}`)})
 	if err != nil {
-		t.Fatalf("invokeSpawn 不应向上抛错: %v", err)
+		t.Fatalf("spawnSubagent 不应向上抛错: %v", err)
 	}
 	if res == nil || !res.IsError {
 		t.Fatalf("未接线必须返回 IsError 结果: %+v", res)
@@ -69,12 +69,12 @@ func TestSpawnSubagentCompleted(t *testing.T) {
 			},
 		}, nil
 	}
-	res, err := invokeSpawn(context.Background(), h, &toolapi.Call{
+	res, err := spawnSubagent(context.Background(), h, &toolapi.Call{
 		RunID: "run-parent-1", SessionID: "sess-1",
 		Args: []byte(`{"task":"统计仓库文件数"}`),
 	})
 	if err != nil {
-		t.Fatalf("invokeSpawn 不应向上抛错: %v", err)
+		t.Fatalf("spawnSubagent 不应向上抛错: %v", err)
 	}
 	if res.IsError {
 		t.Fatalf("子 Run 完成不应标记失败: %q", res.Content)
@@ -112,9 +112,9 @@ func TestSpawnSubagentChildNotCompleted(t *testing.T) {
 					},
 				}, nil
 			}
-			res, err := invokeSpawn(context.Background(), h, &toolapi.Call{Args: []byte(`{"task":"x"}`)})
+			res, err := spawnSubagent(context.Background(), h, &toolapi.Call{Args: []byte(`{"task":"x"}`)})
 			if err != nil {
-				t.Fatalf("invokeSpawn 不应向上抛错: %v", err)
+				t.Fatalf("spawnSubagent 不应向上抛错: %v", err)
 			}
 			if !res.IsError {
 				t.Fatalf("状态 %s 必须判为失败: %q", tc.status, res.Content)
@@ -140,9 +140,9 @@ func TestSpawnSubagentBadArgs(t *testing.T) {
 		spawned = true
 		return nil, errors.New("不应被调用")
 	}
-	res, err := invokeSpawn(context.Background(), h, &toolapi.Call{Args: []byte(`not-json`)})
+	res, err := spawnSubagent(context.Background(), h, &toolapi.Call{Args: []byte(`not-json`)})
 	if err != nil {
-		t.Fatalf("invokeSpawn 不应向上抛错: %v", err)
+		t.Fatalf("spawnSubagent 不应向上抛错: %v", err)
 	}
 	if !res.IsError {
 		t.Fatalf("非法参数必须返回 IsError: %+v", res)
@@ -161,7 +161,7 @@ func TestSpawnSubagentSpawnError(t *testing.T) {
 	h.SpawnFn = func(context.Context, toolapi.SpawnRequest) (toolapi.ChildRun, error) {
 		return nil, errors.New("嵌套深度超限（max_depth=2）")
 	}
-	res, err := invokeSpawn(context.Background(), h, &toolapi.Call{Args: []byte(`{"task":"x"}`)})
+	res, err := spawnSubagent(context.Background(), h, &toolapi.Call{Args: []byte(`{"task":"x"}`)})
 	if err != nil {
 		t.Fatalf("Spawn 失败不应上抛为 error: %v", err)
 	}
@@ -179,7 +179,7 @@ func TestSpawnSubagentWaitError(t *testing.T) {
 	h.SpawnFn = func(context.Context, toolapi.SpawnRequest) (toolapi.ChildRun, error) {
 		return &fakeChild{id: "run-child-3", status: toolapi.ChildRunning, waitErr: errors.New("上下文已取消")}, nil
 	}
-	res, err := invokeSpawn(context.Background(), h, &toolapi.Call{Args: []byte(`{"task":"x"}`)})
+	res, err := spawnSubagent(context.Background(), h, &toolapi.Call{Args: []byte(`{"task":"x"}`)})
 	if err != nil {
 		t.Fatalf("Wait 失败不应上抛为 error: %v", err)
 	}
@@ -200,13 +200,13 @@ func TestSpawnSubagentRequestPassthrough(t *testing.T) {
 		return &fakeChild{status: toolapi.ChildCompleted,
 			res: toolapi.ChildResult{RunID: "run-child-4", Status: toolapi.ChildCompleted, Output: "ok"}}, nil
 	}
-	_, err := invokeSpawn(context.Background(), h, &toolapi.Call{
+	_, err := spawnSubagent(context.Background(), h, &toolapi.Call{
 		RunID:     "run-parent-9",
 		SessionID: "sess-9",
 		Args:      []byte(`{"task":"写一份 README 摘要","model_ref":"gpt-4o-mini"}`),
 	})
 	if err != nil {
-		t.Fatalf("invokeSpawn 不应向上抛错: %v", err)
+		t.Fatalf("spawnSubagent 不应向上抛错: %v", err)
 	}
 	if got.Input != "写一份 README 摘要" {
 		t.Fatalf("Input 未透传 task: %q", got.Input)

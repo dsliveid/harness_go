@@ -2,21 +2,35 @@
   "id": "plan",
   "name": "执行计划",
   "description": "维护结构化执行计划（步骤与完成状态），用于复杂任务的显式规划",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "kind": "builtin",
   "default_tier": "deferred",
   "protocol_version": 1,
   "tools": [
     {
-      "name": "plan_set",
-      "description": "设置/更新执行计划（标题 + 步骤列表，步骤可标记完成）",
-      "schema_json": {"type":"object","properties":{"title":{"type":"string"},"steps":{"type":"array","items":{"type":"object","properties":{"title":{"type":"string"},"done":{"type":"boolean"}},"required":["title"]}}},"required":["title","steps"]},
+      "name": "create_plan",
+      "description": "创建执行计划（标题 + 分步清单）。已存在同名计划时覆盖。复杂任务动工前先立计划，作为防需求失真的锚点。",
+      "schema_json": {"type":"object","properties":{"title":{"type":"string","description":"计划标题（简明说明要达成什么）"},"steps":{"type":"array","description":"分步清单（有序）","items":{"type":"object","properties":{"title":{"type":"string","description":"步骤描述"},"done":{"type":"boolean","description":"是否已完成（默认 false）"}},"required":["title"]}}},"required":["title","steps"]},
       "tier": "deferred",
       "risk": "write"
     },
     {
-      "name": "plan_get",
-      "description": "读取当前执行计划",
+      "name": "update_plan",
+      "description": "更新执行计划：可改标题、可整体替换步骤清单，或按序号标记某步完成/未完成。用于推进进度与需求变更同步。",
+      "schema_json": {"type":"object","properties":{"title":{"type":"string","description":"新标题（省略则保持不变）"},"steps":{"type":"array","description":"整体替换的步骤清单（省略则保持不变）","items":{"type":"object","properties":{"title":{"type":"string"},"done":{"type":"boolean"}},"required":["title"]}},"complete_step":{"type":"integer","description":"按序号（1 起）标记该步为已完成"},"uncomplete_step":{"type":"integer","description":"按序号（1 起）标记该步为未完成"}}},
+      "tier": "deferred",
+      "risk": "write"
+    },
+    {
+      "name": "read_plan",
+      "description": "读取当前执行计划的完整内容与完成进度。",
+      "schema_json": {"type":"object","properties":{}},
+      "tier": "deferred",
+      "risk": "readonly"
+    },
+    {
+      "name": "list_plans",
+      "description": "列出所有已保存的执行计划（标题与完成进度）。",
       "schema_json": {"type":"object","properties":{}},
       "tier": "deferred",
       "risk": "readonly"
