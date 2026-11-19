@@ -11,7 +11,7 @@ import (
 
 // memStore 内存版压缩存储桩。
 type memStore struct {
-	records []model.Compaction
+	records   []model.Compaction
 	createErr error
 	listErr   error
 }
@@ -131,19 +131,27 @@ func TestCompactRejectsUnprofitableSummary(t *testing.T) {
 	}
 }
 
-// TestCompactSingleTurnRunningSkipped 单轮任务运行中必须跳过（事故会话形态）。
-func TestCompactSingleTurnRunningSkipped(t *testing.T) {
+// TestCompactSingleTurnRunningStillCompacts 单轮长任务运行中也要压缩（事故会话形态）。
+//
+// 与旧断言相反（见 compact_test.go TestPlanRunningSingleTurnStillCompacts 的说明）：
+// 「运行中不压缩」会让单轮超长任务彻底失去容量治理 —— 事故会话 122559a3 正是
+// 1 条 user + 217 条工具步骤，session_compactions 恒为 0，账单烧到 839 万 token。
+func TestCompactSingleTurnRunningStillCompacts(t *testing.T) {
 	svc, st := newSvc(t, "摘要")
-	msgs := []model.Message{
-		msg(1, model.RoleUser, strings.Repeat("任务描述", 500)),
-		msg(2, model.RoleTool, strings.Repeat("输出", 500)),
+	// 复刻真实形态：1 条 user + 多组 assistant(tool_calls)/tool。
+	// （只有 2 条消息是退化形态：折叠任一条都会留下孤儿 tool 或丢失全部现场，
+	//   此时不压缩才是对的，因此这里必须用有代表性的历史。）
+	msgs := []model.Message{msg(1, model.RoleUser, strings.Repeat("任务描述", 200))}
+	for i := int64(2); i <= 20; i += 2 {
+		msgs = append(msgs, toolCallMsg(i))
+		msgs = append(msgs, msg(i+1, model.RoleTool, strings.Repeat("输出", 200)))
 	}
 	res, _ := svc.CompactIfNeeded(context.Background(), 900, 1000, msgs, true)
-	if res.Compacted {
-		t.Fatal("单轮任务运行中不得压缩（会把任务本身折叠掉）")
+	if !res.Compacted {
+		t.Fatalf("单轮长任务运行中必须能压缩，实际跳过原因=%q", res.SkipReason)
 	}
-	if len(st.records) != 0 {
-		t.Error("不得落库")
+	if len(st.records) != 1 {
+		t.Fatalf("应落库 1 条压缩记录，实际 %d", len(st.records))
 	}
 }
 

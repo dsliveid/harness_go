@@ -342,7 +342,11 @@ func TestEndToEndChatFlow(t *testing.T) {
 			t.Fatalf("事件流缺少 %s，实际: %s", want, joined)
 		}
 	}
-	if !strings.Contains(deltas.String(), "收到：你好") {
+	// fake provider 回显的是「最后一条 user 消息全文」，而引擎会把本轮可变尾段
+	// （步数进度提示 / 思考语言锚定）拼在该 user 消息之前，故回显正文会带上
+	// 「收到：（系统提示：……）\n\n你好」这类前置尾段。
+	// 断言只应校验「用户原文被完整回显」，不能假设回显正文以用户输入开头。
+	if !strings.Contains(deltas.String(), "收到：") || !strings.Contains(deltas.String(), "你好") {
 		t.Fatalf("delta 拼接结果异常: %q", deltas.String())
 	}
 
@@ -373,7 +377,11 @@ func TestEndToEndChatFlow(t *testing.T) {
 	if msgs.Items[0].Role != "user" || msgs.Items[0].Content != "你好" {
 		t.Fatalf("第 1 条应为用户消息: %+v", msgs.Items[0])
 	}
-	if msgs.Items[1].Role != "assistant" || !strings.Contains(msgs.Items[1].Content, "收到：你好") {
+	// 助手回复 = fake 回显（含引擎拼在本轮 user 消息前的可变尾段，如思考语言锚定），
+	// 因此只断言「角色 + 用户原文被回显」，不断言正文前缀。
+	if msgs.Items[1].Role != "assistant" ||
+		!strings.Contains(msgs.Items[1].Content, "收到：") ||
+		!strings.Contains(msgs.Items[1].Content, "你好") {
 		t.Fatalf("第 2 条应为助手回复: %+v", msgs.Items[1])
 	}
 	if msgs.Items[1].Seq != 2 {

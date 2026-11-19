@@ -526,6 +526,8 @@ function DataScopePane({ projectId }: { projectId: string }) {
           <div>· 工具审批管「能不能执行动作」，数据权限管「这次能触达哪些数据」</div>
           <div>· 「询问」= 每次触达弹审批条；「允许」= 自动放行并记审计日志；「拒绝」= 直接回传失败</div>
           <div>· 审批时选「本项目允许」会自动把对应范围置为「允许」，可在本页回收</div>
+          {/* 0014 起策略已落服务端，刷新/换端/重启均保留，故不再有「未持久化」提示 */}
+          <div>· 本页策略已保存到服务端，刷新页面或换设备后依然生效</div>
         </div>
       </div>
     </div>
@@ -534,10 +536,10 @@ function DataScopePane({ projectId }: { projectId: string }) {
 
 // ---------------- 弹窗外壳：左侧菜单 + 右侧内容 + 统一操作条（对齐桌面端） ----------------
 export function ProjectModal({ project, onClose }: { project: Project | null; onClose: () => void }) {
-  const { setProjectConstraints, setProjectPlanMode } = useSessions()
+  const { setProjectConstraints, setProjectPlanMode, loadProjectSettings } = useSessions()
   const toast = useUI((s) => s.toast)
   const [tab, setTab] = useState<Tab>('constraints')
-  // 草稿：约束文本 + 计划模式；打开时装载，「应用 / 保存」时统一落库（关联项目 / 审批规则为行内即时提交）
+  // 草稿：约束文本 + 计划模式；打开时装载，「应用 / 保存」时统一落服务端（关联项目 / 审批规则为行内即时提交）
   const [constraints, setConstraints] = useState('')
   const [planMode, setPlanMode] = useState<PlanMode>('standard')
 
@@ -547,6 +549,9 @@ export function ProjectModal({ project, onClose }: { project: Project | null; on
     setTab('constraints')
     setConstraints(project.constraints ?? '')
     setPlanMode(project.planMode ?? 'standard')
+    // 0014：关联项目 + 数据权限改为服务端持久化，打开设置时按项目拉取一次
+    // （首屏不批量拉，避免为 N 个项目发 2N 个请求）。
+    void loadProjectSettings(project.id)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project?.id])
 
@@ -555,10 +560,10 @@ export function ProjectModal({ project, onClose }: { project: Project | null; on
     constraints !== (project.constraints ?? '') ||
     planMode !== (project.planMode ?? 'standard')
 
-  // 应用：把草稿统一写入 store（约束 + 计划模式），不关闭窗口
+  // 应用：把草稿统一写入服务端（约束 + 计划模式），不关闭窗口
   const apply = () => {
-    if (constraints !== (project.constraints ?? '')) setProjectConstraints(project.id, constraints)
-    if (planMode !== (project.planMode ?? 'standard')) setProjectPlanMode(project.id, planMode)
+    if (constraints !== (project.constraints ?? '')) void setProjectConstraints(project.id, constraints)
+    if (planMode !== (project.planMode ?? 'standard')) void setProjectPlanMode(project.id, planMode)
     toast('success', '项目设置已应用')
   }
 

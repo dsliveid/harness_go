@@ -423,7 +423,7 @@ func Definitions() []Definition {
 				Title: "精益代码研读与规范探索 SOP",
 				Body: lines(
 					"- 漏斗式探索原则：优先使用 glob / list_dir 查看目录与配置，对源码文件优先调用 `file_outline` 获取结构骨架，结合 `grep` 定位关键线索；",
-					"- 项目源码、配置文件阅读优先使用原生工具（read_file、grep、file_outline），深入阅读时以函数/局部为靶标，结合 offset_line 与 max_lines 阅读必要上下文（建议 100~500 行）；修改前必须局部 read_file 确认原文；",
+					"- 项目源码、配置文件阅读优先使用原生工具（read_file、grep、file_outline），深入阅读时以函数/局部为靶标，结合 offset_line 与 max_lines 阅读必要上下文（精读建议 100~500 行；整文件概览可直接用默认 1200 行）；修改前必须局部 read_file 确认原文；",
 					"- 仅在复杂数据分析或系统底层勘察时允许编写脚本探查，切勿为了读取普通代码文件而舍近求远编写临时脚本。",
 				),
 				Active: func(Context) bool {
@@ -492,16 +492,17 @@ func Definitions() []Definition {
 				CategoryLabel: "任务规划",
 				Scope:         ScopeUniversal,
 				ScopeLabel:    "主/子对话可用",
-				IsHardRule:    false,
-				Description:   "全程简体中文与用户交流；最终回复简洁总结（做了什么、改了哪些文件、验证结果如何）；思考过程仅用于内部推导，面向用户的答复必须且只能输出在正文（Content）中，严禁思考后停止生成导致正文留空。",
-				DisableEffect: "禁用后：解除「结论必须落在正文」的强制口径，深度思考模型可能出现正文留空。",
+				IsHardRule:    true,
+				Description:   "全程简体中文：思考过程（Thinking/Reasoning）与正文都必须使用简体中文；最终回复简洁总结（做了什么、改了哪些文件、验证结果如何）；结论必须输出在正文（Content）中，严禁思考后停止生成导致正文留空。",
+				DisableEffect: "系统级交付口径，常驻生效（语言与正文落位是底线，不提供关闭）。",
 			},
 			Variants: []Variant{{
 				Label: "通用",
-				Title: "交互语言与交付口径",
+				Title: "交互语言与交付口径（含思考过程）",
 				Body: lines(
-					"- 全程使用简体中文与用户交流；最终回复简洁总结：做了什么、改了哪些文件、验证结果如何。",
-					"- 【思考与交付通道分离】：若当前模型具备深度思考能力（Thinking/Reasoning），思考过程仅用于内部推导与推演；面向用户的答复必须且只能完整输出在正文（Content）中，严禁在思考结束后直接停止生成导致正文留空。",
+					"- 全程使用简体中文：**思考过程（Thinking / Reasoning）与正文都必须使用简体中文**，不得因为思考属于内部通道就切换成英文。专有名词、代码、路径、命令与工具名可保留原文。",
+					"- 最终回复简洁总结：做了什么、改了哪些文件、验证结果如何。",
+					"- 【结论必须落在正文】：若当前模型具备深度思考能力（Thinking / Reasoning），思考过程只用于内部推导与推演，**不代表可以换语言**；面向用户的答复必须且只能完整输出在正文（Content）中，严禁在思考结束后直接停止生成导致正文留空。",
 				),
 				Active: func(Context) bool { return true },
 			}},

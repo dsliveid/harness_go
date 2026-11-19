@@ -86,6 +86,11 @@ type RunServiceOptions struct {
 	// 因此没有引擎来发终态事件；但前端有乐观气泡在转圈，必须有人告诉它「已结束」。
 	// nil 时跳过发布（单测/降级），DB 仍是唯一权威。
 	Events agent.EventPublisher
+	// SessionChanges 会话列表级变更观察者；nil 时纯写库不广播（单测/降级）。
+	//
+	// 由装配层（cmd）注入 sessionbus 适配器，让各端对话列表的「运行中」徽标
+	// 与 Run 生命周期同步（Run 一创建即可见，终态即消失）。
+	SessionChanges SessionChangePublisher
 }
 
 // RunService Run 用例：创建（异步执行）/ 停止 / 查询 / 启动恢复。
@@ -116,6 +121,12 @@ type RunService struct {
 	hub HubOnline
 	// events Run 事件发布源；nil 时不发布终态事件（DB 仍是权威）。
 	events agent.EventPublisher
+	// changes 会话摘要变更观察者（会话列表级 SSE）；nil 时纯写库不广播。
+	//
+	// 为什么 RunService 也需要它：Run 创建时会把 last_run_status 投影成 pending
+	// （本文件 AddTokensAndStatus 直调 store，**绕过** agent.SummaryWriter），
+	// 若不在此处广播，各端的「运行中」脉冲点要等下一帧才出现。
+	changes SessionChangePublisher
 
 	mu      sync.Mutex
 	cancels map[string]context.CancelFunc
@@ -153,6 +164,7 @@ func NewRunService(opts RunServiceOptions) *RunService {
 		catalog:        opts.Catalog,
 		hub:            opts.Hub,
 		events:         opts.Events,
+		changes:        opts.SessionChanges,
 		cancels:        make(map[string]context.CancelFunc),
 	}
 }
@@ -510,6 +522,13 @@ func (s *RunService) CreateRunWithSystem(ctx context.Context, sessionID, userInp
 	// 这里补写一次即可让投影全程跟随真相，无需新增接口/表/字段。
 	// 失败不阻断 Run（投影是展示项，真相在会话库），与 TouchMessage 同口径。
 	_ = s.main.Sessions().AddTokensAndStatus(ctx, sessionID, 0, initialStatus)
+	// 会话列表实时推送：Run 一创建就让各端看到「运行中」徽标。
+	//
+	// 必须在投影写库**之后**广播（否则客户端回查读到旧状态）。
+	// 走低延迟通道：这是用户点发送后立刻要看到的反馈，1 秒合并窗口不可接受。
+	if s.changes != nil {
+		s.changes.PublishSessionStatusChanged(sessionID)
+	}
 
 	// ③' 未选择模型：到此收口并返回（消息已落库、Run 已终态）。
 	//

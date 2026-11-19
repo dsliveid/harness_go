@@ -11,7 +11,7 @@
     {
       "name": "read_file",
       "description": "读取工作区内文本文件的局部或全部内容（带行号）。修改文件前必须先用它确认精确原文。支持配合 offset_line 与 max_lines 定向阅读目标区域。",
-      "schema_json": {"type":"object","properties":{"path":{"type":"string","description":"相对于工作区的文件路径"},"offset_line":{"type":"integer","description":"起始行（1 开始，默认 1）"},"max_lines":{"type":"integer","description":"读取最大行数（默认 500，可按需指定至 1000 行）"}},"required":["path"]},
+      "schema_json": {"type":"object","properties":{"path":{"type":"string","description":"相对于工作区的文件路径"},"offset_line":{"type":"integer","description":"起始行（1 开始，默认 1）"},"max_lines":{"type":"integer","description":"读取最大行数（默认 1200，超过 2000 按 2000 处理）。单次输出需控制在 64K 内，读大文件请配合 offset_line 分段；长行文件（如压缩过的 JSON）请指定较小的 max_lines"}},"required":["path"]},
       "tier": "core",
       "risk": "readonly"
     },

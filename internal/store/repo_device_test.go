@@ -74,16 +74,17 @@ func TestMainDevicesMigration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 0013_rename_workspace_path.sql 落地后主库版本为 13。
-	if v != 13 {
-		t.Fatalf("主库 schema 版本期望 13，得到 %d", v)
+	// 0013_rename_workspace_path.sql 落地后主库版本为 13；
+	// 0014_project_settings.sql（项目约束/规划模式/关联项目/数据权限落库）后为 15。
+	if v != 15 {
+		t.Fatalf("主库 schema 版本期望 15，得到 %d", v)
 	}
 	req, err := RequiredSchemaVersion("main")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if req != 13 {
-		t.Fatalf("RequiredSchemaVersion(main) 期望 13，得到 %d", req)
+	if req != 15 {
+		t.Fatalf("RequiredSchemaVersion(main) 期望 15，得到 %d", req)
 	}
 }
 
@@ -619,12 +620,13 @@ func TestMigrationUpgradeFromV1(t *testing.T) {
 	// v1 库升级：0002_devices + 0003_retrieval + 0004_market + 0005_snapshots + 0006_webhooks
 	// + 0007_session_archive + 0008_projects + 0009_workspaces + 0010_pair_code_user
 	// + 0011_device_owner + 0012_session_workspace_backfill + 0013_rename_workspace_path
-	// 共 12 个增量迁移。
-	if applied != 12 {
-		t.Fatalf("主库增量迁移应应用 12 个，得到 %d", applied)
+	// + 0014_project_settings + 0015_session_read_cursor
+	// 共 14 个增量迁移。
+	if applied != 14 {
+		t.Fatalf("主库增量迁移应应用 14 个，得到 %d", applied)
 	}
-	if v, _ := SchemaVersion(ctx, mdb); v != 13 {
-		t.Fatalf("主库升级后版本期望 13，得到 %d", v)
+	if v, _ := SchemaVersion(ctx, mdb); v != 15 {
+		t.Fatalf("主库升级后版本期望 15，得到 %d", v)
 	}
 	var title string
 	if err := mdb.QueryRowContext(ctx, `SELECT title FROM sessions WHERE id='old-s1'`).Scan(&title); err != nil {

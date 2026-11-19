@@ -17,6 +17,7 @@ import (
 	"harness-go/internal/logvault"
 	"harness-go/internal/model"
 	"harness-go/internal/service"
+	"harness-go/internal/sessionbus"
 )
 
 // Deps 传输层依赖（全部经 service/auth，不接触 store）。
@@ -80,10 +81,18 @@ type Deps struct {
 	// DeviceState 设备状态广播总线（nil 时 /devices/events 返回 503 device.disabled）。
 	// 由 cmd 装配：把 Hub 的 OnOnline/OnOffline 与 StateBus.MarkOnline/MarkOffline 组合。
 	DeviceState *device.StateBus
-	Bus         *events.Bus
-	Auth        *auth.Service
-	AuthConfig  AuthConfig
-	VerifyToken TokenVerifier
+	// SessionEvents 会话列表变更总线（nil 时 /sessions/events 返回 unavailable）。
+	//
+	// 为什么需要它：各端此前只能刷新「打开中的会话内内容」，对话列表与每会话状态
+	// （运行中/标题自动生成/归档/删除）只在页面挂载时拉一次，跨端协同时另一端静默。
+	// 该总线把会话写入事件转成 SSE 推送给所有已连接端。
+	//
+	// 埋点约定：写路径**必须在 DB 事务提交之后**调用 Publish*，否则客户端回查读到旧值。
+	SessionEvents *sessionbus.Bus
+	Bus           *events.Bus
+	Auth          *auth.Service
+	AuthConfig    AuthConfig
+	VerifyToken   TokenVerifier
 }
 
 type handlers struct {
@@ -148,18 +157,32 @@ func (h *handlers) createSession(w http.ResponseWriter, r *http.Request) {
 		req.AccessMode = "confirm"
 	}
 	sess, err := h.d.Sessions.Create(r.Context(), service.CreateSessionInput{
-		Title:         req.Title,
-		ModelRef:      req.ModelRef,
-		ProjectDir:    req.ProjectDir,
-		ProjectID:     req.ProjectID,
-		WorkspaceID:   req.WorkspaceID,
-		AccessMode:    req.AccessMode,
+		Title:       req.Title,
+		ModelRef:    req.ModelRef,
+		ProjectDir:  req.ProjectDir,
+		ProjectID:   req.ProjectID,
+		WorkspaceID: req.WorkspaceID,
+		AccessMode:  req.AccessMode,
 	})
 	if err != nil {
 		writeError(w, r, err)
 		return
 	}
+	// 会话列表实时推送：新建会话必须立刻出现在其他端的列表里。
+	// 走立即广播而非合并窗口：新建是低频显式操作，且用户期待「另一端马上就有」。
+	h.publishSessionCreated(sess.ID)
 	writeJSON(w, http.StatusCreated, sess)
+}
+
+// publishSessionCreated 广播新建会话（总线未装配时静默降级）。
+//
+// 与 publishSessionUpdated 分开的理由：新建要求低延迟（立即帧），
+// 更新会走 1s 合并窗口以吸收 token 累加产生的高频变更。
+func (h *handlers) publishSessionCreated(sessionID string) {
+	if h.d.SessionEvents == nil || sessionID == "" {
+		return
+	}
+	h.d.SessionEvents.PublishImmediate(sessionID, sessionbus.EventUpdated)
 }
 
 func (h *handlers) getSession(w http.ResponseWriter, r *http.Request) {
@@ -212,13 +235,54 @@ func (h *handlers) renameSession(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// 会话列表实时推送：PATCH 可能改标题/模型/权限/归属，全部落在同一行上，
+	// 故只推一次「该会话变了」，由 handler 回查 DB 拿最终值（无需区分改了什么）。
+	h.publishSessionUpdated(r.PathValue("sid"))
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// publishSessionUpdated 广播「某会话可能变化了」（列表级 SSE）。
+//
+// 统一出口的意义：所有会话写路径只调这一个方法 → 埋点口径不可能漂移，
+// 且总线为 nil（测试 env / 裁剪部署）时静默降级，绝不会 panic。
+//
+// 🚨 铁律：**必须在 DB 写入成功之后**调用。先广播再写库会让客户端回查读到旧值。
+func (h *handlers) publishSessionUpdated(sessionID string) {
+	if h.d.SessionEvents == nil || sessionID == "" {
+		return
+	}
+	h.d.SessionEvents.PublishUpdated(sessionID)
+}
+
+// publishProjectsChanged 广播「项目列表变了」（纯信号，前端收到后整表重拉）。
+//
+// 统一出口的意义与 publishSessionUpdated 相同：埋点口径集中一处，不会漂移；
+// 总线未装配时静默降级（测试 env / 裁剪部署不会 panic）。
+func (h *handlers) publishProjectsChanged() {
+	if h.d.SessionEvents == nil {
+		return
+	}
+	h.d.SessionEvents.PublishDomain(sessionbus.EventProjectsChanged)
+}
+
+// publishWorkspacesChanged 广播「工作空间列表变了」（纯信号，前端收到后整表重拉）。
+func (h *handlers) publishWorkspacesChanged() {
+	if h.d.SessionEvents == nil {
+		return
+	}
+	h.d.SessionEvents.PublishDomain(sessionbus.EventWorkspacesChanged)
+}
+
 func (h *handlers) deleteSession(w http.ResponseWriter, r *http.Request) {
-	if err := h.d.Sessions.Delete(r.Context(), r.PathValue("sid")); err != nil {
+	sid := r.PathValue("sid")
+	if err := h.d.Sessions.Delete(r.Context(), sid); err != nil {
 		writeError(w, r, err)
 		return
+	}
+	// 删除是终态：立即广播（不走合并窗口），否则其他端要多等 1 秒才让会话消失，
+	// 观感上像「删除没生效」。
+	if h.d.SessionEvents != nil {
+		h.d.SessionEvents.PublishRemoved(sid)
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -232,6 +296,9 @@ func (h *handlers) archiveSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, err)
 		return
 	}
+	// 归档走 updated 而非 removed：归档会话在归档中心仍可见，
+	// 「从活跃列表移出」是前端的列表分区规则，服务端只如实报 archived_at。
+	h.publishSessionUpdated(r.PathValue("sid"))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -241,18 +308,64 @@ func (h *handlers) unarchiveSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, err)
 		return
 	}
+	h.publishSessionUpdated(r.PathValue("sid"))
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// markSessionRead 上报会话已读：POST /api/v1/sessions/{sid}/read（204；幂等）。
+//
+// 语义：把已读游标推进到当前最后消息时间 → 侧栏的未读红点消失。
+// 前端在「打开会话」与「会话内收到新消息且窗口可见」时调用。
+//
+// 为什么要服务端广播：已读是**跨端**状态。A 端读完，B 端的侧栏红点也该消失
+// （同一账号同一份数据）。走 sessionbus 的 updated 通道即可，无需新事件类型。
+func (h *handlers) markSessionRead(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("sid")
+	if err := h.d.Sessions.MarkRead(r.Context(), sid); err != nil {
+		writeError(w, r, err)
+		return
+	}
+	// 已读是用户主动操作，且只改一行派生值 → 用合并通道即可（不必抢低延迟）。
+	h.publishSessionUpdated(sid)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// listMessages 读取会话消息（增量分页）。
+//
+// 🚨 必须返回 `has_more`（2026-11 修复「对话完成后结果不显示」）：
+// 旧实现只回 `items`，前端不知道后面还有多少条，长会话（事故会话 258 条）
+// 首屏只拿到前 100 条且没有任何加载更多入口 → **最终结论永远不可见**。
+//
+// 判定方式为「多取一条」：向存储层请求 limit+1 条，多出来那条只用来置位。
+// 这样无需新增 count 查询，也不会因为「恰好剩 limit 条」而出现边界误判。
+// ⚠️ 因此上限取 499 而不是 500：存储层有 `limit > 500 → 100` 的防洪闸
+// （store.MessageRepo.List），若这里给 500 则 limit+1=501 会被静默改写成 100，
+// has_more 立刻变成假阴性 —— 这个坑必须在同一处显式写清楚。
 func (h *handlers) listMessages(w http.ResponseWriter, r *http.Request) {
+	const (
+		defaultLimit = 100
+		maxLimit     = 499 // ≤ 存储层上限 500 - 1（多取的那一条）
+	)
 	afterSeq := int64(intParam(r, "after_seq", 0))
-	limit := intParam(r, "limit", 100)
-	msgs, err := h.d.Sessions.Messages(r.Context(), r.PathValue("sid"), afterSeq, limit)
+	limit := intParam(r, "limit", defaultLimit)
+	if limit <= 0 || limit > maxLimit {
+		limit = defaultLimit
+	}
+	msgs, err := h.d.Sessions.Messages(r.Context(), r.PathValue("sid"), afterSeq, limit+1)
 	if err != nil {
 		writeError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": msgs, "after_seq": afterSeq, "limit": limit})
+	hasMore := len(msgs) > limit
+	if hasMore {
+		msgs = msgs[:limit]
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"items":     msgs,
+		"after_seq": afterSeq,
+		"limit":     limit,
+		"has_more":  hasMore,
+	})
 }
 
 // ============ Run ============

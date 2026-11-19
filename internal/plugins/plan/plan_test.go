@@ -52,6 +52,31 @@ func TestUpdatePlanMarksStep(t *testing.T) {
 	}
 }
 
+// TestUpdatePlanAcceptsStepIndexAlias 模型最自然的 `step_index` + `status` 必须被归一。
+//
+// 事故会话 122559a3 实测：模型写 `{"status":"..."}` 被直接报「未知参数 "status"」，
+// 白烧两步（先猜一次、再看报错、再猜）。别名归一是零成本的宽容。
+func TestUpdatePlanAcceptsStepIndexAlias(t *testing.T) {
+	h := plugintest.New(t)
+	ctx := context.Background()
+	if _, err := createPlan(ctx, h, &toolapi.Call{Args: []byte(
+		`{"title":"T","steps":[{"title":"A"},{"title":"B"}]}`)}); err != nil {
+		t.Fatal(err)
+	}
+	res, _ := updatePlan(ctx, h, &toolapi.Call{Args: []byte(`{"step_index":1,"status":"completed"}`)})
+	if res.IsError {
+		t.Fatalf("step_index + status 别名不应报错: %q", res.Content)
+	}
+	if !strings.Contains(res.Content, "（1/2 完成）") {
+		t.Fatalf("别名应等价于 complete_step=1，实际: %q", res.Content)
+	}
+	// 反向也必须生效（status=pending → 取消完成）。
+	res, _ = updatePlan(ctx, h, &toolapi.Call{Args: []byte(`{"step_index":1,"status":"pending"}`)})
+	if !strings.Contains(res.Content, "（0/2 完成）") {
+		t.Fatalf("status=pending 应等价于 uncomplete_step，实际: %q", res.Content)
+	}
+}
+
 // TestUpdatePlanWithoutPlanRejected 无计划时更新必须报错，提示先 create_plan。
 func TestUpdatePlanWithoutPlanRejected(t *testing.T) {
 	h := plugintest.New(t)

@@ -51,13 +51,27 @@ func createPlan(ctx context.Context, host toolapi.Host, call *toolapi.Call) (*to
 // 按序号标记只需一个整数，语义最小、出错面最窄，这才是"更新"最常用的形态。
 func updatePlan(ctx context.Context, host toolapi.Host, call *toolapi.Call) (*toolapi.Result, error) {
 	var args struct {
-		Title         string `json:"title"`
-		Steps         []Step `json:"steps"`
-		CompleteStep  int    `json:"complete_step"`
-		UncompleteStep int   `json:"uncomplete_step"`
+		Title          string `json:"title"`
+		Steps          []Step `json:"steps"`
+		CompleteStep   int    `json:"complete_step"`
+		UncompleteStep int    `json:"uncomplete_step"`
+		// StepIndex 兼容别名（2026-11）：模型稳定倾向于写 `step_index` + `status`，
+		// 而实现只认 complete_step/uncomplete_step → 直接报「未知参数 "status"」，
+		// 白白浪费一步再猜一次。这里做输入归一，规范参数名保持唯一真源。
+		StepIndex int    `json:"step_index"`
+		Status    string `json:"status"`
 	}
 	if err := pluginkit.DecodeArgs(call.Args, &args); err != nil {
 		return pluginkit.ErrorResult("update_plan: %v", err), nil
+	}
+	// 别名归一：step_index + status 是模型最自然的表达，落到规范字段上。
+	if args.StepIndex > 0 && args.CompleteStep == 0 && args.UncompleteStep == 0 {
+		switch strings.ToLower(strings.TrimSpace(args.Status)) {
+		case "", "completed", "complete", "done", "finished", "ok":
+			args.CompleteStep = args.StepIndex
+		case "pending", "in_progress", "doing", "todo", "not_started", "uncompleted":
+			args.UncompleteStep = args.StepIndex
+		}
 	}
 	p, err := load(ctx, host)
 	if err != nil {

@@ -108,6 +108,14 @@ export interface Session {
   created_at: number;
   updated_at: number;
   archived_at?: number;
+  /** 已读游标（Unix 毫秒）：最后一次看到该会话内容的时刻。0/缺省 = 从未上报。 */
+  last_read_at?: number;
+  /**
+   * 有未读新消息（**服务端派生值**，不落库：`last_message_at > last_read_at`）。
+   *
+   * 前端**不得自行重算** —— 两套判定必然漂移。直接透传即可。
+   */
+  unread?: boolean;
 }
 
 export interface CreateSessionRequest {
@@ -129,9 +137,42 @@ export interface Project {
   /** 项目级默认控制权限：只对之后新建的会话生效（快照一次） */
   default_access_mode: 'confirm' | 'full';
   pinned: boolean;
+  /** 项目约束正文（0014 起服务端持久化；此前仅前端 localStorage） */
+  constraints: string;
+  /** 规划与执行策略（0014 起服务端持久化；此前仅前端 localStorage） */
+  plan_mode: PlanModeDTO;
   created_at: number;
   updated_at: number;
   deleted_at?: number;
+}
+
+/** 规划与执行策略：与后端 service.normalizePlanModeStrict 的合法值逐字一致 */
+export type PlanModeDTO = 'standard' | 'always_plan' | 'always_proceed';
+
+/** 关联项目（0014 起服务端持久化） */
+export interface ProjectLinkDTO {
+  id: string;
+  project_id: string;
+  path: string;
+  description: string;
+  created_at: number;
+}
+
+/** 数据权限策略档位（与后端 validDataModes 逐字一致） */
+export type DataGrantModeDTO = 'deny' | 'ask' | 'allow';
+
+/** 数据范围（与后端 validDataScopes / 前端 lib/dataScopes.ts 逐字一致） */
+export type DataGrantScopeDTO = 'fs_outside' | 'session_export' | 'db_query' | 'net_egress';
+
+/**
+ * 数据权限策略行（0014 起服务端持久化）。
+ * 🚨 服务端**只返回用户显式设置过的 scope**；未出现的 scope 一律按 ask 兜底。
+ */
+export interface ProjectDataGrantDTO {
+  project_id: string;
+  scope: DataGrantScopeDTO;
+  mode: DataGrantModeDTO;
+  updated_at: number;
 }
 
 export interface ProjectApprovalRule {
@@ -242,6 +283,11 @@ export interface Message {
   usage?: Record<string, unknown>;
   created_at: number;
   hidden?: boolean;
+}
+
+export interface ApiMessagePage {
+  items: Message[];
+  has_more?: boolean;
 }
 
 export interface Run {
@@ -526,8 +572,14 @@ export interface WebviewExchangeRequest {
 }
 
 /**
- * 兑换响应：**不含任何令牌字段**——会话凭据只通过 `Set-Cookie: hg_sess=...` 下发，
- * 且该会话 token kind=`webview`（可读会话、会话内发消息，禁止审批决策）。
+ * 兑换响应：**不含任何令牌字段**——会话凭据只通过 `Set-Cookie: hg_sess=...` 下发。
+ *
+ * ⚠️ 会话的 token kind 由**签发 ticket 时的 device_id 对应的设备形态**决定，不固定为 webview：
+ *   - 设备 kind=desktop → `web_session`（与表单登录同源，**不降级**：可建项目/可审批）；
+ *   - 其它形态 / 设备查不到 / device_id 为空 → `webview`（可读会话、会话内发消息，
+ *     禁审批决策、禁建项目）。
+ * 详见服务端 `sessionKindForDevice`（webview_ticket_handler.go）。旧注释写的
+ * 「该会话 token kind=webview」是绝对化表述，已随桌面端修复更正。
  */
 export interface WebviewExchangeResponse {
   ok: boolean;
@@ -557,8 +609,15 @@ export const API_PATHS = {
   workspace: (wid: string) => `/api/v1/workspaces/${wid}`,
   projectRules: (pid: string) => `/api/v1/projects/${pid}/approval-rules`,
   projectRule: (pid: string, rid: string) => `/api/v1/projects/${pid}/approval-rules/${rid}`,
+  // 项目设置（0014）：关联项目 + 数据权限策略
+  projectLinks: (pid: string) => `/api/v1/projects/${pid}/links`,
+  projectLink: (pid: string, lid: string) => `/api/v1/projects/${pid}/links/${lid}`,
+  projectDataGrants: (pid: string) => `/api/v1/projects/${pid}/data-grants`,
+  projectDataGrant: (pid: string, scope: string) => `/api/v1/projects/${pid}/data-grants/${scope}`,
   sessionArchive: (sid: string) => `/api/v1/sessions/${sid}/archive`,
   sessionUnarchive: (sid: string) => `/api/v1/sessions/${sid}/unarchive`,
+  /** 已读上报（未读红点）：把已读游标推进到当前最后消息时间（幂等） */
+  sessionRead: (sid: string) => `/api/v1/sessions/${sid}/read`,
   messages: (sid: string) => `/api/v1/sessions/${sid}/messages`,
   runs: (sid: string) => `/api/v1/sessions/${sid}/runs`,
   /**
@@ -644,6 +703,14 @@ export const API_PATHS = {
   deviceUnpair: '/api/v1/devices/unpair',
   /** 设备状态实时推送（SSE）：首帧 snapshot + 增量上下线 + device.revoked；**不续传** */
   deviceEvents: '/api/v1/devices/events',
+  /**
+   * 会话列表实时推送（SSE）：首帧 snapshot（全量会话）+ 增量 session.updated /
+   * session.removed；**不续传**。
+   *
+   * 与 sessionRunEvents（单个 Run 的事件流）是两条不同的流：
+   * 那个刷「当前对话内的消息」，本端点刷「左侧对话列表与各会话状态」。
+   */
+  sessionEvents: '/api/v1/sessions/events',
   /** C-6：会话租约（跨端写者归属） */
   sessionLease: (sid: string) => `/api/v1/sessions/${sid}/lease`,
   /* P1：Webhook 事件订阅 */

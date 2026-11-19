@@ -62,9 +62,15 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
   // 与壳能力声明（mobileCapabilities.createProject）取「与」：任一为 false 都不渲染。
   const allowNewProject = canCreateProject() && canCreateProjectIn(activeWs)
   const wsProjects = projects.filter((p) => wsOfProject(p) === activeWorkspaceId)
-  const active = sessions.filter(
-    (s) => !s.archivedAt && wsOfSession(s, projects) === activeWorkspaceId,
-  )
+  // 展示顺序：按「最新时间」倒序（对齐老版本口径）。
+  //
+  // 虽然 store 里的 sessions 已由 sortStable 排过一次，这里再显式排一遍是**故意的**：
+  // 侧栏分组只是 filter 结果，任何一次局部 set（乐观壳插入、快照合并、补丁覆盖）
+  // 都可能让 filter 后的相对顺序与服务端最新时间不再一致；渲染层直接按 updatedAt
+  // 兜底，才能保证用户看到的永远是「刚聊过的在最上」。
+  const active = sessions
+    .filter((s) => !s.archivedAt && wsOfSession(s, projects) === activeWorkspaceId)
+    .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))
   const pinnedProjects = wsProjects.filter((p) => p.pinned)
   const otherProjects = wsProjects.filter((p) => !p.pinned)
 
@@ -146,9 +152,18 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
     browseHostLabel: wsHostLabel,
     browseDisabledReason: wsHost.canList ? undefined : wsHost.reason,
     onSubmit: (v) => {
-      createProject(v.name, v.path ?? '')
+      // 🚨 必须等落库成功再提示成功（2026-11 实测缺陷）：
+      // 旧写法 `createProject(...); setPrompt(null); toast('success', ...)` 在请求发出前
+      // 就无条件弹成功，而 store 的失败分支又会弹失败 —— 服务端一拒（桌面端被误判成
+      // 移动端 403 时）就是「已创建 + 创建失败」双提示，且项目实际不存在。
+      // 现在：成功单独提示；失败由 store 统一提示并 reject，这里静默吞掉即可。
+      const name = v.name.trim()
       setPrompt(null)
-      toast('success', `项目「${v.name.trim()}」已创建`)
+      void createProject(v.name, v.path ?? '')
+        .then(() => toast('success', `项目「${name}」已创建`))
+        .catch(() => {
+          /* 失败提示已由 sessionStore.createProject 统一给出，此处不重复 */
+        })
     },
   })
 
@@ -519,7 +534,9 @@ function SessionRow({ s, activeId, onSelect, menuOpen, onMenu, items, onClose }:
         {s.title}
       </span>
 
-      {s.unread && <span className="w-1.5 h-1.5 rounded-full bg-accent shrink-0" />}
+      {/* 未读红点：当前选中的会话**永不显示**（选中即已读，语义强于数据新鲜度）。
+          这条兜底能消除「点开会话后红点因 SSE 尚未来得及回推而闪一下」的抖动。 */}
+      {s.unread && s.id !== activeId && <span className="w-1.5 h-1.5 rounded-full bg-accent shrink-0" />}
 
       <button
         className={cn(

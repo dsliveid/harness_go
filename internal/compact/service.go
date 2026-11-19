@@ -35,6 +35,31 @@ import (
 // 单独定义错误是为了让调用方区分"压了但没收益"与"压失败了"。
 var ErrSummaryTooLong = errors.New("compact: 摘要未短于原区间，已放弃本次压缩")
 
+// 压缩跳过原因码（SkipReason 的取值，全部为稳定字符串，可进事件与日志）。
+//
+// 为什么要枚举而不是自由文本：这些值会被前端/排障脚本按等值匹配消费
+// （「为什么这个长会话从没压缩过？」是最常被问的问题）。
+const (
+	// SkipReasonWindowUnknown 模型上下文窗口未知（limit<=0），按设计不压缩。
+	SkipReasonWindowUnknown = "window_unknown"
+	// SkipReasonBelowWatermark 未达压缩水位（**正常高频路径**，非异常）。
+	SkipReasonBelowWatermark = "below_watermark"
+	// SkipReasonStoreReadFailed 读不到既有的压缩边界（存储异常）。
+	SkipReasonStoreReadFailed = "store_read_failed"
+	// SkipReasonPlanEmpty 分区后没有可折叠内容（例如未压缩区间只剩 1 条）。
+	SkipReasonPlanEmpty = "plan_empty"
+	// SkipReasonSummaryFailed 摘要模型调用失败。
+	SkipReasonSummaryFailed = "summary_failed"
+	// SkipReasonSummaryEmpty 摘要模型返回空内容。
+	SkipReasonSummaryEmpty = "summary_empty"
+	// SkipReasonTooLong 摘要不比原区间短，压缩无收益（拒绝写入更差的上下文）。
+	SkipReasonTooLong = "summary_too_long"
+	// SkipReasonCreateFailed 压缩记录落库失败。
+	SkipReasonCreateFailed = "create_failed"
+	// SkipReasonNotConfigured 未装配压缩能力（引擎侧判定）。
+	SkipReasonNotConfigured = "not_configured"
+)
+
 // Store 压缩所需的存储端口（由 store.CompactionRepo 实现）。
 //
 // 只声明两个方法：压缩不需要更宽的接口。窄接口让测试桩极简，
@@ -84,6 +109,16 @@ type Result struct {
 	Compacted bool
 	// Skipped 是否因为无可压缩内容而跳过。
 	Skipped bool
+	// SkipReason 跳过/放弃的**明确原因**（Skipped 或 ErrSummaryTooLong 时有效）。
+	//
+	// 🚨 为什么必须显式记录（2026-11 教训）：
+	// 「压缩没生效」此前完全不可观测 —— 会话 122559a3 烧到 839 万 token 时，
+	// 日志里一条压缩相关的痕迹都没有，只能靠人肉读 SQL 才推断出「压缩真空」。
+	// 现在每个放弃分支都必须留下原因码，供 run.status / error 事件透出：
+	//   no_candidates / window_unknown / below_watermark / plan_empty /
+	//   summary_failed / summary_empty / summary_too_long / create_failed /
+	//   store_read_failed / not_configured
+	SkipReason string
 	// Viewer 压缩后的水位视图（供调用方发事件）。
 	Viewer Viewer
 	// Record 本次写入的压缩记录（Compacted 时有效）。
@@ -107,7 +142,13 @@ func (s *Service) CompactIfNeeded(
 ) (Result, error) {
 	viewer := Evaluate(used, limit)
 	if !viewer.NeedsCompaction {
-		return Result{Skipped: true, Viewer: viewer}, nil
+		// 未达水位是**最常见的正常路径**（每一步都会走一遍），原因码用于
+		// 排障时区分「没到水位」与「到了水位但压不动」，两者处置完全不同。
+		reason := SkipReasonBelowWatermark
+		if limit <= 0 {
+			reason = SkipReasonWindowUnknown
+		}
+		return Result{Skipped: true, SkipReason: reason, Viewer: viewer}, nil
 	}
 
 	// 注意：这里用 WithoutCancel 保护压缩过程。
@@ -120,29 +161,29 @@ func (s *Service) CompactIfNeeded(
 	latest, err := s.opts.Store.LatestEndSeq(cctx)
 	if err != nil {
 		s.logWarn("读取压缩边界失败，跳过本次压缩", "err", err)
-		return Result{Skipped: true, Viewer: viewer}, nil
+		return Result{Skipped: true, SkipReason: SkipReasonStoreReadFailed, Viewer: viewer}, nil
 	}
 
 	plan := PlanCompaction(msgs, latest, running)
 	if plan.Empty() {
 		// 无可压缩内容：这是正常情况（例如单轮任务运行中），不是错误。
-		return Result{Skipped: true, Viewer: viewer}, nil
+		return Result{Skipped: true, SkipReason: SkipReasonPlanEmpty, Viewer: viewer}, nil
 	}
 
 	prompt := BuildSummaryPrompt(plan.Messages)
 	summary, err := s.opts.Summarizer.Summarize(cctx, prompt)
 	if err != nil {
 		s.logWarn("生成摘要失败，跳过本次压缩", "err", err)
-		return Result{Skipped: true, Viewer: viewer}, nil
+		return Result{Skipped: true, SkipReason: SkipReasonSummaryFailed, Viewer: viewer}, nil
 	}
 	summary = trimSummary(summary)
 	if summary == "" {
 		s.logWarn("摘要为空，跳过本次压缩")
-		return Result{Skipped: true, Viewer: viewer}, nil
+		return Result{Skipped: true, SkipReason: SkipReasonSummaryEmpty, Viewer: viewer}, nil
 	}
 	// 收益校验：摘要必须有实质性缩短，否则保留原样更优。
 	if estimateText(summary) >= plan.EstimatedTokens {
-		return Result{Skipped: true, Viewer: viewer}, ErrSummaryTooLong
+		return Result{Skipped: true, SkipReason: SkipReasonTooLong, Viewer: viewer}, ErrSummaryTooLong
 	}
 
 	rec := model.Compaction{
@@ -156,7 +197,7 @@ func (s *Service) CompactIfNeeded(
 	}
 	if err := s.opts.Store.Create(cctx, &rec); err != nil {
 		s.logWarn("写入压缩记录失败，跳过本次压缩", "err", err)
-		return Result{Skipped: true, Viewer: viewer}, nil
+		return Result{Skipped: true, SkipReason: SkipReasonCreateFailed, Viewer: viewer}, nil
 	}
 
 	// 压缩后重新计算水位：用摘要 token 替代被折叠区间。

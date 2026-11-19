@@ -23,7 +23,14 @@ type SessionProvider interface {
 // SessionDB 会话库操作（消息 / Run / 工具事件 / 审批规则）。
 type SessionDB interface {
 	AppendMessage(ctx context.Context, m *model.Message) error
-	ListMessages(ctx context.Context, afterSeq int64, limit int) ([]model.Message, error)
+	// ListMessagesTail 取**最近** limit 条未置灰消息（seq 升序返回）。
+	//
+	// 契约关键点：必须是「取尾部」而不是「从头取前 N 条」。
+	// 历史事故：旧签名 `ListMessages(afterSeq, limit)` 用 `seq > ? ORDER BY seq ASC`，
+	// 引擎传 1000 又被存储层防洪闸静默改成 100 → 引擎只看到**最旧的 100 条**，
+	// 跨 Run 续聊时最新进展全丢，且压缩找不到可折叠轮次（839 万 token 会话压缩次数为 0）。
+	// 语义差异必须在类型层面显式（Tail），不能靠调用方记得传对参数。
+	ListMessagesTail(ctx context.Context, limit int) ([]model.Message, error)
 
 	GetRun(ctx context.Context, id string) (*model.Run, error)
 	TransitionRun(ctx context.Context, id string, to model.RunStatus, stopReason, errCode, errMsg string) error
@@ -73,6 +80,14 @@ type CompactRequest struct {
 type CompactResult struct {
 	// Compacted 是否真的完成了一次压缩（写入了持久化摘要）。
 	Compacted bool
+	// Skipped 是否被跳过（未压缩）。
+	Skipped bool
+	// SkipReason 跳过原因码（Skipped 时必填，取值见 compact.SkipReason* 常量）。
+	//
+	// 🚨 必须透出（2026-11 教训）：会话 122559a3 烧到 839 万 token 时
+	// 日志里一条压缩痕迹都没有，无法区分「没到水位」与「到了水位压不动」。
+	// 引擎把它写进 `error` 事件（scope=compaction），前端/排障可等值匹配。
+	SkipReason string
 	// StartSeq / EndSeq 本次折叠的区间（Compacted 时有效）。
 	StartSeq int64
 	EndSeq   int64

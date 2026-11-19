@@ -117,6 +117,77 @@ func (r *MessageRepo) List(ctx context.Context, afterSeq int64, limit int) ([]mo
 	return out, rows.Err()
 }
 
+// maxTailLimit ListTail / ListVisibleTail 的硬上限。
+//
+// 与 List 的 500 上限不同：这两个函数是**引擎内部**（单会话、单人）读全量上下文
+// 的唯一入口，物理上最多也就几千条；给 5000 是为了既能装下超长会话，又不会被
+// 异常参数一次拉爆内存。
+const maxTailLimit = 5000
+
+// ListTail 按 seq **倒序**取最近 limit 条后反转成升序返回（引擎组装上下文专用）。
+//
+// # 为什么必须新增，而不是把 List 的 limit 调大
+//
+// 真实事故（会话 122559a3，258 条消息 / 839 万 token 账单）：引擎两处调用点
+// 都传 `ListMessages(ctx, 0, 1000)`，而 `List` 内部有防洪闸：
+//
+//	if limit <= 0 || limit > 500 { limit = 100 }
+//
+// 于是 `1000` 被**静默改写为 100**，且 SQL 是 `ORDER BY seq ASC`（取头不取尾）——
+// 引擎拿到的是**最旧的 100 条**。后果有两个，都很致命：
+//
+//	① 跨 Run 续聊（第 2 个 Run 从 seq42 开始）时，最近几十步执行进展全部丢失，
+//	   模型明明"刚做完"却对自己做过什么一无所知；
+//	② tryCompact 也只看到最旧 100 条 → compact.PlanCompaction 找不到「已完成轮次」
+//	   （lastUser 恒为 0）→ 压缩永不发生 → 单会话烧到 839 万 token。
+//
+// 那条防洪闸本身是**对的**（List 是 HTTP 分页接口的底座，不能因外部参数打爆内存），
+// 所以：**不要改 List，改用这个新入口**。语义差异必须显式体现在函数名上
+// （Tail = 取最新），而不是靠调用方记得传对参数。
+func (r *MessageRepo) ListTail(ctx context.Context, limit int) ([]model.Message, error) {
+	msgs, err := r.listTail(ctx, limit, false)
+	return msgs, err
+}
+
+// ListVisibleTail 同 ListTail，但只返回未置灰（hidden=0）消息。
+//
+// 引擎侧必须用这个：被回滚置灰的消息不得进入模型上下文（否则回滚形同虚设）。
+func (r *MessageRepo) ListVisibleTail(ctx context.Context, limit int) ([]model.Message, error) {
+	return r.listTail(ctx, limit, true)
+}
+
+func (r *MessageRepo) listTail(ctx context.Context, limit int, visibleOnly bool) ([]model.Message, error) {
+	if limit <= 0 || limit > maxTailLimit {
+		limit = maxTailLimit
+	}
+	q := `SELECT ` + messageColumns + ` FROM messages`
+	if visibleOnly {
+		q += ` WHERE hidden = 0`
+	}
+	q += ` ORDER BY seq DESC LIMIT ?`
+	rows, err := r.s.conn().QueryContext(ctx, q, limit)
+	if err != nil {
+		return nil, fmt.Errorf("store: 读取尾部消息失败: %w", err)
+	}
+	defer rows.Close()
+	out := make([]model.Message, 0, limit)
+	for rows.Next() {
+		m, err := scanMessage(rows)
+		if err != nil {
+			return nil, fmt.Errorf("store: 解析消息行失败: %w", err)
+		}
+		out = append(out, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// 倒序取回后必须反转：调用方（引擎、压缩规划）全部假定 seq 升序。
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out, nil
+}
+
 // ListVisible 只读未置灰消息（阶段 G：引擎组装上下文用；
 // 置灰消息保留在库里供审计与 reapply，但不进模型上下文）。
 func (r *MessageRepo) ListVisible(ctx context.Context, afterSeq int64, limit int) ([]model.Message, error) {

@@ -32,6 +32,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Settings } from 'lucide-react'
 import { isMobileBridge, openHostSettings, shouldShowHostSettings } from '../lib/hostShell'
+import { useUI } from '../stores/uiStore'
 import {
   DRAG_THRESHOLD,
   EDGE_GAP,
@@ -86,6 +87,9 @@ export function HostSettingsFab() {
   const [pos, setPos] = useState<FabPos>(() => resolveFabPos())
   const [dragOffset, setDragOffset] = useState<{ x: number; y: number } | null>(null)
   const [isDragging, setIsDragging] = useState(false)
+  // 失败时要给用户一句可读的话（不能静默隐藏，见 onClick 内说明）。
+  // 取 store 里的 toast 方法：它是全站统一的提示通道，无需自建 UI。
+  const toast = useUI((s) => s.toast)
 
   const btnRef = useRef<HTMLButtonElement | null>(null)
   const dragStartRef = useRef<{ x: number; y: number; pos: FabPos } | null>(null)
@@ -225,12 +229,30 @@ export function HostSettingsFab() {
     try {
       const result = await openHostSettings()
       if (!result.ok) {
-        // 通道不可用 → 隐藏浮标（绝不留死钮），原因保留在 console 供诊断。
+        // ## 失败时为什么不再「静默隐藏」
+        //
+        // 旧行为是 `setDisabled(true)` 直接自隐（注释理由是「绝不留死钮」）。
+        // 但真实反馈是：「点击后没返回设置界面，而且按钮不见了」—— 用户既没有
+        // 得到任何解释，也**永久失去了唯一的返回设置入口**，只能关窗重开。
+        // 「不留死钮」的目标是对，但代价不该是「无解释 + 无出路」。
+        //
+        // 现在：先把可读原因摆到用户面前（toast），再隐藏浮标。
+        // 原因里已带壳侧/ACL 的原始信息（见 openHostSettings 的 reason），
+        // 足够让用户知道该重启客户端还是检查权限。
         console.warn('[hostSettings] 浮标通道不可用，浮标将隐藏：', result.reason)
+        toast(
+          'error',
+          `返回设置界面失败：${result.reason ?? '未知原因'}。` +
+            '浮标已隐藏；请从系统托盘菜单选择「返回设置界面」，或重启客户端后重试。',
+        )
         setDisabled(true)
       }
     } catch (err) {
       console.warn('[hostSettings] 浮标点击异常，浮标将隐藏：', err)
+      toast(
+        'error',
+        `返回设置界面时发生异常：${String(err)}。请从系统托盘菜单选择「返回设置界面」。`,
+      )
       setDisabled(true)
     } finally {
       setBusy(false)

@@ -60,14 +60,19 @@ func (f *fakeSessionDB) AppendMessage(ctx context.Context, m *model.Message) err
 	return nil
 }
 
-func (f *fakeSessionDB) ListMessages(_ context.Context, afterSeq int64, _ int) ([]model.Message, error) {
+// ListMessagesTail 取最近 limit 条（seq 升序），复刻真实实现的 tail 语义。
+//
+// 必须按「尾部」截断：历史上这里是 afterSeq 前向扫描，与真实 store 的
+// `seq > ? ORDER BY seq ASC` 一致，但引擎实际需要的是最新进展。
+func (f *fakeSessionDB) ListMessagesTail(_ context.Context, limit int) ([]model.Message, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := make([]model.Message, 0, len(f.messages))
 	for _, m := range f.messages {
-		if m.Seq > afterSeq {
-			out = append(out, *m)
-		}
+		out = append(out, *m)
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[len(out)-limit:]
 	}
 	return out, nil
 }

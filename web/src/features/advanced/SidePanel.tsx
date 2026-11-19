@@ -8,7 +8,7 @@ import { DiffView } from '../../components/DiffView'
 import { CodeBlock } from '../../components/CodeBlock'
 import { MessageThread } from '../chat/MessageList'
 import { RollbackHistoryPanel } from '../chat/RollbackHistoryPanel'
-import { Check, Square, RotateCcw, X, ArrowLeft, Bot, FileText, CheckSquare, ListTodo, TerminalSquare, Layers, ShieldAlert, ChevronRight, ChevronDown, Download } from 'lucide-react'
+import { Check, Square, RotateCcw, X, ArrowLeft, Bot, FileText, CheckSquare, ListTodo, TerminalSquare, Layers, ShieldAlert, ChevronRight, ChevronDown, Download, Crosshair } from 'lucide-react'
 import type { CommandRun, FileDiff, Message, PlanDoc, Snapshot, Subagent } from '../../types'
 
 const TITLES: Record<Exclude<SidePanel, 'none'>, string> = {
@@ -154,11 +154,13 @@ function TaskListPanel({ mode }: { mode: 'todo' | 'plan' }) {
 
   return (
     <div>
-      <div className="text-[12px] text-inkdim mb-1.5">
-        方案 · {activePlan.title}
-        <span className="ml-2 font-mono text-[11px] text-ok">
+      <div className="text-[12px] text-inkdim mb-1.5 flex items-center gap-2">
+        <span className="truncate">方案 · {activePlan.title}</span>
+        <span className="font-mono text-[11px] text-ok shrink-0">
           {activePlan.steps.filter((s) => s.status === 'done').length}/{activePlan.steps.length}
         </span>
+        <span className="flex-1" />
+        <PlanLocateButton plan={activePlan} />
       </div>
       <PlanDetailInfo plan={activePlan} />
       <div className="mt-3 mb-1.5 text-[12px] text-inkdim">执行进度</div>
@@ -178,6 +180,50 @@ function TaskListPanel({ mode }: { mode: 'todo' | 'plan' }) {
         ))}
       </div>
     </div>
+  )
+}
+
+/**
+ * 「定位出处」按钮：把右侧面板里的方案锚回主对话中生成它的那一轮。
+ *
+ * 三重设计要点：
+ * 1. 先 setPanel('none') 再 locateMessage —— 移动端该面板是覆盖式 Drawer，
+ *    不先关闭就会正好盖住刚滚到的对话位置（用户以为没生效）。
+ * 2. plan.sourceMessageId 为空即禁用：出处来自前端派生（消息流里存在该 create_plan
+ *    调用才有值）。没有出处时如实禁用并说明原因，绝不静默点了没反应。
+ * 3. 只发请求不自己滚动：滚动逻辑归对话区（MessageList）统一收敛，
+ *    避免两处各写一套滚动实现而行为漂移。
+ */
+function PlanLocateButton({ plan }: { plan: PlanDoc }) {
+  const setPanel = useUI((s) => s.setPanel)
+  const locateMessage = useUI((s) => s.locateMessage)
+  const messageId = plan.sourceMessageId
+  const disabled = !messageId
+
+  return (
+    <button
+      type="button"
+      disabled={disabled}
+      onClick={() => {
+        if (!messageId) return
+        setPanel('none')
+        locateMessage(messageId)
+      }}
+      className={cn(
+        'inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-medium transition-all shrink-0',
+        disabled
+          ? 'text-inkfaint/60 cursor-not-allowed'
+          : 'text-emerald-500 hover:text-emerald-400 bg-emerald-500/10 hover:bg-emerald-500/20 cursor-pointer active:scale-95',
+      )}
+      title={
+        disabled
+          ? '该方案缺少消息出处：出处由消息流中的 create_plan 调用派生，历史数据未记录时无法定位'
+          : '回到主对话中生成此方案的消息位置（自动展开执行过程并高亮）'
+      }
+    >
+      <Crosshair size={11} className="shrink-0" />
+      <span>定位出处</span>
+    </button>
   )
 }
 

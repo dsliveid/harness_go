@@ -62,3 +62,106 @@ export function resolveModelContext(modelRef?: string): {
 
 /** 紧凑 token 展示：12345 → 12.3k */
 export const formatTokens = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n))
+
+/**
+ * 启发式估算文本 Token 数（与老版本 harness_mini `estimateTokens` 口径一致）。
+ *
+ * 用途：只用「最后一条真实 usage 之后新增的内容」这一小段做增量估算，
+ * 让上下文水位在用户刚发消息、模型还没回来时也能动起来。
+ * 非 ASCII（中日韩）按 0.7、ASCII 按 0.3 —— 与后端 estimate 口径对齐，
+ * 只做趋势展示，不作为计费依据。
+ */
+export function estimateTokens(s: string): number {
+  if (!s) return 0
+  let cjk = 0
+  let other = 0
+  for (const ch of s) {
+    if (ch.charCodeAt(0) <= 0x7f) other++
+    else cjk++
+  }
+  return Math.ceil(cjk * 0.7 + other * 0.3)
+}
+
+/** 上下文水位计算所需的最小消息结构（避免 lib 依赖 stores/types 全图） */
+export interface ContextMessageLike {
+  role: string
+  content?: string
+  reasoning?: string
+  promptTokens?: number
+  tokens?: number
+  reverted?: boolean
+  queued?: boolean
+}
+
+export interface ActiveContextUsage {
+  /** 当前活跃上下文 token 水位（≈ 下一次请求会携带的输入规模） */
+  activeTokens: number
+  /** 该水位是否含估算成分（无真实 usage / 尾部有新增内容） */
+  isEstimated: boolean
+}
+
+/**
+ * 计算**当前会话的活跃上下文水位**（唯一口径，ContextGauge 专用）。
+ *
+ * 🚨 铁律：上下文占用 ≠ 会话累计 token 用量。
+ * 累计用量（tokensIn + tokensOut 逐轮累加）是「这个会话一共烧了多少 token」，
+ * 会随轮数单调增长、永远逼近上限；而真正决定「还能不能继续对话」的是
+ * **最后一次请求携带的输入 + 该轮产出**——它在新一轮开始后可能回落（前面的
+ * 长工具结果被裁掉时），这才是上下文占用应有的语义。
+ *
+ * 算法（对齐老版本 harness_mini computeContextUsage）：
+ *   ① 倒序找最近一条带真实 `promptTokens` 的 assistant 消息，水位 = prompt + completion；
+ *      —— 用 `limit * 3` 过滤被历史累计账单污染的异常值，避免直接顶到 100%。
+ *   ② 累加该消息之后的消息（用户新输入 / 尚未产生 usage 的步骤）的估算增量；
+ *   ③ 一条真实 usage 都没有（新对话）时，估算全量内容 + 系统提示词基线。
+ *
+ * 之所以允许估算：模型还没回复时若坚持「无数据即 0」，用户会看到水位从 0 开始
+ * 一跳一大截，误以为上下文被清空；估算值以 isEstimated 如实标注，绝不冒充真实值。
+ */
+export function computeActiveContext(
+  messages: ContextMessageLike[],
+  limit: number,
+): ActiveContextUsage {
+  // 已被服务端回滚（hidden）/ 排队未发送的消息不进入上下文，不参与水位
+  const live = messages.filter((m) => !m.reverted && !m.queued)
+
+  // ① 定位最近一条有真实用量的 assistant 消息
+  let lastIdx = -1
+  const maxSane = limit > 0 ? limit * 3 : Number.POSITIVE_INFINITY
+  for (let i = live.length - 1; i >= 0; i--) {
+    const m = live[i]
+    if (m.role !== 'assistant') continue
+    const pt = m.promptTokens ?? 0
+    if (pt > 0 && pt <= maxSane) {
+      lastIdx = i
+      break
+    }
+  }
+
+  if (lastIdx >= 0) {
+    const last = live[lastIdx]
+    const prompt = last.promptTokens ?? 0
+    // tokens 为 0/缺失时视为「服务端未给总用量」，直接以输入为水位（勿把输出算成负数）
+    const total = last.tokens && last.tokens > 0 ? last.tokens : prompt
+    // 输出量 = 该步总 token − 输入（不信任单独字段，避免历史数据口径漂移）
+    let activeTokens = prompt + Math.max(0, total - prompt)
+    let isEstimated = false
+    // ② 尾部增量：该步之后的内容（用户刚发的话 / 尚未结算的步骤）按估算累加
+    for (let i = lastIdx + 1; i < live.length; i++) {
+      const m = live[i]
+      const est = estimateTokens(`${m.content ?? ''}${m.reasoning ?? ''}`)
+      if (est > 0) {
+        activeTokens += est
+        isEstimated = true
+      }
+    }
+    return { activeTokens, isEstimated }
+  }
+
+  // ③ 尚无任何真实 usage：全量估算（系统提示词基线 1500，与老版本一致）
+  let est = live.length > 0 ? 1500 : 0
+  for (const m of live) {
+    est += estimateTokens(`${m.content ?? ''}${m.reasoning ?? ''}`)
+  }
+  return { activeTokens: est, isEstimated: live.length > 0 }
+}

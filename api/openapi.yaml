@@ -222,14 +222,25 @@ paths:
   /api/v1/auth/webview-exchange:
     post:
       tags: [auth]
-      summary: 凭 ticket 兑换降级会话 Cookie（免鉴权）
+      summary: 凭 ticket 兑换会话 Cookie（免鉴权；按设备形态决定是否降级）
       description: |
         **免鉴权**：在 internal/api/router.go:17-20 的 publicPaths 内——WebView 首屏尚无任何 Cookie，
         ticket 本身即凭据（32 字节随机值 + 默认 TTL 60s + 一次性消费，强度与端侧配对码同级）。
 
         成功时**不返回令牌**，而是写 `hg_sess` Cookie（Path=/，HttpOnly，SameSite=Lax，
-        MaxAge=SessionTTL），该会话 token kind=`webview`——降级语义：可读会话、看消息、会话内发消息，
-        **禁止审批决策**（decideApproval 处校验并拒绝）。
+        MaxAge=SessionTTL）。该会话的能力档位按**签发 ticket 时的 device_id 对应的设备形态**裁决
+        （`sessionKindForDevice`，webview_ticket_handler.go）：
+
+        - 设备 `kind=desktop` → 签发 `web_session`（与表单登录同源），**不降级**：可建项目、
+          可带项目目录建会话、可做审批决策。桌面端走同一套 ticket 免登（harness_desktop
+          `prepare_web_ui_entry`），把它打成 webview 会让桌面端在「服务端工作空间建项目」处
+          被误判成移动端而 403（2026-11 实测缺陷）。
+        - 其它形态（mobile/tablet/browser/cli）、设备查不到、device_id 为空、设备域未装配
+          → 仍签发 `webview` 降级会话：可读会话、看消息、会话内发消息，**禁止审批决策**
+          （decideApproval 处校验并拒绝）且**禁止创建项目**（createProject 处拒绝）。
+
+        判定依据始终是**服务端库中已配对设备的 kind**，绝不读取请求体（请求体里也没有
+        device_id 字段）—— 客户端无从伪造。
 
         失败不区分「不存在 / 已过期 / 已使用」，统一 401 `unauthorized`（防探测）。
       security: []
@@ -293,6 +304,62 @@ paths:
               schema: { $ref: "#/components/schemas/Session" }
         "400":
           $ref: "#/components/responses/BadRequest"
+  /api/v1/sessions/events:
+    get:
+      tags: [sessions]
+      summary: 会话列表实时推送（SSE；**需用户令牌**）
+      description: |
+        把**会话列表本身**的变更实时推给各端，用于左侧对话列表的实时刷新。
+
+        **与另外两条 SSE 是不同语义的流，勿混用**：
+        - `/sessions/{sid}/runs/{rid}/events`：per-Run 事件流（含 seq，支持 `Last-Event-ID` 续传）；
+        - `/api/v1/devices/events`：设备当前态；
+        - 本端点：会话**列表**的变更（新建 / 标题自动生成 / 运行状态 / 归档 / 删除），
+          **不支持续传** —— 重连即重拿全量快照。
+
+        帧格式：
+        ```
+        event: snapshot
+        data: {"type":"snapshot","items":[<Session>...],"at":<ms>}
+
+        event: session.updated
+        data: {"type":"session.updated","session":{...},"at":<ms>}
+
+        event: session.removed
+        data: {"type":"session.removed","session_id":"s-1","at":<ms>}
+        ```
+        首帧固定为 `snapshot`（全量、上限 200 条），随后仅推增量。
+
+        语义铁律：
+        - 增量帧内容为**回查数据库后的权威视图**，不是总线载荷直接转发 →
+          客户端拿到 `session` 即可直接 upsert，无需二次请求；
+        - `session.updated` 同时承担「新建 / 改名 / **归档** / 运行状态 / 计数变化 / 已读」，
+          客户端按 `session_id` upsert 即可；归档只改变 `archived_at`，
+          由客户端决定是否从活跃列表移出（服务端不与删除混用同一事件）；
+        - `session.removed` 仅用于**真删除**（会话不会再出现在任何列表里）；
+        - `projects.changed` / `workspaces.changed` 是**纯信号帧**（只有 `type` + `at`，
+          **不带任何数据**）：前者表示项目列表变了、后者表示工作空间列表变了。
+          客户端收到后应自行整表重拉（`GET /projects` / `GET /workspaces`）。
+          为什么不推数据：project 含**前端独有字段**（workspaceId 分组），
+          服务端视图不足以独立重建本地状态，强推全量会覆盖前端字段；
+          且这两个列表变更频率极低，多一次列表请求的开销可忽略。
+        - 快照上限 200 条：分页由客户端显式翻页处理，不在实时流职责内；
+        - 总线未装配时返回 503（绝不挂一个永不来数据的连接）。
+      responses:
+        "200":
+          description: SSE 流（`text/event-stream`）
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: 见上方的 snapshot / session.updated / session.removed 帧格式
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          description: 会话实时推送未启用，或当前连接不支持流式推送
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorBody" }
   /api/v1/sessions/{sid}:
     parameters:
       - $ref: "#/components/parameters/SessionID"
@@ -358,6 +425,29 @@ paths:
         "204": { description: 已取消归档 }
         "404":
           $ref: "#/components/responses/NotFound"
+  /api/v1/sessions/{sid}/read:
+    parameters:
+      - $ref: "#/components/parameters/SessionID"
+    post:
+      tags: [sessions]
+      summary: 上报会话已读（未读红点；幂等）
+      description: |
+        把会话已读游标 `last_read_at` 推进到当前 `last_message_at`，随后该会话的
+        派生字段 `unread` 变为 false（侧栏红点消失）。
+
+        语义细节：
+        - 置为 `last_message_at` 而**不是**服务端 now：游标表达「读到哪条消息」，
+          用 now 会把「读取瞬间新到达的消息」直接标成已读（假已读）；
+        - **单调不回退**：`last_read_at = MAX(last_read_at, COALESCE(last_message_at,0))`，
+          重复/乱序上报都不可能把已读变回未读；
+        - 空会话（无消息）上报为无操作，游标保持 0。
+
+        已读是跨端状态：本端点成功后会经 `GET /api/v1/sessions/events` 推一帧
+        `session.updated`，使其他端的红点同步消失。
+      responses:
+        "204": { description: 已标记为已读（幂等） }
+        "404":
+          $ref: "#/components/responses/NotFound"
   # ============ 项目域（项目为服务端一等实体：默认控制权限 + 项目审批规则） ============
   /api/v1/projects:
     get:
@@ -387,7 +477,7 @@ paths:
           $ref: "#/components/responses/NotFound"
     patch:
       tags: [projects]
-      summary: 更新项目（名称 / 默认控制权限 / 置顶；缺省字段保留原值）
+      summary: 更新项目（名称 / 默认控制权限 / 置顶 / 约束 / 规划模式；缺省字段保留原值）
       responses:
         "204": { description: 已更新 }
         "400":
@@ -396,9 +486,103 @@ paths:
           $ref: "#/components/responses/NotFound"
     delete:
       tags: [projects]
-      summary: 删除项目（事务级联：软删 + 清规则 + 会话 project_id 归零）
+      summary: 删除项目（事务级联：软删 + 清规则/关联项目/数据权限 + 会话 project_id 归零）
       responses:
         "204": { description: 已删除 }
+        "404":
+          $ref: "#/components/responses/NotFound"
+  # 关联项目（0014 起落库；此前仅存前端 localStorage，刷新/换端即丢）
+  /api/v1/projects/{pid}/links:
+    parameters:
+      - name: pid
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [projects]
+      summary: 关联项目列表
+      responses:
+        "200": { description: 关联项目列表（items） }
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      tags: [projects]
+      summary: 新增关联项目（path 必填）
+      responses:
+        "201": { description: 已创建 }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/v1/projects/{pid}/links/{lid}:
+    parameters:
+      - name: pid
+        in: path
+        required: true
+        schema: { type: string }
+      - name: lid
+        in: path
+        required: true
+        schema: { type: string }
+    patch:
+      tags: [projects]
+      summary: 更新关联项目（路径 + 说明整体覆盖）
+      responses:
+        "204": { description: 已更新 }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [projects]
+      summary: 删除关联项目
+      responses:
+        "204": { description: 已删除 }
+        "404":
+          $ref: "#/components/responses/NotFound"
+  # 数据权限策略（0014 起落库；此前仅前端内存，刷新即丢）
+  /api/v1/projects/{pid}/data-grants:
+    parameters:
+      - name: pid
+        in: path
+        required: true
+        schema: { type: string }
+    get:
+      tags: [projects]
+      summary: 数据权限列表（只含已显式设置的 scope；未出现者按 ask 兜底）
+      responses:
+        "200": { description: 数据权限列表（items） }
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/v1/projects/{pid}/data-grants/{scope}:
+    parameters:
+      - name: pid
+        in: path
+        required: true
+        schema: { type: string }
+      - name: scope
+        in: path
+        required: true
+        schema:
+          type: string
+          enum: [fs_outside, session_export, db_query, net_egress]
+    put:
+      tags: [projects]
+      summary: 设置某数据范围的策略（幂等 upsert）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                mode:
+                  type: string
+                  enum: [deny, ask, allow]
+      responses:
+        "204": { description: 已设置 }
+        "400":
+          $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
   /api/v1/projects/{pid}/approval-rules:
@@ -2907,6 +3091,17 @@ components:
           type: integer
           format: int64
           description: 归档时间（毫秒；缺省 = 未归档。归档中心可见，侧栏默认列表不显示）
+        last_read_at:
+          type: integer
+          format: int64
+          description: |
+            已读游标（毫秒）：最后一次看到该会话内容的时刻。
+            由 `POST /api/v1/sessions/{sid}/read` 推进到当时的 last_message_at（单调不回退）。
+        unread:
+          type: boolean
+          description: |
+            **派生字段（不落库）**：last_message_at > last_read_at。
+            由 service 层在读取时填充，前端应直接透传而不得自行重算（两套判定必然漂移）。
     Message:
       type: object
       properties:

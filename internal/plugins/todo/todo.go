@@ -16,6 +16,27 @@ type Item struct {
 	Status  string `json:"status"` // pending | in_progress | done
 }
 
+// normalizeStatus 把模型常见的同义状态词归一为规范词表。
+//
+// # 为什么必须归一（2026-11 实测）
+//
+// 模型在全仓任务里稳定倾向于写 `completed`（与 create_plan 的 done 语义混用），
+// 旧实现直接报错「第 1 项状态非法 "completed"（可选 pending|in_progress|done）」，
+// 白白浪费一步，且模型的自然纠正是**再猜一次**（推测成 done），仍可能失败。
+// 归一化把「一次可避免的往返」换成零成本字符串映射：契约的规范词表不变，
+// 只是对同义输入宽容。
+func normalizeStatus(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "pending", "todo", "not_started", "waiting":
+		return "pending"
+	case "in_progress", "doing", "active", "running", "started":
+		return "in_progress"
+	case "done", "completed", "complete", "finished", "ok", "success":
+		return "done"
+	}
+	return strings.ToLower(strings.TrimSpace(s))
+}
+
 func validStatus(s string) bool {
 	switch s {
 	case "pending", "in_progress", "done":
@@ -61,7 +82,9 @@ func writeTodo(ctx context.Context, host toolapi.Host, items []Item) (*toolapi.R
 		if strings.TrimSpace(it.Content) == "" {
 			return pluginkit.ErrorResult("todo: 第 %d 项 content 为空", i+1), nil
 		}
-		if !validStatus(it.Status) {
+		// 同义状态词归一（completed → done 等），避免一次可避免的往返。
+		items[i].Status = normalizeStatus(it.Status)
+		if !validStatus(items[i].Status) {
 			return pluginkit.ErrorResult("todo: 第 %d 项状态非法 %q（可选 pending|in_progress|done）", i+1, it.Status), nil
 		}
 	}

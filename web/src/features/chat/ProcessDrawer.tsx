@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { ChevronDown, ChevronRight, Cpu, Clock, Zap } from 'lucide-react'
 import type { Message } from '../../types'
 import { MarkdownLite } from '../../components/MarkdownLite'
@@ -26,15 +26,36 @@ export function formatStepTokens(n?: number): string {
  * - 交付轨：最终答复独立于抽屉之外（由 MessageList 渲染）
  * - 纯实体背景呈现，移动端无任何模糊遮罩与半透发虚
  */
-export function ProcessDrawer({ steps, running, reasoning }: {
+export function ProcessDrawer({ steps, running, reasoning, expandSignal }: {
   steps: Message[]
   running: boolean
   reasoning?: string
+  /**
+   * 外部强制展开信号（「定位出处」用）：值变化即把抽屉展开。
+   *
+   * 为什么必须有：历史轮次的抽屉默认是收起的（`userOpen ?? running` → false），
+   * 而 create_plan / todo 的调用卡片就躺在抽屉内部。若定位只滚到轮次而抽屉仍收起，
+   * 用户会看到一个「什么都没有」的轮次，误判定位失灵。
+   */
+  expandSignal?: number
 }) {
   const stepCount = steps.length
   // 运行中默认展开；结束后自动收起；用户手动切换后以用户为准
   const [userOpen, setUserOpen] = useState<boolean | null>(null)
   const open = userOpen ?? running
+
+  // 强制展开：仅在信号变化时置 userOpen=true，不覆盖后续用户手动收起。
+  //
+  // 🚨 初值必须是 undefined 而不是 expandSignal：定位到的轮次往往是**首次进入虚拟窗口**、
+  // 抽屉此刻才挂载。若把初值设为当前 expandSignal，effect 会因「值没变化」直接跳过 →
+  // 抽屉保持收起 → 用户看到空轮次，白定位一场。
+  const prevExpand = useRef<number | undefined>(undefined)
+  useEffect(() => {
+    if (expandSignal === undefined) return
+    if (prevExpand.current === expandSignal) return
+    prevExpand.current = expandSignal
+    setUserOpen(true)
+  }, [expandSignal])
 
   // 零步骤但有待展示的实时思考：抽屉仍要渲染（思考过程按设计只属于抽屉内部）。
   //

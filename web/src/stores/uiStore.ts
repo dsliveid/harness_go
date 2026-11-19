@@ -23,6 +23,17 @@ interface UIState {
   subagentId: string | null
   /** 当前打开的文件详情路径（panel === 'file'） */
   filePath: string | null
+  /**
+   * 主对话「定位出处」请求（一次性、非持久）。
+   *
+   * 为什么放在全局 store 而不是 props：发起方是右侧方案面板（features/advanced/SidePanel），
+   * 消费方是对话区虚拟列表（features/chat/MessageList），二者在组件树上互不相邻
+   * （SidePanel 是 overlay/侧栏，ChatView 是主内容），props 传不通。
+   *
+   * nonce 必须自增：用户可能对同一目标连点两次（第一次滚走了想再回来），
+   * 若只传 messageId，React 的依赖比较会认为「没变化」而不再触发滚动。
+   */
+  focusMessage: { messageId: string; nonce: number } | null
   toasts: ToastMsg[]
   toggleTheme: () => void
   setBreakpoint: (b: Breakpoint) => void
@@ -38,6 +49,15 @@ interface UIState {
   openRunsDetail: (id: string) => void
   /** 打开文件详情浮窗（接收会话内已出现过的路径） */
   openFileDetail: (path: string) => void
+  /**
+   * 请求主对话滚动定位到某条消息并高亮（「定位出处」）。
+   *
+   * 注意：调用方**应先关闭侧面板**（移动端 Drawer 会遮住对话区）；
+   * 本动作只负责发出请求，不理解也不关心面板状态。
+   */
+  locateMessage: (messageId: string) => void
+  /** 消费/清除定位请求（对话区完成滚动后调用，避免切换会话时重复定位） */
+  clearFocusMessage: () => void
   toast: (type: ToastMsg['type'], text: string) => void
   dismissToast: (id: string) => void
 }
@@ -55,6 +75,7 @@ export const useUI = create<UIState>((set, get) => ({
   panel: 'none',
   subagentId: null,
   filePath: null,
+  focusMessage: null,
   toasts: [],
 
   toggleTheme: () => set((s) => ({ theme: s.theme === 'dark' ? 'light' : 'dark' })),
@@ -74,6 +95,14 @@ export const useUI = create<UIState>((set, get) => ({
   openRunsDetail: (subagentId) => set({ panel: 'runs', subagentId, filePath: null }),
 
   openFileDetail: (filePath) => set({ panel: 'file', filePath, subagentId: null }),
+
+  locateMessage: (messageId) =>
+    set((s) => ({
+      // nonce 单调自增：同一 id 连点两次也必然产生新的 nonce，从而重新触发滚动
+      focusMessage: { messageId, nonce: (s.focusMessage?.nonce ?? 0) + 1 },
+    })),
+
+  clearFocusMessage: () => set({ focusMessage: null }),
 
   toast: (type, text) => {
     const id = `t-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`

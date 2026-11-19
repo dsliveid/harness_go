@@ -321,3 +321,69 @@ func TestUnknownPlanModeFallsBack(t *testing.T) {
 		t.Fatal("未知规划模式应回落 standard")
 	}
 }
+
+// TestReasoningLanguageContract 思考语言的硬契约（2026-11 落地）。
+//
+// # 背景（真实缺陷）
+//
+// 用户反馈思考过程大量是英文，而老版本多为中文。代码实证：两版提示词都只约束
+// 「与用户交流」的语言，**从未约束思考语言**；且本项目原措辞
+// 「【思考与交付通道分离】思考过程仅用于内部推导」把思考通道显式排除在交付口径
+// 之外，模型据此推断「思考不受语言约束」→ 落回训练主语言（英文）。
+//
+// 本测试锁死三件事，防日后被"顺手优化"改回去：
+//  1. 语言条款必须**正面覆盖思考过程**（思考 + 简体中文 同句出现）；
+//  2. 不得再出现「思考与交付通道分离」这类把思考排除在规范外的误导表述；
+//  3. 该规则必须是硬规则（用户关不掉、core 覆盖也不失效）。
+func TestReasoningLanguageContract(t *testing.T) {
+	text := render(mainCtx())
+
+	// ① 正面覆盖：思考过程与简体中文必须在同一条规则内共现
+	target := ""
+	for _, line := range strings.Split(text, "\n") {
+		if strings.Contains(line, "【交互语言与交付口径（含思考过程）】") {
+			target = line
+			break
+		}
+	}
+	if target == "" {
+		t.Fatal("缺少【交互语言与交付口径（含思考过程）】规则")
+	}
+	for _, must := range []string{"思考过程", "简体中文"} {
+		if !strings.Contains(target, must) {
+			t.Fatalf("语言规则必须正面覆盖思考语言，缺少关键词 %q: %s", must, target)
+		}
+	}
+	// 明确禁止「内部通道」可换语言的暗示
+	if strings.Contains(target, "思考与交付通道分离") {
+		t.Fatalf("不得保留「思考与交付通道分离」的误导表述: %s", target)
+	}
+
+	// ② 子会话同样生效（子 Agent 也会英文思考）
+	subText := render(subCtx())
+	if !strings.Contains(subText, "【交互语言与交付口径（含思考过程）】") {
+		t.Fatal("语言规则必须对子会话生效")
+	}
+
+	// ③ 硬规则：出现在 Disabled 中也必须渲染（用户关不掉）
+	var def *Definition
+	for i := range Definitions() {
+		if Definitions()[i].Item.ID == "delivery_etiquette" {
+			d := Definitions()[i]
+			def = &d
+			break
+		}
+	}
+	if def == nil {
+		t.Fatal("缺少 delivery_etiquette 定义")
+	}
+	if !def.Item.IsHardRule {
+		t.Fatal("delivery_etiquette 必须为硬规则：语言底线不可被用户关闭")
+	}
+	ctx := mainCtx()
+	ctx.Disabled = []string{"delivery_etiquette"}
+	disabledText := render(ctx)
+	if !strings.Contains(disabledText, "【交互语言与交付口径（含思考过程）】") {
+		t.Fatal("硬规则被关闭：语言底线不可关闭")
+	}
+}

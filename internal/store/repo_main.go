@@ -52,7 +52,7 @@ func (r *SessionRepo) Create(ctx context.Context, sess *model.Session) error {
 // 0009 新增 workspace_id 时三处同步位置：均紧随 project_id 之后。
 const sessionColumns = `id, title, project_dir, project_id, workspace_id, access_mode, model_ref, user_id,
 	message_count, last_message_at, total_tokens, last_run_status,
-	created_at, updated_at, deleted_at, source, archived_at`
+	created_at, updated_at, deleted_at, source, archived_at, last_read_at`
 
 func scanSession(sc interface{ Scan(...any) error }) (model.Session, error) {
 	var (
@@ -67,7 +67,7 @@ func scanSession(sc interface{ Scan(...any) error }) (model.Session, error) {
 	)
 	err := sc.Scan(&s.ID, &s.Title, &s.ProjectDir, &s.ProjectID, &workspaceID, &s.AccessMode, &s.ModelRef, &s.UserID,
 		&s.MessageCount, &lastMsg, &s.TotalTokens, &status,
-		&s.CreatedAt, &s.UpdatedAt, &deleted, &source, &archived)
+		&s.CreatedAt, &s.UpdatedAt, &deleted, &source, &archived, &s.LastReadAt)
 	if err != nil {
 		return model.Session{}, err
 	}
@@ -235,6 +235,25 @@ func (r *SessionRepo) TouchMessage(ctx context.Context, id string, at int64) err
 		 WHERE id=? AND deleted_at IS NULL`, at, at, id)
 	if err != nil {
 		return fmt.Errorf("store: 回写消息摘要失败: %w", err)
+	}
+	return ensureAffected(res, "会话 "+id)
+}
+
+// MarkRead 把已读游标推进到当前最后消息时间（「我已经看到此刻为止的全部内容」）。
+//
+// 为什么置为 last_message_at 而不是服务端 now：
+//   - 语义精确：游标表达的是「读到哪条消息」，不是「点了按钮的时刻」。
+//     用 now 会让「读取瞬间又来个消息」的竞态把新消息直接标成已读（假已读）。
+//   - 幂等且单调：重复调用不会让游标倒退（SQL 里用 MAX 兜住）。
+//
+// 无消息的会话（last_message_at 为 NULL）游标保持不动 —— 空会话本就没有「未读」概念。
+func (r *SessionRepo) MarkRead(ctx context.Context, id string) error {
+	res, err := r.s.conn().ExecContext(ctx,
+		`UPDATE sessions
+		    SET last_read_at = MAX(last_read_at, COALESCE(last_message_at, 0))
+		  WHERE id=? AND deleted_at IS NULL`, id)
+	if err != nil {
+		return fmt.Errorf("store: 上报已读失败: %w", err)
 	}
 	return ensureAffected(res, "会话 "+id)
 }

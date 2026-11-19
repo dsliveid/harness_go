@@ -139,6 +139,17 @@ type Session struct {
 	DeletedAt     *int64    `json:"deleted_at,omitempty"`
 	// ArchivedAt 归档时间（NULL/缺省 = 未归档；对齐桌面端「归档中心」语义）。
 	ArchivedAt *int64 `json:"archived_at,omitempty"`
+	// LastReadAt 已读游标（Unix 毫秒）：用户最后一次「看到」该会话内容的时刻。
+	//
+	// 由 POST /sessions/{sid}/read 写入（置为当时的 last_message_at），
+	// 与 LastMessageAt 比较得出未读状态。**不存布尔值** ——
+	// 布尔是派生值，存了必然与真实消息时间漂移（详见 0015 迁移文件头）。
+	LastReadAt int64 `json:"last_read_at,omitempty"`
+	// Unread 「有未读新消息」（**派生字段，不落库**）。
+	//
+	// 判定口径：last_message_at > last_read_at。
+	// 由 service 层在读取时填充（本包不提供此判定，避免两套逻辑漂移）。
+	Unread bool `json:"unread,omitempty"`
 }
 
 // Message 消息（会话库）。

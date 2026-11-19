@@ -148,7 +148,14 @@ func (s *SessionService) SetProject(ctx context.Context, id, projectID string) e
 
 // List 分页列出会话。
 func (s *SessionService) List(ctx context.Context, limit, offset int) ([]model.Session, error) {
-	return s.main.Sessions().List(ctx, limit, offset)
+	list, err := s.main.Sessions().List(ctx, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	for i := range list {
+		deriveUnread(&list[i])
+	}
+	return list, nil
 }
 
 // Get 取会话。
@@ -157,7 +164,32 @@ func (s *SessionService) Get(ctx context.Context, id string) (*model.Session, er
 	if err != nil {
 		return nil, wrapStoreErr(err, apperr.CodeSessionNotFound, "会话不存在")
 	}
+	deriveUnread(sess)
 	return sess, nil
+}
+
+// MarkRead 上报「该会话已读到此刻」。
+//
+// 语义：把已读游标推进到当前最后消息时间，随后该会话的 unread 立即变 false。
+// 幂等（重复调用无副作用），已删除会话返回 not found。
+func (s *SessionService) MarkRead(ctx context.Context, id string) error {
+	return wrapStoreErr(s.main.Sessions().MarkRead(ctx, id), apperr.CodeSessionNotFound, "会话不存在")
+}
+
+// deriveUnread 派生未读标记（**唯一判定入口**，store 与 API 层都不得另写一套）。
+//
+// 口径：最后消息时间晚于已读游标 → 有未读。
+//
+// 边界处理：
+//   - 无消息（LastMessageAt 为 nil）→ 不可能未读（空会话没有「新内容」）；
+//   - 游标为 0（从未上报过已读，如新建会话）→ 一旦有消息即为未读，符合直觉；
+//   - 严格大于：游标恰好等于最后消息时间（刚读完）→ 已读。
+func deriveUnread(sess *model.Session) {
+	if sess == nil || sess.LastMessageAt == nil {
+		sess.Unread = false
+		return
+	}
+	sess.Unread = *sess.LastMessageAt > sess.LastReadAt
 }
 
 // Rename 重命名。

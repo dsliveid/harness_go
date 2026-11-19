@@ -1,6 +1,7 @@
 package fs
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"harness-go/internal/globsyntax"
 	"harness-go/internal/pluginkit"
@@ -16,10 +18,38 @@ import (
 
 // 默认参数。
 const (
-	defaultReadLimit = 2000
+	// defaultReadLimit 单次读取的默认行数。
+	//
+	// 取值不是「越大越好」，必须与入库定型器自洽：工具结果在首次入库前会过
+	// 一次 resultfmt（read_file 策略 MaxChars=64K，保留头 32000 + 尾 16000，
+	// 见 internal/resultfmt/resultfmt.go）。而 tool 消息入库后**终生不可变、
+	// 每轮请求全量重发** —— 所以「读得多」不等于「看得多」：越过 64K 的部分
+	// 会被掐掉中段，模型拿到的是首尾碎片 + 一行 hint，往往还要再花一轮
+	// offset 补读（多付一次真实 token）。
+	//
+	// 实测（data/tmp/measure，480 个真实源文件，覆盖 go/ts/tsx/md/yaml/json）：
+	//   - 全库平均行宽 31.1 rune/行（含 `%6d\t` 行号前缀）→ 64K ≈ 2105 行；
+	//   - 窗口 1200 行：**0 个文件**超 64K，最大输出 54344 rune；
+	//   - 窗口 2000 行：**2 个文件**超 64K，最大输出 82146 rune
+	//     （api/openapi.yaml，触顶后中段被掐）。
+	// 取 1200 = 留 ~11K rune 安全边际，同时仍能覆盖本库除
+	// engine.go/chatStore.ts/api.ts/openapi.yaml/apiTypes.ts 外的全部文件。
+	// 历史对照：
+	//   - 老版本 harness_mini 默认 500 行（src-tauri/src/tools/file.rs），
+	//     约 25KB，远小于 64K 线，**从不触顶**，是自洽的；
+	//   - 上一版把默认抬到 2000 行，在真实体量下开始触顶（见上实测），
+	//     名义上更大、实际更差。
+	defaultReadLimit = 1200
+	// maxReadLimit 单次读取可申请行数的硬顶（clamp）。
+	//
+	// 不设顶端时模型传 max_lines=100000 会产出超长输出，随后被入库定型掐成
+	// 首尾碎片：信息既丢失、又无法定位丢了哪段。硬顶让「超量申请」退化为
+	// 可解释的分段读取（invokeReadFile 会标注「共 N 行，已读 x-y」），而不是
+	// 静默碎裂。
+	maxReadLimit     = 2000
 	defaultGlobLimit = 200
 	defaultGrepHits  = 100
-	// maxReadBytes 单次读取上限（防巨型文件撑爆上下文）。
+	// maxReadBytes 字节级读取上限（防巨型文件先撑爆内存）。
 	maxReadBytes = 512 << 10
 )
 
@@ -40,8 +70,15 @@ func invokeReadFile(ctx context.Context, host toolapi.Host, call *toolapi.Call) 
 	if err != nil {
 		return pluginkit.ErrorResult("read_file: 读取 %s 失败: %v", args.Path, err), nil
 	}
+	// byteTruncated 标记是否因字节上限被截断：决定尾部提示必须写明
+	// 「文件未读完」，否则模型会把截断当成文件真实结尾。
+	var byteTruncated bool
 	if len(data) > maxReadBytes {
-		data = data[:maxReadBytes]
+		// 字节上限必须在**行边界**收敛，不能直接切片：
+		//   1. 硬切会把 UTF-8 多字节字符切成半个，输出非法文本；
+		//   2. 硬切后「共 N 行」会把截断行数当成文件总行数，模型会误判
+		//      「文件就这么长、读完了」，从而漏掉后半部分（比报错更危险）。
+		data, byteTruncated = truncateAtLineBoundary(data, maxReadBytes)
 	}
 	text := strings.ReplaceAll(string(data), "\r\n", "\n")
 	lines := strings.Split(text, "\n")
@@ -52,6 +89,9 @@ func invokeReadFile(ctx context.Context, host toolapi.Host, call *toolapi.Call) 
 	limit := args.MaxLines
 	if limit <= 0 {
 		limit = defaultReadLimit
+	}
+	if limit > maxReadLimit {
+		limit = maxReadLimit
 	}
 	if offset > len(lines) {
 		return pluginkit.TextResult("%s：共 %d 行，offset %d 越界（文件为空或偏移过大）", args.Path, len(lines), offset), nil
@@ -64,8 +104,18 @@ func invokeReadFile(ctx context.Context, host toolapi.Host, call *toolapi.Call) 
 	for i := offset - 1; i < end; i++ {
 		fmt.Fprintf(&b, "%6d\t%s\n", i+1, strings.TrimSuffix(lines[i], "\r"))
 	}
-	truncated := ""
-	if end < len(lines) {
+	// 尾部提示分三种情况，语义必须严格区分（模型据此决定「要不要继续读」）：
+	//   a. 字节上限已截断：本次甚至没读完文件的一半字节，「共 N 行」只是
+	//      **已加载部分**的行数，必须显式说明「非全文」，否则模型会以为读完了；
+	//   b. 只是 max_lines 截断：文件总行数可信，给出续读 offset 即可；
+	//   c. 已读到文件末行：不加提示。
+	var truncated string
+	switch {
+	case byteTruncated:
+		truncated = fmt.Sprintf(
+			"\n…[文件超过 %d KB，本次仅加载前 %d 行（非全文）；已读 %d-%d，请用 offset_line=%d 继续读取后续内容]",
+			maxReadBytes>>10, len(lines), offset, end, end+1)
+	case end < len(lines):
 		truncated = fmt.Sprintf("\n…[共 %d 行，已读 %d-%d；用 offset 继续读取]", len(lines), offset, end)
 	}
 	binaryNote := ""
@@ -73,6 +123,34 @@ func invokeReadFile(ctx context.Context, host toolapi.Host, call *toolapi.Call) 
 		binaryNote = "\n（检测到二进制内容，输出可能不可读）"
 	}
 	return pluginkit.TextResult("%s%s%s", b.String(), binaryNote, truncated), nil
+}
+
+// truncateAtLineBoundary 把 data 截到不超过 limit 字节，且**只切在行尾**。
+//
+// 返回 (截断后的数据, 是否发生截断)。
+//
+// 两条硬约束：
+//  1. **不能落在 UTF-8 多字节序列中间**。做法是先退到最近一个换行符之后
+//     （换行是 ASCII，天然是字符边界）；若整段没有换行（单行超大文件），
+//     再按 rune 边界回退，绝不产生半个字符。
+//  2. **必须报告"我是截断的"**。调用方据此把尾部提示从「共 N 行」
+//     （听起来像全文）改成「本次仅加载前 N 行（非全文）」——否则模型会
+//     把截断当文件结尾，直接漏掉后半部分。
+//
+// 找不到任何边界时返回空数据（宁可空，也不给半字符垃圾）。
+func truncateAtLineBoundary(data []byte, limit int) ([]byte, bool) {
+	if len(data) <= limit {
+		return data, false
+	}
+	cut := limit
+	if i := bytes.LastIndexByte(data[:cut], '\n'); i >= 0 {
+		return data[:i+1], true // 保留换行，行结构完整
+	}
+	// 无换行可退：按 rune 边界回退（最多回退 3 字节即 UTF-8 最大序列长）。
+	for cut > 0 && !utf8.RuneStart(data[cut]) {
+		cut--
+	}
+	return data[:cut], true
 }
 
 // invokeListDir 列出目录。

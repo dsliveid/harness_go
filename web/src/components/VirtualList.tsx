@@ -1,5 +1,11 @@
-import { useEffect, type RefObject } from 'react'
+import { useEffect, useRef, type RefObject } from 'react'
 import { useVirtualizer } from '@tanstack/react-virtual'
+
+export interface ScrollTarget {
+  index: number
+  nonce: number
+  align: 'start' | 'center' | 'end'
+}
 
 export interface VirtualListProps<T> {
   items: T[]
@@ -14,6 +20,16 @@ export interface VirtualListProps<T> {
   /** 贴底触发信号：流式内容增长时变化，可在长度不变时也触发跟随 */
   followKey?: string | number
   overscan?: number
+  /**
+   * 受控定位请求（「定位出处」用）：nonce 变化即滚动到 index 项。
+   *
+   * 为什么不复用 scrollToIndex 直调：virtualizer 实例在 VirtualList 内部，
+   * 外部（MessageList）拿不到；且定位需要等 items 更新、容器测量完成后再执行，
+   * 只能由本组件内部的 effect 在正确时机触发。
+   */
+  scrollTarget?: ScrollTarget | null
+  /** 定位请求执行后回调（父层据此清除请求与置位高亮） */
+  onScrollTargetDone?: (nonce: number) => void
 }
 
 /**
@@ -31,6 +47,8 @@ export function VirtualList<T>({
   stickToBottom,
   followKey,
   overscan = 6,
+  scrollTarget,
+  onScrollTargetDone,
 }: VirtualListProps<T>) {
   const virtualizer = useVirtualizer({
     count: items.length,
@@ -48,6 +66,30 @@ export function VirtualList<T>({
     })
     return () => cancelAnimationFrame(id)
   }, [items.length, followKey, stickToBottom, virtualizer])
+
+  // 受控定位：**独立 effect 且置于贴底 effect 之后**，保证同一帧内定位优先于贴底。
+  // 两层 rAF 的原因：首帧 items/高度尚未测量完，立刻 scrollToIndex 会滚到估算位置后
+  // 又被 measureElement 的实际高度修正顶偏；等一帧测量落地再滚，落点才准。
+  const doneRef = useRef<number | null>(null)
+  useEffect(() => {
+    if (!scrollTarget || items.length === 0) return
+    if (doneRef.current === scrollTarget.nonce) return
+    const index = Math.max(0, Math.min(scrollTarget.index, items.length - 1))
+    let raf2 = 0
+    const raf1 = requestAnimationFrame(() => {
+      raf2 = requestAnimationFrame(() => {
+        virtualizer.scrollToIndex(index, { align: scrollTarget.align })
+        doneRef.current = scrollTarget.nonce
+        onScrollTargetDone?.(scrollTarget.nonce)
+      })
+    })
+    return () => {
+      cancelAnimationFrame(raf1)
+      cancelAnimationFrame(raf2)
+    }
+    // onScrollTargetDone 故意不入依赖：父层每次都传新闭包，入依赖会反复重滚
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scrollTarget?.nonce, items.length, virtualizer])
 
   return (
     <div style={{ height: virtualizer.getTotalSize(), position: 'relative', width: '100%' }}>

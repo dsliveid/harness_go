@@ -2,10 +2,10 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useChat } from '../../stores/chatStore'
 import { useSessions } from '../../stores/sessionStore'
 import { MarkdownLite } from '../../components/MarkdownLite'
-import { VirtualList } from '../../components/VirtualList'
+import { VirtualList, type ScrollTarget } from '../../components/VirtualList'
 import { cn } from '../../components/ui'
 import { useUI } from '../../stores/uiStore'
-import { Check, Clock, Copy, GitBranch, GitCompare, RotateCcw, RotateCw, Trash2, Zap, Sparkles } from 'lucide-react'
+import { ArrowDown, Check, Clock, Copy, GitBranch, GitCompare, RotateCcw, RotateCw, Sparkles, Trash2, Zap } from 'lucide-react'
 import { ProcessDrawer, formatStepMs, formatStepTokens } from './ProcessDrawer'
 import { ReasoningCard } from './ReasoningCard'
 import { formatDuration, RunProgressInline, useLiveElapsed, type RunPhase } from './LiveProgress'
@@ -15,6 +15,16 @@ interface TurnGroup {
   turnSeq: number
   items: Message[]
 }
+
+/**
+ * 「选中即有内容」不变量的失败重试上限。
+ *
+ * 3 次 + 800ms/1600ms/3200ms 退避：覆盖服务端重启、网络瞬断这类可恢复失败，
+ * 又不至于把某个「服务端确实没有该会话」的 404 变成永久的请求风暴。
+ * 用尽后不再自动重试 —— 但用户手动点一次对话（select）仍会重新拉取，
+ * 保留人工自救通道。
+ */
+const MAX_LOAD_RETRY = 3
 
 /**
  * 线程级对话操作集：
@@ -45,9 +55,45 @@ interface MessageThreadProps {
 }
 
 export function MessageList() {
-  const { streaming, reasoning, fork, revertTo, reapply, deleteFrom, runPhase } = useChat()
+  const { streaming, reasoning, fork, revertTo, reapply, deleteFrom, runPhase, ensureMessages, resumeRun } = useChat()
   const currentId = useSessions((s) => s.currentId)
   const messages = useChat((s) => s.messagesOf(currentId))
+  const loaded = useChat((s) => (currentId ? Boolean(s.loadedSessions[currentId]) : true))
+  const [retryTick, setRetryTick] = useState(0)
+  // 每个会话各自的重试计数（切会话即归零，不会因为上一条会话重试用尽而放弃新会话）
+  const retryRef = useRef<{ id: string; n: number }>({ id: '', n: 0 })
+
+  // 【不变量：只要左侧处于选中态，右侧必须必然有内容】
+  //
+  // 2026-11 缺陷：刷新后左侧默认选中第一条对话，右侧却是空白，必须手动点一次才出现内容。
+  // 根因是消息加载只挂在零散入口（load 的 void reloadMessages / select / 快照），
+  // 任一入口失败或时序错过就留下「选中但空白」的死状态，且失败被静默吞掉、无自愈通道。
+  //
+  // 这里把「选中 → 有内容」提升为渲染层不变量：currentId 有值而该会话尚未成功加载过，
+  // 就自动加载（并顺带接回服务端可能仍在跑的 Run）。加载成功由 loadedSessions 打标；
+  // 失败则按指数退避有限次重试 —— 绝不静默停在空白（这正是不变量该守住的东西）。
+  useEffect(() => {
+    if (!currentId || loaded) return
+    let alive = true
+    let timer: ReturnType<typeof setTimeout> | null = null
+    void ensureMessages(currentId).then((ok) => {
+      if (!alive) return
+      if (ok) {
+        void resumeRun(currentId)
+        return
+      }
+      if (retryRef.current.id !== currentId) retryRef.current = { id: currentId, n: 0 }
+      if (retryRef.current.n >= MAX_LOAD_RETRY) return
+      retryRef.current.n += 1
+      timer = setTimeout(() => {
+        if (alive) setRetryTick((v) => v + 1)
+      }, 800 * 2 ** (retryRef.current.n - 1))
+    })
+    return () => {
+      alive = false
+      if (timer) clearTimeout(timer)
+    }
+  }, [currentId, loaded, ensureMessages, resumeRun, retryTick])
 
   return (
     <div className="flex-1 min-h-0 flex flex-col">
@@ -76,6 +122,15 @@ export function MessageThread({
 }: MessageThreadProps) {
   const scrollerRef = useRef<HTMLDivElement>(null)
   const [nearBottom, setNearBottom] = useState(true)
+  const hasMessages = messages.length > 0
+
+  // ---------------- 受控定位（右侧方案面板「定位出处」的消费端） ----------------
+  const focusMessage = useUI((s) => s.focusMessage)
+  const clearFocusMessage = useUI((s) => s.clearFocusMessage)
+  const toast = useUI((s) => s.toast)
+  const [scrollTarget, setScrollTarget] = useState<ScrollTarget | null>(null)
+  /** 高亮目标：id + nonce（nonce 保证对同一消息重复定位时高亮能再次闪烁） */
+  const [highlight, setHighlight] = useState<{ id: string; nonce: number } | null>(null)
 
   // 切换数据源：重置贴底并跳到底部
   useEffect(() => {
@@ -84,6 +139,9 @@ export function MessageThread({
     if (el) el.scrollTop = el.scrollHeight
   }, [messages[0]?.id])
 
+  // 滚动监听：**必须以 hasMessages 为依赖**（原实现依赖 []，若挂载时消息为空则
+  // scrollerRef.current 为 null → 监听器永不挂上 → nearBottom 恒为 true，
+  // 「回到最新答复」按钮永远不会出现）。
   useEffect(() => {
     const el = scrollerRef.current
     if (!el) return
@@ -91,9 +149,11 @@ export function MessageThread({
       const v = el.scrollHeight - el.scrollTop - el.clientHeight < 140
       setNearBottom((prev) => (prev === v ? prev : v))
     }
+    // 初次判定：进入会话时通常已贴底，同步一次真实位置
+    onScroll()
     el.addEventListener('scroll', onScroll, { passive: true })
     return () => el.removeEventListener('scroll', onScroll)
-  }, [])
+  }, [hasMessages, plain])
 
   const turns = useMemo<TurnGroup[]>(() => {
     const out: TurnGroup[] = []
@@ -105,8 +165,95 @@ export function MessageThread({
     return out
   }, [messages])
 
+  /** 定位请求 nonce 发生器：与 uiStore 的 focusMessage.nonce 独立自增，互不干扰 */
+  const localNonce = useRef(0)
+  /** 纠正性滚动的取消器（用户一旦主动滚动/触摸即作废，绝不再抢视口） */
+  const correctionRef = useRef<(() => void) | null>(null)
+
+  /**
+   * 消费「定位出处」请求：消息 id → 轮次索引 → 虚拟列表滚动。
+   *
+   * 🚨 绝不能沿用老版本 `document.querySelector([data-message-id]) + scrollIntoView`：
+   * 主对话是 @tanstack/react-virtual 虚拟列表，未进入视口的轮次**不在 DOM 里**，
+   * 查询恒失败（表现为「点了定位毫无反应」）。必须走数据 → 索引 → scrollToIndex。
+   */
+  useEffect(() => {
+    // 仅主对话（非 plain 浮窗）响应；子进程详情浮窗不应该被主对话的定位请求劫持
+    if (plain || !focusMessage) return
+    const idx = turns.findIndex((t) => t.items.some((m) => m.id === focusMessage.messageId))
+    if (idx < 0) {
+      // 目标已被过滤（如撤回）或用户已切走会话 → 如实提示，绝不静默失败
+      toast('warn', '未在当前对话中找到该消息位置（可能已撤回或已切换会话）')
+      clearFocusMessage()
+      return
+    }
+    localNonce.current += 1
+    const nonce = localNonce.current
+    setScrollTarget({ index: idx, nonce, align: 'center' })
+    setHighlight({ id: focusMessage.messageId, nonce })
+    // 定位期间必须关掉贴底，否则流式增量会让 VirtualList 立刻把视口拽回底部
+    setNearBottom(false)
+    clearFocusMessage()
+
+    // ---- 纠正性滚动（一次性）----
+    // 时序坑：若目标在「执行过程」抽屉内部，抽屉是在滚动之后才展开的
+    // （ProcessDrawer 的 expandSignal effect → 再渲染 → 高度变大），
+    // 首次 scrollToIndex 用的是展开前的高度 → 落点会偏。故 320ms 后按同一 index 再滚一次。
+    // 但用户此刻若已自行滚动/触摸，说明他已在阅读，绝不能再抢视口 → 立即取消。
+    correctionRef.current?.()
+    const el = scrollerRef.current
+    let fired = false
+    let timer = 0
+    // 取消/收尾统一出口：既清定时器也摘监听（once:true 若未被触发则不会自动摘除，
+    // 反复定位会累积监听器 —— 这是必须显式 remove 的原因）。
+    const finish = (runCorrection: boolean) => {
+      if (fired) return
+      fired = true
+      window.clearTimeout(timer)
+      el?.removeEventListener('wheel', onUserInput)
+      el?.removeEventListener('touchstart', onUserInput)
+      el?.removeEventListener('keydown', onUserInput)
+      correctionRef.current = null
+      if (runCorrection) {
+        localNonce.current += 1
+        setScrollTarget({ index: idx, nonce: localNonce.current, align: 'center' })
+      }
+    }
+    function onUserInput() { finish(false) }
+    timer = window.setTimeout(() => finish(true), 320)
+    correctionRef.current = () => finish(false)
+    const opts = { passive: true } as const
+    el?.addEventListener('wheel', onUserInput, opts)
+    el?.addEventListener('touchstart', onUserInput, opts)
+    el?.addEventListener('keydown', onUserInput)
+  }, [focusMessage, turns, plain, toast, clearFocusMessage])
+
+  // 卸载时清掉挂起的纠正滚动，避免在已卸载组件上 setState
+  useEffect(() => () => { correctionRef.current?.() }, [])
+
+  // 高亮 2.4s 后自动消退（对齐老版本 ring 高亮 2s 的手感，略放长便于视线捕捉）
+  useEffect(() => {
+    if (!highlight) return
+    const t = setTimeout(() => setHighlight(null), 2400)
+    return () => clearTimeout(t)
+  }, [highlight?.nonce])
+
+  /** 「回到最新答复」：置贴底 + 滚到最后一轮 */
+  const jumpToLatest = () => {
+    setNearBottom(true)
+    if (plain) {
+      // plain（浮窗少量轮次直排，全量在 DOM 中）→ 直接平滑滚底即可
+      const el = scrollerRef.current
+      if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' })
+      return
+    }
+    localNonce.current += 1
+    setScrollTarget({ index: Math.max(0, turns.length - 1), nonce: localNonce.current, align: 'end' })
+  }
+
   const lastMsg = messages[messages.length - 1]
   const followKey = `${messages.length}:${lastMsg?.content.length ?? 0}:${streaming ? 1 : 0}`
+  const showJumpToLatest = hasMessages && !nearBottom
 
   if (messages.length === 0) {
     return (
@@ -128,49 +275,84 @@ export function MessageThread({
   // plain：直排渲染全部轮次
   if (plain) {
     return (
-      <div ref={scrollerRef} className={scrollCls ? cn('flex-1 overflow-y-auto', scrollCls) : 'flex-1 overflow-y-auto px-3 sm:px-6 py-5'}>
-        <div className="max-w-[860px] mx-auto space-y-2">
-          {turns.map((t, i) => (
-            <TurnBlock
-              key={t.turnSeq}
-              turn={t}
-              isLast={i === turns.length - 1}
-              running={streaming}
-              reasoning={reasoning}
-              runPhase={runPhase}
-              actions={actions}
-              showCopy={showCopy}
-            />
-          ))}
+      <div className="relative flex-1 min-h-0 flex flex-col">
+        <div ref={scrollerRef} className={scrollCls ? cn('flex-1 overflow-y-auto', scrollCls) : 'flex-1 overflow-y-auto px-3 sm:px-6 py-5'}>
+          <div className="max-w-[860px] mx-auto space-y-2">
+            {turns.map((t, i) => (
+              <TurnBlock
+                key={t.turnSeq}
+                turn={t}
+                isLast={i === turns.length - 1}
+                running={streaming}
+                reasoning={reasoning}
+                runPhase={runPhase}
+                actions={actions}
+                showCopy={showCopy}
+                highlight={highlight}
+              />
+            ))}
+          </div>
         </div>
+        {showJumpToLatest && <JumpToLatestButton onClick={jumpToLatest} />}
       </div>
     )
   }
 
   return (
-    <div ref={scrollerRef} className={scrollCls ? cn('flex-1 overflow-y-auto', scrollCls) : 'flex-1 overflow-y-auto px-3 sm:px-6 py-5'}>
-      <div className="max-w-[860px] mx-auto">
-        <VirtualList<TurnGroup>
-          items={turns}
-          scrollerRef={scrollerRef}
-          estimateSize={() => 240}
-          getKey={(t) => String(t.turnSeq)}
-          stickToBottom={nearBottom}
-          followKey={followKey}
-          renderItem={(t, index) => (
-            <TurnBlock
-              turn={t}
-              isLast={index === turns.length - 1}
-              running={streaming}
-              reasoning={reasoning}
-              runPhase={runPhase}
-              actions={actions}
-              showCopy={showCopy}
-            />
-          )}
-        />
+    <div className="relative flex-1 min-h-0 flex flex-col">
+      <div ref={scrollerRef} className={scrollCls ? cn('flex-1 overflow-y-auto', scrollCls) : 'flex-1 overflow-y-auto px-3 sm:px-6 py-5'}>
+        <div className="max-w-[860px] mx-auto">
+          <VirtualList<TurnGroup>
+            items={turns}
+            scrollerRef={scrollerRef}
+            estimateSize={() => 240}
+            getKey={(t) => String(t.turnSeq)}
+            stickToBottom={nearBottom}
+            followKey={followKey}
+            scrollTarget={scrollTarget}
+            renderItem={(t, index) => (
+              <TurnBlock
+                turn={t}
+                isLast={index === turns.length - 1}
+                running={streaming}
+                reasoning={reasoning}
+                runPhase={runPhase}
+                actions={actions}
+                showCopy={showCopy}
+                highlight={highlight}
+              />
+            )}
+          />
+        </div>
       </div>
+      {showJumpToLatest && <JumpToLatestButton onClick={jumpToLatest} />}
     </div>
+  )
+}
+
+/**
+ * 「回到最新答复」浮钮（对齐老版本 ChatView.tsx:466 的「最新答复」胶囊）。
+ *
+ * 定位：贴在滚动容器右下角。容器是 relative，故用 absolute；z-20 保证压在消息之上、
+ * 但不抢 SideRail（z-30）与 SidePanel 的层级。
+ */
+function JumpToLatestButton({ onClick }: { onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        'absolute right-3 sm:right-5 bottom-4 z-20',
+        'inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full',
+        'bg-panel2/95 hover:bg-panel border border-edge hover:border-accent/50 shadow-lg backdrop-blur-sm',
+        'text-[12px] font-medium text-inkdim hover:text-ink transition-all cursor-pointer select-none',
+        'active:scale-95 fade-in',
+      )}
+      title="回到最新一轮答复（并恢复运行中自动跟随）"
+    >
+      <ArrowDown size={13} className="text-accent shrink-0" />
+      <span>最新答复</span>
+    </button>
   )
 }
 
@@ -178,7 +360,7 @@ export function MessageThread({
  * 单轮对话块（参照桌面端双轨容器模型）：
  * 「第 N 轮」分隔条 → 用户提问 → 执行过程抽屉（N 个步骤）→ 最终交付答复
  */
-function TurnBlock({ turn, isLast, running, reasoning, runPhase, actions, showCopy }: {
+function TurnBlock({ turn, isLast, running, reasoning, runPhase, actions, showCopy, highlight }: {
   turn: TurnGroup
   isLast: boolean
   running: boolean
@@ -186,6 +368,8 @@ function TurnBlock({ turn, isLast, running, reasoning, runPhase, actions, showCo
   runPhase: RunPhase
   actions: ThreadActions
   showCopy: boolean
+  /** 全局定位高亮态：本轮回命中时用于展开抽屉 + 高亮目标消息 */
+  highlight?: { id: string; nonce: number } | null
 }) {
   const users = turn.items.filter((m) => m.role === 'user')
   const assistants = turn.items.filter((m) => m.role === 'assistant')
@@ -230,6 +414,28 @@ function TurnBlock({ turn, isLast, running, reasoning, runPhase, actions, showCo
     }
   }
 
+  /**
+   * 交付轨兜底（2026-11「对话完成后结果没显示出来」的最直接成因）。
+   *
+   * # 缺陷现场（事故会话 122559a3 / 9ee34e00）
+   *
+   * 93 条 assistant 里 **86 条正文为空**（只有 reasoning + tool_calls）。
+   * 旧判据 `canAlsoDeliver = 有正文`，于是这 86 条全被塞进「执行过程」抽屉，
+   * 交付轨渲染为 null —— 用户跑完 15 分钟只看到「第 1 轮」分隔条和一个折叠的
+   * 过程卡片，**正文区一片空白**，体感就是「什么都没出来」。
+   *
+   * # 为什么兜底必须存在（而不是「模型本来就该给结论」）
+   *
+   * 收敛指令确实要求模型给结论，但**不能把可读性押在模型一定听话上**：
+   * 用户中途停止、步数耗尽、上游断流都会让最后一步停在「带工具无正文」的形态。
+   * 这时如实展示「本轮没有文字结论，共 N 步」是唯一不撒谎的做法 ——
+   * 既不伪造正文，也不让整轮彻底隐身。
+   */
+  const needFallback = !active && process.length > 0 && !deliverable
+  const fallbackStepCount = process.length
+  // 兜底态必须自动展开抽屉：否则用户仍需手点一次才知道「跑过什么」
+  const autoExpandSignal = needFallback ? -(turn.turnSeq + 1) : undefined
+
   const lastAssistantReasoning = assistants[assistants.length - 1]?.reasoning ?? ''
   const reverted = turn.items.some((m) => m.revertedAt)
 
@@ -242,13 +448,36 @@ function TurnBlock({ turn, isLast, running, reasoning, runPhase, actions, showCo
     ? { ...deliverable, reasoning: undefined, toolCalls: undefined }
     : null
 
+  /**
+   * 本轮的定位命中情况（供「定位出处」联动）：
+   * - hitInProcess：目标消息在抽屉内部 → 必须强制展开抽屉，否则用户看到空轮次
+   * - 目标在交付轨/用户消息上时无需展开，靠 MessageItem 自身高亮即可
+   *
+   * nonce 作为 expandSignal 直传：每次定位都产生新 nonce，故重复定位同一轮也会再次展开。
+   */
+  const hitId = highlight?.id
+  const hitInProcess = Boolean(hitId) && process.some((m) => m.id === hitId)
+  const expandSignal = hitInProcess ? highlight!.nonce : autoExpandSignal
+
   return (
     <div className="pb-8">
       <div className={cn('space-y-3', reverted && 'opacity-60')}>
-        {users.map((m) => <MessageItem key={m.id} msg={m} actions={actions} />)}
+        {users.map((m) => (
+          <MessageItem
+            key={m.id}
+            msg={m}
+            actions={actions}
+            highlighted={Boolean(hitId) && hitId === m.id}
+          />
+        ))}
 
         {process.length > 0 && (
-          <ProcessDrawer steps={process} running={active} reasoning={active ? reasoning : undefined} />
+          <ProcessDrawer
+            steps={process}
+            running={active}
+            reasoning={active ? reasoning : undefined}
+            expandSignal={expandSignal}
+          />
         )}
 
         {deliverableForRender && (
@@ -256,11 +485,25 @@ function TurnBlock({ turn, isLast, running, reasoning, runPhase, actions, showCo
             key={deliverableForRender.id}
             msg={deliverableForRender}
             actions={actions}
+            highlighted={Boolean(hitId) && hitId === deliverableForRender.id}
             // 只有「本轮的进行中答复」才带阶段与秒表：历史轮次给 undefined，
             // 避免给已完成的旧消息挂上一个永不停止的计时器。
             runPhase={active ? runPhase : undefined}
             turnStartedAt={active ? turnStartedAt : undefined}
           />
+        )}
+
+        {/*
+          交付轨兜底条：本轮全部步骤都没有正文时，正文区会完全空白。
+          这里如实告知「跑到哪一步、为什么没有文字结论」，并已自动展开过程抽屉。
+          🚨 绝不编造答复文案 —— 只陈述事实（步数 + 需要去哪里看细节）。
+        */}
+        {needFallback && (
+          <div className="rounded-lg border border-edge bg-panel2/60 px-3 py-2 text-[12px] text-inkdim leading-relaxed">
+            本轮已执行 <span className="text-ink font-medium">{fallbackStepCount}</span> 个步骤，
+            但未产生文字结论（可能被中途停止、步数耗尽或上游断流）。
+            详细执行过程已在上方展开，可逐步查看工具调用与输出。
+          </div>
         )}
 
         {/* 轮次底部指标栏 */}
@@ -413,19 +656,27 @@ function TurnFooterBar({ turn, streaming, actions, showCopy, turnStartedAt }: {
   )
 }
 
-function MessageItem({ msg, actions, runPhase, turnStartedAt }: {
+function MessageItem({ msg, actions, runPhase, turnStartedAt, highlighted }: {
   msg: Message
   actions: ThreadActions
   /** 仅「本轮进行中的答复」传入；历史消息不传（否则会挂上永不停止的计时器） */
   runPhase?: RunPhase
   /** 本轮开始时刻（本轮 user 消息 createdAt，不可变事实）：秒表基准 */
   turnStartedAt?: number
+  /** 「定位出处」命中高亮：ring 高亮 1 次（由 MessageList 的 2.4s 定时器自动清除） */
+  highlighted?: boolean
 }) {
+  // 锚点属性：id 供外部（如未来的深链）定位，data-message-id 供调试与自动化校验。
+  // 🚨 注意：虚拟列表下未渲染的轮次并没有这个 DOM，所以**内部定位逻辑不得依赖它**
+  // （见 MessageThread 里「数据 → 索引 → scrollToIndex」的注释）；此处仅供可见项使用。
+  const anchorProps = { id: `msg-${msg.id}`, 'data-message-id': msg.id } as const
+  const ringCls = 'ring-2 ring-accent ring-offset-2 ring-offset-panel transition-all duration-500'
+
   if (msg.role === 'user') {
     const reverted = Boolean(msg.revertedAt)
     const actBtn = 'w-7 h-7 rounded-lg hover:bg-panel2 flex items-center justify-center transition-all shrink-0 active:scale-95'
     return (
-      <div className="group flex justify-end items-start gap-2">
+      <div className="group flex justify-end items-start gap-2" {...anchorProps}>
         {/* 操作列（用户消息前方：移动端与桌面端均常驻显示） */}
         <div className="flex items-center gap-0.5 mt-2 shrink-0">
           {reverted ? (
@@ -476,7 +727,8 @@ function MessageItem({ msg, actions, runPhase, turnStartedAt }: {
         <div className="flex flex-col items-end gap-1 max-w-[92%] sm:max-w-[80%] min-w-0">
           <div className={cn(
             'w-full text-left rounded-2xl rounded-tr-sm bg-panel2 border border-edge px-4 py-2.5 text-ink',
-            reverted && 'opacity-80 border-dashed border-warn/40 bg-warn/10'
+            reverted && 'opacity-80 border-dashed border-warn/40 bg-warn/10',
+            highlighted && ringCls,
           )}>
             {reverted && (
               <div className="flex items-center gap-1.5 text-[11px] text-warn bg-warn/15 border border-warn/30 px-2 py-0.5 rounded-md w-fit mb-2 select-none">
@@ -493,7 +745,10 @@ function MessageItem({ msg, actions, runPhase, turnStartedAt }: {
 
   // assistant（交付轨）
   return (
-    <div className="flex flex-col gap-1.5 py-1">
+    <div
+      className={cn('flex flex-col gap-1.5 py-1 rounded-xl', highlighted && ringCls)}
+      {...anchorProps}
+    >
       {msg.reasoning && msg.reasoning.trim() && (
         <ReasoningCard text={msg.reasoning} streaming={Boolean(msg.streaming && !msg.content)} />
       )}

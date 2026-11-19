@@ -73,6 +73,7 @@ func (h *handlers) createWorkspace(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, err)
 		return
 	}
+	h.publishWorkspacesChanged()
 	writeJSON(w, http.StatusCreated, v)
 }
 
@@ -125,6 +126,7 @@ func (h *handlers) updateWorkspace(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, err)
 		return
 	}
+	h.publishWorkspacesChanged()
 	writeJSON(w, http.StatusOK, v)
 }
 
@@ -145,5 +147,9 @@ func (h *handlers) deleteWorkspace(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, err)
 		return
 	}
+	// 删除会级联迁移引用它的会话/项目（migrate_refs=true 时），
+	// 故两组列表都可能变化，两个信号都发。
+	h.publishWorkspacesChanged()
+	h.publishProjectsChanged()
 	w.WriteHeader(http.StatusNoContent)
 }

@@ -76,16 +76,24 @@ func (a *CompactionAdapter) Compact(ctx context.Context, req agent.CompactReques
 	svc, err := a.service(ctx, req.SessionID, req.ModelRef)
 	if err != nil {
 		// 装配失败不是致命错误：压缩是优化项，退回原样继续跑。
-		return agent.CompactResult{}, nil
+		// 但仍要如实报告"没压"的原因（没摘要器/没会话库属于配置问题）。
+		return agent.CompactResult{Skipped: true, SkipReason: compact.SkipReasonNotConfigured}, nil
 	}
 	res, cerr := svc.CompactIfNeeded(ctx, req.Used, req.Limit, req.Messages, req.Running)
 	// ErrSummaryTooLong 是「本次不值得压」，对引擎而言等同于未压缩，
 	// 不应作为错误上报——否则引擎会记录一条无意义的告警。
 	if cerr != nil && !isNoopCompactionError(cerr) {
-		return agent.CompactResult{}, cerr
+		return agent.CompactResult{
+			Skipped:    true,
+			SkipReason: compact.SkipReasonSummaryFailed,
+		}, cerr
 	}
 	if !res.Compacted {
-		return agent.CompactResult{}, nil
+		// 原因码透传：这是「为什么长会话没压缩」的唯一可观测答案。
+		return agent.CompactResult{
+			Skipped:    true,
+			SkipReason: res.SkipReason,
+		}, nil
 	}
 	return agent.CompactResult{
 		Compacted:        true,

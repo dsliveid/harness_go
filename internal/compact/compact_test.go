@@ -99,11 +99,20 @@ func TestPlanRunningKeepsActiveTurn(t *testing.T) {
 	}
 }
 
-// TestPlanRunningSingleTurnNoCompaction 单轮任务运行中不得压缩。
+// TestPlanRunningSingleTurnStillCompacts 单轮长任务**运行中也要能压缩**。
 //
-// 事故会话正是这个形态：1 条 user + 大量工具。运行期间压缩它
-// 等于把任务本身删掉。
-func TestPlanRunningSingleTurnNoCompaction(t *testing.T) {
+// # 这条断言与旧版相反（2026-11 变更，勿回退）
+//
+// 旧实现认为「单轮任务运行中压缩 = 把任务本身删掉」，于是 `lastUser == 0`
+// 直接 `return Plan{}`。但事故会话（122559a3）正是这个形态：
+// 1 条 user + 200+ 条工具步骤，未压缩区间全被当前轮占据 → 压缩**永不发生**
+// → 单会话账单烧到 839 万 token，而 session_compactions 恒为 0。
+//
+// 正确语义对齐老版本 harness_mini governance.rs:361-373：
+// 找不到可切轮次边界时，退化为「保留最后 1 条、折叠其余」，
+// 用户目标与关键结论由 BuildSummaryPrompt 强制要求写进摘要（见其「必须保留」四条），
+// 因此模型不会对任务失忆，但上下文规模能真正降下来。
+func TestPlanRunningSingleTurnStillCompacts(t *testing.T) {
 	var msgs []model.Message
 	msgs = append(msgs, msg(1, model.RoleUser, "分析启动变慢"))
 	for i := int64(2); i <= 50; i++ {
@@ -113,8 +122,19 @@ func TestPlanRunningSingleTurnNoCompaction(t *testing.T) {
 	}
 
 	p := PlanCompaction(msgs, 0, true)
-	if !p.Empty() {
-		t.Fatalf("单轮任务运行中不得压缩，却规划了 seq[%d,%d]", p.StartSeq, p.EndSeq)
+	if p.Empty() {
+		t.Fatal("单轮长任务运行中必须能压缩（否则压缩永不休眠，复现 839 万 token 事故）")
+	}
+	// 铁律：最后一条必须保留（它是"此刻正在发生的事"）。
+	last := msgs[len(msgs)-1]
+	for _, m := range p.Messages {
+		if m.Seq == last.Seq {
+			t.Fatalf("最后一条消息 seq=%d 被折叠（会让模型丢失当前现场）", last.Seq)
+		}
+	}
+	// 折叠区间必须从第一条开始（不能留孤儿 tool 在头部）。
+	if p.StartSeq != 1 {
+		t.Fatalf("折叠区间应从 seq1 开始，得到 %d", p.StartSeq)
 	}
 }
 

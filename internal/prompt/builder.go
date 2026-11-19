@@ -150,7 +150,21 @@ func (b *Builder) Build(in Input) BuildResult {
 	//
 	// 铁律（宽进严出）：未命中的 deferred 工具**仍然可执行**，只是模型看不到其 schema；
 	// 本函数只影响「注入深度」，绝不影响「能否调用」。
-	deferred, promoted := promoteActive(deferred, in.ActiveTools)
+	//
+	// 🚨 缓存红线（2026-11，勿回退）：promote 的结果**只影响 Request.Tools 与
+	// IndexedDeferred 报告**，绝不影响 system 里的「## 可按需调用的工具」索引段。
+	//
+	// 历史缺陷：旧实现把命中项从 deferred 里抠掉再传给 buildSystem，于是**同一次 Run
+	// 内相邻两步的 system 字节不同**（A 步命中 read_file，B 步命中 edit_file）。
+	// system 一变，它后面的整段 messages 缓存全部击穿 —— 而 system + history 恰恰是
+	// 上下文里最长的前缀。老版本 harness_mini 的 messages[0] 是**纯静态** System Prompt
+	// （message_stream.rs:28 不可变前缀五准则之一），本项目必须对齐。
+	//
+	// 索引段多列几个名字的成本是每步约 18 token/条，而击穿一次前缀缓存的代价是
+	// 整段 system+history 重新计费 —— 这笔账只在一个方向上划算。
+	indexSource := deferred // system 索引段数据源：promote 之前全量
+	rest, promoted := promoteActive(deferred, in.ActiveTools)
+	deferred = rest
 
 	// deferred 索引截断（超出上限只保留前 N 条，并计入结果便于告警）。
 	//
@@ -172,7 +186,7 @@ func (b *Builder) Build(in Input) BuildResult {
 		sop = sop[:b.limits.MaxSOP]
 	}
 
-	system := b.buildSystem(in, sop, deferred)
+	system := b.buildSystem(in, sop, indexSource)
 
 	history := in.History
 	dropped := 0
@@ -234,15 +248,15 @@ func (b *Builder) Build(in Input) BuildResult {
 			Tools:    toolSpecs,
 			Stream:   true,
 		},
-		Breakdown:       bd,
-		InjectedCore:    coreNames,
-		IndexedDeferred: deferredNames,
-		SkippedOnDemand: onDemandNames,
-		PromotedTools:   promotedNames(promoted),
-		Estimated:       b.counter.Estimated(),
-		OverBudget:      overBudget,
-		DroppedHistory:  dropped,
-		SOPOverflow:     sopOverflow,
+		Breakdown:        bd,
+		InjectedCore:     coreNames,
+		IndexedDeferred:  deferredNames,
+		SkippedOnDemand:  onDemandNames,
+		PromotedTools:    promotedNames(promoted),
+		Estimated:        b.counter.Estimated(),
+		OverBudget:       overBudget,
+		DroppedHistory:   dropped,
+		SOPOverflow:      sopOverflow,
 		DeferredOverflow: deferredOverflow,
 	}
 }
@@ -286,28 +300,71 @@ func (b *Builder) buildSystem(in Input, sop []string, deferred []ToolRef) string
 	return strings.TrimRight(sb.String(), "\n")
 }
 
-// trimHistory 从最旧开始丢弃历史，直到满足预算（保留最近消息）。
+// trimHistory 按预算裁剪历史（**轮次级原子裁切**，对齐老版本 message_stream.rs:268-328）。
+//
+// # 为什么不能逐条丢（历史缺陷，2026-11 修复）
+//
+// 旧实现从最旧开始「每轮丢 1/4 条」，切点落在任意位置 —— 极可能把
+// assistant(tool_calls) 与它配对的 tool 结果切开。后果有两层：
+//
+//	① 协议层：孤儿 tool 消息让上游 400（bad_request），整段历史再也跑不通；
+//	② 缓存层：切点位置随预算波动，同一次 Run 内相邻两步的 history 前缀
+//	   起始消息不同 → 前缀缓存全废（而 system + history 是最长的那段前缀）。
+//
+// # 正确口径（老版本 five 准则之五）
+//
+// 「仅在极端 token 压力下才对远期历史实施**轮次级**原子裁切」：
+//   - 切点必须是**用户消息**（轮的起点），整轮丢弃，绝不切半轮；
+//   - 保留段必须以 user 开头，孤立的 tool / assistant 一律跟着它的轮一起丢；
+//   - 丢弃量必须留痕（DroppedHistory），让 UI 与排障能解释"模型为什么忘了前文"。
 func (b *Builder) trimHistory(history []llm.Message, maxTokens int) ([]llm.Message, int) {
 	if len(history) == 0 {
 		return history, 0
 	}
-	msgs := toCountMessages(history)
-	if b.counter.CountMessages(msgs) <= maxTokens {
+	if b.counter.CountMessages(toCountMessages(history)) <= maxTokens {
 		return history, 0
 	}
-	// 从头逐步丢弃（每轮丢弃 1/4，避免 O(n²) 估算）
-	keep := len(history)
-	for keep > 0 {
-		keep = keep - maxInt(1, len(history)/4)
-		if keep < 0 {
-			keep = 0
-		}
-		candidate := history[len(history)-keep:]
-		if b.counter.CountMessages(toCountMessages(candidate)) <= maxTokens {
-			return candidate, len(history) - keep
+
+	// 轮起点索引：role == user 的位置（第 0 条若为 user 也算）。
+	turnStarts := make([]int, 0, len(history)/2+1)
+	for i, m := range history {
+		if m.Role == llm.RoleUser {
+			turnStarts = append(turnStarts, i)
 		}
 	}
-	return nil, len(history)
+	// 无 user 消息（如全 tool 的历史）时退化为「整段丢弃直到达标」，
+	// 这是唯一无法按轮裁切的形态，且此时保留任一段都缺少对话前提。
+	if len(turnStarts) == 0 {
+		return nil, len(history)
+	}
+
+	// 从最早的轮开始整轮丢弃，直到达标（二分定位，避免 O(n²) 估算）。
+	lo, hi := 0, len(turnStarts)
+	// best 记录「最小可行丢弃轮数」对应的保留起点。
+	best := -1
+	for lo < hi {
+		mid := (lo + hi) / 2
+		start := turnStarts[mid]
+		candidate := history[start:]
+		if b.counter.CountMessages(toCountMessages(candidate)) <= maxTokens {
+			best = start
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	if best >= 0 {
+		return history[best:], best
+	}
+	// 🚨 连「只保留最后一轮」都超预算时，仍然保留最后一轮（丢弃前 N-1 轮），
+	// 把超预算这件事交给预算闸门/压缩去处理。
+	//
+	// 为什么不能返回 nil：那会让模型在**最需要它的时刻**（历史最长、任务最复杂）
+	// 完全失去对话前提 —— 它会对着一个没有任何上下文的请求"从头开始猜"。
+	// 老版本对齐口径：`while est > token_limit && user_indices.len() > 1`，
+	// 即循环条件里就有「至少保留一轮」，永不把历史清空。
+	best = turnStarts[len(turnStarts)-1]
+	return history[best:], best
 }
 
 func (b *Builder) computeBreakdown(system string, history []llm.Message, tools []llm.ToolSpec, userContent string) Breakdown {
@@ -428,6 +485,7 @@ func joinTails(parts ...string) string {
 	return strings.Join(out, "\n\n")
 }
 
+// maxInt 两整数取大（保留：预算与阈值计算中仍可能用到）。
 func maxInt(a, b int) int {
 	if a > b {
 		return a

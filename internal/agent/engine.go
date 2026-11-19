@@ -47,8 +47,15 @@ type Deps struct {
 	// 「当前步数 X/总步数 N」，让模型感知剩余预算、在接近上限时主动收敛。
 	// <=0 时回落默认 10；显式关闭请配 0 以外的语义（引擎内 <=0 即视为默认值）。
 	StepNoticeEvery int
-	ToolTimeout     time.Duration
-	Now             func() int64
+	// ToolTimeout 单次工具执行的超时上限（外层闸门）。
+	//
+	// 🚨 与 run_command 的 `timeout_s` 必须取 max 对齐（见 execTool）：
+	// 此前这里硬编码 120s，而模型常给 timeout_s=400 → 外层先砍内层，
+	// 命令返回「context canceled」，模型误判为"被取消"而非"超时"，
+	// 于是重试同一条命令（事故会话连跑 3 次 go build，累计 271 秒）。
+	// <=0 时回落默认 180s（由 cmd 装配层从 config.Agent.ToolTimeoutS 传入）。
+	ToolTimeout time.Duration
+	Now         func() int64
 	// AccessModeProvider 实时读取会话访问模式（可选）。
 	// 对齐桌面端语义：顶栏「变更前确认/完全访问」切换即时生效——对话进行中同样立即生效，
 	// 因此每次审批决策前重读一次；读取失败回落 RunRequest.AccessMode（Run 启动快照）。
@@ -133,7 +140,8 @@ func New(deps Deps) (*Engine, error) {
 		deps.StepNoticeEvery = 10 // 每 10 步注入一次步数进度提示
 	}
 	if deps.ToolTimeout <= 0 {
-		deps.ToolTimeout = 120 * time.Second
+		// 180s：覆盖绝大多数构建/测试命令；过小必然砍掉 run_command 的 timeout_s。
+		deps.ToolTimeout = 180 * time.Second
 	}
 	if deps.Now == nil {
 		deps.Now = func() int64 { return time.Now().UnixMilli() }
@@ -469,7 +477,18 @@ func (e *Engine) loop(ctx context.Context, sdb SessionDB, req RunRequest, usage 
 	//   ② 语义错误——A 会话压缩 3 次后，B 会话的压缩也被一起掐掉。
 	// 放在 loop 局部，天然按 Run 隔离且随 Run 结束自动归零。
 	compactionsThisRun := 0
-	for step := 0; step < e.deps.MaxSteps; step++ {
+	// 工具失败/重复调用追踪器（同样必须按 Run 隔离，理由同上）。
+	// 移植老版本 ToolErrorTracker：连续失败超限注入中文自纠提示，
+	// 完全重复的调用直接拦下并把原因回灌模型（见 error_tracker.go）。
+	tools := newToolErrorTracker()
+	// 本轮开始时刻（用于步数提示里的「已耗时」，对齐老版本「正在执行… 21分5秒」）。
+	runStartedAt := e.deps.Now()
+	// 步数预算可在「续步审批」通过后扩展（对齐老版本 step_extension）。
+	// 用可变上限而不是重开一层循环：续步后上下文（history / usage）必须原样接续，
+	// 重新进入 loop 会丢失这些内存态（等价于把任务从头再来一遍）。
+	maxSteps := e.deps.MaxSteps
+	extensions := 0
+	for step := 0; step < maxSteps; step++ {
 		if ctx.Err() != nil {
 			return model.RunCancelled, "context_canceled", "", "", tokens
 		}
@@ -486,10 +505,13 @@ func (e *Engine) loop(ctx context.Context, sdb SessionDB, req RunRequest, usage 
 		e.drainGuidance(ctx, sdb, req, &history)
 
 		// 步数进度提示（每 StepNoticeEvery 步注入一次）：
-		// 让模型感知剩余预算，在接近上限时主动收敛输出。
-		// 走 DynamicTail 通道（Builder 保证置尾到本轮 user 消息前），
+		// 让模型感知剩余预算与**已耗时**，在接近上限时主动收敛输出。
+		// 与中文思考锚定一起走 DynamicTail 通道（Builder 保证置尾到本轮 user 消息前），
 		// **绝不进 system 稳定前缀**，否则每步变化的进度文本会击穿前缀缓存。
-		dynamicTail := stepNotice(step, e.deps.MaxSteps, e.deps.StepNoticeEvery)
+		dynamicTail := joinTailSections(
+			stepNotice(step, maxSteps, e.deps.StepNoticeEvery, time.Duration(e.deps.Now()-runStartedAt)*time.Millisecond),
+			reasoningLanguageAnchor,
+		)
 
 		res := e.deps.Builder.Build(prompt.Input{
 			Model:          req.ModelRef,
@@ -640,9 +662,47 @@ func (e *Engine) loop(ctx context.Context, sdb SessionDB, req RunRequest, usage 
 		// 工具调用：回灌 assistant(tool_calls) + 逐条 tool 结果
 		history = append(history, toLLMMessage(assistantMsg))
 		for _, tc := range out.toolCalls {
+			// 重复调用闸门（对齐老版本 ToolErrorTracker 的强化版）：
+			// 完全相同的 (工具名+参数) 第三次起直接拦下，把原因作为工具结果回灌，
+			// 而不是白跑一次几十秒的命令（事故会话连跑 3 次同类 go build，271 秒）。
+			// 拦截也要落库+发事件，否则前端会少一张工具卡片、审计也断链。
+			if allowed, notice := tools.allow(tc.Name, tc.Arguments); !allowed {
+				blocked := toolMessage(tc, notice)
+				blocked.RunID = req.RunID
+				blocked.CreatedAt = e.deps.Now()
+				if e.assertMutable(ctx, sdb, req.RunID) {
+					if err := sdb.AppendMessage(dbctx(ctx), blocked); err != nil {
+						return model.RunFailed, "", "persist_failed", err.Error(), tokens
+					}
+					if e.deps.Summary != nil {
+						_ = e.deps.Summary.TouchMessage(ctx, req.SessionID, e.deps.Now())
+					}
+				}
+				e.publish(req.RunID, events.TypeToolResult, map[string]any{
+					"tool_event_id": "",
+					"tool_name":     tc.Name,
+					"status":        string(model.ToolDenied),
+					"error":         notice,
+					"blocked":       true,
+				})
+				history = append(history, toLLMMessage(blocked))
+				continue
+			}
+
 			toolMsg, cancelled := e.execTool(ctx, sdb, req, tc)
 			toolMsg.RunID = req.RunID
 			toolMsg.CreatedAt = e.deps.Now()
+
+			// 记账：成功清零该工具失败计数，失败累加并在超限时把自纠提示附加到结果里。
+			// 提示**必须**并入 toolMsg 内容：模型只读消息，看不到引擎内部状态。
+			if isToolFailure(toolMsg) {
+				overLimit, n := tools.recordFailure(tc.Name)
+				if overLimit {
+					toolMsg.Content += toolFailureWarning(tc.Name, n)
+				}
+			} else {
+				tools.recordSuccess(tc.Name)
+			}
 
 			// 终态不可变（单一断言点之二，**最关键的一处**）：
 			// 工具执行可能耗时数十秒。期间用户点停止，Run 会被别处迁移到
@@ -673,11 +733,145 @@ func (e *Engine) loop(ctx context.Context, sdb SessionDB, req RunRequest, usage 
 			}
 		}
 		userInput = "" // 后续轮次不再重复用户输入
+
+		// 步数耗尽：不再硬截断，改为对齐老版本 `step_extension`——向用户申请续步。
+		//
+		// # 为什么必须这样（2026-11 事故）
+		//
+		// 旧实现是循环结束后直接 failed / max_steps_exceeded。会话 9ee34e00 跑到
+		// 第 100 步时任务其实只差最后一步（已经 build 成功，正要验证启动耗时），
+		// 却被硬截断；用户看到的是"失败了"，而模型连"我差一点就完成了"都说不出来。
+		// 老版本 harness_mini（agent.rs:1660）的做法是：步数耗尽**原地挂起**，
+		// 向前端推送 step_extension 审批申请，等用户决定是否加步。
+		//
+		// 放在循环体末尾而不是循环之后：这样 history / usage / 追踪器等内存态
+		// 全部原样接续（等价于"同一轮的下半段"），而不是重开一层循环从头再来。
+		//
+		// 约束：
+		//   - 续步次数上限 2（最多 3 倍预算，防止无限续命烧钱）；
+		//   - 审批被拒 / 超时 → 如实以 max_steps_exceeded 收口（行为与改造前一致）。
+		if step+1 >= maxSteps && extensions < maxStepExtensions {
+			if added := e.askStepExtension(ctx, sdb, req, step+1, maxSteps,
+				time.Duration(e.deps.Now()-runStartedAt)*time.Millisecond); added > 0 {
+				extensions++
+				maxSteps += added
+			}
+		}
 	}
 
 	return model.RunFailed, "", "max_steps_exceeded",
-		fmt.Sprintf("超过最大步数 %d", e.deps.MaxSteps), tokens
+		fmt.Sprintf("超过最大步数 %d", maxSteps), tokens
 }
+
+// maxStepExtensions 单 Run 最多申请几次续步（每次续 MaxSteps 步）。
+//
+// 取 2 而不是无限：续步是"差一点就完成"的救援通道，不是把 MaxSteps 变成
+// 没有意义的长跑授权。3 倍预算足够覆盖绝大多数真实长任务。
+const maxStepExtensions = 2
+
+// askStepExtension 步数耗尽时向用户申请续步（对齐老版本 step_extension）。
+//
+// 返回本次获批追加的步数；0 表示不续步（用户拒绝 / 超时 / 闸门未装配）。
+//
+// 实现走既有审批闸门而不是新造一套协议：这样三端（web/mobile/desktop）无需新增
+// 事件类型与交互组件，复用的正是它们已经实现的审批条（ApprovalBar）。
+func (e *Engine) askStepExtension(
+	ctx context.Context, sdb SessionDB, req RunRequest, step, maxSteps int, elapsed time.Duration,
+) int {
+	if e.deps.Gate == nil {
+		return 0
+	}
+	if ctx.Err() != nil {
+		return 0
+	}
+	// 复用工具审批的落库与推送路径，但用一个**虚拟工具名**表达"这不是业务工具"。
+	// 落 tool_events 是为了让前端卡片与审计都能看到"用户在此处做了决定"。
+	eventID := newID()
+	startedAt := e.deps.Now()
+	// 记录真实 Risk（approval 需要非空风险级），用 danger 确保一定弹审批。
+	ev := &model.ToolEvent{
+		ID:          eventID,
+		RunID:       req.RunID,
+		ToolName:    stepExtensionToolName,
+		Namespace:   "builtin",
+		ArgsJSON:    json.RawMessage(fmt.Sprintf(`{"current_steps":%d,"max_steps":%d,"elapsed_ms":%d}`, step, maxSteps, elapsed.Milliseconds())),
+		Status:      model.ToolPending,
+		Risk:        model.RiskDanger,
+		Executor:    model.ExecutorServer,
+		SourceTrust: model.TrustTrusted,
+		StartedAt:   &startedAt,
+	}
+	if err := sdb.InsertToolEvent(dbctx(ctx), ev); err != nil {
+		return 0
+	}
+	requester := approvalRequester(req)
+	if _, err := e.deps.Gate.RegisterWithDevice(eventID, requester, ""); err != nil {
+		_ = sdb.FinishToolEvent(dbctx(ctx), eventID, model.ToolError, "", "", err.Error(),
+			model.ToolEventExec{Executor: model.ExecutorServer, SourceTrust: model.TrustTrusted})
+		return 0
+	}
+	// 状态机闭环：必须落到 waiting_approval，否则前端刷新后无法重建审批条
+	// （GET /active-run 只能按该状态返回，DecideApproval 也硬校验它）。
+	if err := e.transition(ctx, sdb, req.RunID, model.RunWaitingApproval, "", "", ""); err != nil {
+		_ = sdb.FinishToolEvent(dbctx(ctx), eventID, model.ToolError, "", "", err.Error(),
+			model.ToolEventExec{Executor: model.ExecutorServer, SourceTrust: model.TrustTrusted})
+		return 0
+	}
+	e.publishStatus(req.RunID, req.SessionID, model.RunWaitingApproval, "", "", "", nil)
+	e.publish(req.RunID, events.TypeApprovalRequest, map[string]any{
+		"approval_id":   eventID,
+		"tool_event_id": eventID,
+		"tool_name":     stepExtensionToolName,
+		"risk":          string(model.RiskDanger),
+		"reason": fmt.Sprintf("本轮已用尽 %d 步步数预算（已耗时 %s）。"+
+			"是否追加 %d 步继续？拒绝或不响应将按「超过最大步数」收口。",
+			maxSteps, formatElapsed(elapsed), e.deps.MaxSteps),
+		"session_id": req.SessionID,
+		"run_id":     req.RunID,
+		"args":       string(ev.ArgsJSON),
+		// 新增字段（协议向后兼容）：前端可据此把审批条渲染成「续步」而不是「放行工具」
+		"kind":                "step_extension",
+		"current_steps":       step,
+		"max_steps":           maxSteps,
+		"requested_by_device": requester,
+		"required_device_id":  "",
+	})
+
+	d, reason := e.deps.Gate.Await(ctx, eventID)
+	// 审批结束后状态回到 running（与工具审批同语义）；取消路径不回迁。
+	if ctx.Err() == nil {
+		_ = e.transition(ctx, sdb, req.RunID, model.RunRunning, "", "", "")
+		e.publishStatus(req.RunID, req.SessionID, model.RunRunning, "", "", "", nil)
+	}
+	e.publish(req.RunID, events.TypeApprovalDecision, map[string]any{
+		"approval_id":         eventID,
+		"decision":            string(d),
+		"reason":              reason,
+		"requested_by_device": requester,
+		"required_device_id":  "",
+		"kind":                "step_extension",
+	})
+
+	added := 0
+	if d == approval.AllowOnce || d == approval.AllowSession {
+		added = e.deps.MaxSteps
+	}
+	// 审计收口：批准记 ok，拒绝/超时记 denied（原因如实落库）。
+	status := model.ToolDenied
+	if added > 0 {
+		status = model.ToolOK
+	}
+	_ = sdb.FinishToolEvent(dbctx(ctx), eventID, status,
+		fmt.Sprintf(`{"granted":%t,"added_steps":%d}`, added > 0, added), "",
+		"", model.ToolEventExec{Executor: model.ExecutorServer, SourceTrust: model.TrustTrusted})
+	return added
+}
+
+// stepExtensionToolName 续步审批的虚拟工具名（仅用于 tool_events 审计与前端卡片）。
+//
+// 必须以 `agent.` 前缀与真实工具区分：它不是可执行工具，任何 Gate/Risk 判定
+// 都不应把它当成工具调用处理；前端也应据此把它渲染成「续步申请」。
+const stepExtensionToolName = "agent.request_step_extension"
 
 // drainGuidance 消费运行中引导（轮次边界）：消息已由 service 层落库，这里只
 // 回灌上下文（history）并广播 message.appended 事件供多端对齐。非阻塞：无引导立即返回。
@@ -1111,7 +1305,13 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 		return toolMessage(tc, msg), false
 	}
 
-	toolCtx, cancel := context.WithTimeout(ctx, e.deps.ToolTimeout)
+	// 超时口径对齐（2026-11 事故）：外层闸门绝不能短于工具自己请求的超时。
+	//
+	// `run_command` 允许调用方传 `timeout_s`（实测模型常给 400），若外层仍是固定
+	// 120s，内层还没跑完就被外层砍成「context canceled」——模型看到"被取消"而不是
+	// "超时"，会误判为偶发中断并重试同一条命令（事故会话连跑 3 次 go build，271 秒）。
+	// 因此取 max(配置超时, 工具自报超时 + 缓冲)。
+	toolCtx, cancel := context.WithTimeout(ctx, e.toolTimeoutFor(tc))
 	defer cancel()
 	effMode := e.effectiveAccessMode(ctx, req)
 	result, runErr := e.deps.Tools.Run(toolCtx, ToolRunRequest{
@@ -1194,7 +1394,9 @@ func (e *Engine) tryCompact(
 	cctx, cancel := detachedCtx(ctx)
 	defer cancel()
 
-	msgs, err := sdb.ListMessages(cctx, 0, 1000)
+	// 取**最近** 1000 条（tail 语义）：跨 Run 续聊必须看得到最新进展。
+	// 旧实现传 ListMessages(0, 1000) 被存储层防洪闸静默截成最旧 100 条。
+	msgs, err := sdb.ListMessagesTail(cctx, 1000)
 	if err != nil {
 		return nil, false
 	}
@@ -1207,6 +1409,20 @@ func (e *Engine) tryCompact(
 		Running:   true, // 本 Run 正在执行：必须保护当前轮次
 	})
 	if err != nil || !res.Compacted {
+		// 压缩没发生也必须**留痕**（2026-11 教训：839 万 token 会话里
+		// 一条压缩痕迹都没有，只能靠人肉读 SQL 才推断出压缩真空）。
+		// 走非致命 error 事件，前端/排障可按 code 等值匹配：
+		//   scope=compaction / code=agent.compaction_skipped / reason=<原因码>
+		if err != nil || res.SkipReason != "" {
+			e.publish(req.RunID, events.TypeError, map[string]any{
+				"scope":   "compaction",
+				"code":    "agent.compaction_skipped",
+				"message": fmt.Sprintf("已到压缩水位但未压缩（原因：%s）", res.SkipReason),
+				"reason":  res.SkipReason,
+				"used":    built.Breakdown.Total,
+				"limit":   e.deps.MaxContextTokens,
+			})
+		}
 		return nil, false
 	}
 	// 压缩成功：重建历史（已压缩区间由摘要替代）。
@@ -1229,35 +1445,109 @@ func (e *Engine) tryCompact(
 	return newHistory, true
 }
 
+// reasoningLanguageAnchor 思考过程的中文语言锚定（近端提示）。
+//
+// # 为什么需要这一层（2026-11 实测根因）
+//
+// 稳定前缀里的语言条款（sop/catalog.go 的 delivery_etiquette + agent-core.md）
+// 距离生成点很远，且工具续轮（Step≥2）不再带用户输入，模型在长上下文里
+// 极易漂回训练语料主语言（英文思考）。老版本同样不约束思考语言，但每轮
+// 有更强的近场中文语境；新版工具上下文英文密度高（schema / 参数名 / 工具名），
+// 漂移更明显。
+//
+// # 为什么走 DynamicTail 而不是 SystemBase（红线）
+//
+// DynamicTail 拼在本轮 user 消息前，是本轮唯一「必变」的段落（stepNotice 已在用），
+// 因此不额外破坏前缀缓存。若写进 SystemBase，会污染稳定前缀并击穿 KV 缓存命中。
+//
+// # 为什么每步都注入（含 Step 0）
+//
+// Step 0 有用户输入作近场锚，但工具续轮（Step≥2）没有；统一每步注入可让
+// 行为与步数无关，避免「第一轮中文、后续转英文」的分裂体验。
+const reasoningLanguageAnchor = "（系统提示：本轮思考过程请使用简体中文，不要切换成英文。）"
+
+// joinTailSections 拼接可变尾段（跳过空段，保序，以空行分隔）。
+//
+// 与 prompt.joinTails 同语义，但本函数留在 agent 包内：DynamicTail 的**内容决策**
+// 属于引擎职责，不应反向依赖 prompt 包的内部工具函数（该函数未导出）。
+func joinTailSections(parts ...string) string {
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return strings.Join(out, "\n\n")
+}
+
 // stepNotice 生成步数进度提示文本（走 prompt.Input.DynamicTail 通道）。
 //
 // 设计要点：
 //   - step 从 0 计，对外展示一律用 step+1（即「当前第几步」）；
 //   - 每 every 步注入一次（第 every、2×every … 步），every <= 0 表示关闭；
+//   - **必须带已耗时**（2026-11 新增）：13.7 分钟的事故会话里，模型收到的
+//     提示只有「步数 21/100」，完全没有时间概念，因此没有任何收敛压力。
+//     老版本每轮都给「正在执行… 21分5秒」，模型能自行判断"这一轮是不是太久了"。
+//     时间走 DynamicTail（本轮必变段），不污染稳定前缀。
 //   - 最后一步额外追加收敛指令：此时已无余量继续调用工具，必须强制模型
 //     交出最终结论，避免像以往那样被硬截断后「无声停住」。
 //
 // 返回空串时 Builder 不会追加多余空行（joinTails 已过滤空段）。
-func stepNotice(step, maxSteps, every int) string {
+func stepNotice(step, maxSteps, every int, elapsed time.Duration) string {
 	if every <= 0 || maxSteps <= 0 {
 		return ""
 	}
 	current := step + 1
+	cost := ""
+	if elapsed > 0 {
+		cost = "，已耗时 " + formatElapsed(elapsed)
+	}
 
 	// 最后一步优先级最高：无论是否命中 every 的整数倍，都必须提示收敛。
 	if current >= maxSteps {
-		return fmt.Sprintf("【步数进度】当前步数 %d/总步数 %d。已到最后一步，"+
+		return fmt.Sprintf("【步数进度】当前步数 %d/总步数 %d%s。已到最后一步，"+
 			"后续无法再调用任何工具，请立即基于已有信息给出最终答复；"+
 			"若任务未完成，请说明已完成部分、剩余部分与建议的下一步。",
-			current, maxSteps)
+			current, maxSteps, cost)
 	}
 
 	if current%every != 0 {
 		return ""
 	}
-	return fmt.Sprintf("【步数进度】当前步数 %d/总步数 %d，剩余 %d 步。"+
+	msg := fmt.Sprintf("【步数进度】当前步数 %d/总步数 %d，剩余 %d 步%s。"+
 		"请据此规划剩余工作，优先保证能给出完整结论。",
-		current, maxSteps, maxSteps-current)
+		current, maxSteps, maxSteps-current, cost)
+	// 时间收敛信号（与步数解耦）：单 Run 超过 10 分钟后每 10 步提醒一次交付阶段结论。
+	// 为什么不按固定时间硬中断：那会把「正在跑长构建」这种合法场景误杀。
+	if elapsed >= stepTimeSoftLimit {
+		msg += fmt.Sprintf("\n【耗时提醒】本轮已运行 %s，长任务请优先交付阶段性结论："+
+			"先给出已完成部分与关键发现，再说明后续步骤，避免用户长时间看不到任何结论。",
+			formatElapsed(elapsed))
+	}
+	return msg
+}
+
+// stepTimeSoftLimit 单 Run 的「时间收敛」软阈值。
+//
+// 取 10 分钟的依据：事故会话两轮都跑到 13~16 分钟才收口，而用户在这个量级
+// 就已经开始怀疑"是不是卡住了"。这不是硬中断，只是让模型知道"该先给结论了"。
+const stepTimeSoftLimit = 10 * time.Minute
+
+// formatElapsed 把时长格式化成中文可读形式（1m20s / 12m / 1h3m）。
+func formatElapsed(d time.Duration) string {
+	if d < time.Minute {
+		return fmt.Sprintf("%d秒", int(d.Seconds()))
+	}
+	h := int(d / time.Hour)
+	m := int(d % time.Hour / time.Minute)
+	s := int(d % time.Minute / time.Second)
+	if h > 0 {
+		return fmt.Sprintf("%d小时%d分", h, m)
+	}
+	if s == 0 {
+		return fmt.Sprintf("%d分", m)
+	}
+	return fmt.Sprintf("%d分%d秒", m, s)
 }
 
 // degradeDetails 提取降级动作明细（事件 payload 用）。
@@ -1272,8 +1562,12 @@ func degradeDetails(actions []prompt.DegradeAction) []string {
 }
 
 // loadHistory 载入会话历史并转成 llm.Message。
+//
+// 🚨 必须用 ListMessagesTail（取最近 N 条），不能用 ListMessages(0, N)：
+// 后者是 `seq > ? ORDER BY seq ASC`（取头）且被存储层 `limit>500→100` 防洪闸
+// 静默改写 → 引擎只看到最旧 100 条，跨 Run 续聊时"自己的最近几十步"全部丢失。
 func (e *Engine) loadHistory(ctx context.Context, sdb SessionDB) ([]llm.Message, error) {
-	msgs, err := sdb.ListMessages(ctx, 0, 1000)
+	msgs, err := sdb.ListMessagesTail(ctx, 1000)
 	if err != nil {
 		return nil, err
 	}
@@ -1504,6 +1798,30 @@ func marshalToolCalls(e *Engine, req RunRequest, tcs []llm.ToolCall) json.RawMes
 	}
 	return raw
 }
+
+// toolTimeoutFor 计算本次工具调用的外层超时。
+//
+// 契约：外层**永不短于**工具自报超时 —— 否则内层没跑完就被砍成 context canceled，
+// 模型会把"超时"误读为"被取消"，从而盲目重试同一条命令（2026-11 事故：连跑 3 次）。
+//
+// 只在参数里显式给了 `timeout_s` 时才上抬，且加 10s 缓冲用于进程收尾，
+// 避免边界上「外层恰好等于内层」导致结果读取窗口被吃掉。
+func (e *Engine) toolTimeoutFor(tc llm.ToolCall) time.Duration {
+	base := e.deps.ToolTimeout
+	var args struct {
+		TimeoutS int `json:"timeout_s"`
+	}
+	if len(tc.Arguments) > 0 && json.Unmarshal(tc.Arguments, &args) == nil && args.TimeoutS > 0 {
+		want := time.Duration(args.TimeoutS)*time.Second + toolTimeoutGrace
+		if want > base {
+			return want
+		}
+	}
+	return base
+}
+
+// toolTimeoutGrace 外层超时相对内层 timeout_s 的缓冲（进程收尾 + 结果读取）。
+const toolTimeoutGrace = 10 * time.Second
 
 // toolMessage 构造回灌给模型的 tool 消息。
 func toolMessage(tc llm.ToolCall, content string) *model.Message {

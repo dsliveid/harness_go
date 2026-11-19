@@ -168,8 +168,9 @@ func TestProjectServiceValidation(t *testing.T) {
 	if _, err := projSvc.Create(ctx, "x", "", "yolo"); !isInvalidArg(t, err) {
 		t.Fatalf("非法 default_access_mode 应 invalid_argument，得到 %v", err)
 	}
-	// Update：name/权限空串表示不修改，pinned 按入参覆盖
-	if err := projSvc.Update(ctx, p.ID, "", "", true); err != nil {
+	// Update：PATCH 语义——nil = 不修改；pinned 用指针传入即覆盖
+	pinned := true
+	if err := projSvc.Update(ctx, p.ID, UpdateProjectInput{Pinned: &pinned}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := projSvc.Get(ctx, p.ID)

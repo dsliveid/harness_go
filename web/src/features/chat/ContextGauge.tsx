@@ -2,20 +2,22 @@ import { useMemo, useState, useRef, useEffect } from 'react'
 import { Brain } from 'lucide-react'
 import { useChat } from '../../stores/chatStore'
 import { useSessions } from '../../stores/sessionStore'
-import { resolveModelContext, formatTokens } from '../../lib/context'
+import { resolveModelContext, formatTokens, computeActiveContext } from '../../lib/context'
 import { cn } from '../../components/ui'
 
 // 内联上下文仪表（对齐桌面端 ContextUsageGauge）：
 // 触发钮 = SVG 环形圆圈进度 + 百分比 + 「上下文」；点击弹出「上下文窗口负载」详情浮层
 // （状态徽标 + 模型 + 活跃 tokens/上限 + 进度条 + 剩余/缓存命中）。
 // 说明：上下文「智能压缩」交互已整体下线（后端无压缩能力，保留即静默失败），
-// 本组件只展示 Provider usage 返回的真实 token 水位（tokensIn/tokensOut/cachedTokens）。
+// 本组件只展示真实 token 水位。
 //
-// 口径：水位按**当前会话**记账（chatStore 的 usageBySession 账本），新开对话从 0 起算、
-// 切回旧会话恢复其自身水位；页面刷新后内存账本清空，展示回到 0（delta 不落库是既定铁律，
-// 服务端只有 sessions.total_tokens 合计，无法拆出输入/输出/缓存，故不做近似回填以免伪造数据）。
+// 🚨 口径铁律（本轮修复的核心）：上下文占用 = **当前活跃上下文水位**，
+// 绝不是「会话累计 token 用量」。旧实现拿 tokensIn + tokensOut（会话账本累计值）当水位，
+// 导致对话越久仪表越接近 100%、与「还能不能继续聊」完全脱节。
+// 现在改由 lib/context.computeActiveContext 计算：取最近一条真实 usage 的
+// 输入+输出，再叠加其后新增内容的估算增量（对齐老版本 harness_mini 口径）。
 export function ContextGauge() {
-  const { tokensIn, tokensOut, cachedTokens } = useChat()
+  const { messages, tokensIn, tokensOut, cachedTokens } = useChat()
   const { sessions, currentId } = useSessions()
   const s = sessions.find((x) => x.id === currentId)
   const [open, setOpen] = useState(false)
@@ -56,8 +58,14 @@ export function ContextGauge() {
 
   const { limit, modelName, providerName } = useMemo(() => resolveModelContext(s?.modelRef), [s?.modelRef])
 
-  // 活跃上下文 = Provider usage 累计的输入 + 输出 tokens（真实水位，无压缩抵扣）
-  const activeTokens = Math.max(0, tokensIn + tokensOut)
+  // 活跃上下文水位（**不是**会话累计用量）：按当前会话的消息序列实时推导。
+  // 依赖 messages 引用即可 —— 流式 delta / 每步 message.end 都会重建 messages，
+  // 故对话进行中水位会随步骤推进持续刷新，不再等整轮结束才跳一次。
+  const { activeTokens, isEstimated } = useMemo(() => {
+    const mine = messages.filter((m) => m.sessionId === currentId)
+    return computeActiveContext(mine, limit)
+  }, [messages, currentId, limit])
+
   const pct = limit > 0 ? Math.min(100, Math.round((activeTokens / limit) * 1000) / 10) : 0
   const remaining = Math.max(0, limit - activeTokens)
   const cacheRate = tokensIn > 0 ? Math.round((cachedTokens / tokensIn) * 1000) / 10 : 0
@@ -150,16 +158,18 @@ export function ContextGauge() {
             <div className={cn('h-full rounded-full transition-all duration-300', barCls)} style={{ width: `${Math.min(pct, 100)}%` }} />
           </div>
 
-          {/* 详细指标明细（均来自 Provider usage 真实事件） */}
+          {/* 详细指标明细（水位来自最近一次真实 usage；累计项来自会话账本） */}
           <div className="mt-3 space-y-1.5 text-[11px] text-inkdim border-t border-edge/40 pt-2.5 font-mono">
             <Row label="剩余可用空间:" value={`${remaining.toLocaleString('zh-CN')} tokens`} />
-            <Row label="累计输入:" value={`${formatTokens(tokensIn)} tokens`} />
-            <Row label="累计输出:" value={`${formatTokens(tokensOut)} tokens`} />
+            {isEstimated && <Row label="水位口径:" value="含估算增量（等待 Provider usage）" tone="accent2" />}
+            <Row label="会话累计输入:" value={`${formatTokens(tokensIn)} tokens`} />
+            <Row label="会话累计输出:" value={`${formatTokens(tokensOut)} tokens`} />
             {tokensIn > 0 && <Row label="缓存命中:" value={`${formatTokens(cachedTokens)} · ${cacheRate.toFixed(1)}%`} tone="accent2" />}
           </div>
 
           <div className="mt-2.5 pt-2 border-t border-edge/40 text-[10px] text-inkfaint leading-relaxed">
-            未发生预算标注 ≈；已发生用量以 Provider <code className="font-mono bg-panel2 px-1 py-0.5 rounded text-accent">usage</code> 为准。
+            水位 = 最近一次请求真实 usage + 其后新增内容的估算增量；
+            累计项是会话总消耗，与水位不同。
           </div>
         </div>
       )}

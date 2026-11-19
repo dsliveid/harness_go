@@ -42,6 +42,16 @@ interface CallEntry {
   call: ToolCall
   /** 该调用所属消息的落库时刻（后端未下发工具级时间戳，仅能用消息时间作近似基准） */
   at: number
+  /**
+   * 该调用所属消息的 id（跨组件「定位出处」的锚点）。
+   *
+   * 为什么不靠 querySelector 找 DOM：主对话已改为虚拟列表（components/VirtualList.tsx），
+   * DOM 里只有可视区 + overscan 的轮次，历史轮次**根本不在 DOM 中** →
+   * 老版本「document.querySelector([data-message-id]) + scrollIntoView」的写法
+   * 对未渲染项恒失效（表现为点了定位毫无反应）。所以定位必须走「数据 → 索引 → 虚拟滚动」，
+   * 而这条消息 id 就是数据侧唯一可靠的入口。
+   */
+  messageId: string
 }
 
 /**
@@ -55,6 +65,7 @@ function flattenCalls(messages: Message[]): CallEntry[] {
   const order: string[] = []
   const latest = new Map<string, ToolCall>()
   const firstAt = new Map<string, number>()
+  const ownerMsg = new Map<string, string>()
 
   for (const m of messages) {
     const calls = m.toolCalls ?? []
@@ -65,11 +76,19 @@ function flattenCalls(messages: Message[]): CallEntry[] {
         order.push(id)
         firstAt.set(id, m.createdAt)
       }
+      // 归属消息取**首次出现**的那条：started 与 completed 落在同一条消息时无差别；
+      // 若跨消息（极少见），首次出现就是调用发起处，正是用户要「定位出处」的位置。
+      if (!ownerMsg.has(id)) ownerMsg.set(id, m.id)
       latest.set(id, c)
     })
   }
 
-  return order.map((id) => ({ id, call: latest.get(id) as ToolCall, at: firstAt.get(id) ?? 0 }))
+  return order.map((id) => ({
+    id,
+    call: latest.get(id) as ToolCall,
+    at: firstAt.get(id) ?? 0,
+    messageId: ownerMsg.get(id) ?? '',
+  }))
 }
 
 /** 调用是否处于「不可采信」的终态：出错 / 被拒时不应用它改写运行态 */
@@ -117,7 +136,7 @@ function deriveTodos(entries: CallEntry[]): TodoItem[] {
  */
 function derivePlans(entries: CallEntry[]): PlanDoc[] {
   for (let i = entries.length - 1; i >= 0; i--) {
-    const { id, call, at } = entries[i]
+    const { id, call, at, messageId } = entries[i]
     if (call.name !== TOOL.planSet || isRejected(call)) continue
 
     const title = typeof call.args?.title === 'string' ? call.args.title.trim() : ''
@@ -142,6 +161,10 @@ function derivePlans(entries: CallEntry[]): PlanDoc[] {
       active: true,
       steps,
       updatedAt: at,
+      // 出处锚点：本条调用所属消息 + tool_event_id（供右侧方案面板「定位出处」使用）。
+      // messageId 为空说明该调用的归属消息已不可考（极端脏数据），此时如实留空、由 UI 禁用入口。
+      sourceMessageId: messageId || undefined,
+      sourceToolCallId: id,
     }]
   }
   return []

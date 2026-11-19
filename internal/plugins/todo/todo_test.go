@@ -42,11 +42,15 @@ func TestTodoRoundTrip(t *testing.T) {
 }
 
 // TestTodoValidation 非法状态拒绝。
+//
+// 注（2026-11 变更）：`doing` / `completed` 等**同义词已被归一**，不再算非法
+// （模型稳定倾向使用它们，报错只会换来一次无意义的往返）。
+// 因此这条断言改用真正无法映射的词（`archived`）。
 func TestTodoValidation(t *testing.T) {
 	h := plugintest.New(t)
 	ctx := context.Background()
 	res, _ := invoke(ctx, h, &toolapi.Call{Args: []byte(
-		`{"items":[{"content":"x","status":"doing"}]}`)})
+		`{"items":[{"content":"x","status":"archived"}]}`)})
 	if !res.IsError || !strings.Contains(res.Content, "状态非法") {
 		t.Fatalf("非法状态必须拒绝: %q", res.Content)
 	}
@@ -55,6 +59,28 @@ func TestTodoValidation(t *testing.T) {
 		`{"items":[{"content":"  ","status":"done"}]}`)})
 	if !res.IsError {
 		t.Fatal("空内容必须拒绝")
+	}
+}
+
+// TestTodoStatusSynonymNormalized 同义状态词必须被归一而不是报错。
+//
+// 事故会话 122559a3 的实测：模型写 `completed` 被直接拒绝，
+// 白烧一步且要靠"再猜一次"纠正。归一化的契约是「规范词表不变，只宽容同义输入」。
+func TestTodoStatusSynonymNormalized(t *testing.T) {
+	h := plugintest.New(t)
+	ctx := context.Background()
+	res, _ := invoke(ctx, h, &toolapi.Call{Args: []byte(
+		`{"items":[{"content":"a","status":"completed"},{"content":"b","status":"doing"}]}`)})
+	if res.IsError {
+		t.Fatalf("同义状态词不应报错: %q", res.Content)
+	}
+	// 输出必须已归一为规范词（● = done，◐ = in_progress）。
+	out, _ := invoke(ctx, h, &toolapi.Call{})
+	if !strings.Contains(out.Content, "1. ● a") {
+		t.Fatalf("completed 应归一为 done，实际: %q", out.Content)
+	}
+	if !strings.Contains(out.Content, "2. ◐ b") {
+		t.Fatalf("doing 应归一为 in_progress，实际: %q", out.Content)
 	}
 }
 

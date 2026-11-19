@@ -45,6 +45,7 @@ import (
 	"harness-go/internal/retrieval"
 	"harness-go/internal/secret"
 	"harness-go/internal/service"
+	"harness-go/internal/sessionbus"
 	"harness-go/internal/snapshot"
 	"harness-go/internal/sop"
 	"harness-go/internal/store"
@@ -389,9 +390,17 @@ func run() error {
 	//     替换 compact.Options.Summarizer，调用点不变）；
 	//   - 未启用或窗口未知时不装配 Compactor（引擎自动退回旧行为）。
 	compactor := buildCompactor(cfg, sessionStore, modelResolver)
+	// 会话列表变更总线（供 /api/v1/sessions/events SSE 实时刷新各端对话列表）。
+	//
+	// 必须在 engine 之前构造：引擎的 SummaryWriter 要把「会话摘要已变化」这件事
+	// 推给它，否则各端的列表永远停在上次页面刷新的状态。
+	// 与 events.Bus / device.StateBus 是三套独立总线，语义各不相同（见各自包注释）。
+	sessionEvents := sessionbus.New(sessionbus.Options{})
+	// 引擎侧只认 service.SessionChangePublisher 窄接口，适配器在 api 包，
+	// 装配点在这里把它们接起来（避免 service 反向依赖传输层广播包）。
 	engine, err := agent.New(agent.Deps{
 		Sessions:      service.NewSessionProvider(sessionStore),
-		Summary:       service.NewSummaryWriter(mainStore),
+		Summary:       service.NewSummaryWriterWithChanges(mainStore, api.NewSessionBusPublisher(sessionEvents)),
 		Events:        bus,
 		Models:        modelResolver,
 		Builder:       gatedBuilder,
@@ -404,6 +413,8 @@ func run() error {
 		MaxSteps:      cfg.Agent.MaxSteps,
 		// 每 N 步向模型注入「当前步数 X/总步数 N」进度提示（0 = 关闭）。
 		StepNoticeEvery: cfg.Agent.StepNoticeEvery,
+		// 单次工具执行的外层超时（与 run_command 的 timeout_s 取 max 对齐，见 engine.execTool）。
+		ToolTimeout: time.Duration(cfg.Agent.ToolTimeoutS) * time.Second,
 		// 上下文压缩（nil = 未启用，行为与改造前一致）。
 		Compactor:        compactor,
 		MaxContextTokens: cfg.Compaction.MaxContextTokens,
@@ -556,6 +567,10 @@ func run() error {
 		// 能力天花板过滤工具注入：toolRunner 同时实现 agent.ToolCatalog（Risk），
 		// 与引擎侧用的风险源完全一致，避免两处判定漂移（协议 §4.1）。
 		Catalog: toolRunner,
+		// 会话列表级实时推送：Run 创建时把 last_run_status 投影成 pending 之后广播，
+		// 让各端的「运行中」脉冲点立刻出现（本文件的投影是直调 store 的，
+		// 绕过了 agent.SummaryWriter，故必须在此单独注入）。
+		SessionChanges: api.NewSessionBusPublisher(sessionEvents),
 	})
 	if n, rErr := runSvc.RecoverInterrupted(ctx); rErr == nil && n > 0 {
 		logger.Warn("已将未完成 Run 置为 interrupted（不做断点续跑）", "count", n)
@@ -908,6 +923,8 @@ func run() error {
 		},
 		DeviceWS:    deviceWSHandler(deviceGateway),
 		DeviceState: deviceState,
+		// 会话列表级 SSE 总线（各端对话列表与状态实时刷新）。
+		SessionEvents: sessionEvents,
 		Bus:         bus,
 		Auth:        authSvc,
 		AuthConfig: api.AuthConfig{

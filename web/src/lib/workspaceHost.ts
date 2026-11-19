@@ -55,12 +55,31 @@ export interface HostStatus {
  *
  * 铁律：这是**纯映射**。绝不能写成「在线就挑某台设备」，否则同一空间在不同时刻
  * 会列出不同机器的目录（对接约定 §1.2）。
- * 内置服务端空间（builtin / kind=server）→ 'server'；其余客户端空间 → 'device:<id>'。
+ *
+ * 推导顺序（前一步不成立才看下一步，最后一档只是一致性兜底）：
+ *  1. 内置服务端空间（builtin / kind=server）→ `'server'`；
+ *  2. 服务端权威 `host` 字段（`device:<deviceID>`）→ 直接采用；
+ *  3. `deviceId`（真实设备 ID，服务端 `device_id` 映射而来）→ 拼 `device:<id>`；
+ *  4. 以上都没有（如设备记录缺失的悬空空间）→ 退回 `device:<id>` 仅作占位：
+ *     服务端会回「设备不在线/不支持」，前端据此置灰，**绝不**降级成 'server'。
+ *
+ * 🚨 历史缺陷（2026-11，用户实际报障）：这里曾写作 `ws.clientId || ws.id`。
+ * 但 `clientId` 从未被 `toUiWorkspace` 赋值（恒 undefined），而 `ws.id` 是**工作空间
+ * 主键**（`ws-<deviceID>` 或 `ws-<随机串>`），于是拼出 `device:ws-9f3a...`：
+ * 服务端 `Hub.Get("ws-9f3a...")` 查不到连接 → 桌面端明明在线，新建项目点「浏览」
+ * 却提示「该设备当前不在线，无法列举其目录」。**绝不能再用工作空间 id 顶替设备 id。**
  */
 export function hostOfWorkspace(ws: Workspace | undefined | null): HostID {
   if (!ws) return 'server'
   if (ws.builtin || ws.kind === 'server') return 'server'
-  return `device:${ws.clientId || ws.id}`
+  // 服务端已给出权威 host：原样采用（它是 `device:<真实设备ID>`）。
+  const declared = (ws.host ?? '').trim()
+  if (declared.startsWith('device:')) return declared as HostID
+  // 退一步用真实设备 ID（服务端 device_id）。
+  const deviceID = (ws.deviceId ?? '').trim()
+  if (deviceID) return `device:${deviceID}`
+  // 兜底：只做占位，让服务端如实报错，绝不悄悄回落服务端本地列举。
+  return `device:${ws.id}`
 }
 
 /**
@@ -94,6 +113,19 @@ export function hostStatus(ws: Workspace | undefined | null): HostStatus {
       reason: '移动端工作空间支持纯对话，不支持浏览或指定目录',
     }
   }
+  // 「没有可用执行宿主」优先于离线判断，否则用户会等一个永远不会来的结果
+  // （设备早已删除/解绑，就算等到上线也列不出目录）。
+  const hostGone = ws?.deviceRevoked === true || ws?.deviceMissing === true
+  if (hostGone) {
+    return {
+      id,
+      online: false,
+      canList: false,
+      reason: ws?.deviceRevoked
+        ? '该工作区已解绑设备，需重新配对后才能浏览目录'
+        : '该工作区绑定的设备记录已不存在，需重新配对后才能浏览目录',
+    }
+  }
   // 桌面端工作空间：服务端已支持派发。
   if (ws?.kind === 'desktop') {
     return {
@@ -120,7 +152,9 @@ export function hostStatus(ws: Workspace | undefined | null): HostStatus {
  * 2026-11 产品决策：**移动端工作空间只支持纯对话，不支持添加项目**。
  *
  * 🚨 这是前端 UX 层面的一道闸，不是安全边界。服务端另有两道真强制：
- *  1. `createProject` 按令牌 kind 拒绝 webview（移动端 WebView 会话）；
+ *  1. `createProject` 按令牌 kind 拒绝 webview（**移动形态**设备的 WebView 会话；
+ *     桌面端走同一套 ticket 免登但签发 web_session，不降级 —— 见服务端
+ *     `sessionKindForDevice`，2026-11 修复）；
  *  2. `resolveToolPolicy` 对 `kind=mobile` 的空间返回零工具。
  * 本函数只负责"别让用户点一个注定失败的按钮"。
  */

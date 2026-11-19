@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"harness-go/internal/pluginkit/plugintest"
 	"harness-go/pkg/toolapi"
@@ -53,6 +54,118 @@ func TestReadFileOffsetLimit(t *testing.T) {
 	}
 	if !strings.Contains(c, "已读 8-9") {
 		t.Fatalf("应标注续读信息: %q", c)
+	}
+}
+
+func TestReadFileDefaultLimitAndClamp(t *testing.T) {
+	h := plugintest.New(t)
+	var b strings.Builder
+	for i := 1; i <= 2600; i++ {
+		b.WriteString("X\n")
+	}
+	_ = h.Seed("big.txt", b.String())
+
+	// 默认不传 max_lines：必须按 defaultReadLimit 截取（而非读全 2600 行）。
+	res, _ := invokeReadFile(t.Context(), h, call(t, `{"path":"big.txt"}`))
+	c := contentOf(t, res)
+	if !strings.Contains(c, fmt.Sprintf("已读 1-%d", defaultReadLimit)) {
+		t.Fatalf("默认读取应按 defaultReadLimit=%d 截取: %q", defaultReadLimit, c)
+	}
+	if strings.Contains(c, fmt.Sprintf("%6d\t", defaultReadLimit+1)) {
+		t.Fatalf("默认读取不应越过 defaultReadLimit=%d 行: %q", defaultReadLimit, c)
+	}
+
+	// 超量申请：必须被 clamp 到 maxReadLimit，而不是产出超长输出被入库定型碎裂。
+	res, _ = invokeReadFile(t.Context(), h, call(t, `{"path":"big.txt","max_lines":99999}`))
+	c = contentOf(t, res)
+	if !strings.Contains(c, fmt.Sprintf("已读 1-%d", maxReadLimit)) {
+		t.Fatalf("max_lines 超大值应被 clamp 到 %d: %q", maxReadLimit, c)
+	}
+}
+
+func TestReadFileManifestMatchesDefaults(t *testing.T) {
+	// 防「契约谎言」回归：schema 描述曾写「默认 500，可按需指定至 1000 行」，
+	// 而代码默认值早已漂移到 2000 —— 模型据此决策会误判读取范围。
+	// 这里把描述与常量强绑定，改常量却忘了改描述会立刻变红。
+	var schemaJSON string
+	for _, tl := range Manifest().Tools {
+		if tl.Name == "read_file" {
+			schemaJSON = string(tl.SchemaJSON)
+		}
+	}
+	if schemaJSON == "" {
+		t.Fatal("manifest 缺少 read_file")
+	}
+	for _, want := range []string{
+		fmt.Sprintf("默认 %d", defaultReadLimit),
+		fmt.Sprintf("超过 %d", maxReadLimit),
+	} {
+		if !strings.Contains(schemaJSON, want) {
+			t.Fatalf("schema 描述应与代码常量一致，缺少 %q: %s", want, schemaJSON)
+		}
+	}
+}
+
+func TestTruncateAtLineBoundary(t *testing.T) {
+	t.Run("不超限不截断", func(t *testing.T) {
+		data := []byte("a\nb\n")
+		got, cut := truncateAtLineBoundary(data, 100)
+		if cut || string(got) != "a\nb\n" {
+			t.Fatalf("未超限不应截断: %q cut=%v", got, cut)
+		}
+	})
+
+	t.Run("切在行尾且保留换行", func(t *testing.T) {
+		data := []byte("aaaa\nbbbb\ncccc\n")
+		got, cut := truncateAtLineBoundary(data, 11) // 落在第二行中间
+		if !cut {
+			t.Fatal("超限必须报告截断")
+		}
+		if string(got) != "aaaa\nbbbb\n" {
+			t.Fatalf("必须回退到行尾: %q", got)
+		}
+	})
+
+	t.Run("不切断多字节字符", func(t *testing.T) {
+		// 无换行时只能按 rune 边界回退：中文 3 字节/字。
+		data := []byte("中文内容测试")
+		got, cut := truncateAtLineBoundary(data, 7) // 7 落在第二个字的中间
+		if !cut {
+			t.Fatal("超限必须报告截断")
+		}
+		if !utf8.Valid(got) {
+			t.Fatalf("截断结果必须是合法 UTF-8: %q", got)
+		}
+		if string(got) != "中文" {
+			t.Fatalf("应按 rune 边界回退到「中文」: %q", got)
+		}
+	})
+}
+
+// TestReadFileByteTruncationWarns 锁定「字节上限触发时不得冒充全文」。
+//
+// 这是本工具最危险的一类失真：字节截断后行数只是**已加载部分**，
+// 若提示仍写「共 N 行」，模型会认为文件读完了，直接漏掉后半部分。
+func TestReadFileByteTruncationWarns(t *testing.T) {
+	h := plugintest.New(t)
+	// 构造 > maxReadBytes 且行数很少的文件（每行 4KB，共 200 行 ≈ 800KB）。
+	line := strings.Repeat("x", 4096)
+	var b strings.Builder
+	for i := 0; i < 200; i++ {
+		b.WriteString(line + "\n")
+	}
+	_ = h.Seed("huge.txt", b.String())
+
+	res, _ := invokeReadFile(t.Context(), h, call(t, `{"path":"huge.txt","max_lines":5}`))
+	c := contentOf(t, res)
+	if !strings.Contains(c, "非全文") {
+		t.Fatalf("字节截断时必须明示非全文，否则模型会误判已读完: %q", c)
+	}
+	if strings.Contains(c, "…[共 200 行") {
+		t.Fatalf("字节截断时不得宣称文件总行数为 200: %q", c)
+	}
+	if !utf8.ValidString(c) {
+		t.Fatal("输出必须为合法 UTF-8")
 	}
 }
 

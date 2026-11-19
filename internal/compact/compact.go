@@ -149,14 +149,36 @@ func PlanCompaction(msgs []model.Message, alreadyCompactedEndSeq int64, running 
 				break
 			}
 		}
-		if lastUser > 0 {
+		switch {
+		case lastUser > 0:
 			boundary = lastUser
-		} else if lastUser == 0 {
-			// 当前轮就是第一条消息：没有任何"已完成轮次"可折叠。
+		case len(candidates) >= 2:
+			// 🚨 2026-11 缺陷修复（「机制第二次休眠」，勿回退）
+			//
+			// 旧实现在这里分两支：`lastUser == 0` → **直接 return Plan{}**（永不压缩）。
+			// 那个分支把「当前轮占满整个未压缩区间」当成了「没有任何可折叠内容」，
+			// 而它恰恰是**最该压缩**的形态：
+			//   - 单轮超长任务（1 条 user + 上百条工具步骤）：lastUser 恒为 0；
+			//   - 会话 122559a3 的第 2 个 Run：未压缩区间从 seq42 起，若历史只读到
+			//     区间头部（旧 loadHistory 被静默截断为最旧 100 条）也会退化成 lastUser==0。
+			// 结果：单会话账单烧到 839 万 token，而 session_compactions 始终为 0。
+			//
+			// 正确语义对齐老版本 harness_mini governance.rs:361-373：
+			// 找不到可切的轮次边界时，退化为「保留尾部一个完整现场、折叠其余全部」——
+			// 任务背景由结构化摘要承接（摘要 prompt 明确要求保留任务目标与关键决策），
+			// 模型不会因此失忆，但上下文规模能真正降下来。
+			//
+			// 「尾部一个完整现场」= 最后一条非 tool 消息及其后续 tool 结果：
+			// 若只保留最后一条且它是 tool，它的 declaring assistant 已被折进摘要
+			// → 重放时出现孤儿 tool，上游必然 400。故必须从尾往前找到非 tool 起点。
+			keepFrom := len(candidates) - 1
+			for keepFrom > 0 && candidates[keepFrom].Role == model.RoleTool {
+				keepFrom--
+			}
+			boundary = keepFrom
+		default:
+			// 未压缩区间只有 1 条：确实没有可折叠内容（压缩收益必然为负）。
 			return Plan{}
-		} else {
-			// 没有 user 消息（如引导触发的续跑）：保守地保留最后一条。
-			boundary = len(candidates) - 1
 		}
 	}
 
@@ -241,17 +263,29 @@ func estimateText(s string) int {
 // 模型后续所有回答都会跑偏，而且这种跑偏是**静默的**——用户只看到答非所问，
 // 完全不知道为什么。因此提示词强制要求保留：目标、已确认事实、已排除方向、
 // 待办事项四类信息。
+//
+// # 结构与老版本对齐（harness_mini governance.rs:594-611）
+//
+// 老版本用四段式 Markdown（🎯任务背景 / 🔑技术决策 / 📁涉及文件 / 📌遗留事项），
+// 实测效果显著优于自由格式：模型后续能按段落定位"我要的那个信息在哪"。
+// 本项目此前是「四条自然语言要求」，模型经常把四条揉成一段散文，可读性差。
 func BuildSummaryPrompt(turns []model.Message) string {
 	var b strings.Builder
-	b.WriteString("请把下面这段已完成的对话压缩成简洁摘要，供后续轮次作为上下文使用。\n\n")
+	b.WriteString("你是编码项目的上下文备忘助手。请把下面这段已完成的对话精炼成结构化摘要，")
+	b.WriteString("它将在后续轮次替代这段历史，用来保持关键记忆。\n\n")
 	b.WriteString("必须保留（缺一不可）：\n")
 	b.WriteString("1. 用户原始目标的准确表述（不要改写、不要泛化）；\n")
 	b.WriteString("2. 已经确认的事实与结论（含关键文件路径、行号、命令结论）；\n")
 	b.WriteString("3. 已经排除的错误方向及排除原因（避免后续重复踩坑）；\n")
 	b.WriteString("4. 尚未完成的事项，以及下一步该做什么。\n\n")
+	b.WriteString("请严格按以下结构输出 Markdown（简洁干练，剔除寒暄与重复过程）：\n")
+	b.WriteString("### 🎯 任务背景与核心目标\n")
+	b.WriteString("### 🔑 关键技术决策与约定\n")
+	b.WriteString("### 📁 涉及文件与修改记录\n")
+	b.WriteString("### 📌 历史遗留与注意事项\n\n")
 	b.WriteString("可以丢弃：完整的工具原始输出、重复的中间过程、与目标无关的探索。\n")
-	b.WriteString("不要编造对话中未出现的信息。若某项信息在原对话中没有出现，直接省略该条。\n\n")
-	b.WriteString("输出要求：Markdown，不超过 800 字，不要包含寒暄。\n\n")
+	b.WriteString("不要编造对话中未出现的信息。若某项在原对话中没有出现，该段落写「（无）」即可。\n\n")
+	b.WriteString("输出要求：Markdown，不超过 800 字。\n\n")
 	b.WriteString("---- 以下是待压缩的对话 ----\n")
 	for _, m := range turns {
 		switch m.Role {

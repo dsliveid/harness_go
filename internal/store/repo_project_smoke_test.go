@@ -43,8 +43,9 @@ func TestTmpProjectRepoSmoke(t *testing.T) {
 	if p2.DefaultAccessMode != "confirm" {
 		t.Fatalf("默认权限回落失败: %s", p2.DefaultAccessMode)
 	}
-	// pinned 排序
-	if err := repo.Update(ctx, "proj-2", "b2", "full", true); err != nil {
+	// pinned 排序（0014 起 Update 收 *model.Project 整体覆盖，调用方合并未提供字段）
+	p2.Name, p2.DefaultAccessMode, p2.Pinned = "b2", "full", true
+	if err := repo.Update(ctx, p2); err != nil {
 		t.Fatal(err)
 	}
 	list, err := repo.List(ctx)

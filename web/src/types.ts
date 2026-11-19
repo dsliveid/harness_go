@@ -24,8 +24,21 @@ export interface Workspace {
   protocol?: string
   /** 内置空间（服务端本身）：永远在线、不可移除 */
   builtin?: boolean
-  /** 接入该空间时客户端上报的标识，如 desk-01 / phone-01 */
+  /**
+   * 接入该空间时客户端上报的标识，如 desk-01 / phone-01。
+   *
+   * ⚠️ 2026-11 起**不再参与宿主推导**：它只是可读的展示标签，历史上从未被
+   * `toUiWorkspace` 赋值（恒为 undefined）。目录列举的宿主请用 `host`/`deviceId`。
+   */
   clientId?: string
+  /**
+   * 目录列举宿主（服务端权威值，`server` 或 `device:<deviceID>`）。
+   *
+   * 🚨 **禁止**在前端用 `id`/`clientId` 自行拼接：工作空间主键形如 `ws-<deviceID>`
+   * 或 `ws-<随机串>`，直接当设备 ID 用会让服务端 Hub 查不到连接，把在线的桌面端
+   * 误报成「设备不在线」。唯一真源见 `lib/workspaceHost.ts::hostOfWorkspace`。
+   */
+  host?: string
   /** 归属设备 ID（空 = 未绑定设备；服务端内置空间也为空但 bound=true） */
   deviceId?: string
   /** 归属设备名（未绑定 / 设备已删除时为空） */
@@ -139,6 +152,18 @@ export interface Message {
   revertedAt?: number
   queued?: boolean
   snapshotSkipped?: boolean
+}
+
+/**
+ * 会话消息分页结果（GET /api/v1/sessions/{sid}/messages）。
+ *
+ * hasMore 是「首屏是否被截断」的唯一信号：长会话（事故会话 258 条）若被
+ * 静默截断到 100 条，最终结论就永远不可见 —— 调用方必须消费它，
+ * 绝不能靠「条数 == limit」猜测（服务端可能恰好只有 limit 条）。
+ */
+export interface MessagePage {
+  items: Message[]
+  hasMore: boolean
 }
 
 export interface Run {
@@ -380,6 +405,17 @@ export interface PlanDoc {
   status?: 'in_progress' | 'completed' | 'suspended'
   /** 物理计划文档路径（.harness/plans/xxx.md） */
   path?: string
+  /**
+   * 生成该方案的 create_plan 调用所落在的消息 id（「定位出处」的锚点）。
+   *
+   * 🚨 这是**前端派生**字段，不是后端下发：后端 REST 层没有 plan 专用端点，
+   * 方案完全由 `messages[].toolCalls` 派生（见 lib/workspaceDerive.ts）。
+   * 因此该字段只在「消息流里确实存在这次调用」时才被填上，缺省表示无可定位出处，
+   * UI 必须如实禁用定位入口，绝不能编造一个消息 id 去骗点击。
+   */
+  sourceMessageId?: string
+  /** 该 create_plan 调用的 tool_event_id（定位后用于精确高亮到工具卡片） */
+  sourceToolCallId?: string
 }
 
 export interface TodoItem {

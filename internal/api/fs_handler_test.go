@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"harness-go/internal/apperr"
+	"harness-go/internal/model"
 	"harness-go/internal/observ"
 )
 
@@ -197,6 +198,34 @@ func TestFSDeviceHostUnsupported(t *testing.T) {
 		status, code, _ := doFSGet(t, srv, token, url)
 		if status != http.StatusConflict || code != string(apperr.CodeFSHostUnsupported) {
 			t.Fatalf("%s 期望 409 fs.host_unsupported，得到 %d %q", url, status, code)
+		}
+	}
+}
+
+// TestFSListCapabilityNames 固定「目录列举能力」的认名口径。
+//
+// 回归背景（2026-11 实测）：服务端曾只认 `fs.list`（协议帧类型名），而能力标签的
+// 权威词汇表（docs/protocols.md:38）与对接约定 C2 都是 `workspace.list`，桌面端
+// hd-host 也照此申报。两边名字对不上 → 设备在线、能力也已申报，服务端却判定
+// 「未申报目录列举能力」，用户永远选不了目录。
+func TestFSListCapabilityNames(t *testing.T) {
+	cases := []struct {
+		name string
+		caps []model.Capability
+		want bool
+	}{
+		{"规范名 workspace.list", []model.Capability{{Name: "workspace.list"}}, true},
+		{"旧名 fs.list（向后兼容）", []model.Capability{{Name: "fs.list"}}, true},
+		{"带空白仍需识别", []model.Capability{{Name: "  workspace.list  "}}, true},
+		{"混在其他能力中", []model.Capability{{Name: "process"}, {Name: "workspace.list"}}, true},
+		{"未申报", nil, false},
+		{"只有无关能力", []model.Capability{{Name: "workspace.read"}}, false},
+		// 大小写敏感：能力名是协议字面量，不做模糊匹配，避免"看起来像"就放行。
+		{"大小写不符不放行", []model.Capability{{Name: "Workspace.List"}}, false},
+	}
+	for _, c := range cases {
+		if got := hasFsListCapability(c.caps); got != c.want {
+			t.Fatalf("%s：期望 %v，实际 %v", c.name, c.want, got)
 		}
 	}
 }

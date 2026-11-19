@@ -40,8 +40,21 @@ const (
 	hostServer = "server"
 	// hostDevicePrefix 客户端宿主标识前缀（L1 已支持派发）
 	hostDevicePrefix = "device:"
-	// fsListCapability 客户端必须申报的能力名，否则不派发（对接约定 §7 C2）
-	fsListCapability = "fs.list"
+	// fsListCapabilities 客户端必须申报的能力名（任一命中即视为具备目录列举能力）。
+	//
+	// 🚨 历史缺陷（2026-11，实测踩坑）：这里曾只认 `"fs.list"`，但它是**协议帧类型名**
+	// （`device.MsgFsList`），不是能力标签。能力标签的权威词汇表在
+	// `docs/protocols.md:38`（`workspace.list / workspace.read / workspace.write / ...`），
+	// 「工作区宿主与目录选择对接约定」§6 C2 与 C7 也明确要求客户端申报 `workspace.list`，
+	// 桌面端 hd-host 就是按此申报的（crates/hd-host/src/pairing.rs）。
+	// 结果：设备在线、能力也申报了，服务端却认不出来 → 一律回
+	// 「该设备未申报目录列举能力（fs.list）」，用户永远选不了目录。
+	//
+	// 修法：**规范名优先，同时接受旧名**。多认一个名字不会放宽任何安全边界
+	// （能不能列目录最终仍由端侧 Policy 白名单决定），但能让已发布的旧客户端继续可用。
+	fsListCapability = "workspace.list"
+	// fsListCapabilityLegacy 旧客户端可能沿用的帧类型名（向后兼容，勿删）。
+	fsListCapabilityLegacy = "fs.list"
 )
 
 // fsDirEntry 一个目录项（只含目录名与绝对路径，不含任何文件元数据）。
@@ -277,12 +290,12 @@ func (h *handlers) fsDispatchDevice(ctx context.Context, deviceID, path string) 
 		return nil, apperr.New(apperr.CodeFSHostOffline,
 			"该设备当前不在线，无法列举其目录").WithDetails(map[string]any{"device_id": deviceID})
 	}
-	// 能力协商：未申报 fs.list 的设备（例如还没升级的旧客户端）不能派发。
+	// 能力协商：未申报 workspace.list 的设备（例如还没升级的旧客户端）不能派发。
 	if h.d.DeviceCapabilities != nil {
 		caps, capErr := h.d.DeviceCapabilities(ctx, deviceID)
 		if capErr == nil && !hasFsListCapability(caps) {
 			return nil, apperr.New(apperr.CodeFSHostUnsupported,
-				"该设备未申报目录列举能力（fs.list），请升级客户端或手动填写路径").
+				"该设备未申报目录列举能力（workspace.list），请升级客户端或手动填写路径").
 				WithDetails(map[string]any{"device_id": deviceID})
 		}
 		// capErr 不阻断：能力查询失败属于服务端内部问题，不能因此让用户无法选目录；
@@ -316,13 +329,17 @@ func fsConvertEntries(in []device.FsDirEntry) []fsDirEntry {
 	return out
 }
 
-// hasFsListCapability 判断能力列表里是否含 fs.list。
+// hasFsListCapability 判断能力列表里是否具备目录列举能力。
+//
+// 认两个名字：规范名 `workspace.list`（docs/protocols.md:38 词汇表、对接约定 C2）
+// 与旧名 `fs.list`（帧类型名，早期客户端沿用）。任一命中即是。
 //
 // 只认名字不看版本：目录列举的 v1 契约已冻结（只列目录），未来若升版也仍是
 // 兼容的扩展，没必要因版本号不同就把用户拒之门外。
 func hasFsListCapability(caps []model.Capability) bool {
 	for _, c := range caps {
-		if strings.TrimSpace(c.Name) == fsListCapability {
+		name := strings.TrimSpace(c.Name)
+		if name == fsListCapability || name == fsListCapabilityLegacy {
 			return true
 		}
 	}

@@ -85,6 +85,89 @@ function persistScope(st: { projects: Project[]; workspaces: Workspace[]; active
   savePersistedActiveWorkspace(st.activeWorkspaceId)
 }
 
+/**
+ * 把项目设置补丁写到服务端，**成功后**才更新本地 state。
+ *
+ * 为什么不用乐观更新：这些配置（约束 / 规划模式 / 数据权限）会被后端真正消费
+ * （约束注入 prompt、数据权限决定弹不弹审批）。若先改本地再写服务端，
+ * 一旦请求失败，界面显示「已改」而引擎仍按旧值运行 —— 属安全语义漂移，
+ * 与 setProjectDefaultAccessMode 的既有判断完全同源。
+ */
+function patchProject(
+  id: string,
+  patch: { constraints?: string; planMode?: PlanMode },
+  failMsg: string,
+): Promise<void> {
+  return api
+    .updateProject(id, patch)
+    .then(() => {
+      useSessions.setState((s) => ({
+        projects: s.projects.map((p) => (p.id === id ? { ...p, ...patch } : p)),
+      }))
+    })
+    .catch((err) => {
+      useUI.getState().toast('error', failMsg)
+      throw err
+    })
+}
+
+/**
+ * 是否为「本地乐观壳」的临时 id。
+ *
+ * create() 用 `s-<Date.now()>` 先行插入本地列表，等服务端返回真实 id 后替换。
+ * 实时快照/合并必须能识别出这类条目并保留它们，否则会出现
+ * 「刚点新对话，列表里却没有它」（服务端还不知道它存在）。
+ *
+ * 判定刻意收窄为「s- 前缀 + 纯数字时间戳」：服务端真实 id 由服务端生成，
+ * 不会撞上这一形态；同时绝不能把所有非快照条目都当乐观壳（那会把别端删除的
+ * 幽灵会话永久保留下来）。
+ */
+function isOptimisticId(id: string): boolean {
+  return /^s-\d{10,}$/.test(id)
+}
+
+/**
+ * 按 updatedAt 降序稳定排序。
+ *
+ * 「稳定」是指：updatedAt 相同时保持**原有相对顺序**（用下标兜底），
+ * 否则每来一帧就会出现等值条目互换位置，用户看到列表莫名跳动。
+ * 乐观壳的 updatedAt 是 Date.now()，天然排在前面（刚新建的会话就该在最上）。
+ */
+function sortStable(list: Session[]): Session[] {
+  return list
+    .map((s, i) => ({ s, i }))
+    .sort((a, b) => (b.s.updatedAt ?? 0) - (a.s.updatedAt ?? 0) || a.i - b.i)
+    .map((x) => x.s)
+}
+
+/**
+ * 在给定列表里挑出「指定工作空间内、未归档、最新一条」会话。
+ *
+ * 统一口径的用途（2026-11 用户要求「刷新后默认选中最新一条对话」）：
+ *   - `load()` 首屏默认选中；
+ *   - `applyServerSnapshot` 的快照回落；
+ *   - 删除/归档当前会话后的回落。
+ * 三处若各写一套判定，必然漂移成「左边选中 A、右边像没内容」的错位体感。
+ *
+ * 🚨 不依赖调用方传入的列表是否已排序，直接按 updatedAt 取最大：
+ * `applyServerRemoval` 的候选集是 `sessions.filter(...)`，其数组顺序就是 store
+ * 里的物理顺序（可能是乐观壳插到最前、也可能是历史遗留顺序），若这里用 `find`
+ * 取「首个命中」，得到的其实是「数组里最靠前的那条」而不是「最新的那条」。
+ */
+function newestVisibleIn(
+  list: Session[],
+  wsId: string,
+  projects: Project[],
+): Session | undefined {
+  let best: Session | undefined
+  for (const s of list) {
+    if (s.archivedAt) continue
+    if (wsOfSession(s, projects) !== wsId) continue
+    if (!best || (s.updatedAt ?? 0) > (best.updatedAt ?? 0)) best = s
+  }
+  return best
+}
+
 interface SessionState {
   workspaces: Workspace[]
   activeWorkspaceId: string
@@ -155,7 +238,16 @@ interface SessionState {
    */
   unbindWorkspaceDevice: (wsId: string) => Promise<void>
   // ---- 项目操作（对齐桌面端） ----
-  createProject: (name: string, path: string) => string
+  /**
+   * 新建项目（落服务端 projects 表）。
+   *
+   * 🚨 返回 Promise：**调用方必须 await 成功后再提示成功**。
+   * 旧签名 `=> string` 只回本地临时 id，落库在后台异步进行，调用方拿到就提示
+   * 「已创建」→ 服务端拒绝时会出现「成功 + 失败」双 toast（2026-11 实测缺陷）。
+   *
+   * @returns 服务端最终生成的真实项目 id（失败时 reject，并已由本方法提示错误）
+   */
+  createProject: (name: string, path: string) => Promise<string>
   renameProject: (id: string, name: string) => void
   removeProject: (id: string) => void
   toggleProjectPin: (id: string) => void
@@ -166,6 +258,13 @@ interface SessionState {
    * 合并服务端字段与本地独有的 workspaceId/constraints/planMode，并回写本地持久化。
    */
   loadProjects: () => Promise<void>
+  /**
+   * 拉取单个项目的设置子集合（关联项目 + 数据权限）。
+   *
+   * 这两个集合是项目级数据，服务端只提供按项目的列表端点（与审批规则同口径），
+   * 因此由「打开项目设置」时按需触发，不进入首屏批量加载。
+   */
+  loadProjectSettings: (projectId: string) => Promise<void>
   /**
    * 设置项目默认控制权限（**只影响此后新建的对话**）。
    * real 模式落服务端 projects.default_access_mode，是权限继承的唯一权威源。
@@ -180,6 +279,45 @@ interface SessionState {
   // ---- 数据权限策略 ----
   setDataScope: (projectId: string, scope: DataScope, mode: DataScopeMode) => void
   dataScopeOf: (projectId: string, scope: DataScope) => DataScopeMode
+  // ---- 实时同步（会话列表级 SSE：/api/v1/sessions/events） ----
+  /**
+   * 应用服务端**全量快照**（SSE 首帧 / 重连后首帧）。
+   *
+   * 🚨 不能直接 `set({ sessions: list })`：必须走 adoptServerSessions 补
+   * projectId/workspaceId 归属，否则刷新后项目会话会掉进「纯对话」（历史缺陷）。
+   * 同时保留本地乐观插入的壳（服务端尚未落库的「新对话」不能被快照抹掉）。
+   */
+  applyServerSnapshot: (list: Session[]) => void
+  /**
+   * 应用单个会话变更（按 id upsert）。
+   *
+   * 幂等：同一 id 多次到达只表现为重复覆盖，故 SSE 的乱序/重复帧天然安全。
+   */
+  applyServerPatch: (session: Session) => void
+  /**
+   * 应用单个会话删除。
+   *
+   * 若删除的正是当前会话，回落到列表首条（或空），避免右侧停留在已不存在的会话上。
+   */
+  applyServerRemoval: (id: string) => void
+  /**
+   * 上报当前会话已读（清掉侧栏红点）。
+   *
+   * 同时做**本地乐观清除**（立刻 `unread=false`）再异步上报：
+   * 若等网络往返才清红点，用户点开会话后会看到红点"迟滞一拍"才消失，
+   * 观感上像没生效。服务端校验通过后会由 SSE 推回权威值，两者最终一致。
+   */
+  markRead: (id: string) => void
+  /**
+   * 本地把某会话的「最新时间」推到现在并重排列表（发消息即置顶）。
+   *
+   * 为什么必须本地做：服务端 updated_at 要靠 `TouchMessage` 回写，而那是
+   * **与会话库写入不同事务、最终一致** 的异步摘要回写 —— 用户发完消息到
+   * SSE `session.updated` 帧到达之间存在真空期，列表纹丝不动，
+   * 体感就是「刚聊过的对话不往上走」。这里按本地事实先置顶，
+   * 随后被服务端权威帧覆盖（同口径，不会来回跳）。
+   */
+  bumpSession: (id: string, at?: number) => void
 }
 
 // 项目：**服务端 projects 表是权威源**（由 loadProjects() 拉取）；
@@ -243,24 +381,42 @@ export const useSessions = create<SessionState>((set, get) => ({
         get().create()
         return
       }
-      const keep = get().currentId
-      const current = list.some((s) => s.id === keep) ? keep : list[0].id
       // 归属恢复（踩坑：刷新后项目会话掉进「纯对话」）：
       // 服务端 sessions 只有 project_dir，没有 project_id / workspace_id，
       // toUiSession 映射不出归属 → 必须按已落库的目录反查项目，把 projectId/workspaceId 补回来。
       const withScope = adoptServerSessions(list, get().projects)
+      // 🚨 排序不信任服务端返回的物理顺序（2026-11 用户要求「参照老版本按最新时间倒序」）：
+      // 服务端 SQL 虽已 ORDER BY updated_at DESC，但分页合并 / 本地乐观壳混入后
+      // 顺序仍可能错乱 —— 统一在落状态前过一遍 sortStable，保证恒定倒序。
+      const ordered = sortStable(withScope)
+      const keep = get().currentId
+      const activeWs = get().activeWorkspaceId
+      // 刷新默认选中：**当前工作空间内、未归档的最新一条会话**。
+      //
+      // 旧实现用 `list[0]`（全局最新，可能落在别的空间或是一条已归档/空会话），
+      // 一旦它与侧栏可见分组的首条不一致，用户看到的就是「左边选中的是 A，
+      // 右边却像没内容」这种错位体感。
+      const newestInWs = ordered.find(
+        (s) => !s.archivedAt && wsOfSession(s, get().projects) === activeWs,
+      )
+      // 保持续用：上次选中的会话若仍存在且未归档，优先继续选中它（刷新不该打断用户手选）。
+      const keepSess = keep ? ordered.find((s) => s.id === keep && !s.archivedAt) : undefined
+      const current = keepSess?.id ?? newestInWs?.id ?? ordered.find((s) => !s.archivedAt)?.id ?? ordered[0].id
       // 当前空间若在新列表里已无任何可见会话（如它只是上次的临时空间），
       // 回落到当前会话自身所属空间，避免刷新后停在一个空空间、看不到刚聊过的对话。
-      const curSess = withScope.find((s) => s.id === current)
-      const activeWs = get().activeWorkspaceId
-      const hasInActive = withScope.some((s) => !s.archivedAt && wsOfSession(s, get().projects) === activeWs)
+      const curSess = ordered.find((s) => s.id === current)
+      const hasInActive = Boolean(newestInWs)
       const nextActiveWs = hasInActive || !curSess ? activeWs : wsOfSession(curSess, get().projects)
-      set({ sessions: withScope, currentId: current, activeWorkspaceId: nextActiveWs })
-      // 动态 import 规避 sessionStore ↔ chatStore 的静态循环依赖
+      set({ sessions: ordered, currentId: current, activeWorkspaceId: nextActiveWs })
+      // 动态 import 规避 sessionStore ↔ chatStore 的静态循环依赖。
+      // 🚨 首屏这里必须 await（不能 void）：用户反馈「刷新后选中第一条但右侧空白」，
+      // 根因之一就是 void 出去后任何一次静默失败都没有第二次机会。await 让首屏消息
+      // 加载在 load() 返回前完成；即便失败，MessageList 的「选中即有内容」不变量
+      // effect 还会兜一次（见 chatStore.ensureMessages）。
       const { useChat } = await import('./chatStore')
-      void useChat.getState().reloadMessages(current)
+      const ok = await useChat.getState().ensureMessages(current)
       // 刷新后接回服务端仍在跑的 Run（否则界面看不出对话还在进行中）
-      void useChat.getState().resumeRun(current)
+      if (ok) void useChat.getState().resumeRun(current)
       // token 水位与活跃会话对齐（否则沿用上一个会话的用量）
       useChat.getState().activateSession(current)
     } catch {
@@ -268,17 +424,102 @@ export const useSessions = create<SessionState>((set, get) => ({
     }
   },
 
+  // ---- 实时同步（会话列表级 SSE） ----
+  // 设计要点：三个 action 都**不做网络请求**，只把服务端推来的权威视图合并进本地状态。
+  // 「查库」这件事由服务端在推送前完成（见 session_events_handler.go），前端只管落位。
+  applyServerSnapshot: (list) => {
+    const st = get()
+    if (list.length === 0) return
+    // 🚨 必须补归属：服务端 sessions 表只有 project_dir，没有 workspaceId 的前端分组语义。
+    // 不调 adoptServerSessions 就会让项目会话刷新后掉进「纯对话」（历史缺陷）。
+    const withScope = adoptServerSessions(list, st.projects)
+    // 保留本地乐观壳：用户刚点「新对话」时服务端还没返回真实 id，
+    // 快照若直接覆盖会把这行抹掉，界面表现为「点了新对话但列表里没有」。
+    // 判定标准：不在快照里、且仍是本地临时 id（s-<时间戳>）的条目。
+    const serverIds = new Set(withScope.map((s) => s.id))
+    const optimistic = st.sessions.filter((s) => !serverIds.has(s.id) && isOptimisticId(s.id))
+    const merged = sortStable([...withScope, ...optimistic])
+    // currentId 若已不在列表中（被别端删除），回落到「当前空间内最新未归档会话」
+    // （与 load() 同口径），避免右侧停在幽灵会话或空落落的错位会话上。
+    const current = merged.some((s) => s.id === st.currentId)
+      ? st.currentId
+      : (newestVisibleIn(merged, st.activeWorkspaceId, st.projects)?.id ?? merged[0]?.id ?? '')
+    set({ sessions: merged, currentId: current })
+  },
+
+  applyServerPatch: (session) => {
+    const st = get()
+    // 补归属（同上）：单条变更同样需要 projectId/workspaceId 才能正确分组。
+    const [patched] = adoptServerSessions([session], st.projects)
+    if (!patched) return
+    const exists = st.sessions.some((s) => s.id === patched.id)
+    // upsert：已存在则替换（服务端是权威视图，整体覆盖），否则插入。
+    //
+    // 注意：替换时**保留本地壳的 projectId/workspaceId 兜底**？不保留 ——
+    // adoptServerSessions 已按 project_dir 反查补齐，本地 override 也存在其中，
+    // 无条件相信服务端视图才不会产生「两套归属判定」漂移。
+    const next = exists
+      ? st.sessions.map((s) => (s.id === patched.id ? patched : s))
+      : [patched, ...st.sessions]
+    set({ sessions: sortStable(next) })
+  },
+
+  applyServerRemoval: (id) => {
+    const st = get()
+    if (!st.sessions.some((s) => s.id === id)) return
+    const next = st.sessions.filter((s) => s.id !== id)
+    // 删除的正是当前会话 → 回落到「当前空间内最新未归档会话」（与 load() 同口径），
+    // 而不是机械取 next[0]（那可能是别的空间/已归档会话 → 右侧看起来空落落）。
+    const fallback = st.currentId === id
+      ? (newestVisibleIn(next, st.activeWorkspaceId, st.projects)?.id ?? next[0]?.id ?? '')
+      : st.currentId
+    set({ sessions: next, currentId: fallback })
+    if (st.currentId === id) syncUsage(fallback)
+  },
+
+  bumpSession: (id, at) => {
+    const st = get()
+    const hit = st.sessions.find((s) => s.id === id)
+    if (!hit) return
+    const now = at ?? Date.now()
+    set({
+      sessions: sortStable(
+        st.sessions.map((s) => (s.id === id ? { ...s, updatedAt: now } : s)),
+      ),
+    })
+  },
+
   select: (id) => {
     if (id !== get().currentId) syncUsage(id)
     set({ currentId: id })
     if (id) {
-      // 切换会话即拉取该会话消息快照（以 DB 为准）
+      // 选中即已读：立刻清本地红点并异步上报服务端。
+      // 放在 select 里而不是 Sidebar 的点击回调里 —— 任何入口（搜索结果、
+      // 快捷键、深层链接）切换会话都必须同样清红点，避免漏点。
+      get().markRead(id)
+      // 切换会话即拉取该会话消息快照（以 DB 为准）。
+      // 这里用 reloadMessages（而非 ensureMessages）：切回旧会话可能要拿到别端新写入的消息，
+      // 必须强制重拉；首屏兜底由 MessageList 的「选中即有内容」不变量负责。
       void import('./chatStore').then((m) => {
         // 先清掉上一会话残留的进行中态，再按目标会话的真实情况重建
-        m.useChat.getState().reloadMessages(id)
-          .then(() => m.useChat.getState().resumeRun(id))
+        void m.useChat.getState().reloadMessages(id)
+          .then((ok) => { if (ok) void m.useChat.getState().resumeRun(id) })
       })
     }
+  },
+
+  markRead: (id) => {
+    if (!id) return
+    const st = get()
+    const target = st.sessions.find((s) => s.id === id)
+    // 已经是已读就完全不发请求：select 会被频繁触发（每次切会话都调），
+    // 无脑上报会让「切来切去」产生一串无效 POST。
+    if (!target?.unread) return
+    // 本地乐观清除：立刻让红点消失，不等网络往返。
+    set({ sessions: st.sessions.map((s) => (s.id === id ? { ...s, unread: false } : s)) })
+    // 失败静默：红点只是提示项，不能因为它弹错误打扰对话。
+    // 服务端成功后会由列表级 SSE 推回权威值（unread=false），最终一致。
+    void api.markSessionRead(id).catch(() => {})
   },
 
   // ---- 工作空间 ----
@@ -528,7 +769,14 @@ export const useSessions = create<SessionState>((set, get) => ({
     void api.setSessionModel(id, modelRef).catch(() => useUI.getState().toast('error', '保存模型选择失败'))
   },
 
-  createProject: (name, path) => {
+  // 新建项目。
+  //
+  // 🚨 返回值是 Promise，**必须 await 后再提示成功**（2026-11 实测缺陷）：
+  // 旧实现同步返回本地临时 id，而调用方（Sidebar.newProject）拿到就立刻 toast('success')，
+  // 落库请求却在后台异步跑 —— 一旦服务端拒绝（如桌面端曾被误判成移动端 403），
+  // 用户会同时看到「项目已创建」与「项目创建失败」两条互斥提示，且项目最终不存在。
+  // 现在：成功由调用方提示，失败只由本函数提示一次，绝不再出现双 toast。
+  createProject: async (name, path) => {
     const id = `p-${Date.now()}`
     const p: Project = {
       id,
@@ -537,25 +785,37 @@ export const useSessions = create<SessionState>((set, get) => ({
       workspaceId: get().activeWorkspaceId,
       // 新建项目默认「每次变更前确认」：最保守的初始值，用户可在项目设置中改为完全访问。
       defaultAccessMode: 'confirm',
+      // 0014 起约束与规划模式也落服务端；新建时为空约束 + 标准模式（与服务端列 DEFAULT 一致）。
+      constraints: '',
+      planMode: 'standard',
     }
+    // 乐观插入：列表即时可见（保留原有体验），失败再回滚。
     set((s) => ({ projects: [...s.projects, p] }))
     persistScope(get())
     // 项目是服务端一等实体：创建必须落库，否则后续 PATCH 权限/规则会 404。
     // 以服务端生成的 id 替换本地临时 id，避免本地 id 与服务端不一致导致后续调用全失败。
-    void api
-      .createProject({ name: p.name, path: p.path, defaultAccessMode: p.defaultAccessMode })
-      .then((created) =>
-        set((s) => ({
-          projects: s.projects.map((x) => (x.id === id ? { ...created, workspaceId: x.workspaceId } : x)),
-          sessions: s.sessions.map((x) => (x.projectId === id ? { ...x, projectId: created.id } : x)),
-        })),
-      )
-      .then(() => persistScope(get()))
-      .catch(() => {
-        set((s) => ({ projects: s.projects.filter((x) => x.id !== id) }))
-        useUI.getState().toast('error', '项目创建失败，请检查服务状态')
+    try {
+      const created = await api.createProject({
+        name: p.name,
+        path: p.path,
+        defaultAccessMode: p.defaultAccessMode,
       })
-    return id
+      set((s) => ({
+        projects: s.projects.map((x) => (x.id === id ? { ...created, workspaceId: x.workspaceId } : x)),
+        sessions: s.sessions.map((x) => (x.projectId === id ? { ...x, projectId: created.id } : x)),
+      }))
+      persistScope(get())
+      return created.id
+    } catch (err) {
+      // 回滚乐观插入，并**只**在这里提示失败（调用方不再提示成功）。
+      set((s) => ({ projects: s.projects.filter((x) => x.id !== id) }))
+      persistScope(get())
+      // 透传服务端文案（如「移动端不支持创建项目」）：泛化的「请检查服务状态」
+      // 会让用户以为只是网络抖动，从而反复重试一个必然失败的请求。
+      const msg = (err as { message?: string })?.message?.trim()
+      useUI.getState().toast('error', msg ? `项目创建失败：${msg}` : '项目创建失败，请检查服务状态')
+      throw err
+    }
   },
   renameProject: (id, name) => {
     set((s) => ({ projects: s.projects.map((p) => (p.id === id ? { ...p, name: name.trim() || p.name } : p)) }))
@@ -577,37 +837,54 @@ export const useSessions = create<SessionState>((set, get) => ({
     set((s) => ({ projects: s.projects.map((p) => (p.id === id ? { ...p, pinned: !p.pinned } : p)) }))
     persistScope(get())
   },
-  setProjectConstraints: (id, constraints) => {
-    set((s) => ({ projects: s.projects.map((p) => (p.id === id ? { ...p, constraints } : p)) }))
-    persistScope(get())
-  },
-  setProjectPlanMode: (id, planMode) => {
-    set((s) => ({ projects: s.projects.map((p) => (p.id === id ? { ...p, planMode } : p)) }))
-    persistScope(get())
-  },
+  // 项目约束：0014 起落服务端（此前只写 localStorage，换端即丢）。
+  // 先写服务端、成功后再更新本地（与 setProjectDefaultAccessMode 同口径）：
+  // 这是会被引擎注入 prompt 的配置，界面显示已改而服务端没存属于语义漂移。
+  setProjectConstraints: (id, constraints) =>
+    patchProject(id, { constraints }, '项目约束保存失败'),
+  setProjectPlanMode: (id, planMode) =>
+    patchProject(id, { planMode }, '规划与执行策略保存失败'),
   // 从服务端拉项目列表（real 模式的权威源）。
-  // 服务端不认识前端的 workspaceId/constraints/planMode，必须与本地既有值按 id 合并保留，
-  // 否则一次刷新就会把用户的空间分组与项目约束全部抹掉。
+  //
+  // 0014 起 constraints / planMode 也由服务端持久化，因此不再需要与本地
+  // localStorage 按 id 合并（旧实现那样做是为了保住「服务端不认识」的前端字段）。
+  // 现在服务端回包即完整真相：整段替换即可，避免本地残留值反向污染服务端。
+  // workspaceId 仍是纯前端概念（项目归属哪台设备的执行面），由本地按 id 保留。
   loadProjects: async () => {
     try {
       const list = await api.listProjects()
       set((st) => {
         const prevById = new Map(st.projects.map((p) => [p.id, p]))
-        const merged = list.map((p) => {
-          const prev = prevById.get(p.id)
-          return {
-            ...p,
-            workspaceId: p.workspaceId ?? prev?.workspaceId,
-            constraints: prev?.constraints,
-            planMode: prev?.planMode,
-          }
-        })
+        const merged = list.map((p) => ({
+          ...p,
+          workspaceId: p.workspaceId ?? prevById.get(p.id)?.workspaceId,
+        }))
         return { projects: merged }
       })
       persistScope(get())
     } catch {
       // 失败不打断工作台加载：保留本地缓存项目，权限裁决仍在服务端
       useUI.getState().toast('error', '加载项目列表失败，已使用本地缓存')
+    }
+  },
+  // 拉取单个项目的「设置子集合」（关联项目 + 数据权限）。
+  //
+  // 为什么不放进 loadProjects：这两个集合是**项目级**数据，服务端没有
+  // 「一次返回全部项目设置」的端点（沿用审批规则的既有口径），
+  // 只能在打开该项目设置时按项目拉取。这样也避免首屏为 N 个项目发 2N 个请求。
+  loadProjectSettings: async (projectId) => {
+    try {
+      const [links, grants] = await Promise.all([
+        api.listProjectLinks(projectId),
+        api.listProjectDataGrants(projectId),
+      ])
+      set((s) => ({
+        // 整体替换该项目的两份子集合，避免残留已删除项
+        projectLinks: [...s.projectLinks.filter((l) => l.projectId !== projectId), ...links],
+        dataGrants: [...s.dataGrants.filter((g) => g.projectId !== projectId), ...grants],
+      }))
+    } catch {
+      useUI.getState().toast('error', '加载项目设置失败')
     }
   },
   // 切换项目默认控制权限。
@@ -629,15 +906,36 @@ export const useSessions = create<SessionState>((set, get) => ({
       })
   },
 
-  // ---- 关联项目（草稿由项目设置外壳统一提交） ----
+  // ---- 关联项目（0014 起落服务端；此前只在内存 + localStorage，换端即丢） ----
+  //
+  // 三个动作都改为「先写服务端，成功后更新本地」：
+  // 关联项目是项目设置的一部分，界面显示已加而服务端没有，属于典型假成功。
   addProjectLink: (projectId, path, description) => {
-    const id = `pl-${Date.now()}`
-    const link: ProjectLink = { id, projectId, path: path.trim(), description, createdAt: '' }
-    set((s) => ({ projectLinks: [...s.projectLinks, link] }))
+    void api
+      .addProjectLink(projectId, { path: path.trim(), description })
+      .then((saved) => set((s) => ({ projectLinks: [...s.projectLinks, saved] })))
+      .catch(() => useUI.getState().toast('error', '关联项目添加失败'))
   },
-  updateProjectLink: (id, path, description) =>
-    set((s) => ({ projectLinks: s.projectLinks.map((l) => (l.id === id ? { ...l, path: path.trim(), description } : l)) })),
-  deleteProjectLink: (id) => set((s) => ({ projectLinks: s.projectLinks.filter((l) => l.id !== id) })),
+  updateProjectLink: (id, path, description) => {
+    const victim = get().projectLinks.find((l) => l.id === id)
+    if (!victim) return
+    void api
+      .updateProjectLink(victim.projectId, id, { path: path.trim(), description })
+      .then(() =>
+        set((s) => ({
+          projectLinks: s.projectLinks.map((l) => (l.id === id ? { ...l, path: path.trim(), description } : l)),
+        })),
+      )
+      .catch(() => useUI.getState().toast('error', '关联项目更新失败'))
+  },
+  deleteProjectLink: (id) => {
+    const victim = get().projectLinks.find((l) => l.id === id)
+    if (!victim) return
+    void api
+      .removeProjectLink(victim.projectId, id)
+      .then(() => set((s) => ({ projectLinks: s.projectLinks.filter((l) => l.id !== id) })))
+      .catch(() => useUI.getState().toast('error', '关联项目删除失败'))
+  },
 
   // ---- 审批规则（项目级；服务端为权威源） ----
   addApprovalRule: (projectId, toolName, pattern) => {
@@ -671,26 +969,36 @@ export const useSessions = create<SessionState>((set, get) => ({
     }
   },
 
-  // ---- 数据权限策略（项目级；无记录时按「询问」兜底） ----
-  setDataScope: (projectId, scope, mode) =>
-    set((s) => {
-      const hit = s.dataGrants.find((g) => g.projectId === projectId && g.scope === scope)
-      if (hit) {
-        return {
-          dataGrants: s.dataGrants.map((g) =>
-            g.id === hit.id ? { ...g, mode, updatedAt: Date.now() } : g,
-          ),
-        }
-      }
-      const next: DataScopeGrant = {
-        id: `dg-${Date.now()}-${scope}`,
-        projectId,
-        scope,
-        mode,
-        updatedAt: Date.now(),
-      }
-      return { dataGrants: [...s.dataGrants, next] }
-    }),
+  // ---- 数据权限策略（0014 起落服务端；此前仅内存，刷新即丢） ----
+  //
+  // 先写服务端、成功后更新本地。这里的语义漂移风险最高：
+  // 数据权限决定「越界数据是弹审批还是自动放行」，界面显示 allow 而服务端仍是 ask
+  // 会让用户以为已授权、实际每次都被拦（或反之更危险）。故不做乐观更新。
+  setDataScope: (projectId, scope, mode) => {
+    void api
+      .setProjectDataGrant(projectId, scope, mode)
+      .then(() =>
+        set((s) => {
+          const hit = s.dataGrants.find((g) => g.projectId === projectId && g.scope === scope)
+          if (hit) {
+            return {
+              dataGrants: s.dataGrants.map((g) =>
+                g.id === hit.id ? { ...g, mode, updatedAt: Date.now() } : g,
+              ),
+            }
+          }
+          const next: DataScopeGrant = {
+            id: `dg-${Date.now()}-${scope}`,
+            projectId,
+            scope,
+            mode,
+            updatedAt: Date.now(),
+          }
+          return { dataGrants: [...s.dataGrants, next] }
+        }),
+      )
+      .catch(() => useUI.getState().toast('error', '数据权限保存失败'))
+  },
   dataScopeOf: (projectId, scope) =>
     get().dataGrants.find((g) => g.projectId === projectId && g.scope === scope)?.mode ?? 'ask',
 }))

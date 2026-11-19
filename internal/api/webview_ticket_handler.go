@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"harness-go/internal/apperr"
+	"harness-go/internal/model"
 )
 
 // ============ WebView 一次性 ticket（协议 §6.2 / 移动端架构 §4.2） ============
@@ -25,13 +26,59 @@ import (
 //  1. 一次性消费：重放必须 401
 //  2. 绝不写日志：ticket 明文不得出现在任何日志输出中
 //  3. 权限降级：兑换出的会话带 webview 标记，高危审批决策被拒
+//
+// 第 ④ 条（2026-11 补，原三条之外的新增口径）：
+//
+//	4. 降级只针对**移动形态**设备：桌面端同样走 ticket 免登（harness_desktop
+//	   gui.rs prepare_web_ui_entry），但它是一台电脑，不该被当成移动端 WebView。
+//	   按 ticket 记录里的 deviceID 查设备形态：kind=desktop → 签发与表单登录同源的
+//	   web_session；其它形态 / 查不到 / 设备域未装配 → 仍签发 webview 降级。
+//	   判定依据全部来自**服务端库里的已配对设备**，不读请求体自报字段，客户端无法伪造。
 
 // tokenKindWebview WebView 降级会话的令牌 kind（协议 §6.2 硬约束 ③）。
 //
 // 语义：由 webview-ticket 兑换而来的 hg_sess 会话，能力受限——
 // 可行：读会话、看消息、在会话内发消息；
-// 禁行：审批决策（decideApproval 处校验并拒绝）。
+// 禁行：审批决策（decideApproval 处校验并拒绝）、创建项目、建带项目/目录的会话。
+//
+// ⚠️ 只有**非桌面端**设备兑换 ticket 时才应落到这个 kind（见 sessionKindForDevice）：
+// 桌面端受同一套 ticket 免登机制服务的是一台电脑，把它打成 webview 会让它在
+// 「服务端工作空间建项目」等处被误判成移动端而 403（2026-11 实测缺陷）。
 const tokenKindWebview = "webview"
+
+// sessionKindForDevice 决定「这台设备的 ticket 兑换后该签发哪种令牌」。
+//
+// 返回 (kind, scope)：
+//   - 桌面端 → (model.TokenKindWebSession, "write")，与表单登录/设备自续会话同源，
+//     能力等同浏览器（可建项目、可审批、可带项目目录建会话）；
+//   - 其它一切情况 → (tokenKindWebview, tokenKindWebview)，即降级会话。
+//
+// ============ 为什么默认降级而不是默认放行（fail-closed） ============
+//
+// 本函数的调用点没有第二道兜底：一旦误判成放行，移动端就拿回了建项目/审批能力，
+// 直接违反「移动端只做纯问答」的产品决策，而前端看不出任何异常。
+// 因此只有**明确读到 kind=desktop** 才放行，其余全部按降级处理：
+//   - d == nil（设备被吊销 / 设备域未装配 / 查库报错）→ 降级；
+//   - kind 为空或未知形态（tablet/mobile/browser/cli）→ 降级。
+//
+// ============ 为什么判定依据是设备的 kind 而不是请求体 ============
+//
+// 请求体里客户端能自报任何东西（kind、platform 都可伪造），拿它当安全依据等于
+// 把边界交给攻击者。这里的 `d` 必须由调用方用**服务端库中的 deviceID** 查出来，
+// 而 deviceID 来自 ticket 签发时写入的内存记录（见 webviewTicket.deviceID），
+// 兑换请求体里根本没有这个字段 —— 客户端无从篡改。
+//
+// 反例（谁改这里之前必须知道）：若有人图省事改成读兑换请求体的 device_id 或
+// platform，移动端只要在兑换时上报 "desktop" 就重新获得全部能力。这不是假设，
+// 而是本函数刻意不接收 *http.Request 的唯一理由。
+func sessionKindForDevice(d *model.Device) (string, string) {
+	if d != nil && d.Kind == model.DeviceKindDesktop && d.RevokedAt == nil {
+		// 桌面端：与表单登录完全同源，不做任何能力降级。
+		return model.TokenKindWebSession, "write"
+	}
+	// 兜底：降级会话（scope 与 kind 同名，便于日志与存量口径一致）。
+	return tokenKindWebview, tokenKindWebview
+}
 
 // currentTokenKind 返回当前请求令牌的 kind（取不到时返回空串）。
 //
@@ -241,20 +288,37 @@ func (h *handlers) exchangeWebviewTicket(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	// 硬约束 ③：兑换出的会话是**降级会话**。
+	// 硬约束 ③（+ ④）：兑换出的会话是否降级，按**设备形态**裁决。
 	//
-	// 落地方式（权衡后选定）：兑换时清掉 WebView 自己那条会话的审批决策能力。
-	// 具体做法是为该 token 打上 webview kind（IssutToken 的 kind 参数），
-	// 并在 decideApproval 处校验「WebView 会话不得做高危决策」——见 provider_handler.go。
+	// 落地方式（权衡后选定）：兑换时决定该 token 的能力档位。
+	//   - 移动形态 → webview kind，decideApproval 处校验「WebView 会话不得做高危决策」
+	//     （见 provider_handler.go），createProject 处拒绝建项目（见 handler_project.go）；
+	//   - 桌面端 → web_session（与表单登录同源），不降级。
 	//
 	// 之所以不在中间件注入 scope：那要改 TokenVerifier 签名与全部调用点，
-	// 改动面远大于收益；在唯一需要限制的入口（decideApproval）直接校验更内聚。
-	token, _, err := h.d.Auth.IssueToken(r.Context(), rec.userID, tokenKindWebview, tokenKindWebview)
+	// 改动面远大于收益；在唯一需要限制的入口直接校验更内聚。
+	//
+	// ⚠️ 设备形态必须查服务端库，绝不能读请求体（见 sessionKindForDevice 的注释）。
+	// 查不到 / 设备域未装配 / 已吊销 → d 为 nil → 保守降级（fail-closed）。
+	var dev *model.Device
+	if h.d.Devices != nil && strings.TrimSpace(rec.deviceID) != "" {
+		if got, derr := h.d.Devices.Get(r.Context(), rec.deviceID); derr == nil {
+			dev = got
+		} else {
+			// 查库失败只记 Warn 不返回错误：ticket 已被消费，此时报错等于让用户
+			// 连一次降级会话都拿不到（重试也没用，ticket 不在了）。降级放行更合理。
+			h.d.Log.Warn("WebView ticket 兑换：查询设备形态失败，按降级会话处理",
+				"device_id", rec.deviceID, "err", derr)
+		}
+	}
+	kind, scope := sessionKindForDevice(dev)
+	token, _, err := h.d.Auth.IssueToken(r.Context(), rec.userID, kind, scope)
 	if err != nil {
 		writeError(w, r, err)
 		return
 	}
 	setSessionCookie(w, token, h.d.AuthConfig.SessionTTL, h.d.AuthConfig.SecureCookie)
-	h.d.Log.Info("WebView ticket 兑换成功", "user_id", rec.userID, "device_id", rec.deviceID)
+	h.d.Log.Info("WebView ticket 兑换成功",
+		"user_id", rec.userID, "device_id", rec.deviceID, "token_kind", kind)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }

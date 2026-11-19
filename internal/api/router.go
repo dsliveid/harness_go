@@ -63,6 +63,11 @@ func NewRouter(d Deps) http.Handler {
 	// 会话
 	mux.HandleFunc("GET /api/v1/sessions", h.listSessions)
 	mux.HandleFunc("POST /api/v1/sessions", h.createSession)
+	// 会话列表实时推送（SSE）：L 级实时同步。
+	// ⚠️ 必须注册在 `GET /api/v1/sessions/{sid}` **之前**语义上也不冲突：
+	// Go 1.22 ServeMux 中字面量段优先于通配符段，故 "events" 不会被当成 sid。
+	// 这一优先级由 router_test 显式断言，防止未来有人改成旧式前缀匹配而静默失效。
+	mux.HandleFunc("GET /api/v1/sessions/events", h.sessionEvents)
 	mux.HandleFunc("GET /api/v1/sessions/{sid}", h.getSession)
 	mux.HandleFunc("PATCH /api/v1/sessions/{sid}", h.renameSession)
 	mux.HandleFunc("DELETE /api/v1/sessions/{sid}", h.deleteSession)
@@ -70,6 +75,8 @@ func NewRouter(d Deps) http.Handler {
 	// 归档（对齐桌面端「归档中心」；状态落主库，刷新/重启不丢）
 	mux.HandleFunc("POST /api/v1/sessions/{sid}/archive", h.archiveSession)
 	mux.HandleFunc("POST /api/v1/sessions/{sid}/unarchive", h.unarchiveSession)
+	// 已读上报（未读红点）：把已读游标推进到当前最后消息时间（幂等）。
+	mux.HandleFunc("POST /api/v1/sessions/{sid}/read", h.markSessionRead)
 	// 项目域（项目落库为服务端一等实体：默认控制权限 + 项目审批规则）
 	mux.HandleFunc("GET /api/v1/projects", h.listProjects)
 	mux.HandleFunc("POST /api/v1/projects", h.createProject)
@@ -79,6 +86,14 @@ func NewRouter(d Deps) http.Handler {
 	mux.HandleFunc("GET /api/v1/projects/{pid}/approval-rules", h.listProjectRules)
 	mux.HandleFunc("POST /api/v1/projects/{pid}/approval-rules", h.addProjectRule)
 	mux.HandleFunc("DELETE /api/v1/projects/{pid}/approval-rules/{rid}", h.deleteProjectRule)
+	// 关联项目（0014 起落库，原先仅前端 localStorage，刷新/换端即丢）
+	mux.HandleFunc("GET /api/v1/projects/{pid}/links", h.listProjectLinks)
+	mux.HandleFunc("POST /api/v1/projects/{pid}/links", h.addProjectLink)
+	mux.HandleFunc("PATCH /api/v1/projects/{pid}/links/{lid}", h.updateProjectLink)
+	mux.HandleFunc("DELETE /api/v1/projects/{pid}/links/{lid}", h.deleteProjectLink)
+	// 数据权限策略（0014 起落库，原先仅前端内存、刷新即丢）
+	mux.HandleFunc("GET /api/v1/projects/{pid}/data-grants", h.listProjectDataGrants)
+	mux.HandleFunc("PUT /api/v1/projects/{pid}/data-grants/{scope}", h.setProjectDataGrant)
 	// 工作空间域（执行面一等实体：能力天花板依据；kind 创建后不可改）。
 	// 注意：必须登录鉴权（不进 publicPaths），与项目域同权限级别。
 	mux.HandleFunc("GET /api/v1/workspaces", h.listWorkspaces)

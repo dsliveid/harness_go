@@ -16,7 +16,7 @@
 | 1 | 工具契约 | `pkg/toolapi` | `internal/plugins/echo` + `internal/api/tools_integration_test.go` | ✅ 冻结 |
 | 2 | Run 事件协议 | `internal/events` | `internal/events/bus_test.go`（回放/背压/补发） | ✅ 冻结 |
 | 3 | HTTP API 契约 | `api/openapi.yaml` → `web/src/lib/apiTypes.ts` | `internal/api/integration_test.go` + 路径一对一校验 | ✅ 冻结 |
-| 4 | SSE 传输协议 | `internal/api/sse.go` + `handler.go:runEvents` | `TestEndToEndChatFlow`（断线重连补发） | ✅ 冻结 |
+| 4 | SSE 传输协议（**3 条流**：Run 事件 / 设备状态 / 会话列表） | 本文件 §4 + `internal/api/sse.go`、`device_events_handler.go`、`session_events_handler.go` | `TestEndToEndChatFlow`（续传补发）+ `internal/api/device_events_test.go` + `internal/api/session_events_test.go` + `domain_events_test.go` | ✅ 冻结（③ 含未读与领域信号，2026-11 补齐） |
 | 5 | 审批协议 | `internal/approval` | `internal/approval/gate_test.go` + `TestEchoToolInvokedAndRecorded` | ✅ 冻结（跨端仲裁 C-7 已实现，见 §6.4） |
 | 6 | 设备协议 | 本文件 §6（`internal/device` + `internal/service/device_service.go`） | `internal/device/gateway_chain_test.go`（全链）+ `dev/e2e-c.ps1`（真实二进制 + 真 `cmd/fake-runner`） | ✅ 已实现（C 阶段收口） |
 | 7 | 插件协议 | `pkg/toolapi.Manifest` + 本文件 §7 | `internal/plugins/echo`（内置形态）+ `registry_test.go` | 🟡 内置形态冻结、MCP/HTTP/包待 E |
@@ -143,6 +143,24 @@ fixture：`internal/events/bus_test.go` 覆盖「环形缓冲裁剪 / 慢消费�
 
 ## 4. SSE 传输协议
 
+本服务共 **3 条互不相同的 SSE 流**。它们的续传语义、帧结构与底层总线都不同，**严禁混用或合并**。
+
+### 4.0 三条流对照（先读这张表再选端点）
+
+| 维度 | ① Run 事件流 | ② 设备状态 | ③ 会话列表 |
+| --- | --- | --- | --- |
+| 端点 | `GET /api/v1/sessions/{sid}/runs/{rid}/events` | `GET /api/v1/devices/events` | `GET /api/v1/sessions/events` |
+| 观测对象 | 单个 Run 的**事件历史** | 设备**当前态** | 会话**列表**的变更 |
+| 含序号 | ✅ per-Run 单调 `seq` | ❌ | ❌ |
+| 续传 | ✅ `Last-Event-ID` 补发 | ❌ 重连重拿快照 | ❌ 重连重拿快照 |
+| 首帧 | 无（直接接事件） | `snapshot` | `snapshot` |
+| 底层总线 | `events.Bus`（per-Run） | `device.StateBus` | `sessionbus.Bus` |
+| 典型用途 | 对话内容流式渲染 | 设备在线/离线卡片 | 左侧对话列表 + 红点 |
+
+**为什么不能合成一条**：`events.Bus` 的序号是 **per-Run** 的，而设备状态与会话列表变更**与任何 Run 都无关**。硬塞进去只能用假 runID，会污染序号空间并让续传语义彻底混乱（详见 `internal/device/state_bus.go` 与 `internal/sessionbus/bus.go` 的文件头注释）。
+
+### 4.1 Run 事件流（①，含续传）
+
 - 端点：`GET /api/v1/sessions/{sid}/runs/{rid}/events`
 - 帧格式：`id: <seq>\nevent: <type>\ndata: <json>\n\n`；心跳 `: ping` 每 15s。
 - 续传：请求头 `Last-Event-ID: <seq>` → 只补发 `seq > <seq>`。
@@ -150,6 +168,70 @@ fixture：`internal/events/bus_test.go` 覆盖「环形缓冲裁剪 / 慢消费�
   客户端据此重拉 `/messages` 快照，实现「DB 为准」的对齐。
 - 反代要求：`X-Accel-Buffering: no`；服务端 `WriteTimeout=0`（SSE 长连接）。
 - 客户端状态机（B-1 `lib/sse.ts`）：`idle → connecting → open → backoff → resync`；`visibilitychange` 回前台立即重连。
+
+### 4.2 设备状态（②，当前态）
+
+- 端点：`GET /api/v1/devices/events`；设备域未装配时返回 **503 `device.disabled`**（不会挂一个永不来数据的连接）。
+- 帧格式：`event: <type>\ndata: <json>\n\n`（**无 `id:` 行**）；心跳 `: ping` 每 15s。
+- 首帧固定 `snapshot`（全量），随后增量：
+
+  ```
+  event: snapshot
+  data: {"type":"snapshot","all":[<DeviceState>...],"at":<ms>}
+
+  event: device.online | device.offline
+  data: {"type":"device.online","device":{...},"at":<ms>}
+
+  event: device.revoked
+  data: {"type":"device.revoked","device":{"device_id":"..."},"at":<ms>}
+  ```
+
+- `device.offline` 与 `device.revoked` **语义必须分开**：前者是「暂时连不上，仍在绑定关系中」（卡片保留、标灰），后者是「绑定终止」（**必须从列表移除**）。混用会导致「解绑后设备只变灰而没消失」。
+- 不做续传：断线期间错过 3 次上下线，重连后只需知道「现在谁在线」；重放中间过程反而会让 UI 先闪 offline 再闪 online。
+
+### 4.3 会话列表（③，列表 + 状态 + 未读）
+
+- 端点：`GET /api/v1/sessions/events`；总线未装配时返回 **503**。
+- 帧格式同 ②（无 `id:` 行）；心跳 `: ping` 每 15s。
+- 首帧固定 `snapshot`（全量，上限 **200 条**），随后增量：
+
+  ```
+  event: snapshot
+  data: {"type":"snapshot","items":[<Session>...],"at":<ms>}
+
+  event: session.updated
+  data: {"type":"session.updated","session":{<Session>},"at":<ms>}
+
+  event: session.removed
+  data: {"type":"session.removed","session_id":"s-1","at":<ms>}
+
+  event: projects.changed
+  data: {"type":"projects.changed","at":<ms>}
+
+  event: workspaces.changed
+  data: {"type":"workspaces.changed","at":<ms>}
+  ```
+
+- **`session.updated` 的内容是服务端回查 DB 后的权威视图**，客户端拿到即可直接按 `id` upsert，无需二次请求。
+- `session.updated` 统一承担：新建 / 改名 / 归档 / Run 状态跃迁 / token 与消息数变化 / **已读**。
+  - 归档只改变 `archived_at`，**不发 `session.removed`** —— 归档会话在「归档中心」仍可见，是否从活跃列表移出由客户端的分区规则决定。
+  - `session.removed` 仅用于**真删除**。
+- `projects.changed` / `workspaces.changed` 是**纯信号帧**（只有 `type` + `at`，**不带任何数据**）：客户端收到后自行整表重拉 `GET /projects` / `GET /workspaces`。
+  - 为什么不推数据：项目实体含**客户端独有字段**（如 Web 端的 `workspaceId` 分组），服务端视图不足以独立重建本地状态，强推全量会覆盖掉这些字段；且这两个列表变更频率极低，多一次列表请求的开销可忽略。
+  - 服务端处理这两个事件时**不回查 DB**，所以不存在「实体刚被删除导致静默丢帧」的竞态。
+- 服务端做了 **1 秒合并窗口**：一次 Run 内几十次 token 累加最终只会产生 1 帧 `session.updated`。客户端无须自行去抖。
+- `unread` 是**派生字段**（`last_message_at > last_read_at`），客户端应直接透传而**不得自行重算**——两套判定必然漂移。
+  已读上报端点：`POST /api/v1/sessions/{sid}/read`（幂等，服务端把游标推进到当时的 `last_message_at` 并广播 `session.updated`）。
+
+### 4.4 所有客户端接入必守（三条流的共同要求）
+
+1. **必须等首份列表/快照落地后再建连**。以③为例：若在首屏 `GET /sessions` 之前建连，快照帧与首屏结果会交错覆盖（首屏的「无会话则自动建一条」会把快照里的会话挤掉）。Web 端的做法是用 `sessionsReady` 门控。
+2. **增量帧必须幂等落位**（按 id upsert / 按 device_id 覆盖）。重连后可能收到与快照重复的内容，重复是正常的，丢弃才是错误。
+3. **畸形帧必须静默跳过**，绝不能让一条坏帧使整个订阅崩溃（否则界面从此不再更新，用户只能手动刷新）。
+4. **`dispose` 必须移除 `visibilitychange` 监听**；否则组件卸载后监听器泄漏，回前台时会复活已废弃的连接。
+5. **`visibilitychange` 回前台立即重连**：移动端锁屏后连接必然已断，等浏览器自身的退避可能要十几秒，用户看到的就是「一直不更新」。
+6. **`withCredentials: true`**（同源 Cookie 鉴权）。禁止把 token 拼进 URL —— 三条流都不接受 URL 携带凭据。
+7. **慢消费者会被服务端主动断开**（缓冲满即断，绝不阻塞写路径）。客户端应视为普通断线，走退避重连并重拿快照，**不要**假定可以无限重试同一条连接。
 
 ---
 

@@ -13,7 +13,7 @@
  *   - 错误统一为 `ApiError`（携带 code / status / trace_id，trace_id 与后端日志一致）。
  */
 
-import type { AccessMode, Approval, ApprovalRule, FileDiff, Message, Project, ProjectApprovalRule, Run, RunStatus, Session, ToolCall, Risk, ToolPolicy, ToolStatus, Workspace, WorkspaceKind } from '../types'
+import type { AccessMode, Approval, ApprovalRule, DataScopeGrant, FileDiff, Message, MessagePage, Project, ProjectApprovalRule, ProjectLink, Run, RunStatus, Session, ToolCall, Risk, ToolPolicy, ToolStatus, Workspace, WorkspaceKind } from '../types'
 import { SseClient, type SseState as SseStateName, type SseStateInfo } from './sse'
 import { extractFileDiff, extractResultContent } from './toolDiff'
 import {
@@ -59,6 +59,8 @@ import {
   type ProviderTestResult,
   type Project as ApiProject,
   type ProjectApprovalRule as ApiProjectApprovalRule,
+  type ProjectLinkDTO as ApiProjectLink,
+  type ProjectDataGrantDTO as ApiProjectDataGrant,
   type Rollback,
   type Run as ApiRun,
   type RunStatus as ApiRunStatus,
@@ -84,6 +86,7 @@ import {
   type CreateWorkspaceDTO,
   type UpdateWorkspaceDTO,
   type WorkspaceDTO,
+  type ApiMessagePage,
 } from './apiTypes'
 
 /* ============ 模式（正式版：恒为真实后端） ============ */
@@ -133,6 +136,13 @@ export type StreamEvent =
   | { type: 'step'; tokens?: number; promptTokens?: number; cachedTokens?: number; durationMs?: number; reasoning?: string }
   | { type: 'approval'; approval: Approval }
   | { type: 'done'; tokensIn: number; tokensOut: number; cachedTokens?: number }
+  /**
+   * 非失败的非成功终态（用户主动停止 / 设备离线中断 / 会话被接管）。
+   *
+   * 必须与 error 分开：用户看到的不该是红色错误条，而是「已停止」灰条，
+   * 且 chatStore 要在收口前**先重拉消息**补上中止前已落库的内容。
+   */
+  | { type: 'cancelled'; reason: string; message: string }
   | { type: 'error'; code: string; message: string }
 
 /** 审批决策（与后端 approval 端点取值一致） */
@@ -240,6 +250,15 @@ export interface UpdateProjectInput {
   name?: string
   defaultAccessMode?: AccessMode
   pinned?: boolean
+  /** 项目约束正文；**显式传空串 = 清空**（服务端用指针区分「未传」与「置空」） */
+  constraints?: string
+  planMode?: PlanMode
+}
+
+/** 新增/更新关联项目入参（对应 POST|PATCH /projects/{pid}/links） */
+export interface ProjectLinkInput {
+  path: string
+  description?: string
 }
 
 /** 新增项目审批规则入参（对应 POST /projects/{pid}/approval-rules body） */
@@ -300,6 +319,13 @@ export interface ApiClient {
   archiveSession(id: string): Promise<void>
   /** 取消归档（回到原分组） */
   unarchiveSession(id: string): Promise<void>
+  /**
+   * 上报会话已读（把服务端已读游标推进到当前最后消息时间）。
+   *
+   * 调用时机：打开会话、以及会话内收到新消息且窗口可见时。
+   * 幂等：重复调用无副作用；失败静默（红点只是提示，不该阻塞对话）。
+   */
+  markSessionRead(id: string): Promise<void>
   deleteSession(id: string): Promise<void>
   /** 消息级回滚（S10）：seq 之后的消息置灰、受影响文件回滚到 before 快照；返回回滚事件 id（供 reapply） */
   rollbackToMessage(sessionId: string, messageSeq: number): Promise<string>
@@ -325,6 +351,22 @@ export interface ApiClient {
   addProjectRule(projectId: string, input: CreateProjectRuleInput): Promise<ProjectApprovalRule>
   /** 删除项目审批规则（DELETE → 204） */
   removeProjectRule(projectId: string, ruleId: string): Promise<void>
+  // ---- 项目设置（0014 起全部落服务端；此前在前端 localStorage / 内存） ----
+  /** 关联项目列表（GET /projects/{pid}/links → {items}） */
+  listProjectLinks(projectId: string): Promise<ProjectLink[]>
+  /** 新增关联项目（POST → 201） */
+  addProjectLink(projectId: string, input: ProjectLinkInput): Promise<ProjectLink>
+  /** 更新关联项目（PATCH → 204） */
+  updateProjectLink(projectId: string, linkId: string, input: ProjectLinkInput): Promise<void>
+  /** 删除关联项目（DELETE → 204） */
+  removeProjectLink(projectId: string, linkId: string): Promise<void>
+  /**
+   * 数据权限列表（GET /projects/{pid}/data-grants → {items}）。
+   * 🚨 只返回**用户显式设置过**的 scope；未出现的 scope 由调用方按 ask 兜底。
+   */
+  listProjectDataGrants(projectId: string): Promise<DataScopeGrant[]>
+  /** 设置某数据范围的策略（PUT /projects/{pid}/data-grants/{scope} → 204，幂等） */
+  setProjectDataGrant(projectId: string, scope: DataScopeGrant['scope'], mode: DataScopeGrant['mode']): Promise<void>
 
   // ---- 工作空间域（执行面一等实体；ABILITY 天花板依据，router.go:67-71） ----
   /**
@@ -351,7 +393,18 @@ export interface ApiClient {
    */
   deleteWorkspace(id: string, opts?: { migrateRefs?: boolean }): Promise<void>
   // 消息
-  listMessages(sessionId: string, afterSeq?: number): Promise<Message[]>
+  /**
+   * 读取会话消息（分页）。
+   *
+   * 🚨 has_more 必须回传给调用方（2026-11 修复「对话完成后结果不显示」）：
+   * 旧实现丢弃了服务端的 has_more / 也不传 limit，长会话（事故会话 258 条）
+   * 首屏只拿到前 100 条且无从得知后面还有 → **最终结论永远不可见**。
+   *
+   * 调用方（chatStore.reloadMessages）约定：
+   *   - 首次加载：`{ sessionId, limit: 500 }`，服务端上限 499；
+   *   - 向上增量：`{ sessionId, afterSeq }` 只用于「本地已有头部、要补更早的」，不覆盖尾部。
+   */
+  listMessages(sessionId: string, opts?: { afterSeq?: number; limit?: number }): Promise<MessagePage>
   // Run
   startRun(opts: StartRunOptions): Promise<RunHandle>
   /**
@@ -703,11 +756,15 @@ export function toUiSession(s: ApiSession): Session {
     updatedAt: s.updated_at,
     running: s.last_run_status === 'running' || s.last_run_status === 'pending',
     archivedAt: s.archived_at,
+    // 未读直接透传服务端派生值：前端重算会与 service.deriveUnread 形成两套判定，必然漂移。
+    unread: s.unread === true,
   }
 }
 
 // 项目 DTO → UI：服务端是唯一权威源，defaultAccessMode 只做展示与项目设置回填，
 // **绝不用它推导新会话的 accessMode**（裁决权在服务端，避免前后端两套默认值逻辑）。
+//
+// 0014：constraints / planMode 也来自服务端（此前在前端 localStorage 里）。
 export function toUiProject(p: ApiProject): Project {
   return {
     id: p.id,
@@ -715,6 +772,38 @@ export function toUiProject(p: ApiProject): Project {
     path: p.path,
     pinned: p.pinned,
     defaultAccessMode: toAccessMode(p.default_access_mode),
+    constraints: p.constraints ?? '',
+    planMode: toPlanMode(p.plan_mode),
+  }
+}
+
+/** 服务端 plan_mode → UI：非法/缺失一律按 standard 展示（保守，不虚构策略）。 */
+const toPlanMode = (v: string): PlanMode => {
+  if (v === 'always_plan' || v === 'always_proceed') return v
+  return 'standard'
+}
+
+/** 关联项目 DTO → UI（createdAt 原为字符串，统一转成毫秒数字） */
+export function toUiProjectLink(l: ApiProjectLink): ProjectLink {
+  return {
+    id: l.id,
+    projectId: l.project_id,
+    path: l.path,
+    description: l.description,
+    createdAt: String(l.created_at),
+  }
+}
+
+/** 数据权限 DTO → UI（未知枚举按 ask 兜底，绝不放大成 allow） */
+export function toUiDataGrant(g: ApiProjectDataGrant): DataScopeGrant {
+  return {
+    // UI 侧 DataScopeGrant 要求 id，但服务端以 (project_id, scope) 为复合主键，
+    // 没有独立 id 列 —— 用复合键稳定生成，保证同一行每次映射得到的 id 一致（列表 key 不抖）。
+    id: `${g.project_id}:${g.scope}`,
+    projectId: g.project_id,
+    scope: g.scope as DataScopeGrant['scope'],
+    mode: (g.mode === 'deny' || g.mode === 'allow' ? g.mode : 'ask') as DataScopeGrant['mode'],
+    updatedAt: g.updated_at,
   }
 }
 
@@ -908,6 +997,10 @@ function normalizeEventArgs(raw: unknown): Record<string, unknown> {
  *   - builtin：**按 id === 'ws-server' 判定**，不再用 `device_id === ''`。
  *     旧口径把「手工建的无设备空间」也当成内置空间 → 恒在线可执行（D1 已修正）。
  *   - toolPolicy：**直传服务端权威值**，前端绝不按 online/kind 自己推导；
+ *   - host：**直传服务端权威值** `server` / `device:<deviceID>`。历史缺陷（2026-11）：
+ *     该字段从未被映射，`hostOfWorkspace` 只好退回 `clientId || id`，而 `clientId`
+ *     恒为空、`id` 是工作空间主键（`ws-xxx`），于是拼出 `device:ws-xxx` → 服务端
+ *     Hub 查不到该连接 → 桌面端明明在线，新建项目选目录却报「设备当前不在线」。
  *   - limbCount：后端没有「肢体数量」概念，UI 侧固定 0（不虚构能力数）；
  *   - lastSeenAt：优先用设备真实 last_seen_at，缺失时退化到 updated_at 近似。
  */
@@ -920,6 +1013,8 @@ export function toUiWorkspace(w: WorkspaceDTO): Workspace {
     limbCount: 0,
     lastSeenAt: w.last_seen_at ?? (w.updated_at || undefined),
     builtin: w.id === 'ws-server',
+    // 目录列举宿主：服务端权威值优先（唯一真源），见 hostOfWorkspace 的推导顺序。
+    host: w.host || undefined,
     deviceId: w.device_id || undefined,
     deviceName: w.device_name || undefined,
     deviceKind: w.device_kind || undefined,
@@ -1080,11 +1175,31 @@ function mapSseToStreamEvent(type: string, data: string): StreamEvent | null {
           cachedTokens: optionalNumber(payload.cached_tokens),
         }
       }
-      if (status === 'failed' || status === 'cancelled') {
+      if (status === 'cancelled') {
+        // 🚨 cancelled 不是失败（2026-11「结果不显示」成因之一）：
+        // 旧实现把它并进 error 分支，前端只弹一条「Run 已结束」红条并走
+        // settleRun('failed')，**既不重拉消息也不渲染结论** —— 而用户主动停止
+        // 恰恰是最需要看到「已经跑到哪一步」的时刻（服务端此前落库的 tool 结果
+        // 与中止前的答复此时才可读）。因此必须独立成 cancelled 事件。
+        return {
+          type: 'cancelled',
+          reason: String(payload.stop_reason ?? 'user_stopped'),
+          message: String(payload.error_message ?? ''),
+        }
+      }
+      if (status === 'failed') {
         return {
           type: 'error',
           code: String(payload.error_code ?? status),
           message: String(payload.error_message ?? 'Run 已结束'),
+        }
+      }
+      if (status === 'interrupted') {
+        // 中断（设备离线 / 会话被接管）同样不是「失败」，如实区分供 UI 用灰/黄条。
+        return {
+          type: 'cancelled',
+          reason: String(payload.stop_reason ?? 'interrupted'),
+          message: String(payload.error_message ?? ''),
         }
       }
       return null
@@ -1220,6 +1335,9 @@ export const realApi: ApiClient = {
   async unarchiveSession(id) {
     await request<void>(API_PATHS.sessionUnarchive(id), { method: 'POST', headers: authHeaders() })
   },
+  async markSessionRead(id) {
+    await request<void>(API_PATHS.sessionRead(id), { method: 'POST', headers: authHeaders() })
+  },
   async deleteSession(id) {
     await request<void>(API_PATHS.session(id), { method: 'DELETE', headers: authHeaders() })
   },
@@ -1271,6 +1389,9 @@ export const realApi: ApiClient = {
     if (patch.name !== undefined) body.name = patch.name
     if (patch.defaultAccessMode !== undefined) body.default_access_mode = patch.defaultAccessMode
     if (patch.pinned !== undefined) body.pinned = patch.pinned
+    // 🚨 constraints 传空串是有意义的「清空约束」，必须照发（服务端用指针区分未传/置空）
+    if (patch.constraints !== undefined) body.constraints = patch.constraints
+    if (patch.planMode !== undefined) body.plan_mode = patch.planMode
     await request<void>(API_PATHS.project(id), {
       method: 'PATCH',
       headers: authHeaders(),
@@ -1337,12 +1458,63 @@ export const realApi: ApiClient = {
     })
   },
 
-  async listMessages(sessionId, afterSeq) {
-    const q = afterSeq ? `?after_seq=${afterSeq}` : ''
-    const res = await request<{ items: ApiMessage[] }>(`${API_PATHS.messages(sessionId)}${q}`, {
+  // ---- 项目设置（0014：关联项目 + 数据权限全部落服务端） ----
+  async listProjectLinks(projectId) {
+    const res = await request<{ items: ApiProjectLink[] }>(API_PATHS.projectLinks(projectId), {
       headers: authHeaders(),
     })
-    return toUiMessages(res.items ?? [], sessionId)
+    return (res.items ?? []).map(toUiProjectLink)
+  },
+  async addProjectLink(projectId, input) {
+    const l = await request<ApiProjectLink>(API_PATHS.projectLinks(projectId), {
+      method: 'POST',
+      headers: authHeaders(),
+      body: JSON.stringify({ path: input.path, description: input.description ?? '' }),
+    })
+    return toUiProjectLink(l)
+  },
+  async updateProjectLink(projectId, linkId, input) {
+    await request<void>(API_PATHS.projectLink(projectId, linkId), {
+      method: 'PATCH',
+      headers: authHeaders(),
+      body: JSON.stringify({ path: input.path, description: input.description ?? '' }),
+    })
+  },
+  async removeProjectLink(projectId, linkId) {
+    await request<void>(API_PATHS.projectLink(projectId, linkId), {
+      method: 'DELETE',
+      headers: authHeaders(),
+    })
+  },
+  async listProjectDataGrants(projectId) {
+    const res = await request<{ items: ApiProjectDataGrant[] }>(API_PATHS.projectDataGrants(projectId), {
+      headers: authHeaders(),
+    })
+    return (res.items ?? []).map(toUiDataGrant)
+  },
+  async setProjectDataGrant(projectId, scope, mode) {
+    // PUT + 路径参数形式的 scope：语义是「把该 scope 的策略设为 mode」，重复提交结果一致
+    await request<void>(API_PATHS.projectDataGrant(projectId, scope), {
+      method: 'PUT',
+      headers: authHeaders(),
+      body: JSON.stringify({ mode }),
+    })
+  },
+
+  async listMessages(sessionId, opts) {
+    const qs: string[] = []
+    if (opts?.afterSeq) qs.push(`after_seq=${opts.afterSeq}`)
+    // 服务端 listMessages 上限是 499（内部多取一条判 has_more，存储层防洪闸 500）。
+    // 首屏必须尽最大可能一次拿全：事故会话 258 条，给 100 会截断结论。
+    if (opts?.limit) qs.push(`limit=${opts.limit}`)
+    const q = qs.length > 0 ? `?${qs.join('&')}` : ''
+    const res = await request<ApiMessagePage>(`${API_PATHS.messages(sessionId)}${q}`, {
+      headers: authHeaders(),
+    })
+    return {
+      items: toUiMessages(res.items ?? [], sessionId),
+      hasMore: Boolean(res.has_more),
+    }
   },
 
   async startRun(opts) {

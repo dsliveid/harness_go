@@ -45,8 +45,25 @@ let stepStartAt = 0
  * 只有整轮**从未**收到过步级用量（旧后端 / 上游不回 usage）时才允许轮级兜底。
  */
 let sawStepUsage = false
+/**
+ * 本 Run 已通过**步级 message.end 实时入账**的用量累计。
+ *
+ * 存在原因（双计防护）：各步用量此前只在整轮结束的 done 一次性入账，导致
+ * 「对话进行中 token 与缓存命中率不动」；改为逐步入账后，done 携带的
+ * **整轮合计**若再全额累加就是双计（缓存率甚至可能 >100%）。
+ * 收口时按「整轮合计 − 已实时入账部分」补差额，既保证旧后端
+ * （只发 done、不发步级用量）行为不变，也保证新后端不重复计数。
+ */
+let runRealtime: SessionUsage = { tokensIn: 0, tokensOut: 0, cachedTokens: 0 }
 /** 每会话最近一次消息级回滚的事件 id（real 模式 reapply 依据；S10 语义，刷新后从服务端 rollbacks 列表不可得时降级为不可重放） */
 const lastRollbackBySession: Record<string, string> = {}
+/**
+ * 同一会话「正在加载消息」的 in-flight Promise 表（ensureMessages 去重用）。
+ *
+ * 为什么不进 state：它只是并发去重句柄（副作用态），
+ * 进 state 会让每次 set 都 diff 一个 Promise 对象（无意义）。
+ */
+const inflightLoads = new Map<string, Promise<boolean>>()
 
 /**
  * 把「当前会话的消息序列」推给 workspaceStore 派生右侧浮动栏的运行态数据
@@ -187,8 +204,48 @@ interface ChatState {
   reapply: (msgId: string) => void
   deleteFrom: (msgId: string) => void
   messagesOf: (sessionId: string) => Message[]
-  /** 以 DB 为准重拉某会话的消息快照（real 模式；断线重连/resync 时对齐） */
-  reloadMessages: (sessionId: string) => Promise<void>
+  /**
+   * 已从服务端成功加载过消息的会话（加载账本）。
+   *
+   * 为什么进 state 而不是模块变量：MessageList 的「选中即有内容」不变量 effect
+   * 必须能在「加载成功但消息为空」时也感知到变化（空会话的消息数组恒等空数组，
+   * 仅靠 messages 变化不会触发重渲染 → effect 会无限重试）。
+   */
+  loadedSessions: Record<string, true>
+  /**
+   * 首屏被服务端截断的会话（hasMore=true）。
+   *
+   * 存在意义（2026-11）：「对话完成后结果不显示」的直接成因之一就是前端
+   * 静默拿到被截断的 100 条而没有任何信号。现在服务端会回 has_more，
+   * 这里如实记账，供 UI 显示「还有更早的消息」并触发 loadEarlierMessages。
+   * 拿不到 hasMore=false 就不记账 —— 绝不用「条数等于 limit」来猜。
+   */
+  hasMoreSessions: Record<string, true>
+  /**
+   * 向上增量加载更早的消息（只补头部，绝不覆盖尾部）。
+   *
+   * 语义：取当前本地最小 seq 之前的一页，**前置**拼到该会话消息数组前面。
+   * 与 reloadMessages 的「整段替换」是两件事，不可合并：
+   * 整段替换会把用户正在看的尾部内容一起换掉（流式期间尤其危险）。
+   */
+  loadEarlierMessages: (sessionId: string) => Promise<boolean>
+  /** 以 DB 为准重拉某会话的消息快照（real 模式；断线重连/resync 时对齐）；返回是否成功 */
+  reloadMessages: (sessionId: string) => Promise<boolean>
+  /**
+   * 「选中即有内容」的结构性保证：确保该会话的消息已从服务端加载过。
+   *
+   * 存在意义（2026-11 用户反馈：刷新后左侧默认选中第一条对话，右侧却是空白，
+   * 必须手动点一次对话内容才出现）：
+   * 此前消息加载只挂在三个零散入口（load 的 void reloadMessages / select /
+   * applyServerSnapshot），任何一条路径失败或遗漏（首屏 POST 未完成、切空间回落、
+   * 别端删除后回落 currentId……）都会留下「选中但空白」的死状态 ——
+   * 而且失败被 catch 静默吞掉，之后没有任何自愈通道，只有用户手点一次
+   * （重跑 reloadMessages）才恢复。
+   *
+   * 本方法配合 MessageList 的不变量 effect：只要 currentId 有值且该会话未加载成功过，
+   * 就自动加载一次（成功打标、失败不打标以便下次重试，并用 in-flight 去重防止风暴）。
+   */
+  ensureMessages: (sessionId: string) => Promise<boolean>
   /**
    * 刷新/切回会话后，接回服务端仍在跑的 Run（重建「进行中」UI 与 SSE 订阅）。
    *
@@ -281,6 +338,43 @@ export const useChat = create<ChatState>((set, get) => {
    *   Run 仍会继续产出，收口必须落回它自己的会话与用量账本。
    */
   /**
+   * 把**单步** message.end 的真实用量实时记入会话账本，并（若该会话仍是当前会话）
+   * 立即刷新输入框上的 token / 缓存命中率展示。
+   *
+   * 口径（与 settleRun 的轮级记账严格互补，绝不双计）：
+   * - 输入（tokensIn）= promptTokens（缓存命中率的分母）；输出 = tokens − promptTokens；
+   * - 缓存命中 = cachedTokens。
+   * - 服务端对某步未下发 prompt_tokens 时（旧后端 / 上游不回 usage），整步跳过实时记账，
+   *   让该步用量留待 done 的轮级合计兜底 —— 宁可晚一点，也不能编造输入/输出拆分。
+   *
+   * 为什么不直接信任 e.tokens 拆分：`token_count` 有时只是输出量（服务端口径为
+   * 输入+输出，但历史数据/第三方端点不保证）。优先用 prompt_tokens + tokens 反推：
+   * 有 promptTokens 就按 `输出 = tokens - promptTokens`（不小于 0）；
+   * 无 promptTokens 时退化为「整步都算输出」，避免把输出误记成输入导致缓存率失真。
+   */
+  const creditStepUsage = (sessionId: string, e: { tokens?: number; promptTokens?: number; cachedTokens?: number }) => {
+    if (e.promptTokens === undefined && e.cachedTokens === undefined) return
+    const prompt = e.promptTokens ?? 0
+    // token_count 缺失时 api.ts 会归一成 0，故必须按「>0 才采信」处理，
+    // 否则 0 - prompt 会被截成 0 输出，整步输出量凭空丢失。
+    const total = e.tokens && e.tokens > 0 ? e.tokens : prompt
+    const completion = Math.max(0, total - prompt)
+    const delta: SessionUsage = { tokensIn: prompt, tokensOut: completion, cachedTokens: e.cachedTokens ?? 0 }
+    if (delta.tokensIn === 0 && delta.tokensOut === 0 && delta.cachedTokens === 0) return
+    // 记「本轮已实时入账多少」：settleRun 用它把 done 的整轮合计折算成差额
+    runRealtime = {
+      tokensIn: runRealtime.tokensIn + delta.tokensIn,
+      tokensOut: runRealtime.tokensOut + delta.tokensOut,
+      cachedTokens: runRealtime.cachedTokens + delta.cachedTokens,
+    }
+    const usage = accumulateUsage(sessionId, delta)
+    // 只有该会话仍是当前会话时才刷新展示值，避免 A 会话的步用量污染 B 会话的水位条
+    if (useSessions.getState().currentId === sessionId) {
+      set({ tokensIn: usage.tokensIn, tokensOut: usage.tokensOut, cachedTokens: usage.cachedTokens })
+    }
+  }
+
+  /**
    * 单点收口（单一真相铁律）：所有 Run 终结路径的唯一出口。
    *
    * 为什么必须只有这一处：收口动作曾散落在 done / error / resumeRun-onResync 三处各写一遍，
@@ -302,11 +396,18 @@ export const useChat = create<ChatState>((set, get) => {
     if (opts.usage && sessionId) {
       // 用量记进本 Run 所属会话的账本（不是全局单份）：
       // 只有该会话仍是当前会话时才刷新展示值，避免 A 会话 Run 结束污染 B 会话水位条。
-      const usage = accumulateUsage(sessionId, {
-        tokensIn: opts.usage.tokensIn,
-        tokensOut: opts.usage.tokensOut,
-        cachedTokens: opts.usage.cachedTokens ?? 0,
-      })
+      //
+      // 🚨 差额补记（防双计）：各步 message.end 已通过 creditStepUsage **实时**入账，
+      // done 携带的是**整轮合计**，全额再加一次必然双计（多步轮次缓存率甚至 >100%）。
+      // 故这里只补「整轮合计 − 本轮已实时入账」的差额：
+      //   - 新后端（逐步下发 usage）：差额 = 0 或极少残差，展示早已是终值，不跳变；
+      //   - 旧后端（只发 done）：差额 = 整轮合计，行为与改造前完全一致。
+      const delta: SessionUsage = {
+        tokensIn: Math.max(0, opts.usage.tokensIn - runRealtime.tokensIn),
+        tokensOut: Math.max(0, opts.usage.tokensOut - runRealtime.tokensOut),
+        cachedTokens: Math.max(0, (opts.usage.cachedTokens ?? 0) - runRealtime.cachedTokens),
+      }
+      const usage = accumulateUsage(sessionId, delta)
       const isCurrent = useSessions.getState().currentId === sessionId
       usagePatch = {
         tokensIn: isCurrent ? usage.tokensIn : get().tokensIn,
@@ -379,6 +480,41 @@ export const useChat = create<ChatState>((set, get) => {
     }
   }
 
+  /**
+   * 终态收口前先重拉消息快照（2026-11「对话完成后结果不显示」的收口侧修复）。
+   *
+   * # 为什么必须先重拉，而不是直接 settleRun
+   *
+   * 服务端落库顺序与事件推送顺序**不完全同步**：
+   *   - 用户点停止 → RunService.StopRun 同步迁移终态并推送 run.status(cancelled)，
+   *     而引擎 goroutine 手里那条「正在执行的工具结果」可能晚几十毫秒才落库
+   *     （事故会话实测：runs.ended_at 已 cancelled 53 秒后 messages 还在增长）；
+   *   - 引擎在 tool 结果落库后才发 message.end，但 SSE 慢消费者/断线补发可能丢帧。
+   *
+   * 旧实现在收到终态事件时**直接** settleRun，于是本地 messages 永远停在
+   * 「最后一条 delta 的预览」，服务端已落库的 tool 结果与中止前答复永远补不上 ——
+   * 用户看到的就是「对话结束了，结果却没显示出来」。
+   *
+   * # 为什么 finally 而不是 await 后 return
+   *
+   * 重拉失败**绝不能**让 UI 卡在「假运行态」（气泡转圈 + 顶栏已连接）。
+   * 收口是刚性要求，重拉只是锦上添花，因此 finally 里无条件收口。
+   */
+  const settleAfterReload = (
+    runStatus: Run['status'],
+    opts: { error?: string; toast?: string; usage?: { tokensIn: number; tokensOut: number; cachedTokens?: number } } = {},
+  ) => {
+    const sid = currentRunSessionId
+    if (!sid) {
+      settleRun(runStatus, opts)
+      return
+    }
+    void get()
+      .reloadMessages(sid)
+      .catch(() => false)
+      .finally(() => settleRun(runStatus, opts))
+  }
+
   const makeStreamEventHandler = (runSessionId: string) => (e: StreamEvent) => {
         // 事件隔离守卫：本地同一时刻只跟踪一个 Run（streamingMsgId / pendingText 是模块级单份）。
         // 用户切走该会话（或恢复了别的会话的 Run）后，本 Run 的残留事件不得再写入全局 UI 态，
@@ -446,6 +582,10 @@ export const useChat = create<ChatState>((set, get) => {
             if (e.tokens !== undefined || e.promptTokens !== undefined || e.cachedTokens !== undefined) {
               sawStepUsage = true
             }
+            // 🚨 实时入账（修复「对话中 token / 缓存命中率不刷新，要等整轮结束才动」）：
+            // message.end 已经带着该步**真实**用量，此刻就记进会话账本并刷新输入框，
+            // 绝不再攒到整轮 done 才更新 —— 多步长任务否则全程显示上一轮的旧数字。
+            creditStepUsage(sessionId, e)
             const now2 = Date.now()
             const prevId = streamingMsgId
             const sessionMsgs2 = get().messages.filter((m) => m.sessionId === sessionId)
@@ -487,14 +627,25 @@ export const useChat = create<ChatState>((set, get) => {
             break
           }
           case 'error': {
-            // Run 非成功终态（failed / cancelled）必须完整收口，否则 UI 会停在
+            // Run 非成功终态（failed）必须完整收口，否则 UI 会停在
             // 「气泡转圈 + 顶栏已连接」的假运行态。收口动作统一走 settleRun（单点）。
-            settleRun('failed', { error: `${e.code}: ${e.message}`, toast: e.message })
+            // 先重拉快照：失败前已落库的工具结果/答复必须可见（见 settleAfterReload 注释）。
+            settleAfterReload('failed', { error: `${e.code}: ${e.message}`, toast: e.message })
+            break
+          }
+          case 'cancelled': {
+            // 用户停止 / 设备离线中断 / 被接管：**不是错误**。
+            // 不弹红条、不写 lastError，只如实收口为 cancelled，并把「已跑到哪一步」补上。
+            settleAfterReload('cancelled', {})
+            // 「已停止」这类中性结果用 info 提示，避免被误读成失败
+            if (e.reason === 'user_stopped') useUI.getState().toast('info', '已停止本轮对话')
+            else if (e.message) useUI.getState().toast('warn', e.message)
             break
           }
           case 'done': {
             // 成功终态：用量记进本 Run 所属会话的账本后收口（单点 settleRun）。
-            settleRun('completed', {
+            // 同样先重拉：末步 message.end 与 SSE 帧都不如 DB 权威。
+            settleAfterReload('completed', {
               usage: { tokensIn: e.tokensIn, tokensOut: e.tokensOut, cachedTokens: e.cachedTokens },
             })
             break
@@ -605,10 +756,16 @@ export const useChat = create<ChatState>((set, get) => {
     streamingMsgId = assistantMsg.id
     currentRunId = runId
     currentRunSessionId = sessionId
+    // 发消息即置顶（2026-11 用户要求「按对话最新时间倒序」）：
+    // 服务端 updated_at 由 TouchMessage 异步回写（最终一致），本地先按事实推时间，
+    // 列表立刻把这条对话挪到最前；随后 SSE session.updated 帧会用服务端权威值覆盖。
+    useSessions.getState().bumpSession(sessionId, now)
     // 未选模型：本轮只是把消息保存下来（不产生回复），收口时据此摘掉空 reply 气泡。
     noModelRun = noModel
     // 新一轮开始：清空「是否收到过步级用量」标记（每轮独立判定）
     sawStepUsage = false
+    // 新一轮开始：实时入账累计归零（settleRun 的差额补记以本轮的实时入账为基准）
+    runRealtime = { tokensIn: 0, tokensOut: 0, cachedTokens: 0 }
     stepStartAt = now
     pendingText = ''
     pendingReasoning = ''
@@ -697,6 +854,8 @@ export const useChat = create<ChatState>((set, get) => {
   return {
     // 消息一律来自 DB（登录后 / reloadMessages 拉取），绝不预置演示数据
     messages: [],
+    loadedSessions: {},
+    hasMoreSessions: {},
     runStatus: 'completed',
     approval: null,
     queued: [],
@@ -713,11 +872,18 @@ export const useChat = create<ChatState>((set, get) => {
 
     messagesOf: (sessionId) => get().messages.filter((m) => m.sessionId === sessionId && !m.reverted),
 
-    // 以 DB 为准重拉消息快照：断线重连（resync）后覆盖本地流式态
+    // 以 DB 为准重拉消息快照：断线重连（resync）后覆盖本地流式态。
+    // 返回值 = 是否真正成功拉到快照（失败时不打「已加载」标，由 ensureMessages 重试）。
     reloadMessages: async (sessionId) => {
-      if (!sessionId) return
+      if (!sessionId) return false
       try {
-        const list = await api.listMessages(sessionId)
+        // 🚨 必须显式传 limit（2026-11「对话完成后结果不显示」根因）：
+        // 服务端默认 limit=100，事故会话 258 条 → 首屏只拿到前 100 条、
+        // 最终结论（seq258 的 1668 字答复）永远不可见。
+        // 这里取服务端上限（499，由 handler 的「多取一条判 has_more」决定），
+        // 超过上限的超长会话由 hasMore 告知，由 UI 走向上增量加载补齐。
+        const page = await api.listMessages(sessionId, { limit: 499 })
+        const list = page.items
         set((s) => {
           // 🚨 缺陷修复（2026-11，用户反馈「首次发送后消息又没了」）：
           // startRun 会在 POST 前把 userMsg + 空 assistant 壳乐观上屏，而 `onResync`
@@ -734,7 +900,15 @@ export const useChat = create<ChatState>((set, get) => {
             s.streaming && currentRunSessionId === sessionId
               ? s.messages.filter((m) => m.sessionId === sessionId && !serverSeqs.has(m.seq))
               : []
-          return { messages: [...others, ...list, ...keepLocal] }
+          return {
+            messages: [...others, ...list, ...keepLocal],
+            // 加载成功才打标（含「空会话」：空也是一种确定的已加载事实）
+            loadedSessions: { ...s.loadedSessions, [sessionId]: true },
+            // 截断记账：只有服务端明确说还有更早的才记，绝不由「条数 == limit」猜测。
+            hasMoreSessions: page.hasMore
+              ? { ...s.hasMoreSessions, [sessionId]: true }
+              : Object.fromEntries(Object.entries(s.hasMoreSessions).filter(([k]) => k !== sessionId)),
+          }
         })
         // 历史消息里的工具调用是运行态数据的回灌源：切换会话 / 刷新后右侧浮动栏
         // 靠这一次派生恢复出该会话自己的 todos/plans/subagents/commands
@@ -746,9 +920,69 @@ export const useChat = create<ChatState>((set, get) => {
           const id = streamingMsgId
           set((s) => ({ messages: s.messages.map((m) => (m.id === id ? { ...m, streaming: true } : m)) }))
         }
+        return true
       } catch {
-        /* 拉取失败保留本地态，等待下一次 resync 再对齐 */
+        /* 拉取失败保留本地态，等待下一次 resync / ensureMessages 再对齐 */
+        return false
       }
+    },
+
+    /**
+     * 向上增量加载更早的消息（只补头部，绝不覆盖尾部）。
+     *
+     * 与 reloadMessages 的区别（不可合并，合并会出缺陷）：
+     *   - reloadMessages：resync/终态后「以 DB 为准整段替换」，会把尾部也换掉；
+     *   - 本方法：仅当 hasMoreSessions 为真时才可调用，取「本地最小 seq 之前」一页并**前置**，
+     *     用户正在看的尾部内容（正在流式的答复）绝不受影响。
+     *
+     * 服务端 messages 接口是 after_seq 语义（返回 seq > afterSeq 的一页），
+     * 因此「更早的一页」= after_seq 取 0 到本地最小 seq 之间的窗口。这里采用
+     * 直接取 limit=499 从 0 开始的一页并在本地做 head 拼接的去重（按 seq 屏蔽已有条目）。
+     */
+    loadEarlierMessages: async (sessionId) => {
+      if (!sessionId) return false
+      if (!get().hasMoreSessions[sessionId]) return false
+      try {
+        const mine = get().messages.filter((m) => m.sessionId === sessionId)
+        const minSeq = mine.reduce((a, m) => Math.min(a, m.seq), Number.MAX_SAFE_INTEGER)
+        // after_seq 语义是「取 seq 更大的一页」，所以更早的那页要从头取，再按 seq 过滤掉已在本地的。
+        const page = await api.listMessages(sessionId, { limit: 499 })
+        const earlier = page.items.filter((m) => m.seq < minSeq)
+        set((s) => {
+          const existing = new Set(s.messages.filter((m) => m.sessionId === sessionId).map((m) => m.seq))
+          const fresh = earlier.filter((m) => !existing.has(m.seq))
+          if (fresh.length === 0) {
+            // 拿不到更早的消息：撤掉标记，避免按钮一直转圈（如实反馈，不假装还有）
+            return { hasMoreSessions: Object.fromEntries(Object.entries(s.hasMoreSessions).filter(([k]) => k !== sessionId)) }
+          }
+          return {
+            messages: [...s.messages.filter((m) => m.sessionId !== sessionId), ...fresh, ...s.messages.filter((m) => m.sessionId === sessionId)],
+          }
+        })
+        return true
+      } catch {
+        return false
+      }
+    },
+
+    /**
+     * 「选中即有内容」的结构性兜底（详见接口处注释）。
+     *
+     * 三条纪律：
+     *  ① 已成功加载过 → 直接返回 true（不重复打网络）；
+     *  ② 同一会话并发调用 → 复用同一条 in-flight Promise（防止 effect 抖动打出请求风暴）；
+     *  ③ 失败不打标、不抛错（返回 false），让调用方在依赖变化时自然重试。
+     */
+    ensureMessages: async (sessionId) => {
+      if (!sessionId) return false
+      if (get().loadedSessions[sessionId]) return true
+      const inflight = inflightLoads.get(sessionId)
+      if (inflight) return inflight
+      const task = get()
+        .reloadMessages(sessionId)
+        .finally(() => inflightLoads.delete(sessionId))
+      inflightLoads.set(sessionId, task)
+      return task
     },
 
     /**
@@ -817,6 +1051,8 @@ export const useChat = create<ChatState>((set, get) => {
       currentRunSessionId = sessionId
       // 接回在跑的 Run：同样是新一轮跟踪，重置步级用量标记
       sawStepUsage = false
+      // 接回在跑的 Run：已过去的步骤由 DB 快照承载，实时入账从接回点重新起算
+      runRealtime = { tokensIn: 0, tokensOut: 0, cachedTokens: 0 }
       stepStartAt = now
       pendingText = ''
       pendingReasoning = ''
@@ -1175,13 +1411,13 @@ export const useChat = create<ChatState>((set, get) => {
         const session = sessions.sessions.find((x) => x.id === sessions.currentId)
         if (decision === 'allow_session' && session?.projectId && ap.dataScope) {
           sessions.setDataScope(session.projectId, ap.dataScope, 'allow')
-          // 后端无「数据授权 / 项目策略」端点（router.go 仅有 Run 工具审批 decide），
-          // 本地 sessionStore.dataGrants 为内存态且刷新即丢：文案必须如实说明未持久化。
+          // 0014 起数据权限已落服务端（PUT /projects/{pid}/data-grants/{scope}），
+          // 刷新/换端/重启均保留，故文案不再声称「仅本地、会失效」。
           useUI
             .getState()
             .toast(
               'info',
-              `本项目「${DATA_SCOPE_LABEL[ap.dataScope]}」已在本地设为允许：服务端未持久化，刷新页面后失效`,
+              `本项目「${DATA_SCOPE_LABEL[ap.dataScope]}」已设为允许：已保存到服务端，可在项目设置 → 数据权限中回收`,
             )
         } else if (decision === 'allow_once') {
           useUI.getState().toast('info', `已允许本次「${ap.dataScope ? DATA_SCOPE_LABEL[ap.dataScope] : '数据'}」访问（一次性，仅本次调用）`)

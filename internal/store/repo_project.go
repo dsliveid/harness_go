@@ -21,7 +21,8 @@ func (s *MainStore) Projects() *ProjectRepo { return &ProjectRepo{s: s} }
 
 // projectColumns 项目列清单（与 scanProject 顺序严格一致）。
 // 0009 追加 workspace_id：位置紧随 path 之后（scanProject 实参保持一致）。
-const projectColumns = `id, name, path, workspace_id, default_access_mode, pinned, created_at, updated_at, deleted_at`
+// 0014 追加 constraints / plan_mode：位置紧随 pinned 之后（三处必须同步，见下方铁律）。
+const projectColumns = `id, name, path, workspace_id, default_access_mode, pinned, constraints, plan_mode, created_at, updated_at, deleted_at`
 
 func scanProject(sc interface{ Scan(...any) error }) (model.Project, error) {
 	var (
@@ -32,6 +33,7 @@ func scanProject(sc interface{ Scan(...any) error }) (model.Project, error) {
 		workspaceID sql.NullString
 	)
 	err := sc.Scan(&p.ID, &p.Name, &p.Path, &workspaceID, &p.DefaultAccessMode, &pinned,
+		&p.Constraints, &p.PlanMode,
 		&p.CreatedAt, &p.UpdatedAt, &deleted)
 	if err != nil {
 		return model.Project{}, err
@@ -63,14 +65,21 @@ func (r *ProjectRepo) Create(ctx context.Context, p *model.Project) error {
 	if p.DefaultAccessMode == "" {
 		p.DefaultAccessMode = "confirm"
 	}
+	// plan_mode 空串回落 standard：与 0014 迁移的列 DEFAULT 保持同一口径，
+	// 避免「代码缺省」与「库里缺省」两套默认值。
+	if p.PlanMode == "" {
+		p.PlanMode = "standard"
+	}
 	pinned := 0
 	if p.Pinned {
 		pinned = 1
 	}
 	_, err := r.s.conn().ExecContext(ctx,
-		`INSERT INTO projects(id, name, path, workspace_id, default_access_mode, pinned, created_at, updated_at, deleted_at)
-		 VALUES(?,?,?,?,?,?,?,?,NULL)`,
-		p.ID, p.Name, p.Path, p.WorkspaceID, p.DefaultAccessMode, pinned, p.CreatedAt, p.UpdatedAt)
+		`INSERT INTO projects(id, name, path, workspace_id, default_access_mode, pinned, constraints, plan_mode,
+		                      created_at, updated_at, deleted_at)
+		 VALUES(?,?,?,?,?,?,?,?,?,?,NULL)`,
+		p.ID, p.Name, p.Path, p.WorkspaceID, p.DefaultAccessMode, pinned, p.Constraints, p.PlanMode,
+		p.CreatedAt, p.UpdatedAt)
 	if err != nil {
 		return fmt.Errorf("store: 创建项目失败: %w", err)
 	}
@@ -111,20 +120,24 @@ func (r *ProjectRepo) List(ctx context.Context) ([]model.Project, error) {
 	return out, rows.Err()
 }
 
-// Update 更新项目名称、默认控制权限与置顶状态（三字段整体覆盖）。
-func (r *ProjectRepo) Update(ctx context.Context, id, name, defaultAccessMode string, pinned bool) error {
+// Update 更新项目的标量设置（名称 / 默认控制权限 / 置顶 / 约束 / 规划模式）。
+//
+// 0014 起 constraints 与 planMode 也纳入本方法（原先只在前端 localStorage）。
+// 调用方（service.ProjectService.Update）负责把「未提供的字段」合并成当前值，
+// 本方法只做整体覆盖，语义单一、不与上层重复裁决。
+func (r *ProjectRepo) Update(ctx context.Context, p *model.Project) error {
 	pinnedVal := 0
-	if pinned {
+	if p.Pinned {
 		pinnedVal = 1
 	}
 	res, err := r.s.conn().ExecContext(ctx,
-		`UPDATE projects SET name=?, default_access_mode=?, pinned=?, updated_at=?
+		`UPDATE projects SET name=?, default_access_mode=?, pinned=?, constraints=?, plan_mode=?, updated_at=?
 		 WHERE id=? AND deleted_at IS NULL`,
-		name, defaultAccessMode, pinnedVal, NowMillis(), id)
+		p.Name, p.DefaultAccessMode, pinnedVal, p.Constraints, p.PlanMode, NowMillis(), p.ID)
 	if err != nil {
 		return fmt.Errorf("store: 更新项目失败: %w", err)
 	}
-	return ensureAffected(res, "项目 "+id)
+	return ensureAffected(res, "项目 "+p.ID)
 }
 
 // SetDefaultAccessMode 单独更新项目默认控制权限（供"只改权限"的场景使用）。
@@ -234,10 +247,116 @@ func (r *ProjectRepo) DeleteProjectCascade(ctx context.Context, id string) error
 			`DELETE FROM project_approval_rules WHERE project_id=?`, id); err != nil {
 			return fmt.Errorf("store: 级联清理项目规则失败: %w", err)
 		}
+		// 0014：关联项目与数据权限也属项目子集合，必须一并物理清理，
+		// 否则重建同名/同 id 项目时会「继承」上一个项目的幽灵配置。
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM project_links WHERE project_id=?`, id); err != nil {
+			return fmt.Errorf("store: 级联清理关联项目失败: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM project_data_grants WHERE project_id=?`, id); err != nil {
+			return fmt.Errorf("store: 级联清理数据权限失败: %w", err)
+		}
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE sessions SET project_id='' WHERE project_id=?`, id); err != nil {
 			return fmt.Errorf("store: 级联解绑会话归属失败: %w", err)
 		}
 		return nil
 	})
+}
+
+// ============ 关联项目（0014） ============
+
+// ListLinks 列出某项目的全部关联项目（按创建时间升序，保证展示顺序稳定）。
+func (r *ProjectRepo) ListLinks(ctx context.Context, projectID string) ([]model.ProjectLink, error) {
+	rows, err := r.s.conn().QueryContext(ctx,
+		`SELECT id, project_id, path, description, created_at
+		 FROM project_links WHERE project_id=? ORDER BY created_at ASC, id ASC`, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("store: 列出关联项目失败: %w", err)
+	}
+	defer rows.Close()
+	out := make([]model.ProjectLink, 0, 8)
+	for rows.Next() {
+		var l model.ProjectLink
+		if err := rows.Scan(&l.ID, &l.ProjectID, &l.Path, &l.Description, &l.CreatedAt); err != nil {
+			return nil, fmt.Errorf("store: 解析关联项目行失败: %w", err)
+		}
+		out = append(out, l)
+	}
+	return out, rows.Err()
+}
+
+// AddLink 新增关联项目（id 由本层生成）。
+func (r *ProjectRepo) AddLink(ctx context.Context, projectID, path, description string) (*model.ProjectLink, error) {
+	l := model.ProjectLink{
+		ID:          "plink-" + newUUID(),
+		ProjectID:   projectID,
+		Path:        path,
+		Description: description,
+		CreatedAt:   NowMillis(),
+	}
+	if _, err := r.s.conn().ExecContext(ctx,
+		`INSERT INTO project_links(id, project_id, path, description, created_at) VALUES(?,?,?,?,?)`,
+		l.ID, l.ProjectID, l.Path, l.Description, l.CreatedAt); err != nil {
+		return nil, fmt.Errorf("store: 新增关联项目失败: %w", err)
+	}
+	return &l, nil
+}
+
+// UpdateLink 更新关联项目的路径与说明（不存在返回 ErrNotFound）。
+func (r *ProjectRepo) UpdateLink(ctx context.Context, id, path, description string) error {
+	res, err := r.s.conn().ExecContext(ctx,
+		`UPDATE project_links SET path=?, description=? WHERE id=?`, path, description, id)
+	if err != nil {
+		return fmt.Errorf("store: 更新关联项目失败: %w", err)
+	}
+	return ensureAffected(res, "关联项目 "+id)
+}
+
+// DeleteLink 删除关联项目（不存在返回 ErrNotFound）。
+func (r *ProjectRepo) DeleteLink(ctx context.Context, id string) error {
+	res, err := r.s.conn().ExecContext(ctx, `DELETE FROM project_links WHERE id=?`, id)
+	if err != nil {
+		return fmt.Errorf("store: 删除关联项目失败: %w", err)
+	}
+	return ensureAffected(res, "关联项目 "+id)
+}
+
+// ============ 数据权限策略（0014） ============
+
+// ListDataGrants 列出某项目已显式设置的数据权限行。
+//
+// 🚨 返回结果**只含用户明确设置过的 scope**；未出现的 scope 由上层按 ask 兜底。
+func (r *ProjectRepo) ListDataGrants(ctx context.Context, projectID string) ([]model.ProjectDataGrant, error) {
+	rows, err := r.s.conn().QueryContext(ctx,
+		`SELECT project_id, scope, mode, updated_at
+		 FROM project_data_grants WHERE project_id=? ORDER BY scope ASC`, projectID)
+	if err != nil {
+		return nil, fmt.Errorf("store: 列出数据权限失败: %w", err)
+	}
+	defer rows.Close()
+	out := make([]model.ProjectDataGrant, 0, 4)
+	for rows.Next() {
+		var g model.ProjectDataGrant
+		if err := rows.Scan(&g.ProjectID, &g.Scope, &g.Mode, &g.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("store: 解析数据权限行失败: %w", err)
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
+// SetDataGrant 幂等 upsert 某项目某 scope 的数据权限策略。
+//
+// 用 ON CONFLICT 而非「先查后写」：并发重复提交不应产生报错或双行。
+func (r *ProjectRepo) SetDataGrant(ctx context.Context, projectID, scope, mode string) error {
+	_, err := r.s.conn().ExecContext(ctx,
+		`INSERT INTO project_data_grants(project_id, scope, mode, updated_at) VALUES(?,?,?,?)
+		 ON CONFLICT(project_id, scope) DO UPDATE SET mode=excluded.mode, updated_at=excluded.updated_at`,
+		projectID, scope, mode, NowMillis())
+	if err != nil {
+		return fmt.Errorf("store: 写入数据权限失败: %w", err)
+	}
+	return nil
 }

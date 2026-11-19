@@ -139,14 +139,25 @@ type DevicesConfig struct {
 // 而模型全程不知预算，无法在接近上限时收敛输出、交出阶段性结论。
 //
 // 契约：
+//
 //   - MaxSteps：单 Run 最大步数，**默认 100**。<=0 时引擎回落默认值（不在此处兜底）。
+//
 //   - StepNoticeEvery：每 N 步向模型注入一行「当前步数 X/总步数 N」进度提示，
 //     默认 10；0 表示关闭该提示（不再注入）。
 //
-// 两者均在 Validate 中硬校验，非法值直接拒绝加载，不做静默兜底。
+//   - ToolTimeoutS：**单次工具执行**的超时（秒），默认 180。
+//
+//     🚨 为什么必须有这一项（2026-11 事故）：引擎里 ToolTimeout 曾硬编码 120s，
+//     而 `run_command` 插件允许调用方传 `timeout_s`（模型常给 400）。外层 120s
+//     先砍掉内层 400s → 命令返回「context canceled」，模型看到的是"被取消"而不是
+//     "超时"，判断依据被污染，进而重试同一条命令。现在两者取 max 对齐：
+//     外层超时永远不短于内层请求的超时（详见 engine.execTool）。
+//
+// 三者均在 Validate 中硬校验，非法值直接拒绝加载，不做静默兜底。
 type AgentConfig struct {
 	MaxSteps        int `yaml:"max_steps"`         // 单 Run 最大步数，默认 100
 	StepNoticeEvery int `yaml:"step_notice_every"` // 步数提示间隔（每 N 步提示一次），默认 10；0 = 关闭
+	ToolTimeoutS    int `yaml:"tool_timeout_s"`    // 单次工具执行超时（秒），默认 180
 }
 
 // BudgetConfig 预算闸门（阶段 D-4）参数。
@@ -220,6 +231,7 @@ type MCPConfig struct {
 // 与 MCPConfig 的分工（刻意分成两段，语义不同不可合并）：
 //   - MCP 段管「连接托管」：MCP Server 建连、stdio 放行、工具包信任根；
 //   - Market 段管「制品下载」：从远端 registry 拉索引并下载制品（工具包 / 技能）。
+//
 // 两者共用同一套 ed25519 信任语义（internal/market），但开关独立：
 // 关闭市场不影响已装工具包运行，反之亦然。
 //
@@ -229,12 +241,12 @@ type MCPConfig struct {
 //   - TrustedKeys 为空且 AllowUnsigned=false → 一律拒绝（无法证明来源）；
 //   - RegistryURL 为空 → 市场明确标记「未配置」，绝不返回假制品列表。
 type MarketConfig struct {
-	Enabled       bool     `yaml:"enabled"`         // 外部市场总开关（关闭时相关端点返回 unavailable）
-	RegistryURL   string   `yaml:"registry_url"`    // 索引地址（JSON）；空 = 未配置
-	TrustedKeys   []string `yaml:"trusted_keys"`    // 受信公钥（64 位 hex ed25519）；空则签名包一律硬拒
-	AllowUnsigned bool     `yaml:"allow_unsigned"`  // 允许安装未签名制品（默认拒绝）
-	CacheTTLSec   int      `yaml:"cache_ttl_sec"`   // 索引缓存秒数（避免每次开弹窗打远端），默认 300
-	TimeoutSec    int      `yaml:"timeout_sec"`     // 拉取/下载超时秒数，默认 30
+	Enabled       bool     `yaml:"enabled"`        // 外部市场总开关（关闭时相关端点返回 unavailable）
+	RegistryURL   string   `yaml:"registry_url"`   // 索引地址（JSON）；空 = 未配置
+	TrustedKeys   []string `yaml:"trusted_keys"`   // 受信公钥（64 位 hex ed25519）；空则签名包一律硬拒
+	AllowUnsigned bool     `yaml:"allow_unsigned"` // 允许安装未签名制品（默认拒绝）
+	CacheTTLSec   int      `yaml:"cache_ttl_sec"`  // 索引缓存秒数（避免每次开弹窗打远端），默认 300
+	TimeoutSec    int      `yaml:"timeout_sec"`    // 拉取/下载超时秒数，默认 30
 }
 
 // LogConfig 日志（文本运维日志 + 天分片审计日志库族）。
@@ -401,6 +413,7 @@ func Default() Config {
 		Agent: AgentConfig{
 			MaxSteps:        100, // 默认 100 步（原硬编码 20，复杂任务易被截断）
 			StepNoticeEvery: 10,  // 每 10 步向模型注入一次「当前步数 X/总步数 N」
+			ToolTimeoutS:    180, // 单次工具超时（原引擎硬编码 120s，会砍掉 run_command 的 timeout_s=400）
 		},
 		Budget: BudgetConfig{
 			MaxTotal:     0,   // 默认不限预算（闸门直通）；配置后超限走五级降级
@@ -429,7 +442,7 @@ func Default() Config {
 			// ColdArchiveDays=0：用户要求「超 30 天自动清理」，不留归档。
 			// 保留该配置项是为了将来合规需要时改一行即可开启，不用重构。
 			ColdArchiveDays: 0,
-			MaxTotalGB:      0,   // 0 = 不限，仅靠 RetentionDays（界面提示实际占用）
+			MaxTotalGB:      0, // 0 = 不限，仅靠 RetentionDays（界面提示实际占用）
 			SnapshotMode:    SnapshotPreview,
 			QueueCap:        4096,
 			BatchSize:       500,
@@ -713,6 +726,14 @@ func (c *Config) Validate() error {
 		// 间隔大于总步数 = 提示永远不会触发，属自相矛盾配置，直接拒绝。
 		return fmt.Errorf("config: agent.step_notice_every(%d) 不能大于 agent.max_steps(%d)（否则步数提示永不触发）",
 			c.Agent.StepNoticeEvery, c.Agent.MaxSteps)
+	}
+	// 工具超时：过小会让长命令一律被外层砍掉（模型误以为是"取消"），
+	// 过大则单条命令挂死会拖垮整轮。上限取 900s 覆盖绝大多数构建/测试。
+	if c.Agent.ToolTimeoutS < 0 {
+		return errors.New("config: agent.tool_timeout_s 不能为负")
+	}
+	if c.Agent.ToolTimeoutS > 900 {
+		return fmt.Errorf("config: agent.tool_timeout_s(%d) 不能超过 900（单条命令挂死会拖垮整轮 Run）", c.Agent.ToolTimeoutS)
 	}
 	// 阶段 D-2 动态工具注入：两个参数直接决定「模型每轮看得见多少工具」，
 	// 取值非法会让 Token 治理静默失效，故一律硬拒绝而非兜底。
