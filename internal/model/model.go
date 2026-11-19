@@ -159,6 +159,26 @@ type Message struct {
 	CreatedAt int64 `json:"created_at"`
 }
 
+// Compaction 一次上下文压缩记录（会话库 session_compactions）。
+//
+// 语义：把 [StartSeq, EndSeq] 区间内的消息替换为 SummaryMarkdown，
+// 后续组装上下文时不再逐条注入该区间。
+//
+// 铁律：
+//   - EndSeq 在同一会话内单调递增（区间不重叠）；
+//   - 只压缩已完成轮次，绝不切断当前活跃轮次；
+//   - 摘要写入后不可修改（与 messages 的不可变语义一致）。
+type Compaction struct {
+	ID               string `json:"id"`
+	StartSeq         int64  `json:"start_seq"`
+	EndSeq           int64  `json:"end_seq"`
+	SummaryMarkdown  string `json:"summary_markdown"`
+	ReplacedMessages int    `json:"replaced_messages"`
+	ReplacedTokens   int    `json:"replaced_tokens"`
+	ModelRef         string `json:"model_ref,omitempty"`
+	CreatedAt        int64  `json:"created_at"`
+}
+
 // Run 运行（会话库）。
 type Run struct {
 	ID           string    `json:"id"`

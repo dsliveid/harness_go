@@ -13,6 +13,7 @@ import (
 	"harness-go/internal/agent"
 	"harness-go/internal/model"
 	"harness-go/internal/prompt"
+	"harness-go/internal/resultfmt"
 	"harness-go/internal/tools/loader"
 	"harness-go/internal/tools/registry"
 	"harness-go/internal/tools/router"
@@ -135,7 +136,15 @@ func (r *Runner) Run(ctx context.Context, req agent.ToolRunRequest) (agent.ToolR
 	}
 	// 工具输出统一封装成**合法 JSON**：model.ToolEvent.ResultJSON 是 json.RawMessage，
 	// 直接塞纯文本会让事件序列化失败（曾导致 /tool-events 返回空响应体）。
-	payload := map[string]any{"content": res.Content}
+	//
+	// 入库定型（resultfmt）：这里是**全仓唯一的工具结果汇聚点**（服务端执行、
+	// 端侧派发、MCP、内置插件全部经过本函数），因此也是唯一正确的定型位置。
+	// 铁律：只在此处定型一次——入库后的消息内容终生不可变，否则历史消息会
+	// 每轮都变，破坏缓存命中与可复现性。
+	//
+	// 为什么必须在入库前收敛：工具消息会被每一轮请求全量重发给模型，
+	// 一条失控输出不是一次性成本，而是随轮次线性累加的复发性成本。
+	payload := map[string]any{"content": resultfmt.Format(req.ToolName, res.Content)}
 	if len(res.Meta) > 0 {
 		payload["meta"] = res.Meta
 	}

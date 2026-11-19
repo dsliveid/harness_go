@@ -32,6 +32,10 @@ export default {
         inkdim: withOpacity('--inkdim-rgb'),
         inkfaint: withOpacity('--inkfaint-rgb'),
         accent: withOpacity('--accent-rgb'),
+        // accent-soft：accent 的 12% 透明底，用于选中态/标记底色。
+        // 历史遗留：WorkspaceSwitcher.tsx 与 WorkspacePanel.tsx 早已在用 bg-accent-soft，
+        // 但此处一直没定义该令牌，导致那两个选中态静默失效（类名不生成任何样式）。
+        'accent-soft': 'rgba(var(--accent-rgb), 0.12)',
         accent2: withOpacity('--accent2-rgb'),
         ok: withOpacity('--ok-rgb'),
         warn: withOpacity('--warn-rgb'),

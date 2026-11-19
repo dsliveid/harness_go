@@ -98,8 +98,12 @@ export function TopBar() {
             <span className="absolute left-2 pointer-events-none text-accent">
               <Bot size={13} />
             </span>
+            {/* 模型选择器：轻量胶囊下拉
+                【外层滚动条治理】宽度 <md 收窄到 72px、md 起才放宽到 200px：
+                原先 sm 断点(640) 就放宽到 200px，让 768 平板下顶栏总宽溢出 45px
+                → 出现横向滚动条 → 吃掉 6px 可用高度 → 触发页面最外层竖向滚动条。 */}
             <select
-              className={`h-8 pl-6 pr-6 max-w-[96px] sm:max-w-[200px] rounded-lg bg-panel2 text-[12px] font-medium outline-none cursor-pointer appearance-none hover:bg-panel3 transition-all focus:ring-1 focus:ring-accent/40 ${
+              className={`h-8 pl-6 pr-6 max-w-[72px] md:max-w-[200px] rounded-lg bg-panel2 text-[12px] font-medium outline-none cursor-pointer appearance-none hover:bg-panel3 transition-all focus:ring-1 focus:ring-accent/40 ${
                 s.modelRef ? 'text-ink' : 'text-warn'
               }`}
               value={s.modelRef}
@@ -134,7 +138,7 @@ export function TopBar() {
           </div>
 
           {currentModel && (
-            <span className="hidden sm:inline-flex px-1.5 py-0.5 rounded-md bg-panel2 text-[10px] font-mono text-inkfaint" title={`上下文窗口上限: ${currentModel.limit.toLocaleString()} tokens`}>
+            <span className="hidden lg:inline-flex px-1.5 py-0.5 rounded-md bg-panel2 text-[10px] font-mono text-inkfaint" title={`上下文窗口上限: ${currentModel.limit.toLocaleString()} tokens`}>
               {Math.round(currentModel.limit / 1000)}k
             </span>
           )}
@@ -151,8 +155,8 @@ export function TopBar() {
         </div>
       )}
 
-      {/* 分隔线：移动端顶栏空间紧张，隐藏（视觉上也不需要） */}
-      <div className="hidden sm:block h-4 w-px bg-edge mx-0.5" />
+      {/* 分隔线：顶栏空间紧张时（平板及以下）隐藏（视觉上也不需要） */}
+      <div className="hidden lg:block h-4 w-px bg-edge mx-0.5" />
 
       {/* 主题与全局设置：主题开关在移动端收起（设置 → 外观 面板可切换），
           避免 360px 宽度下把会话标题挤成 0 宽 */}

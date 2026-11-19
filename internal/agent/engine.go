@@ -69,7 +69,35 @@ type Deps struct {
 	// TraceID 取当前请求的 trace_id（可选）：nil 或返回空串时审计日志的
 	// trace_id 字段为空（不影响功能，只是无法从日志反查请求链路）。
 	TraceID func(ctx context.Context) string
+	// Compactor 上下文压缩（可选，nil = 不压缩，行为与改造前一致）。
+	//
+	// # 为什么在引擎层而不是 BudgetGate 层
+	//
+	// BudgetGate 只有「决策权」：它能判断"该压缩了"，但没有存储与模型权限
+	// （service 层的 BudgetGate 刻意不碰 store 与 llm，那是它保持可测的前提）。
+	// 而压缩必须写持久化摘要表并调模型 —— 这在编排层（引擎）才成立。
+	//
+	// 因此分工是：
+	//   BudgetGate 第⑤级 → 产出 NeedCompress 信号（已有）
+	//   引擎消费该信号     → 调 Compactor 真正执行（本节新增）
+	//   Compactor 完成后   → 引擎重建 history 并继续（对模型透明）
+	Compactor Compactor
+	// MaxContextTokens 模型上下文窗口上限（压缩水位基准）。
+	//
+	// <=0 表示未知：此时压缩会被跳过（实现层约定），行为退回改造前。
+	// 之所以仍保留"可关闭"，是因为窗口确实可能未知；但**默认值必须是真实值**
+	// （见 config 的 compaction.max_context_tokens），否则又会变成
+	// 「机制存在但常年休眠」——那正是本次事故的制度性根因。
+	MaxContextTokens int
 }
+
+// maxCompactionsPerRun 单个 Run 内允许的压缩次数上限。
+//
+// 为什么必须设上限：压缩触发后若历史仍偏长，下一步可能再次触发。
+// 每触发一次都是一次完整的摘要模型调用（输入是被折叠区间全文）。
+// 长任务若每步都压缩一次，会变成"花在摘要上的钱比正文还多"。
+// 3 次足以应对「第一步就满窗 → 折叠 → 又满 → 再折叠」的极端情况。
+const maxCompactionsPerRun = 3
 
 // Engine Run 执行引擎。
 type Engine struct {
@@ -343,6 +371,45 @@ func (e *Engine) Execute(ctx context.Context, req RunRequest) error {
 	return nil
 }
 
+// assertMutable 判断该 Run 是否仍可写入新消息（终态不可变守卫）。
+//
+// # 为什么需要这个守卫，以及为什么必须只有一处
+//
+// Run 的终态（cancelled / failed / completed / interrupted）一旦写入，
+// 就不该再有任何业务写入。但真实路径里，终态可能由**别处**触发：
+//   - 用户点停止 → service 层直接迁移 Run 状态；
+//   - 设备离线 / 请求断开 → 上层取消；
+//   - 会话被其他端接管。
+//
+// 而引擎此时可能正卡在一次耗时几十秒的工具执行里。工具返回后若不加校验
+// 就把结果落库，就会出现「Run 已 cancelled，messages 却仍在增长」。
+//
+// 真实事故（会话 9ee34e00）：runs.ended_at=1795058266409 已 cancelled，
+// 但 messages seq107/108 的 created_at 是 …320130/…320132，迟 53.7 秒。
+//
+// # 为什么收敛在这一个函数
+//
+// 若在每个 AppendMessage 前散落 `if run.Status.IsTerminal() { return }`，
+// 迟早会有新的写入点忘记加，缺陷就会以"新的一种表现"复发。收敛到单一
+// 断言点后，新增写入路径只要调用它，就不会绕过不变量。
+//
+// # 为什么用 detached ctx 读取
+//
+// 校验发生在取消路径上，此时父 ctx 已 Done。复用父 ctx 查库会直接返回
+// context canceled 而不执行 SQL，导致守卫在**最需要它的时刻失效**。
+func (e *Engine) assertMutable(ctx context.Context, sdb SessionDB, runID string) bool {
+	rctx, cancel := detachedCtx(ctx)
+	defer cancel()
+	run, err := sdb.GetRun(rctx, runID)
+	if err != nil {
+		// 读不到状态时保守放行？不。宁可少写一条消息，也不能污染已终态的历史。
+		// 但要注意：若库本身不可用，上层 AppendMessage 也会失败并如实报错，
+		// 因此这里返回 false 不会掩盖真实故障。
+		return false
+	}
+	return !run.Status.IsTerminal()
+}
+
 // finishCancelled 前置失败路径的 Run 收口（并发闸门排队被取消 / 打开会话库失败前）。
 //
 // 必须存在：这些路径原本直接 return，Run 停在 pending 永不收口 ——
@@ -394,9 +461,23 @@ func (e *Engine) loop(ctx context.Context, sdb SessionDB, req RunRequest, usage 
 	}
 
 	userInput := req.UserInput
+	// 本 Run 的压缩次数计数器（**局部变量而非 Engine 字段**）。
+	//
+	// 为什么不能放 Engine 上：Engine 是全进程单例且被多个会话并发复用
+	// （MaxConcurrent 8），共享计数器会同时造成两个问题：
+	//   ① 数据竞争（-race 必报）；
+	//   ② 语义错误——A 会话压缩 3 次后，B 会话的压缩也被一起掐掉。
+	// 放在 loop 局部，天然按 Run 隔离且随 Run 结束自动归零。
+	compactionsThisRun := 0
 	for step := 0; step < e.deps.MaxSteps; step++ {
 		if ctx.Err() != nil {
 			return model.RunCancelled, "context_canceled", "", "", tokens
+		}
+		// 终态不可变（单一断言点之一）：每轮循环起始校验一次。
+		// 防止 Run 已在别处（取消/超时/接管）进入终态后，本循环继续产出消息，
+		// 造成"Run 已 cancelled，messages 却还在增长"的历史污染。
+		if !e.assertMutable(ctx, sdb, req.RunID) {
+			return model.RunCancelled, "run_already_terminal", "", "", tokens
 		}
 		// 每步续期会话租约（C-6）：长 Run 不因租约 TTL 到期而被误接管。
 		e.renewLease(ctx, req)
@@ -434,6 +515,54 @@ func (e *Engine) loop(ctx context.Context, sdb SessionDB, req RunRequest, usage 
 				"level":   int(res.Degrade[len(res.Degrade)-1].Level),
 			})
 		}
+		// ⑤ 上下文压缩：**独立的容量治理**，不再挂在预算法失败之下。
+		//
+		// # 这里修的是一个真实缺陷（2026-11 自查发现）
+		//
+		// 上一版把压缩挂在 `res.OverBudget` 条件下，而：
+		//     prompt/builder.go: overBudget := MaxTotal > 0 && Total > MaxTotal
+		//     config 默认值:     budget.max_total: 0
+		// 于是 OverBudget 恒为 false → 压缩**在默认配置下永不执行**。
+		// 讽刺的是，被修的原始缺陷正是"机制存在但常年休眠"（max_total=0 让
+		// 五级降级从不触发，第五级又无消费者）——我在同一处换了个形态重犯。
+		//
+		// # 根因是轴混用
+		//
+		//   - 轴 A「窗口容量」：模型物理上能装多少（MaxContextTokens）。
+		//     装不下就是装不下，与"愿不愿意花钱"无关。
+		//   - 轴 B「预算成本」：愿意为本次 Run 花多少（max_total）。是主动约束。
+		//
+		// 压缩解决的是轴 A 的问题，却继承了轴 B 的开关。现在按轴 A 独立判断：
+		// 只看 used 是否达到窗口的 80%，与 max_total 彻底解耦。
+		//
+		// # 为什么顺带限制单 Run 压缩次数
+		//
+		// 压缩触发后若历史仍偏长，下一步可能再次触发。每触发一次就是一次
+		// 额外模型调用，长任务会变成"每步一次摘要"。因此按 Run 设上限。
+		if e.deps.Compactor != nil && compactionsThisRun < maxCompactionsPerRun &&
+			e.deps.Compactor.NeedsCompaction(res.Breakdown.Total, e.deps.MaxContextTokens) {
+			compactionsThisRun++
+			if newHistory, used := e.tryCompact(ctx, sdb, req, res, history); used {
+				// 压缩成功：用重建后的历史重新组装一次。
+				// 只重建一次——若压缩后仍超窗，那就是真的装不下了，
+				// 交给上游 provider 报错（此时已无更强的本地手段）。
+				history = newHistory
+				res = e.deps.Builder.Build(prompt.Input{
+					Model:          req.ModelRef,
+					SystemBase:     req.SystemBase,
+					SOP:            req.SOP,
+					ProjectSummary: req.ProjectSummary,
+					History:        history,
+					Tools:          req.Tools,
+					ActiveTools:    req.ActiveTools,
+					MemoryCore:     req.MemoryCore,
+					MemoryTail:     req.MemoryTail,
+					DynamicTail:    dynamicTail,
+					UserInput:      userInput,
+				})
+			}
+		}
+		// 预算法失败必须留在压缩**之后**：压缩能救回来的场景不该直接判死。
 		if res.OverBudget {
 			return model.RunFailed, "", "budget_exhausted",
 				"上下文超出总预算，五级降级用尽后仍超限（严禁静默截断）", tokens
@@ -497,9 +626,29 @@ func (e *Engine) loop(ctx context.Context, sdb SessionDB, req RunRequest, usage 
 			toolMsg, cancelled := e.execTool(ctx, sdb, req, tc)
 			toolMsg.RunID = req.RunID
 			toolMsg.CreatedAt = e.deps.Now()
+
+			// 终态不可变（单一断言点之二，**最关键的一处**）：
+			// 工具执行可能耗时数十秒。期间用户点停止，Run 会被别处迁移到
+			// cancelled 终态；而工具结果此刻才返回。若此处不校验就落库，
+			// 就会出现事故现场：runs.ended_at=…266409 已 cancelled，
+			// messages 却在 …320130 又长出两条。
+			//
+			// 处理策略（三者必须同时成立）：
+			//   - tool_events 仍由 execTool 内部写完（审计不丢，前端卡片能收口）；
+			//   - 本轮结果**不**写 messages（不污染模型上下文与后续重放）；
+			//   - 立即以 cancelled 收口，不再进入下一轮。
+			if !e.assertMutable(ctx, sdb, req.RunID) {
+				return model.RunCancelled, "run_terminal_during_tool", "", "", tokens
+			}
 			// tool 消息同样落库（消息最终内容以 DB 为准）
 			if err := sdb.AppendMessage(dbctx(ctx), toolMsg); err != nil {
 				return model.RunFailed, "", "persist_failed", err.Error(), tokens
+			}
+			// 摘要口径单一真源：tool 消息同样推进 last_message_at。
+			// 此前只在 assistant 消息处 Touch，导致 sessions.last_message_at
+			// 停在 assistant（事故会话：停在 seq106）而 updated_at 已到 seq108。
+			if e.deps.Summary != nil {
+				_ = e.deps.Summary.TouchMessage(ctx, req.SessionID, e.deps.Now())
 			}
 			history = append(history, toLLMMessage(toolMsg))
 			if cancelled {
@@ -951,6 +1100,62 @@ func (e *Engine) execTool(ctx context.Context, sdb SessionDB, req RunRequest, tc
 		payload = result.Error
 	}
 	return toolMessage(tc, payload), false
+}
+
+// tryCompact 尝试执行一次上下文压缩。
+//
+// 返回 (新历史, 是否真的压缩成功)。失败一律返回 (nil, false)，
+// 调用方继续走原有的 budget_exhausted 路径 —— 压缩绝不能把
+// 「超预算」这个明确失败变成「压缩失败导致的未知状态」。
+//
+// # 为什么这里要把 messages 全量加载
+//
+// 压缩决策需要「轮次边界」（最后一条 user 在哪里），这只能从完整消息序列判断。
+// 引擎的 history 是 llm.Message（已丢失 seq 与 hidden），不足以做边界判断。
+func (e *Engine) tryCompact(
+	ctx context.Context, sdb SessionDB, req RunRequest, built prompt.BuildResult, history []llm.Message,
+) ([]llm.Message, bool) {
+	// 入口守卫：压缩是可选能力，未装配时必须安全短路。
+	// 调用点虽有判定，但把守卫放在函数内部才能真正防住"新增调用点忘记判断"。
+	if e.deps.Compactor == nil {
+		return nil, false
+	}
+	cctx, cancel := detachedCtx(ctx)
+	defer cancel()
+
+	msgs, err := sdb.ListMessages(cctx, 0, 1000)
+	if err != nil {
+		return nil, false
+	}
+	res, err := e.deps.Compactor.Compact(cctx, CompactRequest{
+		SessionID: req.SessionID,
+		ModelRef:  req.ModelRef,
+		Used:      built.Breakdown.Total,
+		Limit:     e.deps.MaxContextTokens,
+		Messages:  msgs,
+		Running:   true, // 本 Run 正在执行：必须保护当前轮次
+	})
+	if err != nil || !res.Compacted {
+		return nil, false
+	}
+	// 压缩成功：重建历史（已压缩区间由摘要替代）。
+	newHistory, err := e.deps.Compactor.History(cctx, req.SessionID, msgs)
+	if err != nil {
+		return nil, false
+	}
+	// 让压缩对用户与前端**可见**：否则用户只看到"突然变快了"，
+	// 而模型却"忘掉了"部分历史，排障时无从下手。
+	e.publish(req.RunID, events.TypeError, map[string]any{
+		"scope":             "compaction",
+		"code":              "agent.context_compacted",
+		"message":           fmt.Sprintf("上下文已达水位，已将第 %d–%d 条消息（%d 条）折叠为摘要，估算节省 %d tokens",
+			res.StartSeq, res.EndSeq, res.ReplacedMessages, res.SavedTokens),
+		"start_seq":         res.StartSeq,
+		"end_seq":           res.EndSeq,
+		"replaced_messages": res.ReplacedMessages,
+		"saved_tokens":      res.SavedTokens,
+	})
+	return newHistory, true
 }
 
 // stepNotice 生成步数进度提示文本（走 prompt.Input.DynamicTail 通道）。

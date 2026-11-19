@@ -48,6 +48,73 @@ type SummaryWriter interface {
 	AddTokensAndStatus(ctx context.Context, sessionID string, tokens int64, status model.RunStatus) error
 }
 
+// ============ 上下文压缩端口（可为 nil） ============
+
+// CompactRequest 一次压缩请求。
+type CompactRequest struct {
+	SessionID string
+	// ModelRef 会话绑定的模型引用。
+	//
+	// 为什么由引擎传入而不是实现自行反查：引擎在 req.ModelRef 里已经持有它，
+	// 反查需要额外访问主库并可能落在错误的事务边界上。传入更简单也更准确。
+	ModelRef string
+	// Used 当前上下文已占用的估算 token。
+	Used int
+	// Limit 模型上下文窗口上限（<=0 表示未知，此时实现应跳过）。
+	Limit int
+	// Messages 会话全量消息（按 seq 升序，含 hidden 标记）。
+	Messages []model.Message
+	// Running 本 Run 是否仍在执行：true 时实现必须保护当前活跃轮次，
+	// 不得把用户最新一次请求及其后续工具调用折叠进摘要。
+	Running bool
+}
+
+// CompactResult 压缩结果。
+type CompactResult struct {
+	// Compacted 是否真的完成了一次压缩（写入了持久化摘要）。
+	Compacted bool
+	// StartSeq / EndSeq 本次折叠的区间（Compacted 时有效）。
+	StartSeq int64
+	EndSeq   int64
+	// ReplacedMessages 被折叠的消息条数。
+	ReplacedMessages int
+	// SavedTokens 估算节省的 token（0 或负值表示无收益）。
+	SavedTokens int
+	// Summary 摘要正文（供事件与排障展示）。
+	Summary string
+}
+
+// Compactor 上下文压缩端口。
+//
+// # 契约（实现方必须遵守）
+//
+//  1. **永不返回致命错误**：压缩是优化项。方法返回 error 时，引擎会记录并
+//     继续用原历史执行，绝不会因压缩失败而让 Run 失败。
+//  2. **不得修改入参**：Messages 是引擎正在使用的切片，实现必须只读。
+//  3. **保护活跃轮次**：Running=true 时绝不能折叠最后一条 user 消息及其
+//     后续工具调用——那等于让模型对当前任务失忆。
+//  4. **幂等**：重复调用不得产生重叠的压缩区间；已压缩部分应跳过。
+type Compactor interface {
+	// NeedsCompaction 判断当前水位是否需要压缩（**必须无 IO**）。
+	//
+	// # 为什么单独暴露这个方法，而不是让引擎直接调 Compact
+	//
+	// 引擎每步都会问一次「现在要不要压缩」。若直接调 Compact，实现内部
+	// 虽会先算水位再早退，但引擎侧为了构造 Messages 参数必须先
+	// ListMessages（最多 1000 条）——那就是**每一步一次全表读**。
+	// 因此把「判断」与「执行」拆开：判断是纯算术，执行才碰存储与模型。
+	//
+	// 契约：limit <= 0（窗口未知）时必须返回 false。
+	NeedsCompaction(used, limit int) bool
+
+	Compact(ctx context.Context, req CompactRequest) (CompactResult, error)
+	// History 返回叠加压缩摘要后的历史（模型实际看到的内容）。
+	//
+	// 这是读取侧的唯一入口：只要经过它，"已压缩区间被摘要替代"这条语义
+	// 就自动生效，调用点无需各自处理。
+	History(ctx context.Context, sessionID string, msgs []model.Message) ([]llm.Message, error)
+}
+
 // ============ 审计日志端口（可为 nil） ============
 //
 // 这里用「窄结构 + 窄接口」而不是直接依赖 logvault 包：

@@ -472,7 +472,9 @@ function MessageItem({ msg, actions, runPhase, turnStartedAt }: {
       )}
 
       {msg.content && (
-        <div className="text-[14px] leading-relaxed text-ink">
+        // leading 走 1.7 与 .md 段统一（原 leading-relaxed=1.625 与正文 1.7 不一致，
+        // 会让流式光标所在行与正文行距错位）
+        <div className="text-[14px] leading-[1.7] text-ink">
           <MarkdownLite text={msg.content} />
           {msg.streaming && <span className="inline-block w-1.5 h-3.5 bg-accent align-text-bottom ml-1 rounded-sm animate-pulse" />}
         </div>

@@ -382,6 +382,15 @@ func run() error {
 	// 审批规则合并器（会话级「本会话允许」+ 项目级声明规则）：合并/去重/降级策略唯一实现，
 	// 引擎只消费结果，不感知「项目」概念。失败一律降级为更保守的逐次审批，绝不阻断 Run。
 	approvalPolicy := service.NewApprovalPolicy(mainStore, sessionStore)
+	// 上下文压缩（compaction）：把「降级用尽 → budget_exhausted 失败」这条死路
+	// 变成「折叠已完成轮次 → 继续跑」的活路。
+	//
+	// 装配要点：
+	//   - 存储用会话级 Compactions()（每个会话独立库，天然隔离）；
+	//   - 摘要器复用当前 provider（MVP 阶段先要正确机制，后续换便宜模型只需
+	//     替换 compact.Options.Summarizer，调用点不变）；
+	//   - 未启用或窗口未知时不装配 Compactor（引擎自动退回旧行为）。
+	compactor := buildCompactor(cfg, sessionStore, modelResolver)
 	engine, err := agent.New(agent.Deps{
 		Sessions:      service.NewSessionProvider(sessionStore),
 		Summary:       service.NewSummaryWriter(mainStore),
@@ -397,6 +406,9 @@ func run() error {
 		MaxSteps:      cfg.Agent.MaxSteps,
 		// 每 N 步向模型注入「当前步数 X/总步数 N」进度提示（0 = 关闭）。
 		StepNoticeEvery: cfg.Agent.StepNoticeEvery,
+		// 上下文压缩（nil = 未启用，行为与改造前一致）。
+		Compactor:        compactor,
+		MaxContextTokens: cfg.Compaction.MaxContextTokens,
 		// 访问模式切换即时生效（对齐桌面端）：每次审批决策前实时重读会话行；
 		// 读取失败回落 Run 启动快照（引擎内空值回落 confirm，与 normalizeAccessMode 同口径）。
 		AccessModeProvider: func(ctx context.Context, sessionID string) (approval.AccessMode, error) {

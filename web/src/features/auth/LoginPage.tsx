@@ -43,9 +43,12 @@ export function LoginPage() {
   }
 
   return (
-    <div className="min-h-dvh w-full bg-bg text-ink flex flex-col justify-between p-4 sm:p-6 select-none">
+    // 【外层滚动条治理】h-full + overflow-y-auto：文档级已 overflow:hidden，
+    // 登录卡片在矮视口（如 640x360 横屏手机）必须由本页自身承担纵向滚动，
+    // 否则内容会被裁掉且用户无法滚动到「进入工作台」按钮。
+    <div className="h-full w-full overflow-y-auto bg-bg text-ink flex flex-col justify-between p-4 sm:p-6 select-none">
       {/* 顶栏微型工具条：主题切换 */}
-      <header className="w-full max-w-[420px] mx-auto flex items-center justify-end">
+      <header className="w-full max-w-[420px] mx-auto flex items-center justify-end shrink-0">
         <button
           type="button"
           onClick={toggleTheme}

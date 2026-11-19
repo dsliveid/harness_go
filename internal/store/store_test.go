@@ -112,8 +112,8 @@ func TestSessionDBCreatedLazily(t *testing.T) {
 	).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
-	if n != 12 {
-		t.Fatalf("会话库表数量期望 12，得到 %d", n)
+	if n != 13 {
+		t.Fatalf("会话库表数量期望 13，得到 %d", n)
 	}
 
 	// 多端预埋字段必须存在

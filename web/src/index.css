@@ -80,7 +80,19 @@ html.light {
 }
 
 * { box-sizing: border-box; }
-html, body, #root { height: 100%; }
+/* ==================== 视口高度：单一真源（2026-11 外层滚动条治理） ====================
+   【历史坑】原先 html/body/#root 用 height:100%，而 .app-shell 用 height:100dvh —— 两套高度源。
+   只要视口可用高度被"吃掉"一点点（典型：某断点下横向溢出多出 6px 高的横向滚动条，
+   实测 768px 平板顶栏溢出 45px 即触发），100dvh 就会比 100% 链高出那 6px，
+   于是 body.scrollHeight > clientHeight → **页面最外层凭空长出竖向滚动条**。
+   【定稿】html 以 100dvh 作唯一真源（随移动端工具栏伸缩动态变化），
+   body / #root / .app-shell 全部走 100% 链承接，再用 overflow:hidden 彻底封住文档级滚动：
+   滚动能力一律下沉到内部容器（侧栏列表 / 消息虚拟列表 / 侧面板 / 弹窗 / 登录页自身）。 */
+html { height: 100dvh; }
+/* ⚠️ 必须是 body, #root —— 不能写成 `html, body, #root`：
+   同特异性下后者会盖掉上面的 html 100dvh，把真源又退化回 100%（本条正是旧版回归的原因）。 */
+body, #root { height: 100%; }
+html, body { overflow: hidden; }
 body {
   margin: 0;
   background: var(--bg);
@@ -133,8 +145,11 @@ textarea, input, textarea:focus, textarea:focus-visible, input:focus, input:focu
   border-bottom-color: inherit;
 }
 
-/* 移动端安全区 + 动态视口 */
-.app-shell { height: 100dvh; padding-bottom: env(safe-area-inset-bottom); }
+/* 移动端安全区 + 动态视口
+   .app-shell 用 100%（承接 #root 的 100% → html 的 100dvh 单一真源），不再写 100dvh：
+   两处各写一份 dvh 会在「横向滚动条吃掉 6px」时与 100% 链错位，直接长出页面级滚动条。
+   padding-bottom 走安全区：height:100% + border-box 已把内边距算在内，不会额外撑高。 */
+.app-shell { height: 100%; padding-bottom: env(safe-area-inset-bottom); }
 /* 输入控件字号统一走组件自身的 text-[13px]（inputCls），移动端不再强制放大到 16px。
    旧规则 `@media (pointer: coarse) { input, textarea { font-size:16px !important } }`
    （原为 iOS 聚焦防缩放）会让设置弹窗里「厂商名称 / Base URL / API Key」等文本框内文字
@@ -153,58 +168,124 @@ textarea, input, textarea:focus, textarea:focus-visible, input:focus, input:focu
   box-shadow: none;
 }
 
-/* Markdown 原型渲染增强 */
+/* ==================== Markdown 渲染样式（间距/字号/行高的唯一真源） ====================
+   约定：MarkdownLite.tsx 里不要再写 my-XXX / text-[13px] 之类的间距与字号工具类。
+   本段用 margin 简写（特异性 0,1,1）会整体覆盖 Tailwind 的 my-XXX（0,1,0），
+   两套并存只会造成「改了 tsx 却没效果」的假象，历史上正是排版杂乱的根源之一。
+   —— 间距令牌：段落下 8px / 列表上下 6~8px / 代码块与表格 12px / 标题上 12~18px 下 6~8px。 */
 .md {
   color: var(--ink);
+  /* 字号 **继承使用方的容器**，不写死 px：
+     - 主对话（MessageList）容器是 text-[14px]，过程抽屉（ProcessDrawer）是 text-[13px]，
+       写死 14px 会把抽屉里的 Markdown 悄悄放大 1px（回归）。
+     - 契约：调用 MarkdownLite 的容器必须自己声明字号（当前两处均满足）。 */
+  font-size: inherit;
+  line-height: 1.7;
+}
+/* 行宽策略：**不做固定 ch 约束，随容器/页面宽度自适应铺满**。
+   历史教训：曾写 `max-width: 72ch` 想把行宽收到「舒适阅读区」，但
+   `ch` 是数字 "0" 的宽度（14px 字体下约 7.5px），72ch ≈ 540px ——
+   而对话容器宽 860px，于是正文永远只占左边 2/3，右侧留下 300px 空白，
+   表现为「没占满宽度就换行」，且与窗口缩放、代码块/表格的全宽渲染不协调。
+   若要限制行宽，正确做法是约束**容器**（MessageList 的 max-w-[860px] 已负责），
+   而不是在块级元素上再套一层 ch 长度——两层约束叠加必然出现右侧空洞。 */
+.md > p, .md > ul, .md > ol, .md > blockquote, .md > h1, .md > h2, .md > h3, .md > h4 {
+  max-width: none;
 }
 .md p {
-  margin: 0 0 10px;
-  line-height: 1.7;
-}
-.md p:last-child {
-  margin-bottom: 0;
+  margin: 0 0 8px;
 }
 .md ul, .md ol {
-  margin: 6px 0 10px;
+  margin: 6px 0 8px;
   padding-left: 20px;
-  line-height: 1.7;
+}
+/* 必须显式补 list-style：Tailwind Preflight 把 ol/ul 重置为 list-style:none，
+   历史上靠 tsx 里的 list-disc 工具类撑着；本次样式回收进 CSS 后必须自己声明，
+   否则改成「列表不显示圆点/序号」的严重回归。 */
+.md ul {
+  list-style: disc;
+}
+.md ol {
+  list-style: decimal;
+}
+.md li::marker {
+  color: var(--inkfaint);
 }
 .md li {
+  margin-bottom: 3px;
+}
+.md li > p {
   margin-bottom: 4px;
 }
+/* 行内代码：中性墨色 + 对称底色。
+   background 用 rgba(var(--ink-rgb), .08) —— 深色主题下墨色为浅白、底色自然变浅，
+   浅色主题下墨色为纯黑、底色自然变浅灰，一套值双主题自适应，不必维护两份变量。
+   此处**不用 --accent**：蓝色专属可交互元素（按钮/焦点环/路径胶囊 hover），
+   正文里满屏 12px 蓝色等宽字正是「晃眼睛」的直接原因。 */
 .md code {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 12px;
-  background: var(--panel2);
-  border: 1px solid var(--edge);
-  padding: 1.5px 6px;
-  border-radius: 5px;
-  color: var(--accent);
+  /* 相对字号（0.9em）：主对话 14px → 12.6px，过程抽屉 13px → 11.7px，随容器自适应。
+     写死 12.5px 会让抽屉里的行内代码显得比正文还抢眼。 */
+  font-size: 0.9em;
+  background: rgba(var(--ink-rgb), 0.08);
+  padding: 1px 5px;
+  border-radius: 4px;
+  color: var(--ink);
+  vertical-align: 0.5px; /* 等宽字字面偏小，微调与正文基线对齐 */
 }
+/* 关键复位：上面的 .md code 是后代选择器，会连带命中 CodeBlock 的 pre > code，
+   导致代码块正文被套上行内底色/内边距/圆角（历史 bug）。必须显式归零。 */
+.md pre code {
+  background: none;
+  padding: 0;
+  border-radius: 0;
+  font-size: inherit;
+  color: inherit;
+  vertical-align: baseline;
+}
+/* 代码块外层是 CodeBlock 的 div（自带 my-2 = 8px 外边距与 border），此处若再给 pre
+   加外边距，会在标题栏下方与容器底部各撑出一段空洞 —— 故归零，间距交给外层 div。 */
 .md pre {
-  margin: 10px 0;
+  margin: 0;
 }
 .md blockquote {
   margin: 10px 0;
   padding: 8px 12px;
-  border-left: 3px solid var(--accent);
+  border-left: 3px solid var(--edge2);
   color: var(--inkdim);
   background: var(--panel2);
   border-radius: 0 8px 8px 0;
   font-size: 13px;
+  line-height: 1.65;
 }
 .md h1, .md h2, .md h3, .md h4 {
   color: var(--ink);
   font-weight: 600;
   letter-spacing: -0.015em;
+  line-height: 1.4;
+}
+.md h1 {
+  font-size: 17px;
+  margin: 18px 0 8px;
 }
 .md h2 {
-  font-size: 15px;
+  font-size: 15.5px;
   margin: 16px 0 8px;
 }
 .md h3 {
   font-size: 14px;
   margin: 14px 0 6px;
+}
+.md h4 {
+  font-size: 13.5px;
+  margin: 12px 0 6px;
+}
+/* 首尾块去掉外边距：气泡内不再出现顶部/底部空洞 */
+.md > :first-child {
+  margin-top: 0;
+}
+.md > :last-child {
+  margin-bottom: 0;
 }
 .md table {
   width: 100%;

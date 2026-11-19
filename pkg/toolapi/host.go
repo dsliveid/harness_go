@@ -109,7 +109,14 @@ type CommandResult struct {
 	ExitCode int    `json:"exit_code"`
 	Stdout   string `json:"stdout"`
 	Stderr   string `json:"stderr"`
-	TimedOut bool   `json:"timed_out,omitempty"`
+	// TimedOut 命令因超时被终止（超时是结果，不是执行器故障）。
+	TimedOut bool `json:"timed_out,omitempty"`
+	// Cancelled 命令因上层取消（用户停止 / 设备离线 / 请求断开）被终止。
+	//
+	// 必须与 TimedOut 分开：二者对模型的行为引导完全相反——
+	// 超时暗示「换个更快的做法或缩小范围」，取消暗示「用户不要这个结果了，
+	// 别再重试同样的命令」。混在一起会让模型反复重跑已被用户中止的操作。
+	Cancelled bool `json:"cancelled,omitempty"`
 }
 
 // CommandRunner 子进程执行（必须经审批闸门，危险命令需确认）。

@@ -134,6 +134,73 @@ func TestGlobCrossDirectory(t *testing.T) {
 	}
 }
 
+// TestGlobBraceAlternation 回归：{a,b} 必须真实展开。
+//
+// 事故背景（会话 9ee34e00 首轮）：模型传 **/*.{go,py,js,...}，旧实现用
+// filepath.Match 不认识花括号 → 命中 0 条 → 返回「无匹配文件」，
+// 模型据此误判「项目里没有代码文件」，白烧一轮并动摇后续判断。
+func TestGlobBraceAlternation(t *testing.T) {
+	h := plugintest.New(t)
+	_ = h.Seed("main.go", "package main\n")
+	_ = h.Seed("tool.py", "print('x')\n")
+	_ = h.Seed("cfg.json", "{}")
+	_ = h.Seed("note.md", "# n\n")
+
+	res, err := invokeGlob(t.Context(), h, call(t, `{"pattern":"**/*.{go,py,json}"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Fatalf("合法大括号模式不应报错: %q", res.Content)
+	}
+	c := contentOf(t, res)
+	for _, want := range []string{"main.go", "tool.py", "cfg.json"} {
+		if !strings.Contains(c, want) {
+			t.Errorf("大括号展开后应命中 %s，实际结果: %q", want, c)
+		}
+	}
+	if strings.Contains(c, "note.md") {
+		t.Errorf("不应命中 note.md: %q", c)
+	}
+}
+
+// TestGlobInvalidPatternIsError 回归：语法非法必须报错，绝不能伪装成「无匹配文件」。
+//
+// 这是与上面同等重要的契约——错误类型决定模型下一步行为：
+// 报错 → 模型换写法重试；「无匹配」→ 模型认定文件不存在，方向直接跑偏。
+func TestGlobInvalidPatternIsError(t *testing.T) {
+	h := plugintest.New(t)
+	_ = h.Seed("main.go", "package main\n")
+
+	res, err := invokeGlob(t.Context(), h, call(t, `{"pattern":"**/*.{go,py"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError {
+		t.Fatalf("花括号未闭合必须返回错误结果，实际: %q", res.Content)
+	}
+	if !strings.Contains(res.Content, "语法错误") {
+		t.Fatalf("错误文案应点明是语法问题，实际: %q", res.Content)
+	}
+}
+
+// TestGlobEmptyResultStillText 合法模式无命中仍是普通文本结果（不是错误）。
+func TestGlobEmptyResultStillText(t *testing.T) {
+	h := plugintest.New(t)
+	_ = h.Seed("main.go", "package main\n")
+
+	res, err := invokeGlob(t.Context(), h, call(t, `{"pattern":"**/*.rs"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError {
+		t.Fatalf("合法但无命中不应是错误，实际: %q", res.Content)
+	}
+	if !strings.Contains(contentOf(t, res), "无匹配文件") {
+		t.Fatalf("应提示无匹配文件，实际: %q", res.Content)
+	}
+}
+
 func TestGrepLiteralAndRegex(t *testing.T) {
 	h := plugintest.New(t)
 	_ = h.Seed("code.go", "func main() {}\n// TODO: fix\n")

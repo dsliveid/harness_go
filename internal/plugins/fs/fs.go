@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 
+	"harness-go/internal/globsyntax"
 	"harness-go/internal/pluginkit"
 	"harness-go/pkg/toolapi"
 )
@@ -233,7 +234,16 @@ func invokeEditFile(ctx context.Context, host toolapi.Host, call *toolapi.Call) 
 	return pluginkit.DataResult(content, map[string]any{"diff": d, "snapshots": snaps}), nil
 }
 
-// invokeGlob 模式匹配（支持 ** 跨目录）。
+// invokeGlob 模式匹配。
+//
+// 语义委托给 globsyntax 包（glob 是一门独立小语言，不归属任何具体工具）。
+//
+// 关键行为契约（此前踩过坑，务必保持）：
+//   - 模式**非法** → ErrorResult，并在文案里点明不支持的写法。
+//   - 模式合法但**无匹配** → TextResult「无匹配文件」。
+//
+// 二者的区别至关重要：旧实现用 filepath.Match 不认识 {a,b}，把「语法不支持」
+// 混成「文件不存在」返回，模型据此误判项目无代码（会话 9ee34e00 首轮即中招）。
 func invokeGlob(ctx context.Context, host toolapi.Host, call *toolapi.Call) (*toolapi.Result, error) {
 	var args struct {
 		Pattern string `json:"pattern"`
@@ -242,98 +252,87 @@ func invokeGlob(ctx context.Context, host toolapi.Host, call *toolapi.Call) (*to
 	if err := pluginkit.DecodeArgs(call.Args, &args); err != nil {
 		return pluginkit.ErrorResult("glob: %v", err), nil
 	}
-	if strings.TrimSpace(args.Pattern) == "" {
+	pattern := strings.TrimSpace(args.Pattern)
+	if pattern == "" {
 		return pluginkit.ErrorResult("glob: pattern 不能为空"), nil
 	}
 	limit := args.Limit
 	if limit <= 0 {
 		limit = defaultGlobLimit
 	}
+	// 编译期就把语法问题暴露出来，避免"跑到一半才发现"。
+	pat, err := globsyntax.Compile(pattern)
+	if err != nil {
+		return pluginkit.ErrorResult("glob: 模式语法错误: %v。"+
+			"支持的写法：* / ** / ? / {a,b} / [abc] / 反斜杠转义", err), nil
+	}
 	// glob 遍历的起点必须是**本次调用的生效根**：ctx 有会话根（用户选的项目目录）
 	// 就用它，否则回落进程根。用 Root() 会忽略会话根，导致"选了目录仍只扫启动目录"。
 	root := workspaceRootFor(ctx, host.Workspace())
-	matches, err := globWalk(root, filepath.ToSlash(strings.TrimSpace(args.Pattern)), limit+1)
-	if err != nil {
-		return pluginkit.ErrorResult("glob: 模式非法: %v", err), nil
-	}
+	matches := globWalk(root, pat, limit+1)
+
 	truncated := ""
 	if len(matches) > limit {
 		matches = matches[:limit]
 		truncated = fmt.Sprintf("\n…[超过 %d 条，已截断；请缩小模式范围]", limit)
 	}
 	if len(matches) == 0 {
-		return pluginkit.TextResult("无匹配文件（模式 %s）", args.Pattern), nil
+		return pluginkit.TextResult("无匹配文件（模式 %s）", pattern), nil
 	}
 	return pluginkit.TextResult("匹配 %d 个文件：\n%s%s", len(matches), strings.Join(matches, "\n"), truncated), nil
 }
 
-// globWalk 用 ** 语义遍历（标准库 filepath.Match 不支持 **，自行展开）。
-func globWalk(root, pattern string, limit int) ([]string, error) {
-	parts := strings.Split(pattern, "/")
+// globWalk 遍历 root，收集相对路径匹配 pat 的**文件**（不含目录）。
+//
+// 与旧实现的根本差异：不再逐段 filepath.Match，而是整条相对路径与编译后的
+// 正则一次性比对。这带来三个结构性好处：
+//  1. ** 与 {a,b} 天然正确，无需为每种语法写特例；
+//  2. 剪枝逻辑与匹配逻辑解耦，正确性可独立单测；
+//  3. 命中上限在遍历侧就能提前收敛（reachLimit），不必先收集再截断。
+func globWalk(root string, pat *globsyntax.Pattern, limit int) []string {
 	var matches []string
-	var walk func(dir, rel string, idx int) error
-	walk = func(dir, rel string, idx int) error {
-		if len(matches) >= limit {
+	reached := false
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, werr error) error {
+		if reached || werr != nil || d == nil {
 			return nil
 		}
-		if idx == len(parts) {
+		if d.IsDir() {
+			if skipGlobDir(d.Name()) {
+				return filepath.SkipDir
+			}
 			return nil
 		}
-		part := parts[idx]
-		last := idx == len(parts)-1
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			return nil // 目录不可读不致命
+		rel, rerr := filepath.Rel(root, path)
+		if rerr != nil {
+			return nil
 		}
-		for _, e := range entries {
-			name := e.Name()
-			if strings.HasPrefix(name, ".git") {
-				continue
-			}
-			childRel := name
-			if rel != "" {
-				childRel = rel + "/" + name
-			}
-			if part == "**" {
-				// ** 匹配零层或多层目录
-				if !last {
-					if err := walk(dir, rel, idx+1); err != nil {
-						return err
-					}
-				}
-				if e.IsDir() {
-					if err := walk(filepath.Join(dir, name), childRel, idx); err != nil {
-						return err
-					}
-				}
-				continue
-			}
-			ok, err := filepath.Match(part, name)
-			if err != nil {
-				return err
-			}
-			if !ok {
-				continue
-			}
-			if last {
-				if !e.IsDir() {
-					matches = append(matches, childRel)
-				}
-				continue
-			}
-			if e.IsDir() {
-				if err := walk(filepath.Join(dir, name), childRel, idx+1); err != nil {
-					return err
-				}
+		if pat.Match(filepath.ToSlash(rel)) {
+			matches = append(matches, filepath.ToSlash(rel))
+			if len(matches) >= limit {
+				reached = true
+				return filepath.SkipAll
 			}
 		}
 		return nil
-	}
-	if err := walk(root, "", 0); err != nil {
-		return nil, err
-	}
+	})
 	sort.Strings(matches)
-	return matches, nil
+	return matches
+}
+
+// skipGlobDir 判断目录是否应在 glob 遍历时剪枝。
+//
+// .git* 必须跳过（元数据不是用户代码，且体量巨大）；
+// node_modules / target / dist 等构建产物目录同样跳过——这与 grep 侧
+// 的跳过策略保持同一口径，避免两处规则漂移。
+func skipGlobDir(name string) bool {
+	if strings.HasPrefix(name, ".git") {
+		return true
+	}
+	switch name {
+	case "node_modules", "vendor", "target", "dist", "build":
+		return true
+	}
+	return false
 }
 
 // invokeGrep 全文检索。

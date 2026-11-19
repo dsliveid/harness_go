@@ -166,6 +166,25 @@ type BudgetConfig struct {
 	HistoryRatio float64 `yaml:"history_ratio"` // 历史段占比上限 (0,1]，默认 0.6
 }
 
+// CompactionConfig 上下文压缩参数。
+//
+// 与 BudgetConfig 的分工（刻意分成两段）：
+//   - Budget 是**硬边界**：超了就降级，降级用尽就明确失败（budget_exhausted）；
+//   - Compaction 是**软续航**：在还有空间时把已完成轮次折叠成摘要，让长会话
+//     能继续跑下去。
+//
+// 二者触发条件与失败语义都不同，合并成一段会导致「调预算意外改了压缩行为」。
+//
+// ⚠️ MaxContextTokens 必须给真实值。填 0 表示"窗口未知"，压缩会被整体跳过，
+// 这会让整套机制退化成「存在但不生效」——正是本次长会话 111 万 token 的
+// 制度性根因（budget.max_total 默认 0 让五级降级从不触发，第五级又无消费者）。
+type CompactionConfig struct {
+	// MaxContextTokens 模型上下文窗口上限（token）。压缩水位取它的 80%。
+	MaxContextTokens int `yaml:"max_context_tokens"`
+	// Enabled 是否启用压缩。默认 true。
+	Enabled bool `yaml:"enabled"`
+}
+
 // SOPConfig 核心 SOP（agent-core）参数。
 //
 // 语义澄清：这里的 SOP **不是**项目级 .harness/sop/*.md 那些条目，而是
@@ -322,6 +341,7 @@ type Config struct {
 	Devices    DevicesConfig    `yaml:"devices"`
 	Agent      AgentConfig      `yaml:"agent"`
 	Budget     BudgetConfig     `yaml:"budget"`
+	Compaction CompactionConfig `yaml:"compaction"`
 	SOP        SOPConfig        `yaml:"sop"`
 	MCP        MCPConfig        `yaml:"mcp"`
 	Market     MarketConfig     `yaml:"market"`
@@ -385,6 +405,12 @@ func Default() Config {
 		Budget: BudgetConfig{
 			MaxTotal:     0,   // 默认不限预算（闸门直通）；配置后超限走五级降级
 			HistoryRatio: 0.6, // 历史段占比上限，仅 MaxTotal>0 时生效
+		},
+		Compaction: CompactionConfig{
+			// 65536：覆盖主流长上下文模型（DeepSeek/Claude 等）的保守下限。
+			// 刻意**不设 0**——0 会让压缩整体跳过，重演「机制存在但不生效」。
+			MaxContextTokens: 65536,
+			Enabled:          true,
 		},
 		SOP: SOPConfig{
 			// 800：出厂内容约 90 token，留足余量供用户在界面逐步调教细化规则。
@@ -731,6 +757,16 @@ func (c *Config) Validate() error {
 	}
 	if c.Budget.HistoryRatio <= 0 || c.Budget.HistoryRatio > 1 {
 		return fmt.Errorf("config: budget.history_ratio 必须在 (0,1] 区间，得到 %v", c.Budget.HistoryRatio)
+	}
+	// 上下文压缩：负窗口无意义；启用状态下窗口为 0 等于"机制存在但不生效"
+	// —— 这正是历史事故（111 万 token 会话）的制度性根因，必须显式拒绝，
+	// 而不是默默降级成"能跑但不压缩"。
+	if c.Compaction.MaxContextTokens < 0 {
+		return errors.New("config: compaction.max_context_tokens 不能为负")
+	}
+	if c.Compaction.Enabled && c.Compaction.MaxContextTokens == 0 {
+		return errors.New("config: compaction 已启用但 max_context_tokens 为 0（窗口未知会导致压缩永不生效）；" +
+			"请填模型真实窗口，或设 compaction.enabled: false 明确关闭")
 	}
 	switch strings.ToLower(c.Log.Level) {
 	case "debug", "info", "warn", "error":

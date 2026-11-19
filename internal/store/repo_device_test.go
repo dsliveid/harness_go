@@ -119,16 +119,16 @@ func TestSessionApprovalAuditMigration(t *testing.T) {
 	).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
-	if n != 12 {
-		t.Fatalf("会话库表数量期望 12，得到 %d", n)
+	if n != 13 {
+		t.Fatalf("会话库表数量期望 13，得到 %d", n)
 	}
 
 	v, err := SchemaVersion(ctx, sdb.conn())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if v != 4 {
-		t.Fatalf("会话库 schema 版本期望 4，得到 %d", v)
+	if v != 5 {
+		t.Fatalf("会话库 schema 版本期望 5，得到 %d", v)
 	}
 }
 
@@ -667,7 +667,7 @@ func TestMigrationUpgradeFromV1(t *testing.T) {
 		 VALUES('ap-1','r-1','te-1','{}','allow_once',1)`); err != nil {
 		t.Fatal(err)
 	}
-	if applied, err := applyMigrations(ctx, sdb, "session"); err != nil || applied != 3 {
+	if applied, err := applyMigrations(ctx, sdb, "session"); err != nil || applied != 4 {
 		t.Fatalf("会话库增量迁移失败: applied=%d err=%v", applied, err)
 	}
 	// 旧审批行保留，新列默认 NULL
