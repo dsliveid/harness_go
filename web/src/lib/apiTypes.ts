@@ -734,7 +734,15 @@ export const API_PATHS = {
    * openapi.yaml / router.go 保持三方一致（契约自检要求）。
    */
   deviceUnpair: '/api/v1/devices/unpair',
-  /** 设备状态实时推送（SSE）：首帧 snapshot + 增量上下线 + device.revoked；**不续传** */
+  /**
+   * 设备状态实时推送（SSE）：首帧 snapshot + 增量上下线 + device.revoked；**不续传**。
+   *
+   * ⚠️ **Web 前端不订阅本流**（原本的 `lib/deviceEvents.ts` + `deviceStore.startLive`
+   * 因零 UI 消费点已整段删除）。此条目**必须保留**：`contract_test.go` 的
+   * `TestContractPathsNoDrift` 要求本文件与 `api/openapi.yaml` 双向一一对应，
+   * 而该端点仍在 router/openapi 中真实注册（与 `deviceUnpair` 同口径：仅为三方一致登记）。
+   * 未来任何端要接设备实时态，服务端端点仍可用。
+   */
   deviceEvents: '/api/v1/devices/events',
   /**
    * 会话列表实时推送（SSE）：首帧 snapshot（全量会话）+ 增量 session.updated /
