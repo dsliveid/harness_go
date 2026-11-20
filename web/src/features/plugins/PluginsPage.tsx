@@ -109,9 +109,19 @@ function InstallAction({ itemKey, platforms, client, disabled, note }: {
 }) {
   const { installOnClient, uninstallOnClient } = usePlugins()
   const toast = useUI((s) => s.toast)
+  const [busy, setBusy] = useState(false)
   const installed = client.installed.includes(itemKey)
-  const installing = client.installing.includes(itemKey)
+  const installing = busy || client.installing.includes(itemKey)
   const compatible = supportsClient(platforms, client.os)
+
+  // 真实端点（PUT /devices/{did}/plugins）：先发请求、按结果提示，绝不先报「已安装」。
+  const run = (fn: () => Promise<void>, ok: string, label: string) => {
+    setBusy(true)
+    fn()
+      .then(() => toast('success', ok))
+      .catch((e: unknown) => toast('error', `${label}失败：${e instanceof Error ? e.message : String(e)}`))
+      .finally(() => setBusy(false))
+  }
 
   // 服务端节点：技能 / 拓展 / 市场制品都**没有**服务端安装端点（服务端能力来自
   // 编译期内置工具 + settings 里的 MCP Server + 本地 zip 工具包），
@@ -141,10 +151,8 @@ function InstallAction({ itemKey, platforms, client, disabled, note }: {
         variant="ghost"
         className="text-inkdim hover:text-err"
         title={`从 ${client.name} 卸载`}
-        onClick={() => {
-          uninstallOnClient(itemKey)
-          toast('info', `已从 ${client.name} 卸载 ${itemKey}`)
-        }}
+        disabled={busy}
+        onClick={() => run(() => uninstallOnClient(itemKey), `已从 ${client.name} 卸载 ${itemKey}`, '卸载')}
       >
         已安装 · 卸载
       </Button>
@@ -156,10 +164,7 @@ function InstallAction({ itemKey, platforms, client, disabled, note }: {
       variant="primary"
       disabled={installing}
       title={`在当前客户端（${client.name}）本地安装`}
-      onClick={() => {
-        installOnClient(itemKey)
-        toast('info', `正在安装到 ${client.name}（本端安装）`)
-      }}
+      onClick={() => run(() => installOnClient(itemKey), `${itemKey} 已安装到 ${client.name}`, '安装')}
     >
       {installing ? '安装中…' : '安装到此端'}
     </Button>
@@ -203,15 +208,24 @@ function resolveInstalled(client: DeviceNode, kinds: CapabilityKind[]): Installe
     if (key.startsWith(KEY_PREFIX.mcp)) {
       const name = key.slice(KEY_PREFIX.mcp.length)
       const m = mcpServers.find((x) => x.name === name)
-      if (m) entry = { key, kind: 'mcp', name, description: m.command ?? m.url ?? '', platforms: m.platforms }
+      // 客户端本机装的 MCP Server 不在服务端托管清单里（两条独立链路）：
+      // 查不到时**不得丢弃**，否则「已安装」页签会静默少条目（用户会以为装丢了）。
+      entry = m
+        ? { key, kind: 'mcp', name, description: m.command ?? m.url ?? '', platforms: m.platforms }
+        : { key, kind: 'mcp', name, description: `本端自行托管的 MCP Server（服务端无该条目）` }
     } else if (key.startsWith(KEY_PREFIX.skill)) {
       const name = key.slice(KEY_PREFIX.skill.length)
       const k = skills.find((x) => x.name === name)
-      if (k) entry = { key, kind: 'skill', name, description: k.description, platforms: k.platforms }
+      entry = k
+        ? { key, kind: 'skill', name, description: k.description, platforms: k.platforms }
+        : { key, kind: 'skill', name, description: '本端 .harness/skills/ 下的技能（服务端技能库可能为空）' }
     } else if (key.startsWith(KEY_PREFIX.ext)) {
       const name = key.slice(KEY_PREFIX.ext.length)
       const e = extensions.find((x) => x.name === name)
-      if (e) entry = { key, kind: 'ext', name, description: e.description, version: e.version }
+      // 拓展同理：服务端无该条目时保留占位，不静默丢弃
+      entry = e
+        ? { key, kind: 'ext', name, description: e.description, version: e.version }
+        : { key, kind: 'ext', name, description: '本端安装的拓展（服务端无该条目）' }
     } else if (key.startsWith(KEY_PREFIX.pkg)) {
       // 服务端本地工具包（服务端节点专属）：id 来自 GET /api/v1/packages
       const id = key.slice(KEY_PREFIX.pkg.length)
@@ -265,7 +279,10 @@ function InstalledPane({ client, kinds, hint }: { client: DeviceNode; kinds: Cap
         .catch((e: unknown) => toast('error', `卸载失败：${e instanceof Error ? e.message : String(e)}`))
       return
     }
+    // 客户端节点：真实端点（PUT /devices/{did}/plugins），失败必须明示
     usePlugins.getState().uninstallOnClient(i.key)
+      .then(() => toast('success', `已从 ${client.name} 卸载 ${i.name}`))
+      .catch((e: unknown) => toast('error', `卸载失败：${e instanceof Error ? e.message : String(e)}`))
   }
   const removable = (i: InstalledEntry) => !serverTarget || i.kind === 'pkg'
   return (
@@ -531,6 +548,7 @@ export function ToolsPane({ client }: { client: DeviceNode }) {
             ) : (
               <>
                 系统内置工具随程序发布，各端可<span className="text-inkdim">自行安装</span>到本机执行。当前端（{client.name}）可安装 {installableOfClient} / {toolList.length} 个；
+                已安装 {client.installed.length} 个，<span className="text-inkdim">安装态持久化在服务端</span>（刷新与换端都保持），未安装的卡片会明确标注「未安装」。
                 移动端不支持 shell 执行类工具，Windows 与 Linux 分别判定（如 bash 脚本、Chromium 依赖）。
               </>
             )}
@@ -1040,7 +1058,8 @@ function ExtensionCard({ e, client }: { e: ExtensionItem; client: DeviceNode }) 
                 variant="outline"
                 onClick={() => {
                   usePlugins.getState().installOnClient(key)
-                  toast('info', `正在安装「${e.name}」到 ${client.name}`)
+                    .then(() => toast('success', `已安装「${e.name}」到 ${client.name}`))
+                    .catch((err: unknown) => toast('error', `安装失败：${err instanceof Error ? err.message : String(err)}`))
                 }}
               >
                 安装到此端
@@ -1051,7 +1070,11 @@ function ExtensionCard({ e, client }: { e: ExtensionItem; client: DeviceNode }) 
                 size="sm"
                 variant="ghost"
                 className="text-inkdim hover:text-err"
-                onClick={() => { uninstallOnClient(key); toast('info', `已从 ${client.name} 卸载「${e.name}」`) }}
+                onClick={() => {
+                  uninstallOnClient(key)
+                    .then(() => toast('success', `已从 ${client.name} 卸载「${e.name}」`))
+                    .catch((err: unknown) => toast('error', `卸载失败：${err instanceof Error ? err.message : String(err)}`))
+                }}
               >
                 卸载
               </Button>

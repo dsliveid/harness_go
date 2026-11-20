@@ -20,6 +20,8 @@ import (
 //	GET    /api/v1/devices             设备列表（默认只含未吊销；?include_revoked=true 含审计）
 //	DELETE /api/v1/devices/{did}       吊销设备（令牌立即失效 + 断连）
 //	POST   /api/v1/devices/unpair      端侧自我解约（凭 device_token 吊销自己，免用户令牌）
+//	GET    /api/v1/devices/{did}/plugins   客户端插件安装清单（插件市场「已安装」真源）
+//	PUT    /api/v1/devices/{did}/plugins   全量替换客户端插件安装清单（安装/卸载落地）
 
 type createPairCodeReq struct {
 	Name string `json:"name"`
@@ -279,6 +281,54 @@ func (h *handlers) revokeDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// setDevicePluginsReq 客户端插件安装清单全量替换入参。
+//
+// keys 是**前端裸 key**（tool:<name> / mcp:<server> / skill:<name>），
+// 服务端统一补 `plugin:` 前缀落 capabilities 表；也容忍调用方自带前缀。
+type setDevicePluginsReq struct {
+	Keys []string `json:"keys"`
+}
+
+// listDevicePlugins 读取客户端插件安装清单：GET /api/v1/devices/{did}/plugins
+//
+// 为什么需要它：插件市场切到某个客户端时，「已安装」必须来自该端真实申报的清单，
+// 而不是前端内存态 —— 旧实现是 setTimeout 假安装，刷新即丢。
+func (h *handlers) listDevicePlugins(w http.ResponseWriter, r *http.Request) {
+	if h.d.Devices == nil {
+		writeError(w, r, apperr.New(apperr.CodeDeviceDisabled, "设备功能未配置"))
+		return
+	}
+	keys, err := h.d.Devices.PluginKeys(r.Context(), r.PathValue("did"))
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"keys": keys})
+}
+
+// setDevicePlugins 全量替换客户端插件安装清单：PUT /api/v1/devices/{did}/plugins
+//
+// 幂等语义：**整份清单覆盖**，不做增量。前端安装/卸载都是「算出新清单 → 整份 PUT」，
+// 这样断线重连、双端并发时最终一致，不需要服务端维护 diff 语义。
+// 响应回写服务端实际落库的裸 key 列表（前端以它为准，不做乐观推算）。
+func (h *handlers) setDevicePlugins(w http.ResponseWriter, r *http.Request) {
+	if h.d.Devices == nil {
+		writeError(w, r, apperr.New(apperr.CodeDeviceDisabled, "设备功能未配置"))
+		return
+	}
+	var req setDevicePluginsReq
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, r, err)
+		return
+	}
+	keys, err := h.d.Devices.SetPluginKeys(r.Context(), r.PathValue("did"), req.Keys)
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"keys": keys})
 }
 
 // getSessionLease 查询会话租约（C-6：写者归属 / epoch / 是否有效）。

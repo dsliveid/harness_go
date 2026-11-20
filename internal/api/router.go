@@ -222,6 +222,10 @@ func NewRouter(d Deps) http.Handler {
 	mux.HandleFunc("POST /api/v1/devices/pair", h.pairDevice)
 	mux.HandleFunc("GET /api/v1/devices", h.listDevices)
 	mux.HandleFunc("DELETE /api/v1/devices/{did}", h.revokeDevice)
+	// 客户端插件安装清单（插件市场「已安装」真源）：走用户令牌中间件，
+	// 因为安装动作由**用户**在 Web/桌面端管理界面发起，设备令牌只用于端侧自证。
+	mux.HandleFunc("GET /api/v1/devices/{did}/plugins", h.listDevicePlugins)
+	mux.HandleFunc("PUT /api/v1/devices/{did}/plugins", h.setDevicePlugins)
 	// 设备长连接（C-3 WS 网关）：设备令牌在升级前独立鉴权，不走用户令牌中间件
 	mux.HandleFunc("GET /api/v1/devices/ws", h.deviceWS)
 	// 设备自续用户会话：凭 device_token 换新 user_token（设备与账号持久绑定的续期入口）。

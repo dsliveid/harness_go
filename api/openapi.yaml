@@ -1845,6 +1845,83 @@ paths:
           $ref: "#/components/responses/NotFound"
         "503":
           $ref: "#/components/responses/DeviceUnavailable"
+  /api/v1/devices/{did}/plugins:
+    get:
+      tags: [devices]
+      summary: 客户端插件安装清单（插件市场「已安装」真源）
+      description: |
+        **需用户令牌**。返回该客户端真实申报的插件安装清单（裸 key，服务端已剥掉
+        `plugin:` 前缀），供 Web / 桌面端的插件市场渲染「已安装 / 未安装」态。
+
+        key 口径与前端 `web/src/stores/pluginStore.ts` 的 `KEY_PREFIX` 逐字对齐：
+        - `tool:<name>` 内置工具
+        - `mcp:<server>` MCP Server
+        - `skill:<name>` 技能
+
+        # 存储位置
+        复用 `capabilities` 表，以 `plugin:` 命名空间隔离 —— 与协议能力
+        （`workspace.list` / `fs.list` 等）**零交集**，不影响目录列举能力协商。
+      parameters:
+        - { name: did, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: 该端的插件安装清单
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  keys:
+                    type: array
+                    items: { type: string }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/DeviceUnavailable"
+    put:
+      tags: [devices]
+      summary: 全量替换客户端插件安装清单（安装 / 卸载的落地写入）
+      description: |
+        **需用户令牌**。整份清单覆盖（幂等，不做增量）—— 前端安装/卸载都是
+        「算出新清单 → 整份 PUT」，断线重连与双端并发下天然收敛到最终一致。
+
+        服务端行为：先读出该设备现有能力 → 剔除全部 `plugin:` 项 → 追加新清单 →
+        一次性全量写回。**协议能力原样保留**，绝不被本端点抹掉。
+
+        响应回写服务端实际落库的裸 key 列表，前端以它为准（不做乐观推算）。
+      parameters:
+        - { name: did, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [keys]
+              properties:
+                keys:
+                  type: array
+                  items: { type: string }
+                  description: 裸 key 列表（tool:<name> / mcp:<server> / skill:<name>）
+      responses:
+        "200":
+          description: 写入后的实际清单
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  keys:
+                    type: array
+                    items: { type: string }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/DeviceUnavailable"
   /api/v1/devices/ws:
     get:
       tags: [devices]

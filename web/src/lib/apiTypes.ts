@@ -701,6 +701,14 @@ export const API_PATHS = {
   /* 阶段 C：设备（配对 / 列表 / 长连接 / 吊销） */
   devices: '/api/v1/devices',
   device: (did: string) => `/api/v1/devices/${did}`,
+  /**
+   * 客户端插件安装清单（插件市场「已安装」真源）。
+   *
+   * GET 读 / PUT 全量替换（幂等，不做增量）：前端安装/卸载都是「算出新清单 → 整份 PUT」，
+   * 断线重连与双端并发下天然收敛。服务端复用 capabilities 表，以 `plugin:` 命名空间隔离，
+   * 与协议能力（workspace.list / fs.list）零交集。
+   */
+  devicePlugins: (did: string) => `/api/v1/devices/${did}/plugins`,
   devicePairCodes: '/api/v1/devices/pair-codes',
   devicePair: '/api/v1/devices/pair',
   /** C-3：端侧出站 WS（鉴权走 query `?token=`，浏览器端不持有设备令牌） */

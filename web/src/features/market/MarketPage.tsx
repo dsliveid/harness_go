@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Blocks, Wrench, Cpu, Sparkles, Boxes, Monitor, Smartphone, Wifi, WifiOff, Check, Server, Globe } from 'lucide-react'
 import { usePlugins } from '../../stores/pluginStore'
+import { useSessions } from '../../stores/sessionStore'
 import { useUI } from '../../stores/uiStore'
 import { Badge, Button, Modal, Tabs, cn } from '../../components/ui'
 import { ToolsPane, McpPane, SkillsPane, ExtensionsPane } from '../plugins/PluginsPage'
@@ -13,7 +14,8 @@ import type { DeviceNode } from '../../types'
 // 安装模型：按「管理目标」区分 —— 服务端 / 桌面端 / 移动端都是一等公民的管理目标。
 //   - 服务端自身：内置工具随程序发布（**只有启用/停用，不可安装/卸载**）；
 //     MCP / 技能 / 拓展与其他端一致（服务端本就是建连与安装宿主）。
-//   - 客户端（PC / 移动）：可安装/卸载到本机，服务端不下发能力。
+//   - 客户端（PC / 移动）：**内置工具可安装/卸载到本机**，安装态持久化在服务端
+//     （PUT /api/v1/devices/{did}/plugins），刷新与换端都保持；未安装的明确显示「未安装」。
 // 平台区分：PC 端分 Windows / Linux，另有移动端（iOS / Android），不兼容的能力直接禁用安装。
 // 【布局定稿】市场以覆盖式弹窗呈现，不再替换右侧主内容；弹窗高度固定，仅内部列表滚动。
 
@@ -113,9 +115,14 @@ export function MarketModal() {
     marketRegistry, marketLoading, loadMarketRegistry,
   } = usePlugins()
   const { pluginsOpen, setPlugins, toast } = useUI()
+  // 当前工作空间绑定的设备：插件市场要与「我正在哪个端上干活」对齐 ——
+  // 用户在桌面端工作空间里打开市场，第一眼就该是该桌面端的安装态，
+  // 而不是永远默认落在服务端（那正是「切到桌面端仍显示仅启停」的直接成因）。
+  const { workspaces, activeWorkspaceId } = useSessions()
   const [tab, setTab] = useState<MarketTab>('tool')
+  const activeDeviceId = workspaces.find((w) => w.id === activeWorkspaceId)?.deviceId
 
-  // 打开即拉取真值：服务端节点（含内置工具停用清单）与客户端节点都由此同步；
+  // 打开即拉取真值：服务端节点（含内置工具停用清单）与已配对客户端节点都由此同步；
   // 同时拉一次外部市场状态，让顶部说明条立刻显示「已配置 / 未配置 / 拉取失败」。
   useEffect(() => {
     if (pluginsOpen) {
@@ -123,6 +130,14 @@ export function MarketModal() {
       void loadMarketRegistry()
     }
   }, [pluginsOpen, loadRemoteCapabilities, loadMarketRegistry])
+
+  // 管理目标跟随当前工作空间：仅当用户尚未手动选择、或所选节点已消失时才自动定位。
+  // 手动选择优先（用户点了 chip 就要立刻生效，不能被这里覆盖）。
+  useEffect(() => {
+    if (!pluginsOpen || !activeDeviceId) return
+    if (currentClientId && devices.some((d) => d.id === currentClientId)) return
+    if (devices.some((d) => d.id === activeDeviceId)) setCurrentClient(activeDeviceId)
+  }, [pluginsOpen, activeDeviceId, currentClientId, devices, setCurrentClient])
 
   // 管理目标清单：服务端自身恒在首位（它永远存在且在线），其后是已配对的客户端。
   // 服务端不能被过滤掉：它承载内置工具（仅启停）且是 MCP / 工具包的真实安装宿主。

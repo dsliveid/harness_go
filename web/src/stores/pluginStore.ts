@@ -57,6 +57,61 @@ function buildServerNode(input: {
   }
 }
 
+/* ============ 已配对客户端 → UI 设备节点映射 ============ */
+
+/**
+ * 用服务端回写的**裸 key** 覆盖某客户端节点的 installed 清单。
+ *
+ * 为什么要单独抽出来：安装与卸载走同一个端点、同一套「整份覆盖」语义，
+ * 回写口径必须完全一致 —— 两处各写一遍必然漂移（一处漏了 lastSyncAt、
+ * 另一处忘了剥前缀之类）。installed 的唯一真源是服务端响应，绝不在前端推算。
+ */
+function applyPluginKeys(
+  set: (fn: (s: { devices: DeviceNode[] }) => { devices: DeviceNode[] }) => void,
+  clientId: string,
+  keys: string[],
+) {
+  set((s) => ({
+    devices: s.devices.map((d) =>
+      d.id === clientId ? { ...d, installed: keys, installing: [], lastSyncAt: Date.now() } : d,
+    ),
+  }))
+}
+
+/**
+ * 设备形态 → 插件市场的平台档位。
+ *
+ * 构件市场只区分「PC 端（Windows/Linux）」与「移动端」两档（见 lib/platform.ts 的
+ * PlatformSupport）。故 tablet 并入 mobile；cli / browser 并入 desktop ——
+ * 它们运行在完整 PC 环境里，shell / 文件系统能力与桌面端一致。
+ */
+function platformOfKind(kind: string): DeviceNode['platform'] {
+  switch (kind) {
+    case 'mobile':
+    case 'tablet':
+      return 'mobile'
+    default:
+      return 'desktop'
+  }
+}
+
+/**
+ * 设备自述 platform 字段 → UI ClientOS。
+ *
+ * 服务端 `devices.platform` 存的是端侧自述字符串（如 windows / darwin / linux / android），
+ * 前端只认 5 个枚举值，故非 Linux/Windows 一律归入移动档（而不是静默当成 Windows，
+ * 那会让「不支持移动端」的工具在平板设备上错误地显示为可安装）。
+ */
+function osOfDevice(kind: string, platform?: string): DeviceNode['os'] {
+  const p = (platform ?? '').toLowerCase()
+  if (p === 'windows') return 'windows'
+  if (p === 'linux') return 'linux'
+  if (p === 'android') return 'android'
+  if (p === 'ios' || p === 'macos' || p === 'darwin') return 'ios'
+  // 无自述时按形态兜底：移动档 → android（Android 与 iOS 在 Plugin 平台上同档）
+  return platformOfKind(kind) === 'mobile' ? 'android' : 'linux'
+}
+
 /* ============ 服务端 DTO → UI 领域模型映射 ============ */
 
 /**
@@ -169,10 +224,16 @@ interface PluginState {
   installExtension: (id: string) => void
   toggleExtension: (id: string) => void
   removeExtension: (id: string) => void
-  /** 把能力安装到当前客户端（客户端自行安装，非服务端下发） */
-  installOnClient: (key: string) => void
-  /** 从当前客户端卸载能力 */
-  uninstallOnClient: (key: string) => void
+  /**
+   * 把能力安装到当前客户端（客户端自行安装，非服务端下发）。
+   *
+   * 🚨 真实端点：PUT /api/v1/devices/{did}/plugins（整份清单覆盖）。
+   * 成功后以服务端回写的 keys 为准刷新该节点 installed —— 不做乐观推算，
+   * 也不再有「700ms 后假装装好」的内存态（那样刷新即丢）。
+   */
+  installOnClient: (key: string) => Promise<void>
+  /** 从当前客户端卸载能力（同一端点，整份清单覆盖） */
+  uninstallOnClient: (key: string) => Promise<void>
 }
 
 export const usePlugins = create<PluginState>((set, get) => ({
@@ -206,12 +267,15 @@ export const usePlugins = create<PluginState>((set, get) => ({
    */
   loadRemoteCapabilities: async () => {
     set({ remoteStatus: 'loading', remoteError: undefined })
-    // 四个端点独立成败：任一通了就应展示已拿到的部分（部分成功优于全空白）
-    const [mcpRes, pkgRes, toolRes, skillRes] = await Promise.allSettled([
+    // 五个端点独立成败：任一通了就应展示已拿到的部分（部分成功优于全空白）。
+    // 第 5 个是设备列表 —— 缺了它插件市场就只能管理服务端自身，客户端节点永不出现，
+    // 于是工具页在桌面端工作空间下也恒走「仅启停」分支（这正是本函数的历史缺陷）。
+    const [mcpRes, pkgRes, toolRes, skillRes, devRes] = await Promise.allSettled([
       api.listMcpServers(),
       api.listPackages(),
       api.getTools(),
       api.listSkills(),
+      api.listDevices(),
     ])
     const errors: string[] = []
     const patch: Partial<PluginState> = {}
@@ -249,6 +313,32 @@ export const usePlugins = create<PluginState>((set, get) => ({
       errors.push(`技能库：${skillRes.reason instanceof Error ? skillRes.reason.message : String(skillRes.reason)}`)
     }
 
+    // 已配对客户端 → 设备节点。铁律：
+    //   - installed 只来自该端**真实申报**的 plugin: 清单（服务端已剥前缀），绝不预置；
+    //   - 拉取失败时保留旧客户端节点（与服务端节点同样「兜底旧值」），不清零；
+    //   - 已吊销设备本就不在默认列表里（服务端口径），无需前端再过滤。
+    let clientNodes: DeviceNode[] | null = null
+    if (devRes.status === 'fulfilled') {
+      clientNodes = (devRes.value.items ?? [])
+        .filter((d) => d.status !== 'revoked')
+        .map((d) => ({
+          id: d.id,
+          name: d.name || d.id,
+          platform: platformOfKind(String(d.kind)),
+          os: osOfDevice(String(d.kind), d.platform),
+          online: d.status === 'online',
+          // 裸 key（服务端已剥 plugin: 前缀）：tool 名 / mcp:<server> / skill:<name>
+          installed: (d.capabilities ?? [])
+            .map((c) => c.name)
+            .filter((n) => n.startsWith('plugin:'))
+            .map((n) => n.slice('plugin:'.length)),
+          installing: [],
+          lastSyncAt: Date.now(),
+        }))
+    } else {
+      errors.push(`设备列表：${devRes.reason instanceof Error ? devRes.reason.message : String(devRes.reason)}`)
+    }
+
     // 服务端节点用「本次拿到的值 + 兜底旧值」重建，避免某个端点抖动导致节点能力清单清零。
     // 服务端节点恒排在首位：它是唯一永远可用的管理目标。
     set((s) => {
@@ -259,7 +349,9 @@ export const usePlugins = create<PluginState>((set, get) => ({
         extensions: s.extensions,
         tools: patch.toolSnapshot ?? s.toolSnapshot,
       })
-      return { ...patch, devices: [node, ...s.devices.filter((d) => d.platform !== 'server')] }
+      // 客户端节点：拉取成功则以服务端为准整体替换；失败则沿用旧值（不清零）
+      const clients = clientNodes ?? s.devices.filter((d) => d.platform !== 'server')
+      return { ...patch, devices: [node, ...clients] }
     })
 
     // 默认管理目标：优先沿用当前选择；若为空或指向已消失的节点，默认落到服务端
@@ -277,6 +369,7 @@ export const usePlugins = create<PluginState>((set, get) => ({
     // 全部失败才算 error；部分失败保留已成功数据并提示原因
     const allFailed = mcpRes.status === 'rejected' && pkgRes.status === 'rejected'
       && toolRes.status === 'rejected' && skillRes.status === 'rejected'
+      && devRes.status === 'rejected'
     set({
       remoteStatus: allFailed ? 'error' : 'ready',
       remoteError: errors.join('；'),
@@ -541,44 +634,55 @@ export const usePlugins = create<PluginState>((set, get) => ({
 
   removeExtension: (id) => set((s) => ({ extensions: s.extensions.filter((e) => e.id !== id) })),
 
-  installOnClient: (key) => {
+  /**
+   * 把能力安装到当前客户端 / 从当前客户端卸载。
+   *
+   * 🚨 真实链路：PUT /api/v1/devices/{did}/plugins（**整份清单覆盖**）。
+   * 旧实现是 setTimeout(700) 后直接改内存 —— 刷新即丢，属于假安装。
+   *
+   * 参数 `key` 是**前端裸 key**（tool 名 / mcp:<server> / skill:<name>），
+   * 服务端会补 `plugin:` 前缀落 capabilities 表；这里原样 PUT 即可。
+   *
+   * 失败必须抛出（不吞）：调用方据 toast 明示失败，界面保持原状而不是假装装好。
+   */
+  installOnClient: async (key) => {
     const clientId = get().currentClientId
-    // 🚨 服务端节点禁止走「安装」路径：内置工具编译期注册，没有制品可装；
-    // 若这里放行，UI 会出现「服务端已装工具」的假象（重启即丢）。
-    // 服务端的内置工具只走 setServerToolEnabled（启用/停用），MCP / 工具包走各自真实端点。
+    // 服务端节点禁止走「安装」路径：内置工具随程序发布、编译期注册，没有制品可装。
+    // 若这里放行，UI 会出现「服务端已装工具」的假象。服务端只走 setServerToolEnabled。
     const target = get().devices.find((d) => d.id === clientId)
     if (!target || target.platform === 'server') return
+    if (target.installed.includes(key)) return
+
+    // 只标记 installing 用于按钮反馈；最终的 installed 以服务端回写为准
     set((s) => ({
       devices: s.devices.map((d) =>
-        d.id === clientId && !d.installed.includes(key) && !d.installing.includes(key)
+        d.id === clientId && !d.installing.includes(key)
           ? { ...d, installing: [...d.installing, key] }
           : d,
       ),
     }))
-    setTimeout(() => {
+    try {
+      const next = target.installed.includes(key) ? target.installed : [...target.installed, key]
+      const res = await api.setDevicePlugins(clientId, next)
+      applyPluginKeys(set, clientId, res.keys)
+    } finally {
       set((s) => ({
         devices: s.devices.map((d) =>
-          d.id === clientId
-            ? {
-                ...d,
-                installing: d.installing.filter((k) => k !== key),
-                installed: d.installed.includes(key) ? d.installed : [...d.installed, key],
-                lastSyncAt: Date.now(),
-              }
-            : d,
+          d.id === clientId ? { ...d, installing: d.installing.filter((k) => k !== key) } : d,
         ),
       }))
-    }, 700)
+    }
   },
 
-  uninstallOnClient: (key) => {
+  uninstallOnClient: async (key) => {
     // 同上：服务端节点没有「卸载内置工具」的概念（不可安装即不可卸载）。
-    const target = get().devices.find((d) => d.id === get().currentClientId)
+    const clientId = get().currentClientId
+    const target = get().devices.find((d) => d.id === clientId)
     if (!target || target.platform === 'server') return
-    set((s) => ({
-      devices: s.devices.map((d) =>
-        d.id === s.currentClientId ? { ...d, installed: d.installed.filter((k) => k !== key) } : d,
-      ),
-    }))
+    if (!target.installed.includes(key)) return
+
+    const next = target.installed.filter((k) => k !== key)
+    const res = await api.setDevicePlugins(clientId, next)
+    applyPluginKeys(set, clientId, res.keys)
   },
 }))

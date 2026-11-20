@@ -84,9 +84,18 @@ function ToolItem({ name, enabled, onToggle, client, serverMode }: {
   const meta = toolInstallInfo(t.name, t.group)
   const { installOnClient, uninstallOnClient } = usePlugins()
   const toast = useUI((s) => s.toast)
+  const [busy, setBusy] = useState(false)
   const installed = client.installed.includes(t.name)
-  const installing = client.installing.includes(t.name)
   const compatible = supportsClient(meta.platforms, client.os)
+
+  // 安装/卸载都走真实端点（PUT /devices/{did}/plugins）：失败必须明示，不能静默或假装装好。
+  const run = (fn: () => Promise<void>, ok: string, label: string) => {
+    setBusy(true)
+    fn()
+      .then(() => toast('success', ok))
+      .catch((e: unknown) => toast('error', `${label}失败：${e instanceof Error ? e.message : String(e)}`))
+      .finally(() => setBusy(false))
+  }
 
   return (
     <div className={cn(
@@ -100,7 +109,13 @@ function ToolItem({ name, enabled, onToggle, client, serverMode }: {
           <RiskBadge risk={t.risk} />
           <CategoryBadge category={t.category} />
           <InstallBadge meta={meta} />
-          {installed && <Badge tone="green">本端已安装</Badge>}
+          {serverMode
+            ? <Badge tone="gray">随服务端内置</Badge>
+            : installed
+              ? <Badge tone="green">已安装</Badge>
+              : meta.installable
+                ? <Badge tone="yellow">未安装</Badge>
+                : <Badge tone="gray">不可安装</Badge>}
         </div>
         <div className="text-[12px] text-inkdim mt-1.5 leading-relaxed">{t.description}</div>
         <div className="mt-1.5 flex flex-wrap items-center gap-2 text-[11px] text-inkfaint font-mono">
@@ -115,23 +130,30 @@ function ToolItem({ name, enabled, onToggle, client, serverMode }: {
             <Button
               size="sm"
               variant="ghost"
+              disabled={busy}
               className="text-inkdim hover:text-err"
               title={`从 ${client.name} 卸载`}
-              onClick={() => { uninstallOnClient(t.name); toast('info', `已从 ${client.name} 卸载 ${t.name}`) }}
+              onClick={() => run(() => uninstallOnClient(t.name), `已从 ${client.name} 卸载 ${t.name}`, '卸载')}
             >
               卸载
             </Button>
           ) : (
             <Button
               size="sm"
-              variant="outline"
-              disabled={!compatible || installing}
-              title={!compatible ? unsupportedReason(meta.platforms, client) : `在当前客户端（${client.name}）本地安装`}
-              onClick={() => { installOnClient(t.name); toast('info', `正在安装 ${t.name} 到 ${client.name}`) }}
+              variant="primary"
+              disabled={!compatible || busy}
+              title={!compatible ? unsupportedReason(meta.platforms, client) : `安装到 ${client.name}（该端本地执行）`}
+              onClick={() => run(() => installOnClient(t.name), `${t.name} 已安装到 ${client.name}`, '安装')}
             >
-              {installing ? '安装中…' : compatible ? '安装到此端' : '该端不支持'}
+              {busy ? '安装中…' : compatible ? '安装到此端' : '该端不支持'}
             </Button>
           )
+        )}
+        {/* 客户端节点：纯服务端能力也要说明原因，绝不渲染成点了没反应的假按钮 */}
+        {!serverMode && !meta.installable && (
+          <span className="text-[11px] text-inkfaint" title={meta.note}>
+            纯服务端能力 · 客户端经 API 调用
+          </span>
         )}
         {serverMode && (
           <span
@@ -333,10 +355,11 @@ export function ToolsPanel({ client, query = '' }: { client: DeviceNode; query?:
       .catch((e: unknown) => toast('error', `操作失败：${e instanceof Error ? e.message : String(e)}`))
   }
 
-  // 进入面板即拉取服务端真值（服务端节点需要 disabled 清单，客户端也复用同一份远端能力）
+  // 进入面板即拉取真值：服务端节点要 disabled 清单，客户端节点要真实 installed 清单
+  // （两者同源，都来自 loadRemoteCapabilities 的一次并发拉取）。
   useEffect(() => {
-    if (serverMode) void loadRemoteCapabilities()
-  }, [serverMode, loadRemoteCapabilities])
+    void loadRemoteCapabilities()
+  }, [loadRemoteCapabilities])
 
   const disabledCount = serverMode ? (toolSnapshot?.disabled?.length ?? 0) : d.disabledTools.length
   const installableCount = toolList.filter((t) => {

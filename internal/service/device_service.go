@@ -422,6 +422,120 @@ func (s *DeviceService) Get(ctx context.Context, deviceID string) (*model.Device
 	return d, nil
 }
 
+// ============ 客户端插件安装清单（plugin: 命名空间） ============
+//
+// ## 为什么复用 capabilities 表而不是新建表
+// `capabilities` 的仓储语义就是「按设备维度**全量替换**」（repo_device.go:378 Replace
+// 先删后插），天然适合「清单下发」这种幂等写入；而设备的目录列举能力协商
+// （internal/api/fs_handler.go:342 hasFsListCapability）只精确比对 `workspace.list`
+// 与旧名 `fs.list`，**不带任何前缀通配**，因此 plugin: 命名空间与协议能力零交集 ——
+// 这是本设计唯一的安全红线，改动此处前必须先复核该方法。
+//
+// ## key 口径
+// 与前端 web/src/stores/pluginStore.ts 的 KEY_PREFIX 逐字对齐：
+//
+//	plugin:tool:<name>    内置工具
+//	plugin:mcp:<server>   MCP Server
+//	plugin:skill:<name>   技能
+//
+// 写入时统一补 `plugin:` 前缀；读出时剥掉前缀返回给前端（前端只认裸 key）。
+
+// pluginCapabilityPrefix 客户端插件安装清单的能力名前缀（协议能力不得使用该前缀）。
+const pluginCapabilityPrefix = "plugin:"
+
+// partitionPluginKeys 从设备能力清单中挑出插件项并剥掉 `plugin:` 前缀（纯函数）。
+//
+// 抽成纯函数是为了可测：端到端测 PluginKeys 需要真库 + 真设备，抖动大；
+// 而这段逻辑才是「哪些算已装」的唯一判据。
+func partitionPluginKeys(caps []model.Capability) []string {
+	out := make([]string, 0, len(caps))
+	for _, c := range caps {
+		if strings.HasPrefix(c.Name, pluginCapabilityPrefix) {
+			out = append(out, strings.TrimPrefix(c.Name, pluginCapabilityPrefix))
+		}
+	}
+	return out
+}
+
+// mergePluginCaps 把新插件清单合并进既有能力集合（纯函数，**保留协议能力**）。
+//
+// 返回：待写回的全量能力项（协议能力原样 + 本次插件项）与回写给前端的裸 key 列表。
+//
+// 三条边界必须守住：
+//   - 入参自带 `plugin:` 前缀 → 不重复加前缀（幂等，容忍调用方口径漂移）；
+//   - 重复 key → 去重（capabilities 表 (device_id,name) 唯一，重复插入会事务失败）；
+//   - 空串 / 纯空白 → 跳过（避免写出 name='' 的脏行）。
+func mergePluginCaps(existing []model.Capability, keys []string) ([]model.Capability, []string) {
+	next := make([]model.Capability, 0, len(existing)+len(keys))
+	for _, c := range existing {
+		if strings.HasPrefix(c.Name, pluginCapabilityPrefix) {
+			continue // 旧插件清单整体作废（整份覆盖语义）
+		}
+		next = append(next, c)
+	}
+	seen := make(map[string]struct{}, len(keys))
+	written := make([]string, 0, len(keys))
+	for _, raw := range keys {
+		k := strings.TrimPrefix(strings.TrimSpace(raw), pluginCapabilityPrefix)
+		if k == "" {
+			continue
+		}
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		written = append(written, k)
+		next = append(next, model.Capability{Name: pluginCapabilityPrefix + k})
+	}
+	return next, written
+}
+
+// PluginKeys 读取某设备的插件安装清单（返回**裸 key**，即已剥掉 plugin: 前缀）。
+//
+// 设备不存在/已吊销同样返回错误（由调用方决定是否降级成空清单）——
+// 绝不把「设备不存在」与「设备没装插件」混为一谈。
+func (s *DeviceService) PluginKeys(ctx context.Context, deviceID string) ([]string, error) {
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		return nil, invalidArg("设备 ID 不能为空")
+	}
+	if _, err := s.Get(ctx, deviceID); err != nil {
+		return nil, err
+	}
+	caps, err := s.main.Capabilities().ListByDevice(ctx, deviceID)
+	if err != nil {
+		return nil, err
+	}
+	return partitionPluginKeys(caps), nil
+}
+
+// SetPluginKeys 全量替换某设备的插件安装清单（保留既有协议能力）。
+//
+// 语义：
+//   - 入参是**裸 key**（可带或不带 plugin: 前缀，两处都容错）；
+//   - 先读出现有能力 → 剔除所有 plugin: 项 → 追加新清单 → 一次性 Replace 写回；
+//   - 协议能力（workspace.list / fs.list 等）**原样保留**，绝不被本方法抹掉。
+//
+// 返回写入后的裸 key 清单（服务端为准，前端不做乐观推算）。
+func (s *DeviceService) SetPluginKeys(ctx context.Context, deviceID string, keys []string) ([]string, error) {
+	deviceID = strings.TrimSpace(deviceID)
+	if deviceID == "" {
+		return nil, invalidArg("设备 ID 不能为空")
+	}
+	if _, err := s.Get(ctx, deviceID); err != nil {
+		return nil, err
+	}
+	existing, err := s.main.Capabilities().ListByDevice(ctx, deviceID)
+	if err != nil {
+		return nil, err
+	}
+	next, written := mergePluginCaps(existing, keys)
+	if err := s.main.Capabilities().Replace(ctx, deviceID, next); err != nil {
+		return nil, err
+	}
+	return written, nil
+}
+
 // Revoke 吊销设备：置 revoked（令牌立即失效）+ 主动断开其长连接 + 广播观察面。
 //
 // 幂等：设备不存在返回 device.not_found；已吊销的设备重复吊销同样返回 not_found

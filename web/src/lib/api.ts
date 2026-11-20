@@ -528,6 +528,13 @@ export interface ApiClient {
   listDevices(): Promise<DeviceListResponse>
   /** 吊销设备（令牌立即失效并断开长连接） */
   revokeDevice(id: string): Promise<void>
+  /** 客户端插件安装清单（插件市场「已安装」真源；裸 key，服务端已剥 plugin: 前缀） */
+  listDevicePlugins(id: string): Promise<{ keys: string[] }>
+  /**
+   * 全量替换客户端插件安装清单（幂等：整份覆盖，不做增量）。
+   * 返回服务端实际落库的裸 key 列表 —— 前端以它为准，不做乐观推算。
+   */
+  setDevicePlugins(id: string, keys: string[]): Promise<{ keys: string[] }>
   /** 会话租约（无租约 = active=true / epoch=0 / holder=''，不是错误） */
   getSessionLease(sessionId: string): Promise<SessionLeaseDTO>
 
@@ -1882,6 +1889,16 @@ export const realApi: ApiClient = {
   },
   async revokeDevice(id) {
     await request<void>(API_PATHS.device(id), { method: 'DELETE', headers: authHeaders() })
+  },
+  async listDevicePlugins(id) {
+    return request<{ keys: string[] }>(API_PATHS.devicePlugins(id), { headers: authHeaders() })
+  },
+  async setDevicePlugins(id, keys) {
+    return request<{ keys: string[] }>(API_PATHS.devicePlugins(id), {
+      method: 'PUT',
+      headers: authHeaders(),
+      body: JSON.stringify({ keys }),
+    })
   },
   async getSessionLease(sessionId) {
     return request<SessionLeaseDTO>(API_PATHS.sessionLease(sessionId), { headers: authHeaders() })
