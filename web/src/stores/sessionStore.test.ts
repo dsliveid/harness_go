@@ -14,7 +14,7 @@
  * 不测 SSE 传输层（`lib/sessionEvents.ts` 的 EventSource 封装）：真实帧契约由
  * 服务端测试 `internal/api/session_events_test.go` 覆盖，那才是权威口径。
  */
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useSessions } from './sessionStore'
 import type { Project, Session } from '../types'
 
@@ -336,5 +336,82 @@ describe('sessionStore.markRead（未读红点）', () => {
     expect(byId('s-2')?.unread).toBe(false)
     expect(byId('s-1')?.unread).toBe(true)
     spy.mockRestore()
+  })
+})
+
+/**
+ * 回归：点一次「新建对话」出现两条、刷新后只剩一条（2026-11 用户缺陷）。
+ *
+ * 竞态链条：服务端 createSession **先** publishSessionCreated（立即 SSE 广播）**后**写回包。
+ * 旧实现里 applyServerPatch 对未知真实 id 直接插入，而 create() 的回调只按乐观壳 id 就地替换，
+ * 于是列表里同时存在「乐观壳」与「同一会话的真实条目」→ 两条；刷新只信服务端 → 又一条。
+ */
+describe('sessionStore 新建会话的乐观壳认领（防重复条目）', () => {
+  // create() 会真的发 POST /sessions。测试里必须拦住，否则会打真实网络并在异步 tick
+  // 后回滚状态，污染后续用例（表现为偶发「多一条 / 少一条」的假失败）。
+  // 默认给一个永不落地的 Promise：保持「回包还没回来」这个竞态窗口不变。
+  beforeEach(async () => {
+    reset([])
+    const { api } = await import('../lib/api')
+    vi.spyOn(api, 'createSession').mockReturnValue(new Promise(() => {}))
+  })
+
+  afterEach(() => vi.restoreAllMocks())
+
+  it('SSE 真实会话抢先到达时顶替乐观壳，而不是并排新增', () => {
+    const shellId = useSessions.getState().create()
+    expect(ids()).toEqual([shellId])
+
+    // 服务端广播先到（真实 id 形态，不在列表里）
+    useSessions.getState().applyServerPatch(mkSession({ id: 'real-1', title: '新对话', updatedAt: 2000 }))
+
+    // 只有一条，且已换成真实 id；当前选中也随之迁徙（否则右侧指向幽灵壳）
+    expect(ids()).toEqual(['real-1'])
+    expect(useSessions.getState().currentId).toBe('real-1')
+  })
+
+  it('回包再到达也不会重复（壳已被认领 → 就地更新真实条目）', async () => {
+    const { api } = await import('../lib/api')
+    const spy = vi.spyOn(api, 'createSession').mockResolvedValue(
+      mkSession({ id: 'real-2', title: '新对话', updatedAt: 3000 }),
+    )
+    const shellId = useSessions.getState().create()
+    useSessions.getState().applyServerPatch(mkSession({ id: 'real-2', updatedAt: 3000 }))
+    // 等回包 .then 落地
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(ids()).toEqual(['real-2'])
+    expect(ids()).not.toContain(shellId)
+    spy.mockRestore()
+  })
+
+  it('同毫秒连点两次新建得到两条互不相同的会话（id 不得相撞）', () => {
+    const a = useSessions.getState().create()
+    const b = useSessions.getState().create()
+    expect(a).not.toBe(b)
+    expect(ids()).toHaveLength(2)
+    // 两个壳都在待认领队列里，分别对应一次 POST
+    useSessions.getState().applyServerPatch(mkSession({ id: 'real-a', updatedAt: 5000 }))
+    useSessions.getState().applyServerPatch(mkSession({ id: 'real-b', updatedAt: 5001 }))
+    expect(ids().sort()).toEqual(['real-a', 'real-b'])
+  })
+
+  it('快照帧包含刚建好的会话时消费乐观壳（重连场景不出现双行）', () => {
+    const shellId = useSessions.getState().create()
+    useSessions.getState().applyServerSnapshot([
+      mkSession({ id: 'real-3', updatedAt: 9000 }),
+    ])
+    expect(ids()).toEqual(['real-3'])
+    expect(ids()).not.toContain(shellId)
+  })
+
+  it('与本次新建无关的真实会话到达时不得吞掉乐观壳（别端新建照常插入）', () => {
+    // 先让待认领队列清空：不调用 create()，直接看别端会话
+    reset([mkSession({ id: 's-1731000000000', updatedAt: 100 })])
+    useSessions.getState().applyServerPatch(mkSession({ id: 'other-real', updatedAt: 200 }))
+    // 该壳从未入队 → 保留，别端会话并排插入
+    expect(ids()).toContain('s-1731000000000')
+    expect(ids()).toContain('other-real')
   })
 })

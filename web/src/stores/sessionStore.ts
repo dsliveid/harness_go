@@ -123,7 +123,29 @@ function patchProject(
  * 幽灵会话永久保留下来）。
  */
 function isOptimisticId(id: string): boolean {
-  return /^s-\d{10,}$/.test(id)
+  // 形态：`s-<13 位毫秒时间戳>`，同毫秒并发时追加 `-<序号>`（见 create()）。
+  return /^s-\d{10,}(-\d+)?$/.test(id)
+}
+
+/**
+ * 已发出 `POST /sessions`、但尚未回来的乐观壳 id 队列（FIFO）。
+ *
+ * 存在的唯一理由：让 SSE 抢先到达的真实会话**顶替**对应的乐观壳，而不是并排新增。
+ * 服务端 `createSession` handler 先广播后写回包（见 handler.go），所以本端必然先收到
+ * 真实 id 的 `session.updated` 帧 —— 不认领就会出现「点一次新建、列表两条同义会话」，
+ * 刷新（只信服务端）后又只剩一条，正是用户报告的 2026-11 缺陷。
+ *
+ * 只存未完成的壳：成功回包 / 失败回滚都必须出队，否则后续别端新建的会话会被错误顶替。
+ */
+const pendingCreateShells: string[] = []
+
+/** 乐观壳 id 的单调序号（保证同毫秒内多次新建也得到互不相同的 id） */
+let createSeq = 0
+
+/** 从待认领队列里移除一个壳（成功回包 / 失败回滚都必须调用）。 */
+function dequeueCreateShell(id: string): void {
+  const i = pendingCreateShells.indexOf(id)
+  if (i >= 0) pendingCreateShells.splice(i, 1)
 }
 
 /**
@@ -438,6 +460,17 @@ export const useSessions = create<SessionState>((set, get) => ({
     // 判定标准：不在快照里、且仍是本地临时 id（s-<时间戳>）的条目。
     const serverIds = new Set(withScope.map((s) => s.id))
     const optimistic = st.sessions.filter((s) => !serverIds.has(s.id) && isOptimisticId(s.id))
+    // 🚨 待认领的壳必须在快照里「认领」掉，而不是与新出现的真实会话语并存：
+    // 重连首帧 / 首次建连的快照可能恰好包含刚刚 POST 建好的会话（服务端已落库、
+    // 但 POST 回包还没回来）。若不消费壳，界面会同时显示「新对话(壳) + 真实会话」，
+    // 而刷新（只信服务端）后又只剩一条 —— 与用户报告的现象完全一致。
+    // 匹配规则：快照里出现了**服务端 id 形态**的会话，就按 FIFO 消费队首的壳。
+    const freshReal = withScope.filter((s) => !st.sessions.some((x) => x.id === s.id))
+    for (let i = 0; i < freshReal.length && pendingCreateShells.length > 0; i++) {
+      const shellId = pendingCreateShells.shift() as string
+      const idx = optimistic.findIndex((x) => x.id === shellId)
+      if (idx >= 0) optimistic.splice(idx, 1)
+    }
     const merged = sortStable([...withScope, ...optimistic])
     // currentId 若已不在列表中（被别端删除），回落到「当前空间内最新未归档会话」
     // （与 load() 同口径），避免右侧停在幽灵会话或空落落的错位会话上。
@@ -453,6 +486,34 @@ export const useSessions = create<SessionState>((set, get) => ({
     const [patched] = adoptServerSessions([session], st.projects)
     if (!patched) return
     const exists = st.sessions.some((s) => s.id === patched.id)
+    // 🚨 乐观壳认领（2026-11 缺陷：「点新建对话出现两条，刷新后只剩一条」）。
+    //
+    // 竞态成因：createSession 的 handler **先** publishSessionCreated（立即广播）**后**写回包，
+    // 于是本端「先收到真实 id 的 SSE 帧，后拿到 POST 回包」。此时列表里已有一条乐观壳
+    // （s-<时间戳>），若这里对未知 id 直接走「插入」分支，界面就会出现
+    // 「新对话(壳) + 新对话(真实)」两行同义条目；刷新后 load() 只拉服务端 → 又只剩一条。
+    //
+    // 解法：每隔一条「未知真实 id」先看有没有本端尚未落地的乐观壳——有就**顶替**它，
+    // 而不是并排新增。FIFO 顺序对应 POST 发起顺序，与广播顺序一致。
+    // 认领只消耗一个壳，绝不会把别端新建的会话吞掉壳以外的任何东西。
+    if (!exists) {
+      const shellIdx = pendingCreateShells.findIndex((sid) => st.sessions.some((x) => x.id === sid))
+      if (shellIdx >= 0) {
+        const [shellId] = pendingCreateShells.splice(shellIdx, 1)
+        const shell = st.sessions.find((x) => x.id === shellId)
+        const claimed: Session = {
+          ...patched,
+          // 壳上的前端独有归属作为兜底（服务端可能不回 workspace_id）。
+          projectId: patched.projectId ?? shell?.projectId,
+          workspaceId: patched.workspaceId ?? shell?.workspaceId,
+        }
+        set({
+          sessions: sortStable(st.sessions.map((x) => (x.id === shellId ? claimed : x))),
+          currentId: st.currentId === shellId ? claimed.id : st.currentId,
+        })
+        return
+      }
+    }
     // upsert：已存在则替换（服务端是权威视图，整体覆盖），否则插入。
     //
     // 注意：替换时**保留本地壳的 projectId/workspaceId 兜底**？不保留 ——
@@ -652,7 +713,9 @@ export const useSessions = create<SessionState>((set, get) => ({
   },
 
   create: (projectId) => {
-    const id = `s-${Date.now()}`
+    // 🚨 同步递增序号：旧的 `s-${Date.now()}` 在同一毫秒内连点两次会生成**同一个 id**，
+    // 两条乐观壳互相覆盖（表现为「点了两次新建却只多一条」/ React key 重复）。
+    const id = `s-${Date.now()}-${++createSeq}`
     const proj = projectId ? get().projects.find((p) => p.id === projectId) : undefined
     // 控制权限由**服务端按项目默认值快照裁决**（单一权威源）；本地乐观壳仅做占位展示，
     // 服务端回包会覆盖它。前端不再复刻「项目默认 > confirm」这套逻辑，避免两处漂移。
@@ -668,6 +731,8 @@ export const useSessions = create<SessionState>((set, get) => ({
       updatedAt: Date.now(),
     }
     set((st) => ({ sessions: [s, ...st.sessions], currentId: id }))
+    // 入队：等 SSE 抢先的真实会话来顶替它（见 applyServerPatch 的乐观壳认领）。
+    pendingCreateShells.push(id)
     // 新对话的 token 用量与上下文占用必须归零（否则沿用上个会话的累计量）
     syncUsage(id)
     // 归属同步落服务端（sessions.project_id / sessions.workspace_id）。
@@ -688,15 +753,38 @@ export const useSessions = create<SessionState>((set, get) => ({
         workspaceId: s.workspaceId,
       })
       .then((created) => {
-        set((st) => ({
-          sessions: st.sessions.map((x) =>
-            // 服务端已回传 workspace_id（R1 起落库）；回包缺字段时才用本地值兜底。
-            x.id === id
-              ? { ...created, projectId: created.projectId ?? x.projectId, workspaceId: created.workspaceId ?? x.workspaceId }
-              : x,
-          ),
-          currentId: st.currentId === id ? created.id : st.currentId,
-        }))
+        // 出队：无论 SSE 是否已认领，此壳都不该再参与后续认领。
+        dequeueCreateShell(id)
+        set((st) => {
+          // 服务端已回传 workspace_id（R1 起落库）；回包缺字段时才用本地值兜底。
+          const upgraded: Session = {
+            ...created,
+            projectId: created.projectId ?? projectId ?? st.sessions.find((x) => x.id === id)?.projectId,
+            workspaceId: created.workspaceId ?? s.workspaceId,
+          }
+          // 🚨 必须按 id 收口，不是可选优化（2026-11 用户缺陷：点一次新建出现两条，
+          // 刷新后只剩一条）。两种到达顺序都要覆盖：
+          //   ① SSE 先到（正常）：applyServerPatch 已把乐观壳顶替成真实 id —— 此时列表里
+          //      没有壳，但已有 `created.id`，必须**就地更新**而不是再插一条；
+          //   ② 回包先到（SSE 慢）：列表里还是壳，就地把壳换成真实 id。
+          const hasShell = st.sessions.some((x) => x.id === id)
+          const hasReal = st.sessions.some((x) => x.id === created.id)
+          let sessions: Session[]
+          if (hasShell) {
+            sessions = st.sessions.map((x) => (x.id === id ? upgraded : x))
+            // 极端情形：壳与真实 id 同时存在（认领失败等）→ 去掉壳，保留真实条目
+            if (hasReal) sessions = sessions.filter((x) => x.id !== id)
+          } else if (hasReal) {
+            sessions = st.sessions.map((x) => (x.id === created.id ? { ...upgraded } : x))
+          } else {
+            sessions = [upgraded, ...st.sessions]
+          }
+          return {
+            sessions,
+            currentId:
+              st.currentId === id || st.currentId === created.id ? created.id : st.currentId,
+          }
+        })
         // 本地壳 id → 服务端真实 id：账本与归属记录都要迁徙，否则切回来/刷新后丢失
         if (projectId || s.workspaceId) {
           setScopeOverride(created.id, { projectId, workspaceId: s.workspaceId })
@@ -705,6 +793,8 @@ export const useSessions = create<SessionState>((set, get) => ({
         void import('./chatStore').then((m) => m.useChat.getState().migrateUsage(id, created.id))
       })
       .catch(() => {
+        // 失败回滚：壳必须出队，否则下一次别端新建的会话会被本壳错误"顶替"。
+        dequeueCreateShell(id)
         set((st) => {
           const rest = st.sessions.filter((x) => x.id !== id)
           return {
@@ -734,6 +824,9 @@ export const useSessions = create<SessionState>((set, get) => ({
     }
   },
   remove: (id) => {
+    // 删的若是一条还没落地的乐观壳，必须出队：否则后续别端新建的会话来临时，
+    // 会被这个已不存在的壳错误认领（表现为「别端新建的对话不出现」）。
+    dequeueCreateShell(id)
     set((s) => {
       const rest = s.sessions.filter((x) => x.id !== id)
       return {
