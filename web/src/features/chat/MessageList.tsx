@@ -5,7 +5,7 @@ import { MarkdownLite } from '../../components/MarkdownLite'
 import { VirtualList, type ScrollTarget } from '../../components/VirtualList'
 import { cn } from '../../components/ui'
 import { useUI } from '../../stores/uiStore'
-import { ArrowDown, Check, Clock, Copy, GitBranch, GitCompare, RotateCcw, RotateCw, Sparkles, Trash2, Zap } from 'lucide-react'
+import { AlertTriangle, ArrowDown, Check, ChevronUp, Clock, Copy, GitBranch, GitCompare, Loader2, RotateCcw, RotateCw, Sparkles, Trash2, Zap } from 'lucide-react'
 import { ProcessDrawer, formatStepMs, formatStepTokens } from './ProcessDrawer'
 import { ReasoningCard } from './ReasoningCard'
 import { formatDuration, RunProgressInline, useLiveElapsed, type RunPhase } from './LiveProgress'
@@ -52,6 +52,25 @@ interface MessageThreadProps {
   emptyHint?: string
   /** plain 直排模式：浮窗内少量轮次不虚拟化（滚动容器多为固定高容器，直排规避测量竞态） */
   plain?: boolean
+  /**
+   * 会话标识（主对话传 currentId）。
+   *
+   * 存在意义：原实现用 `messages[0]?.id` 判断「切数据源」，而**向前加载更早消息
+   * 也会改变 messages[0]**，导致补头部后被误判为切会话 → 强制贴底跳走。
+   * 传了 sessionKey 后，只有真正换会话才重置贴底与滚动位置。
+   */
+  sessionKey?: string
+  /**
+   * 服务端首屏截断信号（has_more=true 表示还有更早的消息未拉取）。
+   * 为 true 时在列表顶部渲染「加载更早消息」触发位；浮窗等不关心分页的场景不传。
+   */
+  hasMoreEarlier?: boolean
+  /** 更早消息正在加载（按钮转禁用 + 加载文案，防重复点击打请求风暴） */
+  loadingEarlier?: boolean
+  /** 上次加载更早消息失败（按钮转「重试」文案，用户可手动再点） */
+  earlierFailed?: boolean
+  /** 点击触发位：由上层（持有 currentId 的 MessageList）调 loadEarlierMessages */
+  onLoadEarlier?: () => void
 }
 
 export function MessageList() {
@@ -59,9 +78,37 @@ export function MessageList() {
   const currentId = useSessions((s) => s.currentId)
   const messages = useChat((s) => s.messagesOf(currentId))
   const loaded = useChat((s) => (currentId ? Boolean(s.loadedSessions[currentId]) : true))
+  // 首屏截断记账（服务端 listMessages 的 has_more）→ 顶部「加载更早消息」触发位。
+  // 服务端只回最近一页（默认 100 条），不接这个信号用户就永远看不到被截断的历史。
+  const hasMoreEarlier = useChat((s) => (currentId ? Boolean(s.hasMoreSessions[currentId]) : false))
+  const loadEarlierMessages = useChat((s) => s.loadEarlierMessages)
+  const [earlierLoading, setEarlierLoading] = useState(false)
+  const [earlierFailed, setEarlierFailed] = useState(false)
   const [retryTick, setRetryTick] = useState(0)
   // 每个会话各自的重试计数（切会话即归零，不会因为上一条会话重试用尽而放弃新会话）
   const retryRef = useRef<{ id: string; n: number }>({ id: '', n: 0 })
+
+  // 切会话即复位「加载更早」的局部 UI 态：失败提示与转圈都不能跨会话残留
+  useEffect(() => {
+    setEarlierLoading(false)
+    setEarlierFailed(false)
+  }, [currentId])
+
+  /**
+   * 加载更早消息（**只补头部，绝不覆盖尾部** —— 语义由 chatStore.loadEarlierMessages 保证）。
+   *
+   * 这里只做 UI 侧接线：加载态 + 失败可重试，不改 store 内任何拼接逻辑。
+   */
+  const onLoadEarlier = () => {
+    if (!currentId || earlierLoading) return
+    setEarlierLoading(true)
+    setEarlierFailed(false)
+    void loadEarlierMessages(currentId)
+      .then((ok) => {
+        if (!ok) setEarlierFailed(true)
+      })
+      .finally(() => setEarlierLoading(false))
+  }
 
   // 【不变量：只要左侧处于选中态，右侧必须必然有内容】
   //
@@ -103,6 +150,11 @@ export function MessageList() {
         reasoning={reasoning}
         runPhase={runPhase}
         actions={{ fork, revertTo, reapply, deleteFrom }}
+        sessionKey={currentId ?? undefined}
+        hasMoreEarlier={hasMoreEarlier}
+        loadingEarlier={earlierLoading}
+        earlierFailed={earlierFailed}
+        onLoadEarlier={onLoadEarlier}
       />
     </div>
   )
@@ -119,6 +171,11 @@ export function MessageThread({
   scrollCls,
   emptyHint,
   plain = false,
+  sessionKey,
+  hasMoreEarlier = false,
+  loadingEarlier = false,
+  earlierFailed = false,
+  onLoadEarlier,
 }: MessageThreadProps) {
   const scrollerRef = useRef<HTMLDivElement>(null)
   const [nearBottom, setNearBottom] = useState(true)
@@ -133,11 +190,76 @@ export function MessageThread({
   const [highlight, setHighlight] = useState<{ id: string; nonce: number } | null>(null)
 
   // 切换数据源：重置贴底并跳到底部
+  //
+  // 🚨 判据从 `messages[0]?.id` 改为 `sessionKey ?? messages[0]?.id`：
+  // 向前加载更早消息**也会改变 messages[0]**，若仍以它作判据，补头部会被误判成
+  // 「切了会话」→ 强制贴底把用户从正在读的位置拽走。现在只有真正换会话才重置。
+  const dataKey = sessionKey ?? messages[0]?.id
+  const firstId = messages[0]?.id
+  const prevDataKeyRef = useRef<string | undefined>(dataKey)
+  const prevFirstIdRef = useRef<string | undefined>(firstId)
+  /** 滚动快照（top/height）：前置插入后据此补偿，保持视口不跳 */
+  const scrollSnapRef = useRef<{ top: number; height: number }>({ top: 0, height: 0 })
+  /**
+   * 加载更早消息期间**临时抑制贴底**。
+   *
+   * 为什么必须抑制：用户打开被截断的会话时初始是贴底状态（nearBottom=true），
+   * 若此时保持 stickToBottom，loadEarlierMessages 让 items 变长会触发
+   * VirtualList 的 scrollToIndex(最后一项) → 视口被拉到最底部，
+   * 用户根本看不到刚补上来的更早内容（等于点了等于没点）。
+   * 加载结束（含失败）后延迟复位，留出补偿 effect 的执行窗口。
+   */
+  const [suppressStick, setSuppressStick] = useState(false)
   useEffect(() => {
-    setNearBottom(true)
+    if (loadingEarlier) {
+      setSuppressStick(true)
+      return
+    }
+    const t = setTimeout(() => setSuppressStick(false), 80)
+    return () => clearTimeout(t)
+  }, [loadingEarlier])
+
+  useEffect(() => {
     const el = scrollerRef.current
-    if (el) el.scrollTop = el.scrollHeight
-  }, [messages[0]?.id])
+    const keyChanged = prevDataKeyRef.current !== dataKey
+    // 首次载入：首条消息从「无」变「有」也算换数据源（plain 直排模式没有
+    // VirtualList 的贴底兜底，必须在这里补一次滚底，否则浮窗会停在顶部）。
+    const firstLoaded = prevFirstIdRef.current === undefined && firstId !== undefined
+    // 头部前置插入：会话没变、但首条消息换了 ⇒ 是 loadEarlierMessages 补的头部
+    const headPrepended =
+      !keyChanged && !firstLoaded && prevFirstIdRef.current !== undefined && prevFirstIdRef.current !== firstId
+    prevDataKeyRef.current = dataKey
+    prevFirstIdRef.current = firstId
+    if (!el) return
+    if (keyChanged || firstLoaded) {
+      setNearBottom(true)
+      el.scrollTop = el.scrollHeight
+      scrollSnapRef.current = { top: el.scrollTop, height: el.scrollHeight }
+      return
+    }
+    if (!headPrepended) return
+    // 前置插入后：用「新增高度」补偿 scrollTop，让用户视线停在原来那段内容上。
+    // 双层 rAF：等 VirtualList 的 measureElement 实测完高度、容器总高稳定后再补偿。
+    const before = scrollSnapRef.current
+    let raf1 = 0
+    let raf2 = 0
+    raf1 = requestAnimationFrame(() => {
+      raf2 = requestAnimationFrame(() => {
+        const grew = el.scrollHeight - before.height
+        if (grew <= 0) {
+          scrollSnapRef.current = { top: el.scrollTop, height: el.scrollHeight }
+          return
+        }
+        // 若浏览器已自行做滚动锚定补偿（scrollTop 已变大），不再叠加，避免跳两倍
+        if (el.scrollTop <= before.top + 1) el.scrollTop = before.top + grew
+        scrollSnapRef.current = { top: el.scrollTop, height: el.scrollHeight }
+      })
+    })
+    return () => {
+      cancelAnimationFrame(raf1)
+      if (raf2) cancelAnimationFrame(raf2)
+    }
+  }, [dataKey, firstId])
 
   // 滚动监听：**必须以 hasMessages 为依赖**（原实现依赖 []，若挂载时消息为空则
   // scrollerRef.current 为 null → 监听器永不挂上 → nearBottom 恒为 true，
@@ -148,6 +270,9 @@ export function MessageThread({
     const onScroll = () => {
       const v = el.scrollHeight - el.scrollTop - el.clientHeight < 140
       setNearBottom((prev) => (prev === v ? prev : v))
+      // 滚动快照实时跟随：前置插入后要按「插入前的真实位置」补偿，
+      // 若快照只在切会话时记录，用户中途滚动过就会拿着过期坐标把视口送错地方。
+      scrollSnapRef.current = { top: el.scrollTop, height: el.scrollHeight }
     }
     // 初次判定：进入会话时通常已贴底，同步一次真实位置
     onScroll()
@@ -276,6 +401,12 @@ export function MessageThread({
   if (plain) {
     return (
       <div className="relative flex-1 min-h-0 flex flex-col">
+        <LoadEarlierBar
+          visible={hasMoreEarlier}
+          loading={loadingEarlier}
+          failed={earlierFailed}
+          onLoad={onLoadEarlier}
+        />
         <div ref={scrollerRef} className={scrollCls ? cn('flex-1 overflow-y-auto', scrollCls) : 'flex-1 overflow-y-auto px-3 sm:px-6 py-5'}>
           <div className="max-w-[860px] mx-auto space-y-2">
             {turns.map((t, i) => (
@@ -300,6 +431,18 @@ export function MessageThread({
 
   return (
     <div className="relative flex-1 min-h-0 flex flex-col">
+      {/*
+        首屏截断的「加载更早消息」触发位。
+        🚨 刻意放在滚动容器**之外**的顶部横条：VirtualList 用 translateY 绝对定位，
+        任何塞进其内部的前置节点都会改变 measureElement 的 start 基准、把已测量高度整体顶偏。
+        放在容器外则只压缩可视高度，滚动的 totalSize 与已测高度完全不受影响。
+      */}
+      <LoadEarlierBar
+        visible={hasMoreEarlier}
+        loading={loadingEarlier}
+        failed={earlierFailed}
+        onLoad={onLoadEarlier}
+      />
       <div ref={scrollerRef} className={scrollCls ? cn('flex-1 overflow-y-auto', scrollCls) : 'flex-1 overflow-y-auto px-3 sm:px-6 py-5'}>
         <div className="max-w-[860px] mx-auto">
           <VirtualList<TurnGroup>
@@ -307,7 +450,7 @@ export function MessageThread({
             scrollerRef={scrollerRef}
             estimateSize={() => 240}
             getKey={(t) => String(t.turnSeq)}
-            stickToBottom={nearBottom}
+            stickToBottom={nearBottom && !suppressStick}
             followKey={followKey}
             scrollTarget={scrollTarget}
             renderItem={(t, index) => (
@@ -326,6 +469,59 @@ export function MessageThread({
         </div>
       </div>
       {showJumpToLatest && <JumpToLatestButton onClick={jumpToLatest} />}
+    </div>
+  )
+}
+
+/**
+ * 「加载更早消息」触发位（服务端 has_more=true 时显示）。
+ *
+ * 交互设计（行为确定、可测，不做隐式滚动劫持）：
+ *   - 默认态：「加载更早的消息」按钮，点击 → 上层调 loadEarlierMessages（只补头部）；
+ *   - 加载中：按钮禁用 + Loader2 转圈 + 「加载中…」，防重复点击打请求风暴；
+ *   - 失败态：文案转「重试」（AlertTriangle 图标），点击即再次尝试，不会自动重试。
+ *
+ * 位置选择：置于滚动容器**上方**的横条，不参与 VirtualList 的绝对定位坐标系，
+ * 因此不会干扰已测量高度（见调用处注释）。
+ */
+function LoadEarlierBar({ visible, loading, failed, onLoad }: {
+  visible: boolean
+  loading: boolean
+  failed: boolean
+  onLoad?: () => void
+}) {
+  if (!visible) return null
+  return (
+    <div className="shrink-0 flex justify-center pt-2.5 pb-1 fade-in">
+      <button
+        type="button"
+        onClick={onLoad}
+        disabled={loading || !onLoad}
+        className={cn(
+          'inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full border',
+          'text-[12px] font-medium transition-all select-none',
+          loading
+            ? 'bg-panel2/80 border-edge text-inkfaint cursor-wait'
+            : 'bg-panel2/95 hover:bg-panel border-edge hover:border-accent/50 text-inkdim hover:text-ink cursor-pointer active:scale-95',
+          failed && !loading && 'border-warn/40 text-warn hover:text-warn',
+        )}
+        title={
+          loading
+            ? '正在加载更早的消息…'
+            : failed
+              ? '上次加载失败，点击重试（只补头部，不影响已加载内容）'
+              : '向上加载更早的消息（只补头部，绝不覆盖当前内容）'
+        }
+      >
+        {loading ? (
+          <Loader2 size={12} className="animate-spin shrink-0" />
+        ) : failed ? (
+          <AlertTriangle size={12} className="shrink-0" />
+        ) : (
+          <ChevronUp size={12} className="shrink-0" />
+        )}
+        <span>{loading ? '加载中…' : failed ? '重试加载更早的消息' : '加载更早的消息'}</span>
+      </button>
     </div>
   )
 }

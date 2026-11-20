@@ -53,6 +53,16 @@ const (
 	CodeRunStateConflict   Code = "run.state_conflict"
 	CodeRunInterrupted     Code = "run.interrupted"
 	CodeRunConcurrencyFull Code = "run.concurrency_full"
+	// CodeRunSessionMismatch 引导的 Run 不属于 URL 指定的会话（客户端串台）。
+	//
+	// 为什么必须拒绝而不是静默写库：前端 useChat 的 currentRunId 是模块级单例，
+	// 切会话不重置 —— 「A 会话 Run 进行中 → 新建 B 会话发消息」会把引导 POST 到
+	// /sessions/{B}/runs/{A的run}/guidance。旧实现放行后会用 B 的会话库 Append 这条
+	// user 消息：B 库里出现一条 run_id 属于 A 的孤儿消息（runs 表为空、永无回复），
+	// 同时该内容被 A 的引擎回灌进历史尾部污染前缀缓存。故此处**必须在 Append 之前拦下**。
+	// 注意：字面量沿用交接书指定的 agent.run_session_mismatch（与相邻 run.* 族
+	// 略有出入，但三端契约以此串为准，不可自行改名）。
+	CodeRunSessionMismatch Code = "agent.run_session_mismatch"
 )
 
 // 工具与插件
@@ -238,7 +248,10 @@ func StatusFor(code Code) int {
 		// 设备离线拒发起对话：属「当前状态不满足」而非「没权限」，409 让前端提示用户恢复设备。
 		CodeDeviceOffline,
 		// 归属未知是"状态需要修正"而非"没权限"：端侧要据此提示重新配对。
-		CodeDeviceOwnerUnknown:
+		CodeDeviceOwnerUnknown,
+		// Run 不属于该会话：客户端串台，必须拒绝而非静默写错库（409 由端侧触发
+		// 「重置本地 Run 态 + 重新拉取会话」的自愈流程）。
+		CodeRunSessionMismatch:
 		return http.StatusConflict
 	case CodeRateLimited, CodeAuthRateLimited:
 		return http.StatusTooManyRequests

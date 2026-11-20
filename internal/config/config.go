@@ -163,17 +163,19 @@ type AgentConfig struct {
 // BudgetConfig 预算闸门（阶段 D-4）参数。
 //
 // 契约：
-//   - MaxTotal = 0 表示不限预算，闸门直通（零开销，行为与 D-4 之前完全一致）；
-//   - MaxTotal > 0 时超出即触发五级降级（省记忆 → topK 减半 → 常驻工具降到 4
-//     → 旧工具结果转引用 → 强制压缩），五级用尽仍超则 Run 明确失败
-//     （budget_exhausted），**严禁静默截断**；
+//   - MaxTotal = 0 表示不限预算，闸门直通（零开销，行为与 D-4 之前完全一致），
+//     且衍生的 prompt.Limits.MaxHistory 为 0 ⇒ 历史段**完全不裁切**（会无边界膨胀，
+//     2026-11 实测已因此把 prompt 顶到 161035 token，故 0 保留为合法值但不再是默认）；
+//   - MaxTotal > 0（**现为默认 131072**）时超出即触发五级降级（省记忆 → topK 减半 →
+//     常驻工具降到 4 → 旧工具结果转引用 → 强制压缩），五级用尽仍超则 Run 明确失败
+//     （budget_exhausted），**严禁静默截断**；同时恢复历史段的轮次级原子裁切；
 //   - HistoryRatio 是历史段占总预算的比例上限（映射 prompt.Limits.MaxHistory），
 //     超出部分由 Builder 从最旧开始裁剪（这是预算内的正常裁剪，有 DroppedHistory 计数，
 //     与「降级用尽后的明确报错」是两条路径）。
 //
 // 两者均在 Validate 中硬校验，非法值直接拒绝加载，不做静默兜底。
 type BudgetConfig struct {
-	MaxTotal     int     `yaml:"max_total"`     // 总 token 预算，0 = 不限（默认）
+	MaxTotal     int     `yaml:"max_total"`     // 总 token 预算，0 = 不限；默认 131072
 	HistoryRatio float64 `yaml:"history_ratio"` // 历史段占比上限 (0,1]，默认 0.6
 }
 
@@ -188,7 +190,8 @@ type BudgetConfig struct {
 //
 // ⚠️ MaxContextTokens 必须给真实值。填 0 表示"窗口未知"，压缩会被整体跳过，
 // 这会让整套机制退化成「存在但不生效」——正是本次长会话 111 万 token 的
-// 制度性根因（budget.max_total 默认 0 让五级降级从不触发，第五级又无消费者）。
+// 制度性根因（budget.max_total 当时默认 0 让五级降级从不触发，第五级又无消费者；
+// 该默认值已于 2026-11 改为 131072，见 Default()）。
 type CompactionConfig struct {
 	// MaxContextTokens 模型上下文窗口上限（token）。压缩水位取它的 80%。
 	MaxContextTokens int `yaml:"max_context_tokens"`
@@ -416,8 +419,24 @@ func Default() Config {
 			ToolTimeoutS:    180, // 单次工具超时（原引擎硬编码 120s，会砍掉 run_command 的 timeout_s=400）
 		},
 		Budget: BudgetConfig{
-			MaxTotal:     0,   // 默认不限预算（闸门直通）；配置后超限走五级降级
-			HistoryRatio: 0.6, // 历史段占比上限，仅 MaxTotal>0 时生效
+			// 131072 = 2 × 65536（compaction.max_context_tokens 默认窗口）。
+			//
+			// 为什么**不能再默认 0**（2026-11 修复，实测事故）：
+			//   max_total=0 ⇒ MaxHistory=0 ⇒ Builder.trimHistory 整段跳过
+			//   ⇒ 历史**没有任何上界**。实测会话 122559a3 的 prompt 由 5705
+			//   一路涨到 161035 token（258 条消息），单步耗时由 2s 涨到 25s。
+			//   这正是「机制存在但常年休眠」的同型缺陷。
+			//
+			// 为什么取 2 倍窗口而不是等于窗口：
+			//   轴 A（窗口容量，compaction.max_context_tokens）与轴 B（预算成本，
+			//   budget.max_total）**刻意不相等**（见 internal/agent/engine.go 的
+			//   轴注释）：压缩先按窗口 80% 水位把旧轮次折叠成摘要，预算轴再作为
+			//   成本上限兜底。取 2 倍窗口 ⇒ 正常 100 步任务（固定开销 <8k +
+			//   历史段 ≤ 0.6×131072 = 78643）在压缩水位（52428）触发前不会被
+			//   轮次级裁切误伤，只有真正失控的长任务才会被裁 —— 既恢复上界，
+			//   又不牺牲正常长任务的前文连续性。
+			MaxTotal:     131072, // 总 token 预算（0 = 不限，旧行为；非零 = 恢复历史段轮次级原子裁切）
+			HistoryRatio: 0.6,    // 历史段占比上限，仅 MaxTotal>0 时生效 ⇒ MaxHistory=78643
 		},
 		Compaction: CompactionConfig{
 			// 65536：覆盖主流长上下文模型（DeepSeek/Claude 等）的保守下限。

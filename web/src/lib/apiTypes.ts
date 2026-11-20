@@ -333,6 +333,26 @@ export interface ActiveRunDTO {
   status?: RunStatus;
 }
 
+/**
+ * 单会话用量汇总（GET /sessions/{sid}/usage）。
+ *
+ * 存在意义（P1-2「用量清零」）：前端 `usageBySession` 账本只是纯内存态，
+ * 刷新后一律归零；而历史用量在库里（runs 表）一直有。该端点把库里的累计量
+ * 一次性给出，供前端做**初始水位**回填。
+ *
+ * 口径（服务端定义，前端只做展示）：
+ *   - tokens_in = SUM(runs.input_tokens)（逐步累加的账单口径，缓存命中率的分母）
+ *   - tokens_out = SUM(runs.output_tokens)
+ *   - cached_tokens = SUM(runs.cached_tokens)
+ *   - runs = 计入汇总的 Run 条数（用于判断「该会话是否真的跑过」）
+ */
+export interface SessionUsageDTO {
+  tokens_in: number;
+  tokens_out: number;
+  cached_tokens: number;
+  runs: number;
+}
+
 export interface ToolEvent {
   id: string;
   run_id: string;
@@ -626,6 +646,11 @@ export const API_PATHS = {
    * 语义：无进行中 Run 返回 200 且 run_id 为空串（不是 404）。
    */
   activeRun: (sid: string) => `/api/v1/sessions/${sid}/active-run`,
+  /**
+   * 会话用量汇总（P1-2：消除「刷新后用量清零」）。
+   * 与 activeRun 同理刻意不嵌套在 runs 子路径下，避免被 runs 详情端点（rid 通配）抢先匹配。
+   */
+  sessionUsage: (sid: string) => `/api/v1/sessions/${sid}/usage`,
   run: (sid: string, rid: string) => `/api/v1/sessions/${sid}/runs/${rid}`,
   runStop: (sid: string, rid: string) => `/api/v1/sessions/${sid}/runs/${rid}/stop`,
   runGuidance: (sid: string, rid: string) => `/api/v1/sessions/${sid}/runs/${rid}/guidance`,

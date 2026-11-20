@@ -35,6 +35,27 @@ let currentRunId: string | null = null
 let noModelRun = false
 /** 当前被跟踪 Run 所属会话（切会话后仍要继续跟踪原 Run，故与 currentId 分开记） */
 let currentRunSessionId: string | null = null
+/**
+ * 乐观壳 id → 服务端真实 id 的别名表（同一会话的两个名字）。
+ *
+ * 为什么需要：新建会话时本地先造壳 `s-<ts>`，POST 后才拿到真实 id 并调用 migrateUsage。
+ * 而流式 Run 的归属记录（currentRunSessionId）与 SSE 订阅闭包捕获的都是**壳 id** ——
+ * 🚨 绝不能把它改写成真实 id：makeStreamEventHandler 的归属守卫正拿它比对，
+ * 一改就会把所有后续事件判定为「别的会话的残留」而全部丢弃（Run 变成假死）。
+ * 所以只能在**比较时**归一化（见 sameSessionId）。
+ */
+const sessionAlias: Record<string, string> = {}
+/** 把会话 id 归一化到它已知的最终名字（无别名则原样返回）。 */
+const aliasOf = (id: string | null): string => (id ? sessionAlias[id] ?? id : '')
+/**
+ * 两个会话 id 是否指向**同一个会话**（兼容「壳 id ↔ 真实 id」的两种写法）。
+ *
+ * 归属守卫必须用它而不是 `===`：否则壳 id 迁徙成真实 id 后，
+ * `isStreamingCurrentSession()` 会误判「当前会话没在跑」→ 用户在本会话再发一条
+ * 就会被当成新 Run（服务端原 Run 仍在跑 → 同会话两个 Run）。
+ */
+const sameSessionId = (a: string | null, b: string | null): boolean =>
+  Boolean(a) && Boolean(b) && (a === b || aliasOf(a) === aliasOf(b))
 let stepStartAt = 0
 /**
  * 本 Run 是否已收到过**服务端下发的步级用量**（message.end 的 token/prompt/cached）。
@@ -132,21 +153,36 @@ export interface SessionUsage {
  */
 const usageBySession: Record<string, SessionUsage> = {}
 
+/**
+ * 已由**服务端汇总**回填、但尚未被本地实时累加覆盖的会话（P1-2 反双计兜底）。
+ *
+ * 为什么必须有这份记账：回填值 = 库里**截至目前**的累计量，可能已含某个正在跑的
+ * Run 已落库的前几步用量；而 resumeRun 接回该 Run 后，`runRealtime` 从接回点归零，
+ * 收口时 settleRun 会把「整轮合计 − 接回后实时入账」全额补进账本 —— 那部分「接回前
+ * 已落库的用量」就与回填值重复了。故接回在跑 Run 时**撤销**该会话的回填，退化为
+ * 全零起算（与改造前一致），由差额补记把整轮合计完整重建一遍。
+ */
+const backfilledSessions = new Set<string>()
+
 /** 把一次 Run 的用量累加进该会话账本，并返回累加后的最新值。 */
 function accumulateUsage(sessionId: string, delta: SessionUsage): SessionUsage {
-  const prev = usageBySession[sessionId] ?? { tokensIn: 0, tokensOut: 0, cachedTokens: 0 }
+  // 本地一旦开始累加，账本即由本地权威接管：撤销「回填未覆盖」标记，
+  // 后续 resumeRun / activateSession 不再把服务端汇总当作可比基准。
+  const key = aliasOf(sessionId)
+  backfilledSessions.delete(key)
+  const prev = usageBySession[key] ?? { tokensIn: 0, tokensOut: 0, cachedTokens: 0 }
   const next: SessionUsage = {
     tokensIn: prev.tokensIn + delta.tokensIn,
     tokensOut: prev.tokensOut + delta.tokensOut,
     cachedTokens: prev.cachedTokens + delta.cachedTokens,
   }
-  usageBySession[sessionId] = next
+  usageBySession[key] = next
   return next
 }
 
 /** 读取某会话的用量水位（无记录 = 全零，绝不借用别的会话数值）。 */
 function usageOf(sessionId: string): SessionUsage {
-  return usageBySession[sessionId] ?? { tokensIn: 0, tokensOut: 0, cachedTokens: 0 }
+  return usageBySession[aliasOf(sessionId)] ?? { tokensIn: 0, tokensOut: 0, cachedTokens: 0 }
 }
 
 /**
@@ -267,6 +303,47 @@ interface ChatState {
 }
 
 export const useChat = create<ChatState>((set, get) => {
+  /**
+   * 「当前选中的会话是否真有进行中的 Run」—— 会话归属守卫的**唯一**判据（P0-2）。
+   *
+   * 为什么不能只看 `get().streaming`：streaming / runStatus 是**全局单份展示态**，
+   * 而「被跟踪的 Run」的归属是 `currentRunId` + `currentRunSessionId`。A 会话的 Run 在跑时
+   * 用户切到/新建 B 会话，streaming 仍可能是 true（跨会话续跑是既有正确行为），
+   * 若据此判定「B 也在跑」→ B 的消息会被当成引导发给 **A 的 runId**：
+   * 消息写进错的会话库、B 永远收不到回复、A 的历史被污染（缓存命中率随之暴跌）。
+   *
+   * 集中到一处判断，避免 send/guide/任何后续入口各写一套而漂移。
+   */
+  const isStreamingCurrentSession = () =>
+    get().streaming
+    && currentRunId !== null
+    && sameSessionId(currentRunSessionId, useSessions.getState().currentId)
+
+  /**
+   * 把本地「被跟踪 Run」的展示态归位（**只影响展示，绝不中断服务端 Run**）。
+   *
+   * 服务端 Run 继续跑（跨会话续跑是既有正确行为），切回该会话时由 resumeRun 重新接回。
+   * 收口落点（currentRunSessionId）必须一并清空：留着它会让该 Run 的残留事件继续
+   * 通过 makeStreamEventHandler 的归属守卫写入全局 UI 态（串台）。
+   */
+  const resetLocalRunTracking = () => {
+    flush()
+    set({
+      streaming: false,
+      runStatus: 'completed',
+      reasoning: '',
+      approval: null,
+      runPhase: 'idle' as RunPhase,
+    })
+    streamingMsgId = null
+    currentRunId = null
+    currentRunSessionId = null
+    handle = null
+    // 切换会话即放弃上一轮的收口语义标记（未选模型的空 reply 摘壳已无对象）
+    noModelRun = false
+    useSse.getState().detachRun()
+  }
+
   const flush = () => {
     if (flushTimer) {
       clearTimeout(flushTimer)
@@ -369,7 +446,8 @@ export const useChat = create<ChatState>((set, get) => {
     }
     const usage = accumulateUsage(sessionId, delta)
     // 只有该会话仍是当前会话时才刷新展示值，避免 A 会话的步用量污染 B 会话的水位条
-    if (useSessions.getState().currentId === sessionId) {
+    // （sameSessionId 兼容壳 id ↔ 真实 id，否则迁徙后本会话的水位条会停止刷新）
+    if (sameSessionId(useSessions.getState().currentId, sessionId)) {
       set({ tokensIn: usage.tokensIn, tokensOut: usage.tokensOut, cachedTokens: usage.cachedTokens })
     }
   }
@@ -408,7 +486,7 @@ export const useChat = create<ChatState>((set, get) => {
         cachedTokens: Math.max(0, (opts.usage.cachedTokens ?? 0) - runRealtime.cachedTokens),
       }
       const usage = accumulateUsage(sessionId, delta)
-      const isCurrent = useSessions.getState().currentId === sessionId
+      const isCurrent = sameSessionId(useSessions.getState().currentId, sessionId)
       usagePatch = {
         tokensIn: isCurrent ? usage.tokensIn : get().tokensIn,
         tokensOut: isCurrent ? usage.tokensOut : get().tokensOut,
@@ -519,7 +597,7 @@ export const useChat = create<ChatState>((set, get) => {
         // 事件隔离守卫：本地同一时刻只跟踪一个 Run（streamingMsgId / pendingText 是模块级单份）。
         // 用户切走该会话（或恢复了别的会话的 Run）后，本 Run 的残留事件不得再写入全局 UI 态，
         // 否则会把 A 会话的增量/收口错误地打到 B 会话的消息与状态上。
-        if (currentRunSessionId !== runSessionId) return
+        if (!sameSessionId(currentRunSessionId, runSessionId)) return
         // Run 所属会话（收口、建新步骤消息、用量记账都落在它身上，与用户当前正在看哪个会话无关）
         const sessionId = runSessionId
         switch (e.type) {
@@ -674,7 +752,7 @@ export const useChat = create<ChatState>((set, get) => {
       void (async () => {
         await get().reloadMessages(opts.sessionId)
         // 本地已不再跟踪该 Run（用户切会话/已收口）：不重连、不重复收口
-        if (currentRunSessionId !== opts.sessionId || currentRunId !== opts.runId) return
+        if (currentRunId !== opts.runId || !sameSessionId(currentRunSessionId, opts.sessionId)) return
         try {
           const run = await api.getRun(opts.sessionId, opts.runId)
           if (isRunTerminal(run.status)) {
@@ -897,7 +975,8 @@ export const useChat = create<ChatState>((set, get) => {
           const others = s.messages.filter((m) => m.sessionId !== sessionId)
           const serverSeqs = new Set(list.map((m) => m.seq))
           const keepLocal =
-            s.streaming && currentRunSessionId === sessionId
+            // sameSessionId 兼容壳 id ↔ 真实 id（该会话迁徙后仍要保住未落库的乐观消息）
+            s.streaming && sameSessionId(currentRunSessionId, sessionId)
               ? s.messages.filter((m) => m.sessionId === sessionId && !serverSeqs.has(m.seq))
               : []
           return {
@@ -994,24 +1073,15 @@ export const useChat = create<ChatState>((set, get) => {
      */
     resumeRun: async (sessionId) => {
       if (!sessionId) return
-      // 仅当本地正在跟踪的**就是该会话**的 Run 时才跳过；跟踪别的会话不影响本会话恢复
-      if (get().streaming && currentRunId && useSessions.getState().currentId === sessionId
-        && currentRunSessionId === sessionId) return
+      // 仅当本地正在跟踪的**就是该会话**的 Run 时才跳过；跟踪别的会话不影响本会话恢复。
+      // 比较统一走 sameSessionId（兼容「壳 id ↔ 真实 id」：该会话迁徙后仍算同一个）。
+      if (get().streaming && currentRunId
+        && sameSessionId(useSessions.getState().currentId, sessionId)
+        && sameSessionId(currentRunSessionId, sessionId)) return
       // 切到另一个会话：先把上一会话的「进行中」本地态归位（服务端 Run 不受影响，仍继续跑；
       // 切回时靠本方法重新接回）。否则输入框会误显「运行中」、顶栏残留连接态。
-      if (get().streaming && currentRunSessionId && currentRunSessionId !== sessionId) {
-        flush()
-        set({
-          streaming: false, runStatus: 'completed', reasoning: '', approval: null,
-          runPhase: 'idle' as RunPhase,
-        })
-        streamingMsgId = null
-        currentRunId = null
-        currentRunSessionId = null
-        handle = null
-        // 切换会话即放弃上一轮的收口语义标记（未选模型的空 reply 摘壳已无对象）
-        noModelRun = false
-        useSse.getState().detachRun()
+      if (get().streaming && currentRunSessionId && !sameSessionId(currentRunSessionId, sessionId)) {
+        resetLocalRunTracking()
       }
       let active: ActiveRunDTO | null = null
       try {
@@ -1027,7 +1097,7 @@ export const useChat = create<ChatState>((set, get) => {
         return
       }
       // 查询期间用户可能已自行发起新对话（同样的会话）——此时本地是更新的真相，不覆盖
-      if (get().streaming && currentRunId && currentRunSessionId === sessionId) return
+      if (get().streaming && currentRunId && sameSessionId(currentRunSessionId, sessionId)) return
 
       const runId = active.run_id
       const mine = get().messages.filter((m) => m.sessionId === sessionId && !m.reverted)
@@ -1049,6 +1119,18 @@ export const useChat = create<ChatState>((set, get) => {
       }
       currentRunId = runId
       currentRunSessionId = sessionId
+      // 🚨 反双计兜底（P1-2）：本会话若已用服务端汇总做过回填，接回在跑 Run 时必须撤销。
+      // 回填值 = 库里截至目前累计量，可能已含本 Run 已落库的前几步用量；而 runRealtime 从
+      // 接回点归零 → settleRun 会把「整轮合计 − 接回后实时入账」全额补记，与回填值重复。
+      // 撤销后退化为全零起算（与改造前一致），由差额补记把整轮合计完整重建一遍。
+      const usageKey = aliasOf(sessionId)
+      if (backfilledSessions.has(usageKey)) {
+        backfilledSessions.delete(usageKey)
+        usageBySession[usageKey] = { tokensIn: 0, tokensOut: 0, cachedTokens: 0 }
+        if (sameSessionId(useSessions.getState().currentId, sessionId)) {
+          set({ tokensIn: 0, tokensOut: 0, cachedTokens: 0 })
+        }
+      }
       // 接回在跑的 Run：同样是新一轮跟踪，重置步级用量标记
       sawStepUsage = false
       // 接回在跑的 Run：已过去的步骤由 DB 快照承载，实时入账从接回点重新起算
@@ -1081,7 +1163,7 @@ export const useChat = create<ChatState>((set, get) => {
             const pendingEv = evs.find((ev) => ev.status === 'pending')
             if (!pendingEv) return
             // 期间状态已变（用户已决策 / 已切会话）则不再覆盖
-            if (currentRunSessionId !== sessionId || !get().streaming) return
+            if (!sameSessionId(currentRunSessionId, sessionId) || !get().streaming) return
             set({
               approval: {
                 id: pendingEv.id,
@@ -1106,21 +1188,87 @@ export const useChat = create<ChatState>((set, get) => {
       attachToRun({ sessionId, runId, fromSeq: -1, onEvent: onStreamEvent })
     },
 
-    // 切换会话：把展示用的 token 水位切到该会话自己的账本（新会话 = 归零）
+    /**
+     * 切换会话：展示态按会话归属复位 + 把 token 水位切到该会话自己的账本（并在需要时回填）。
+     *
+     * 三件事，顺序不可颠倒：
+     *  ① **归属复位（P0-2）**：切到的会话不是「正在被跟踪的那个 Run」的会话 →
+     *     本地展示态归位为空闲。🚨 只归位展示，**绝不** stop/中断服务端那个 Run
+     *     （跨会话续跑是既有正确行为；切回来时 resumeRun 会重新接回）。
+     *     不做这步的话，A 会话 Run 在跑时切到 B，B 的输入框会误显「运行中」，
+     *     进而让 send() 把 B 的消息当引导发给 A 的 runId（串台）。
+     *  ② 账本切换：无记录 = 全零，绝不借用别的会话数值。
+     *  ③ 用量回填（P1-2）：本地账本无该会话记录时，用服务端汇总做**初始水位**。
+     */
     activateSession: (sessionId) => {
+      // 归属复位（P0-2）：切到的不是「被跟踪 Run 所在会话」→ 展示态归位为空闲。
+      // 🚨 这里**只归位展示**，绝不 stop/中断服务端那个 Run（跨会话续跑是既有正确行为）；
+      // 切回该会话时由 resumeRun 重新接回。用 sameSessionId 而非 ===，兼容壳 id ↔ 真实 id。
+      if (get().streaming && !sameSessionId(currentRunSessionId, sessionId)) {
+        resetLocalRunTracking()
+      }
+      const key = aliasOf(sessionId)
       const u = usageOf(sessionId)
+      // 账本切换先落地（同步）：activateSession 的语义就是「展示值现在指向该会话」，
+      // 故与改造前一致地无条件刷新，避免调用方（sessionStore.syncUsage 走动态 import，
+      // 回调时刻 currentId 可能还没切过来）判断出偏差导致水位条停在上一会话。
       set({ tokensIn: u.tokensIn, tokensOut: u.tokensOut, cachedTokens: u.cachedTokens })
+      if (!key) return
+      // 🚨 反双计策略（P1-2 铁律）：
+      // 服务端汇总只在「账本里**尚无**该会话记录」时用作初始水位，此后
+      // creditStepUsage（逐步实时累加）与 settleRun（差额补记）照旧在账本上递增。
+      // 已有记录就完全跳过网络回填 —— 本地账本是更新的真相，用服务端汇总覆盖会
+      // 把本轮已入账的量抹掉（下次 done 差额补记再叠回来就是双计）。
+      if (usageBySession[key]) return
+      void api
+        .getSessionUsage(key)
+        .then((dto) => {
+          // 失败/404（后端未上线该端点）→ 保持既有全零行为，界面不受影响
+          if (!dto) return
+          // 请求期间本会话可能已产生实时入账（用户秒发了一条），此时本地账本优先
+          if (usageBySession[key]) return
+          // 该会话正被跟踪（刷新后 resumeRun 已接回在跑的 Run）：库里的汇总可能
+          // 已含本轮部分用量，叠加实时累加会双计 → 放弃本次回填（退化为全零起算，
+          // 与改造前一致，绝不虚高）。
+          if (get().streaming && sameSessionId(currentRunSessionId, key)) return
+          if (dto.tokens_in === 0 && dto.tokens_out === 0 && dto.cached_tokens === 0) return
+          usageBySession[key] = {
+            tokensIn: dto.tokens_in,
+            tokensOut: dto.tokens_out,
+            cachedTokens: dto.cached_tokens,
+          }
+          backfilledSessions.add(key)
+          // 只有该会话仍是当前选中会话时才刷新展示（切走后不覆盖别人的水位条）
+          if (sameSessionId(useSessions.getState().currentId, key)) {
+            set({ tokensIn: dto.tokens_in, tokensOut: dto.tokens_out, cachedTokens: dto.cached_tokens })
+          }
+        })
+        .catch(() => {
+          /* 回填是锦上添花：失败静默，绝不阻断切换会话 */
+        })
     },
 
-    // 会话 id 迁徙（乐观壳 → 服务端真实 id）：账本跟着搬，展示值若正指向旧 id 也一并刷新
+    /**
+     * 会话 id 迁徙（乐观壳 → 服务端真实 id）：账本跟着搬，展示值若正指向旧 id 也一并刷新。
+     *
+     * 🚨 流式态**不得**被迁徙打断（P0-2）：这里只登记别名（sessionAlias），
+     * 绝不改写 currentRunSessionId —— 那是 SSE 事件归属守卫的比对基准，改了会让
+     * 在跑的 Run 的全部后续事件被丢弃（假死）。归属比较统一走 sameSessionId。
+     */
     migrateUsage: (fromId, toId) => {
       if (!fromId || !toId || fromId === toId) return
+      // 登记别名：此后 fromId 与 toId 视为同一会话（账本键也会归一化到 toId）
+      sessionAlias[fromId] = toId
       const prev = usageBySession[fromId]
       if (prev) {
         usageBySession[toId] = prev
         delete usageBySession[fromId]
       }
-      if (useSessions.getState().currentId === toId) {
+      if (backfilledSessions.has(fromId)) {
+        backfilledSessions.delete(fromId)
+        backfilledSessions.add(toId)
+      }
+      if (sameSessionId(useSessions.getState().currentId, toId)) {
         const u = usageOf(toId)
         set({ tokensIn: u.tokensIn, tokensOut: u.tokensOut, cachedTokens: u.cachedTokens })
       }
@@ -1129,7 +1277,9 @@ export const useChat = create<ChatState>((set, get) => {
     send: (input) => {
       const text = input.trim()
       if (!text) return
-      if (get().streaming) {
+      // 会话归属守卫（P0-2）：只有**当前会话**确有进行中的 Run 才转引导。
+      // 仅看全局 streaming 会把 B 会话的消息当引导发给 A 的 runId（串台）。
+      if (isStreamingCurrentSession()) {
         get().guide(text)
         return
       }
@@ -1235,7 +1385,11 @@ export const useChat = create<ChatState>((set, get) => {
     guide: (input) => {
       const text = input.trim()
       if (!text) return
-      if (!get().streaming) {
+      // 会话归属守卫（P0-2，与 send 共用同一个判据）：
+      // 若正在跑的 Run 属于**别的会话**（用户已切走/新建了会话），这条输入不是引导，
+      // 必须在本会话发起新 Run。否则 sendGuidance 会把消息写进错会话的库：
+      // B 永远收不到回复，A 的历史被污染（缓存命中随之暴跌）。
+      if (!isStreamingCurrentSession()) {
         startRun(text)
         return
       }

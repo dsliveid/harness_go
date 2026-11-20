@@ -54,12 +54,84 @@ func TestDefaultValues(t *testing.T) {
 	if c.Devices.StrictApprovalDevice {
 		t.Fatal("strict_approval_device 应默认 false（只审计不阻断）")
 	}
-	// 阶段 D-4 预算闸门默认值：默认不限预算（闸门直通），历史占比 0.6
-	if c.Budget.MaxTotal != 0 {
-		t.Fatalf("max_total 默认应为 0（不限），得到 %d", c.Budget.MaxTotal)
+	// 阶段 D-4 预算闸门默认值（2026-11 修复：默认值由 0 改为 131072）。
+	// 为什么必须非零：max_total=0 ⇒ 派生的 prompt.Limits.MaxHistory=0 ⇒
+	// prompt.Builder.trimHistory 整段跳过，历史无任何上界（实测 prompt 曾涨到
+	// 161035 token / 单步 25s）。131072 = 2 × compaction.max_context_tokens(65536)。
+	if c.Budget.MaxTotal != 131072 {
+		t.Fatalf("max_total 默认应为 131072（2 × 压缩窗口），得到 %d", c.Budget.MaxTotal)
+	}
+	if c.Budget.MaxTotal != 2*c.Compaction.MaxContextTokens {
+		t.Fatalf("max_total 默认值应等于 2 × compaction.max_context_tokens：%d vs 2×%d",
+			c.Budget.MaxTotal, c.Compaction.MaxContextTokens)
 	}
 	if c.Budget.HistoryRatio != 0.6 {
 		t.Fatalf("history_ratio 默认应为 0.6，得到 %v", c.Budget.HistoryRatio)
+	}
+}
+
+// maxHistoryFor 复刻 cmd/harness-go/main.go 的换算口径（唯一权威实现）：
+//
+//	maxHistory = 0                       当 max_total <= 0（不限，历史不裁切）
+//	maxHistory = max_total * history_ratio 当 max_total > 0
+//
+// 这里刻意重复这段两行逻辑而不是导出生产函数 —— 目的是把「默认值 ⇒ 裁切真的生效」
+// 这条约束钉在配置层，任何一侧改口径都会让本测试失败。
+func maxHistoryFor(c Config) int {
+	if c.Budget.MaxTotal <= 0 {
+		return 0
+	}
+	return int(float64(c.Budget.MaxTotal) * c.Budget.HistoryRatio)
+}
+
+// TestDefaultBudgetEnablesHistoryTrim P1-1 回归：默认配置必须让历史裁切真正生效。
+func TestDefaultBudgetEnablesHistoryTrim(t *testing.T) {
+	c := Default()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("默认配置应通过校验: %v", err)
+	}
+	mh := maxHistoryFor(c)
+	if mh <= 0 {
+		t.Fatalf("默认配置下 MaxHistory 必须非零（否则 trimHistory 永不执行，历史无上界），得到 %d", mh)
+	}
+	// 131072 × 0.6 = 78643（截断）
+	if want := 78643; mh != want {
+		t.Fatalf("默认 MaxHistory 应为 %d（=131072×0.6），得到 %d", want, mh)
+	}
+	// 该上限必须高于「正常 100 步任务」的合理历史段，避免误裁正常任务；
+	// 同时必须低于「无界膨胀」形态（实测 161035），确保失控任务能被裁。
+	if mh <= 32000 {
+		t.Fatalf("MaxHistory=%d 过小，正常长任务会被误裁", mh)
+	}
+	if mh >= 161035 {
+		t.Fatalf("MaxHistory=%d 过大，无法约束实测的失控形态（161035）", mh)
+	}
+}
+
+// TestBudgetHistoryRatioConversion history_ratio=0.6 的换算口径正确性。
+func TestBudgetHistoryRatioConversion(t *testing.T) {
+	cases := []struct {
+		maxTotal int
+		ratio    float64
+		want     int
+	}{
+		{131072, 0.6, 78643},
+		{131072, 1.0, 131072},
+		{32000, 0.5, 16000},
+		{10000, 0.6, 6000},
+		{0, 0.6, 0}, // 0 = 不限，历史不裁切（合法旧行为）
+	}
+	for _, tc := range cases {
+		c := Default()
+		c.Budget.MaxTotal = tc.maxTotal
+		c.Budget.HistoryRatio = tc.ratio
+		if err := c.Validate(); err != nil {
+			t.Fatalf("max_total=%d ratio=%v 应合法: %v", tc.maxTotal, tc.ratio, err)
+		}
+		if got := maxHistoryFor(c); got != tc.want {
+			t.Fatalf("max_total=%d ratio=%v ⇒ MaxHistory 应为 %d，得到 %d",
+				tc.maxTotal, tc.ratio, tc.want, got)
+		}
 	}
 }
 

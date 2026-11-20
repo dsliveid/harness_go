@@ -66,6 +66,7 @@ import {
   type RunStatus as ApiRunStatus,
   type Session as ApiSession,
   type SessionLeaseDTO,
+  type SessionUsageDTO,
   type Snapshot,
   type SSORequest,
   type ToolEvent as ApiToolEvent,
@@ -414,6 +415,13 @@ export interface ApiClient {
   attachRun(opts: AttachRunOptions): RunHandle
   /** 会话当前进行中的 Run；无则 null（服务端语义：无进行中 Run 不是 404） */
   getActiveRun(sessionId: string): Promise<ActiveRunDTO | null>
+  /**
+   * 会话用量汇总（P1-2：消除刷新后用量清零）。
+   *
+   * 失败（含后端尚未上线该端点的 404）一律返回 null，由调用方保持「全零」降级行为，
+   * 绝不抛错阻断界面 —— 用量水位只是展示项，不能因为一个可选端点把对话卡死。
+   */
+  getSessionUsage(sessionId: string): Promise<SessionUsageDTO | null>
   getRun(sessionId: string, runId: string): Promise<Run>
   stopRun(sessionId: string, runId: string): Promise<void>
   /**
@@ -1578,6 +1586,30 @@ export const realApi: ApiClient = {
   async getActiveRun(sessionId) {
     const res = await request<ActiveRunDTO>(API_PATHS.activeRun(sessionId), { headers: authHeaders() })
     return res.run_id ? res : null
+  },
+  /**
+   * 会话用量汇总（GET /api/v1/sessions/{sid}/usage）。
+   *
+   * 降级铁律：任何失败（后端未上线 → 404 / 网络抖动 / 响应体不合法）一律返回 null，
+   * 由 chatStore 保持「账本全零」的既有行为。**绝不 throw** —— 它只服务于输入框下方的
+   * 展示水位，不能让一次可选请求把整个会话切换流程卡住。
+   */
+  async getSessionUsage(sessionId) {
+    if (!sessionId) return null
+    try {
+      const res = await request<SessionUsageDTO>(API_PATHS.sessionUsage(sessionId), {
+        headers: authHeaders(),
+      })
+      if (!res || typeof res !== 'object') return null
+      return {
+        tokens_in: Number(res.tokens_in) || 0,
+        tokens_out: Number(res.tokens_out) || 0,
+        cached_tokens: Number(res.cached_tokens) || 0,
+        runs: Number(res.runs) || 0,
+      }
+    } catch {
+      return null
+    }
   },
   async getRun(sessionId, runId) {
     return toUiRun(await request<ApiRun>(API_PATHS.run(sessionId, runId), { headers: authHeaders() }), sessionId)

@@ -461,6 +461,27 @@ func (r *RunRepo) AddUsage(ctx context.Context, runID string, promptTokens, comp
 	return nil
 }
 
+// UsageSummary 聚合本会话**全部 Run 的累加账单**（会话用量汇总端点数据源）。
+//
+// 🚨 口径铁律（勿改）：runs.input_tokens 由 AddUsage 逐轮 `+=` 累加，是**逐步累加账单**，
+// 不是单次请求的 prompt 量。因此：
+//   - tokens_in 是整会话（全部 Run、全部轮次）累计输入；
+//   - 缓存命中率必须按 SUM(cached)/SUM(input) 计算，直接拿单轮 input 做分母会得出
+//     「缓存失效」的错误结论（实测口径 97.9%）。
+// runs 计数与用量同一 SQL 取，避免两条查询在并发收尾时数字不自洽。
+func (r *RunRepo) UsageSummary(ctx context.Context) (tokensIn, tokensOut, cachedTokens, runs int64, err error) {
+	row := r.s.conn().QueryRowContext(ctx,
+		`SELECT COALESCE(SUM(input_tokens), 0),
+		        COALESCE(SUM(output_tokens), 0),
+		        COALESCE(SUM(cached_tokens), 0),
+		        COUNT(*)
+		   FROM runs`)
+	if err := row.Scan(&tokensIn, &tokensOut, &cachedTokens, &runs); err != nil {
+		return 0, 0, 0, 0, fmt.Errorf("store: 汇总会话用量失败: %w", err)
+	}
+	return tokensIn, tokensOut, cachedTokens, runs, nil
+}
+
 // FailOpenRuns 把未完成 Run 置为 interrupted（进程重启恢复，ADR-009 不做续跑）。
 func (r *RunRepo) FailOpenRuns(ctx context.Context, reason string) (int, error) {
 	if reason == "" {

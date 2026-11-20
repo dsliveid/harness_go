@@ -72,6 +72,10 @@ func NewRouter(d Deps) http.Handler {
 	mux.HandleFunc("PATCH /api/v1/sessions/{sid}", h.renameSession)
 	mux.HandleFunc("DELETE /api/v1/sessions/{sid}", h.deleteSession)
 	mux.HandleFunc("GET /api/v1/sessions/{sid}/messages", h.listMessages)
+	// 会话用量汇总（P1-2）：该会话全部 Run 的累加账单 SUM。
+	// Go 1.22 ServeMux 中字面量段优先于通配符段，故 "usage" 不会被 /sessions/{sid} 吃掉
+	// （同 "events"/"active-run" 的既有约定）。
+	mux.HandleFunc("GET /api/v1/sessions/{sid}/usage", h.sessionUsage)
 	// 归档（对齐桌面端「归档中心」；状态落主库，刷新/重启不丢）
 	mux.HandleFunc("POST /api/v1/sessions/{sid}/archive", h.archiveSession)
 	mux.HandleFunc("POST /api/v1/sessions/{sid}/unarchive", h.unarchiveSession)

@@ -138,9 +138,22 @@ type RunService struct {
 	// 只登记**执行面归属该设备**的 Run：服务端内置空间（ExecutionDeviceID 为空）
 	// 的 Run 永不进索引 —— 服务端恒在线，不该被任何设备离线事件波及。
 	runDevices map[string]map[string]struct{}
-	// guidanceChans 运行中引导通道（§4.2）：runID → chan *model.Message（容量 16）。
+	// guidanceChans 运行中引导通道（§4.2）：runID → guidanceEntry{ch, sessionID}（容量 16）。
 	// 与 cancels 同生命周期：Run 创建时注册、终态注销；Run 已结束的引导返回 409。
+	//
+	// 【2026-11 缺陷修复 · 勿回退】必须绑定 **owner sessionID**：前端 useChat 的
+	// currentRunId 是模块级单例，切会话不重置 ——「A 会话 Run 进行中 → 新建 B 会话发消息」
+	// 会 POST 到 /sessions/{B}/runs/{A}/guidance。旧实现只按 runID 命中通道，然后拿
+	// URL 里的 B 会话 id 去 Append：消息被写进**错的会话库**（B 库里出现 run_id 属于 A
+	// 的孤儿 user 消息，runs 表为空、永无回复），同时被 A 的引擎回灌进历史尾部污染
+	// 前缀缓存。故这里必须存下 owner 供入口比对（见 Guidance）。
 	guidanceChans sync.Map
+}
+
+// guidanceEntry 引导通道 + 归属会话（并发安全：值一经 Store 即不可变）。
+type guidanceEntry struct {
+	ch        chan *model.Message
+	sessionID string
 }
 
 // NewRunService 创建 Run 用例。
@@ -599,9 +612,10 @@ func (s *RunService) CreateRunWithSystem(ctx context.Context, sessionID, userInp
 		// 空串 = 服务端内置空间（ws-server），允许本地执行。
 		ExecutionDeviceID: execDeviceID,
 	}
-	// 运行中引导通道（§4.2）：随 Run 注册/注销，Guidance 端点推送、引擎轮次边界消费
+	// 运行中引导通道（§4.2）：随 Run 注册/注销，Guidance 端点推送、引擎轮次边界消费。
+	// 注册时**绑定 owner 会话**，供 Guidance 入口做归属比对（跨会话引导必须 409）。
 	guidanceCh := make(chan *model.Message, 16)
-	s.guidanceChans.Store(run.ID, guidanceCh)
+	s.guidanceChans.Store(run.ID, guidanceEntry{ch: guidanceCh, sessionID: sessionID})
 	req.GuidanceCh = guidanceCh
 	go func() {
 		defer func() {
@@ -647,6 +661,9 @@ func (s *RunService) publishNoModelCompleted(runID, sessionID string) {
 // 用户消息**立即落库**（多端立即可见），并推送给引擎在**轮次边界**回灌上下文——
 // 当前流结束后模型即看到该引导。Run 已结束（通道已注销）返回 409；
 // 引擎通道缓冲满（16）时消息不丢（已落库），只是本轮不再回灌。
+//
+// 【归属铁律】URL 会话必须先与 Run 的 owner 会话比对：不一致立即 409
+// （agent.run_session_mismatch），**绝不执行任何 Append** —— 见 guidanceChans 注释。
 func (s *RunService) Guidance(ctx context.Context, sessionID, runID, input string) (*model.Message, error) {
 	text := strings.TrimSpace(input)
 	if text == "" {
@@ -656,9 +673,14 @@ func (s *RunService) Guidance(ctx context.Context, sessionID, runID, input strin
 	if !ok {
 		return nil, apperr.New(apperr.CodeConflict, "Run 不在运行中，无法引导")
 	}
-	ch, _ := v.(chan *model.Message)
-	if ch == nil {
+	entry, _ := v.(guidanceEntry)
+	if entry.ch == nil {
 		return nil, apperr.New(apperr.CodeConflict, "Run 不在运行中，无法引导")
+	}
+	// 归属校验放在 Acquire/Append 之前：串台请求必须零副作用地打回。
+	if entry.sessionID != sessionID {
+		return nil, apperr.New(apperr.CodeRunSessionMismatch,
+			"Run 不属于该会话（客户端 Run 归属串台）")
 	}
 	sdb, err := s.sessions.Acquire(ctx, sessionID)
 	if err != nil {
@@ -677,7 +699,7 @@ func (s *RunService) Guidance(ctx context.Context, sessionID, runID, input strin
 	// 摘要回写（最终一致，失败不影响引导本身）
 	_ = s.main.Sessions().TouchMessage(ctx, sessionID, msg.CreatedAt)
 	select {
-	case ch <- msg:
+	case entry.ch <- msg:
 	default:
 		// 引导密度超上限：消息已落库不丢失，仅本轮上下文不回灌（可观测，不打断对话）
 	}
@@ -805,6 +827,21 @@ func (s *RunService) ActiveRun(ctx context.Context, sessionID string) (*model.Ru
 		}
 	}
 	return latest, nil
+}
+
+// UsageSummary 会话用量汇总（GET /api/v1/sessions/{sid}/usage 数据源）。
+//
+// 🚨 口径铁律：runs.input_tokens 是**逐步累加账单**（每轮 AddUsage 累加），不是单次
+// 请求量；命中率必须按 SUM(cached)/SUM(input) 计算 —— 故这里直接透传四个 SUM 真值，
+// 不在服务层做任何「除以轮次」的换算。
+//
+// 空会话（runs 表无行）返回全 0 且无错误：**「还没用」不是 404**，与 active-run 同口径。
+func (s *RunService) UsageSummary(ctx context.Context, sessionID string) (tokensIn, tokensOut, cachedTokens, runs int64, err error) {
+	sdb, err := s.sessions.Acquire(ctx, sessionID)
+	if err != nil {
+		return 0, 0, 0, 0, err
+	}
+	return sdb.Runs().UsageSummary(ctx)
 }
 
 // RunningCount 当前在运行的 Run 数（维护接口用）。

@@ -791,6 +791,45 @@ paths:
                   items:
                     type: array
                     items: { $ref: "#/components/schemas/Message" }
+  /api/v1/sessions/{sid}/usage:
+    parameters:
+      - $ref: "#/components/parameters/SessionID"
+    get:
+      tags: [sessions]
+      summary: 会话累加用量汇总（该会话全部 Run 的 SUM 账单；P1-2）
+      description: |
+        数据源为会话库 runs 表的累加账单列（input/output/cached tokens）。
+
+        🚨 口径铁律：`tokens_in` 是**逐步累加账单**（每轮 AddUsage `+=` 累加），
+        不是单次请求量；缓存命中率必须按 `cached_tokens / tokens_in` 计算。
+
+        语义铁律：**空会话不是 404** —— 从未跑过 Run 的会话返回 200 且全字段为 0
+        （与 `/sessions/{sid}/active-run`、`/sessions/{sid}/lease` 同口径），
+        否则前端刷新后用量面板会报错而非显示 0。
+      responses:
+        "200":
+          description: 用量汇总（空会话全 0）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tokens_in:
+                    type: integer
+                    format: int64
+                    description: 全部 Run、全部轮次的累计输入（逐步累加账单）
+                  tokens_out:
+                    type: integer
+                    format: int64
+                    description: 累计输出
+                  cached_tokens:
+                    type: integer
+                    format: int64
+                    description: 累计命中缓存量；命中率 = cached_tokens / tokens_in
+                  runs:
+                    type: integer
+                    format: int64
+                    description: 该会话的 Run 总数（含已完成/已取消/失败）
   /api/v1/webhooks:
     get:
       tags: [webhooks]

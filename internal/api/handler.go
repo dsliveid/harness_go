@@ -458,6 +458,29 @@ func (h *handlers) guideRun(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, msg)
 }
 
+// sessionUsage 会话用量汇总：GET /api/v1/sessions/{sid}/usage
+//
+// 数据源为会话库 runs 表的**累加账单**列（input/output/cached tokens）。返回形状：
+//
+//	{"tokens_in":0,"tokens_out":0,"cached_tokens":0,"runs":0}
+//
+// 🚨 口径铁律：tokens_in 是整会话（全部 Run、全部轮次）累计输入，不是单次请求量；
+// 缓存命中率请按 cached_tokens/tokens_in 计算。
+// 空会话返回全 0 + 200（**不是 404**）：刷新后用量该显示 0 而非报错。
+func (h *handlers) sessionUsage(w http.ResponseWriter, r *http.Request) {
+	tokensIn, tokensOut, cachedTokens, runs, err := h.d.Runs.UsageSummary(r.Context(), r.PathValue("sid"))
+	if err != nil {
+		writeError(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"tokens_in":     tokensIn,
+		"tokens_out":    tokensOut,
+		"cached_tokens": cachedTokens,
+		"runs":          runs,
+	})
+}
+
 func (h *handlers) listToolEvents(w http.ResponseWriter, r *http.Request) {
 	evs, err := h.d.Runs.ToolEvents(r.Context(), r.PathValue("sid"), r.PathValue("rid"))
 	if err != nil {
