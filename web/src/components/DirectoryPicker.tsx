@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { AlertTriangle, ChevronRight, Folder, HardDrive, Loader2, RefreshCw } from 'lucide-react'
 import { Button, Modal, cn } from './ui'
 import {
-  breadcrumbs, listHostDirs, listHostRoots,
+  breadcrumbs, isRetryableFsError, listHostDirs, listHostRoots,
   type DirEntry, type DirListing, type HostID,
 } from '../lib/workspaceHost'
 
@@ -13,9 +13,11 @@ import {
  *  1. **只显示目录**，不显示任何文件 —— 这是目录选择器，不是文件浏览器；
  *  2. **只读**：无新建 / 重命名 / 删除入口；
  *  3. 只依赖 host 参数，server 宿主与 device 宿主在 UI 侧完全同形
- *     （L0 阶段 device 宿主由调用方置灰，不会打开本组件）；
- *  4. 出错必须明确区分「越界 / 不存在 / 宿主不支持 / 离线」，
- *     绝不静默展示空列表（那会让用户以为目录是空的）。
+ *     （L1 起 device 宿主经 fs.list 帧真实派发，不再由调用方置灰）；
+ *  4. 出错必须明确区分「越界 / 不存在 / 宿主不支持 / 超时 / 离线」，
+ *     绝不静默展示空列表（那会让用户以为目录是空的）；
+ *  5. 错误分档的判定权在服务端（`fs.host_timeout` 可重试 / `fs.host_unsupported`
+ *     不可重试），本组件**只负责按 code 展示对应出路**，不数次数、不做能力探测。
  */
 export function DirectoryPicker({
   open, host, initialPath, hostLabel, onClose, onPick,
@@ -32,8 +34,14 @@ export function DirectoryPicker({
   const [listing, setListing] = useState<DirListing | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<{ message: string; code: string } | null>(null)
+  /**
+   * 最近一次发起的请求目标 —— 供错误面板上的「重试一次」精确复现同一请求，
+   * 而不是重新载入根列表（用户明明是在某个子目录里超时的）。
+   */
+  const target = useRef<{ kind: 'roots' } | { kind: 'path'; path: string }>({ kind: 'roots' })
 
   const loadRoots = useCallback(async () => {
+    target.current = { kind: 'roots' }
     setLoading(true)
     setError(null)
     try {
@@ -47,6 +55,7 @@ export function DirectoryPicker({
   }, [host])
 
   const loadPath = useCallback(async (path: string) => {
+    target.current = { kind: 'path', path }
     setLoading(true)
     setError(null)
     try {
@@ -57,6 +66,13 @@ export function DirectoryPicker({
       setLoading(false)
     }
   }, [host])
+
+  /** 重试最近一次请求：错误面板上的「重试一次」只对可重试错误（超时）出现 */
+  const retry = useCallback(() => {
+    const t = target.current
+    if (t.kind === 'path') void loadPath(t.path)
+    else void loadRoots()
+  }, [loadPath, loadRoots])
 
   // 打开时定位：有初始路径则直接进入（可能越界 → 落回 roots），否则从根开始
   useEffect(() => {
@@ -154,23 +170,31 @@ export function DirectoryPicker({
               <AlertTriangle size={14} className="shrink-0 mt-0.5" />
               <div className="min-w-0">
                 <div>{error.message}</div>
-                {error.code === 'fs.path_denied' && (
-                  <div className="text-inkdim mt-1">
-                    该目录不在服务端可浏览的范围内（仅当服务端配置了
-                    <code className="mx-1 px-1 rounded bg-panel3 font-mono">workspace.fs_roots</code>
-                    限制时才会出现）。可改用左侧其它目录，或直接手动填写该路径。
+                <FsErrorHint code={error.code} />
+                {isRetryableFsError(error.code) && (
+                  <div className="mt-2">
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => retry()}
+                    >
+                      <RefreshCw size={11} className="mr-1" /> 重试一次
+                    </Button>
                   </div>
-                )}
-                {error.code === 'fs.host_unsupported' && (
-                  <div className="text-inkdim mt-1">该工作区暂不支持目录列举，请在输入框手动填写路径。</div>
                 )}
               </div>
             </div>
           )}
 
-          {!loading && !error && entries.length === 0 && (
-            <div className="px-3 py-6 text-[12px] text-inkfaint">
-              {current ? '该目录下没有子目录' : '没有可浏览的根目录'}
+          {!loading && !error && listing && entries.length === 0 && (
+            <div className="px-3 py-6 text-[12px] text-inkfaint leading-relaxed">
+              {current
+                ? '该目录下没有子目录'
+                : host.startsWith('device:')
+                  // 成功响应但 roots 与 dirs 都为空：不是故障，是端侧没配置根目录。
+                  // 只有 listing 存在（成功响应）+ 无错误 + 两个列表都空时才会走到这里。
+                  ? '该设备尚未设置工作区根目录，可在桌面端设置后重试。也可以直接手动填写路径。'
+                  : '服务端尚未配置可浏览的根目录（workspace.fs_roots），可直接手动填写路径。'}
             </div>
           )}
 
@@ -228,3 +252,60 @@ function toErr(e: unknown): { message: string; code: string } {
     code: anyErr?.code || 'http_error',
   }
 }
+
+/**
+ * 按服务端 `apperr` code 给出**有指导意义**的补充说明。
+ *
+ * 文案分工（2026-11 错误语义重构，判定权在服务端，本组件不数次数、不探测）：
+ *  - `fs.host_timeout`    端侧 3 秒无应答 —— **可重试一次**；持续超时则实为客户端
+ *                         未实现目录列举（服务端会在连续 ≥2 次超时后自己升级成
+ *                         `fs.host_unsupported`），故文案前置两条出路：重试 / 升级或手填；
+ *  - `fs.host_unsupported` 设备未申报能力或客户端未实现 —— **不可重试**；
+ *  - `fs.host_offline`    设备不在线 —— 等上线再重试；
+ *  - `fs.path_denied`     越界或无权限；
+ *  - `fs.path_not_found`  路径不存在或不是目录。
+ * 未识别的 code 不出补充说明（仅展示服务端 message），避免臆造。
+ */
+function FsErrorHint({ code }: { code: string }) {
+  if (code === 'fs.host_timeout') {
+    return (
+      <div className="text-inkdim mt-1">
+        设备响应超时。首次超时可能是设备繁忙，请重试一次；若持续超时，说明该客户端版本不支持目录列举，请升级桌面端或直接手动填写路径。
+      </div>
+    )
+  }
+  if (code === 'fs.host_unsupported') {
+    return (
+      <div className="text-inkdim mt-1">
+        该工作区暂不支持目录列举，请在输入框手动填写路径。
+        <br />
+        若这是桌面端工作区，通常是客户端版本过旧未实现目录列举能力，升级桌面端后重试即可（此错误重试无效，不必连点）。
+      </div>
+    )
+  }
+  if (code === 'fs.host_offline') {
+    return (
+      <div className="text-inkdim mt-1">
+        该工作区绑定的设备当前不在线，无法列举其目录。请先启动并连接桌面端，待其上线后再刷新；也可以直接手动填写路径。
+      </div>
+    )
+  }
+  if (code === 'fs.path_denied') {
+    return (
+      <div className="text-inkdim mt-1">
+        该目录不在服务端可浏览的范围内（仅当服务端配置了
+        <code className="mx-1 px-1 rounded bg-panel3 font-mono">workspace.fs_roots</code>
+        限制时才会出现）。可改用左侧其它目录，或直接手动填写该路径。
+      </div>
+    )
+  }
+  if (code === 'fs.path_not_found') {
+    return (
+      <div className="text-inkdim mt-1">
+        该路径不存在，或者它不是一个目录（比如指向了文件）。可在上方面包屑回退到上一级，或直接手动填写正确的路径。
+      </div>
+    )
+  }
+  return null
+}
+

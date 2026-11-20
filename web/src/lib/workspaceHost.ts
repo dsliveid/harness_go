@@ -10,11 +10,34 @@ import type { Workspace } from '../types'
  *  - host = "server"（服务端本地） | "device:<id>"（某个在线客户端）；
  *  - 前端目录选择器只依赖本抽象，因此**浏览器端与客户端走同一条流程**。
  *
- * 当前进度（L0）：仅 server 宿主可用；device 宿主由服务端统一回
- * `fs.host_unsupported`，UI 据此置灰并保留手填退路。
+ * 当前进度（L1）：server 宿主本地列举 + device 宿主经 `fs.list` 帧派发。
+ * 设备侧能力不再由前端猜测，而是由服务端给出**确定性**结论：
+ *  - `fs.host_timeout`：端侧 3 秒无应答，**可重试**（可能只是设备繁忙）；
+ *  - `fs.host_unsupported`：端侧未申报能力 / 未实现目录列举，**不可重试**。
+ * UI 只需按 code 分档提示，退路始终保留「手动填写路径」。
  */
 
 export type HostID = 'server' | `device:${string}`
+
+/**
+ * 目录列举相关错误码（服务端 `apperr` 的字符串 code，原样透传到前端）。
+ *
+ * 🚨 分档责任在服务端，前端**不做**次数统计与启发式探测：
+ * 服务端对同一设备「首次超时」回 `fs.host_timeout`，「连续 ≥2 次超时且从未收到
+ * 端侧任何应答」才升级为 `fs.host_unsupported`（见 internal/api/fs_handler.go
+ * 与 internal/device/pathquery.go 的 classifyPathQueryFailure）。
+ */
+export type FsErrorCode =
+  | 'fs.host_offline'
+  | 'fs.host_timeout'
+  | 'fs.host_unsupported'
+  | 'fs.path_denied'
+  | 'fs.path_not_found'
+
+/** 该错误码是否值得用户再点一次「重试」（仅超时首次档） */
+export function isRetryableFsError(code: string): boolean {
+  return code === 'fs.host_timeout'
+}
 
 /** 一个目录项（只含目录名与宿主本地绝对路径，不含任何文件元数据） */
 export interface DirEntry {
@@ -93,10 +116,18 @@ export function hostOfWorkspace(ws: Workspace | undefined | null): HostID {
  *  - `server` 内置空间：服务端本地列举（L0）。
  *
  * ⚠️ 为什么不在此处探测设备是否真的申报了能力：
- * 前端无法在渲染期同步得知（要额外打请求且结果会随设备重连抖动）。这里按 kind
- * 给出**保守但可用**的判断，真正的能力闸门是服务端的 `fsDispatchDevice`
- * ——未申报能力的设备（例如还没升级的旧桌面端）会被它拦成 `fs.host_unsupported`，
- * 前端再把该错误如实展示即可。
+ * 前端无法在渲染期同步得知（要额外打请求且结果会随设备重连抖动，而设备重连后
+ * 能力也可能变化）。所以这里按 kind 给出**保守但可用**的判断，**不做任何探测、
+ * 不发任何额外请求** —— 真正的能力闸门是服务端的 `fsDispatchDevice`。
+ *
+ * 服务端现在能给出**确定性答案**，前端只需分档展示（2026-11 错误语义重构）：
+ *  - `fs.host_timeout`：端侧 3 秒无应答 → **可重试一次**（可能只是设备繁忙）。
+ *    若服务端已连续 ≥2 次超时且从未收到端侧任何应答，会升级为下面的 unsupported，
+ *    因此用户不会陷入「无限重试」；
+ *  - `fs.host_unsupported`：端侧未申报能力 / 客户端未实现目录列举 → **不可重试**，
+ *    必须升级客户端或手动填写路径；
+ *  - `fs.host_offline`：设备不在线 → 等待上线后重试。
+ * 「重试 vs 升级客户端」的判定权完全在服务端，前端**不数次数、不做启发式探测**。
  */
 export function hostStatus(ws: Workspace | undefined | null): HostStatus {
   const id = hostOfWorkspace(ws)
