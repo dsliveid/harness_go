@@ -9,10 +9,13 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"harness-go/internal/apperr"
+	"harness-go/internal/device"
 	"harness-go/internal/model"
 	"harness-go/internal/observ"
 )
@@ -292,5 +295,169 @@ func TestFSRootLabel(t *testing.T) {
 		if got := fsRootLabel(root); got != vol {
 			t.Fatalf("盘符根 %q 显示名应为 %q，得到 %q", root, vol, got)
 		}
+	}
+}
+
+// ============ 能力协商 TTL 缓存 ============
+
+// fakeCapHub 恒在线的 Hub 桩（缓存用例不关心真实连接）。
+type fakeCapHub struct{ online bool }
+
+func (h *fakeCapHub) Online(string) bool { return h.online }
+
+// newCapCountingHandlers 造一个带「计数端口」的 handlers。
+//
+// 端口每被调用一次就 +1，从而可以精确断言「第二次是否打端口」。
+//
+// PathQuery 必须非 nil：fsDispatchDevice 的第一道判定是「设备域是否启用」，
+// pq 为 nil 会提前返回，永远走不到能力协商（那样这些用例就成了空断言）。
+// 这里用 device.NewPathQuery(nil, nil)：设备域装配了但 hub 未启用的最小形态，
+// 足以让流程抵达能力协商，并让后续 List 明确报错。
+func newCapCountingHandlers(caps []model.Capability) (*handlers, *int32) {
+	var calls int32
+	logger := observ.NewLogger("error", "text", io.Discard)
+	h := &handlers{d: Deps{
+		Version:   "test",
+		Log:       logger,
+		Hub:       &fakeCapHub{online: true},
+		PathQuery: device.NewPathQuery(nil, nil),
+		DeviceCapabilities: func(_ context.Context, _ string) ([]model.Capability, error) {
+			calls++
+			return caps, nil
+		},
+	}}
+	return h, &calls
+}
+
+// TestCapabilityCacheHits 第二次（30s 内）必须命中缓存、不再打端口。
+func TestCapabilityCacheHits(t *testing.T) {
+	want := []model.Capability{{Name: "workspace.list", Version: "1"}}
+	h, calls := newCapCountingHandlers(want)
+	h.capsCache.reset()
+
+	for i := 1; i <= 3; i++ {
+		got, err := h.deviceCapabilitiesCached(context.Background(), "dev-1")
+		if err != nil {
+			t.Fatalf("第 %d 次查询报错: %v", i, err)
+		}
+		if len(got) != 1 || got[0].Name != "workspace.list" {
+			t.Fatalf("第 %d 次查询结果不符: %+v", i, got)
+		}
+		if *calls != 1 {
+			t.Fatalf("第 %d 次查询后端口应只被打过 1 次，实际 %d（缓存未生效）", i, *calls)
+		}
+	}
+	if hits, misses := h.capsCache.stats(); hits != 2 || misses != 1 {
+		t.Fatalf("期望 2 命中 / 1 未命中，得到 %d/%d", hits, misses)
+	}
+
+	// 不同设备必须各自打端口（键必须含 deviceID，否则会跨设备串台）。
+	if _, err := h.deviceCapabilitiesCached(context.Background(), "dev-2"); err != nil {
+		t.Fatalf("另一台设备查询报错: %v", err)
+	}
+	if *calls != 2 {
+		t.Fatalf("不同设备必须重新查端口，实际调用 %d 次", *calls)
+	}
+}
+
+// TestCapabilityCacheTTLExpiry TTL 过期后必须失效并重新打端口。
+func TestCapabilityCacheTTLExpiry(t *testing.T) {
+	h, calls := newCapCountingHandlers(nil)
+	h.capsCache.reset()
+	// 注入极短 TTL（不 sleep 30 秒，也避免为测试改动生产常量）。
+	h.capsCache.ttl = 20 * time.Millisecond
+
+	if _, err := h.deviceCapabilitiesCached(context.Background(), "dev-1"); err != nil {
+		t.Fatalf("首次查询报错: %v", err)
+	}
+	if *calls != 1 {
+		t.Fatalf("首次查询应打端口，实际 %d", *calls)
+	}
+	// TTL 内命中
+	if _, err := h.deviceCapabilitiesCached(context.Background(), "dev-1"); err != nil {
+		t.Fatalf("第二次查询报错: %v", err)
+	}
+	if *calls != 1 {
+		t.Fatalf("TTL 内应命中缓存，实际端口调用 %d 次", *calls)
+	}
+	// 过期后必须重新查
+	time.Sleep(40 * time.Millisecond)
+	if _, err := h.deviceCapabilitiesCached(context.Background(), "dev-1"); err != nil {
+		t.Fatalf("过期后查询报错: %v", err)
+	}
+	if *calls != 2 {
+		t.Fatalf("TTL 过期后必须重新查端口，实际 %d 次", *calls)
+	}
+}
+
+// TestCapabilityCacheKeepsErrorSemantics 缓存不得改变判定结果：
+//   - 未申报能力 → 仍然 fs.host_unsupported（且命中缓存时同样如此）；
+//   - 端口报错时不写缓存（避免把瞬时故障冻结 30 秒）。
+func TestCapabilityCacheKeepsErrorSemantics(t *testing.T) {
+	t.Run("未申报能力时命中缓存仍拒派发", func(t *testing.T) {
+		h, calls := newCapCountingHandlers(nil) // 无 workspace.list
+		h.capsCache.reset()
+		for i := 1; i <= 2; i++ {
+			_, err := h.fsDispatchDevice(context.Background(), "dev-1", "")
+			if err == nil {
+				t.Fatalf("第 %d 次：未申报能力必须拒派发", i)
+			}
+			ae, ok := err.(*apperr.Error)
+			if !ok || ae.Code != apperr.CodeFSHostUnsupported {
+				t.Fatalf("第 %d 次：应为 fs.host_unsupported，得到 %v", i, err)
+			}
+		}
+		if *calls != 1 {
+			t.Fatalf("两次派发应只查端口 1 次，实际 %d", *calls)
+		}
+	})
+
+	t.Run("端口报错不写缓存", func(t *testing.T) {
+		var calls int32
+		h := &handlers{d: Deps{
+			Version:   "test",
+			Log:       observ.NewLogger("error", "text", io.Discard),
+			Hub:       &fakeCapHub{online: true},
+			PathQuery: device.NewPathQuery(nil, nil),
+			DeviceCapabilities: func(_ context.Context, _ string) ([]model.Capability, error) {
+				calls++
+				if calls == 1 {
+					return nil, apperr.New(apperr.CodeInternal, "库抖动")
+				}
+				return []model.Capability{{Name: "workspace.list"}}, nil
+			},
+		}}
+		h.capsCache.reset()
+
+		// 第一次端口报错：不阻断派发（capErr 被忽略），也不得写缓存。
+		if _, err := h.fsDispatchDevice(context.Background(), "dev-1", ""); err == nil {
+			// 走到 PathQuery（未装配）→ fs.host_unsupported，属预期。
+		} else if ae, ok := err.(*apperr.Error); !ok || ae.Code != apperr.CodeFSHostUnsupported {
+			t.Fatalf("能力查询失败不应改变错误语义，得到 %v", err)
+		}
+		// 第二次必须重新查端口（否则瞬时故障被冻结）。
+		if _, err := h.fsDispatchDevice(context.Background(), "dev-1", ""); err == nil {
+			t.Fatal("PathQuery 未装配必须明确报错")
+		} else if ae, ok := err.(*apperr.Error); !ok || ae.Code != apperr.CodeFSHostUnsupported {
+			t.Fatalf("应为 fs.host_unsupported，得到 %v", err)
+		}
+		if calls != 2 {
+			t.Fatalf("端口报错不得写缓存，第二次必须重查，实际调用 %d 次", calls)
+		}
+	})
+}
+
+// TestCapabilityCacheBounds 容量上限必须生效（避免长期运行无界增长）。
+func TestCapabilityCacheBounds(t *testing.T) {
+	var c capabilityCache
+	now := time.Now()
+	for i := 0; i < capabilityCacheMaxEntries+50; i++ {
+		c.put("dev-"+strconv.Itoa(i), []model.Capability{{Name: "workspace.list"}}, now)
+	}
+	c.mu.Lock()
+	n := len(c.entries)
+	c.mu.Unlock()
+	if n > capabilityCacheMaxEntries {
+		t.Fatalf("容量上限失效：条目数 %d 超过 %d", n, capabilityCacheMaxEntries)
 	}
 }

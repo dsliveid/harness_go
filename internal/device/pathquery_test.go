@@ -1,7 +1,12 @@
 package device
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -36,8 +41,8 @@ func (c *pathQueryConn) Send(env Envelope) error {
 	return nil
 }
 func (c *pathQueryConn) CloseWith(string, string) {}
-func (c *pathQueryConn) LastSeen() time.Time  { return time.Now() }
-func (c *pathQueryConn) RemoteAddr() string   { return "test" }
+func (c *pathQueryConn) LastSeen() time.Time      { return time.Now() }
+func (c *pathQueryConn) RemoteAddr() string       { return "test" }
 
 // newPathQueryEnv 造一个带假连接的 Hub。
 func newPathQueryEnv(t *testing.T, deviceID string) (*PathQuery, *pathQueryConn, *Hub) {
@@ -260,6 +265,165 @@ func TestPathQueryEmptyPathRequestsRoots(t *testing.T) {
 		t.Fatal("未定位时必须请求 roots")
 	}
 	q.Deliver(env.ID, FsListResultPayload{Separator: `/`})
+}
+
+// ⑩ 转仓契约 fixture：internal/device/testdata/fs_list.json 必须能解码为本包帧类型。
+//
+// 🚨 **双仓同步约定**：testdata/fs_list.json 与 testdata/fs_list_result.json 是
+// harness_go 与 harness_desktop（crates/hd-protocol/fixtures/）**共用的契约样本**，
+// 由服务端 Go 与桌面端 Rust 各自解码同一份字节。任何一侧改动必须双仓同步，
+// 否则两端会出现「自己都能过测试但互相听不懂」的分叉（这正是 fs.list 事故的土壤）。
+// 服务端侧只允许用 Copy-Item 逐字节复制，**禁止**在此手工编辑。
+func TestFsListFixtureContract(t *testing.T) {
+	raw := readFixture(t, "fs_list.json")
+
+	var env Envelope
+	if err := decodeJSONStrict(raw, &env); err != nil {
+		t.Fatalf("fs_list.json 必须能解码为 Envelope: %v", err)
+	}
+	if env.Type != MsgFsList {
+		t.Fatalf("type 应为 %q，得到 %q", MsgFsList, env.Type)
+	}
+	if !env.Type.Valid() {
+		t.Fatal("fs.list 必须是已知帧类型（否则端侧会归为 Unknown 静默丢弃）")
+	}
+	if env.Type.IsTaskFrame() {
+		t.Fatal("fs.list 不得属于任务帧族（否则会走 dispatcher 产生 tool_event）")
+	}
+	if env.ID != "fsq-1704067200000000000-1" {
+		t.Fatalf("id 应逐字保留，得到 %q", env.ID)
+	}
+	if env.V != 1 {
+		t.Fatalf("v 应为 1，得到 %d", env.V)
+	}
+	var p FsListPayload
+	if err := env.Decode(&p); err != nil {
+		t.Fatalf("payload 解码失败: %v", err)
+	}
+	if p.Path != "" {
+		t.Fatalf("fixture 为「未定位」请求，path 应为空串，得到 %q", p.Path)
+	}
+	if !p.WithRoots {
+		t.Fatal("未定位请求必须 with_roots=true")
+	}
+}
+
+// ⑪ 转仓契约 fixture：fs.list.result 关键字段必须逐字对齐（字段名拼错即在此爆红）。
+func TestFsListResultFixtureContract(t *testing.T) {
+	raw := readFixture(t, "fs_list_result.json")
+
+	var env Envelope
+	if err := decodeJSONStrict(raw, &env); err != nil {
+		t.Fatalf("fs_list_result.json 必须能解码为 Envelope: %v", err)
+	}
+	if env.Type != MsgFsListResult {
+		t.Fatalf("type 应为 %q，得到 %q", MsgFsListResult, env.Type)
+	}
+	var p FsListResultPayload
+	if err := env.Decode(&p); err != nil {
+		t.Fatalf("payload 解码失败: %v", err)
+	}
+	if p.Path != `C:\Users\me\work` {
+		t.Fatalf("path 应逐字对齐，得到 %q", p.Path)
+	}
+	if p.Parent == nil || *p.Parent != `C:\Users\me` {
+		t.Fatalf("parent 应逐字对齐，得到 %v", p.Parent)
+	}
+	if p.Separator != `\` {
+		t.Fatalf("separator 应为反斜杠，得到 %q", p.Separator)
+	}
+	if len(p.Roots) != 2 || p.Roots[0].Name != "work" || p.Roots[1].Path != `C:\Users\me\tmp` {
+		t.Fatalf("roots 应逐字对齐，得到 %+v", p.Roots)
+	}
+	if len(p.Dirs) != 2 || p.Dirs[0].Name != "Proj" || p.Dirs[1].Path != `C:\Users\me\work\Docs` {
+		t.Fatalf("dirs 应逐字对齐，得到 %+v", p.Dirs)
+	}
+	if p.Truncated {
+		t.Fatal("truncated 应为 false")
+	}
+	if p.Error != "" || p.Code != "" {
+		t.Fatalf("成功样本不得携带 error/code，得到 %q/%q", p.Error, p.Code)
+	}
+}
+
+// ⑫ 端侧回带 error + code 的应答帧（走真实 JSON 解码路径）→ 必须如实映射，
+// **不得**降级成空列表（否则用户会以为那台机器上这个目录是空的）。
+func TestPathQueryDeviceErrorFrameMapping(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want apperr.Code
+	}{
+		{
+			name: "path_denied",
+			body: `{"v":1,"type":"fs.list.result","id":"r1","payload":{"path":"","parent":null,` +
+				`"separator":"\\","dirs":[],"error":"该路径不在白名单内","code":"path_denied"}}`,
+			want: apperr.CodeFSPathDenied,
+		},
+		{
+			name: "path_not_found",
+			body: `{"v":1,"type":"fs.list.result","id":"r2","payload":{"path":"","parent":null,` +
+				`"separator":"\\","dirs":[],"error":"目录不存在","code":"path_not_found"}}`,
+			want: apperr.CodeFSPathNotFound,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var env Envelope
+			if err := decodeJSONStrict([]byte(tc.body), &env); err != nil {
+				t.Fatalf("帧解码失败: %v", err)
+			}
+			if env.Type != MsgFsListResult {
+				t.Fatalf("type 应为 fs.list.result，得到 %q", env.Type)
+			}
+			var payload FsListResultPayload
+			if err := env.Decode(&payload); err != nil {
+				t.Fatalf("payload 解码失败: %v", err)
+			}
+
+			q, c, _ := newPathQueryEnv(t, "dev-1")
+			errCh := make(chan error, 1)
+			go func() {
+				_, err := q.List(context.Background(), "dev-1", `D:\x`)
+				errCh <- err
+			}()
+			// 等请求帧写出，再用 fixture 同形的应答投递（reqID 必须配对）。
+			for i := 0; i < 200 && len(c.sent) == 0; i++ {
+				time.Sleep(5 * time.Millisecond)
+			}
+			q.Deliver(c.sent[0].ID, payload)
+			err := <-errCh
+			if err == nil {
+				t.Fatal("端侧拒绝必须转成错误，不得返回空列表")
+			}
+			if code := errCode(err); code != tc.want {
+				t.Fatalf("应为 %s，得到 %s", tc.want, code)
+			}
+		})
+	}
+}
+
+// readFixture 读取 testdata 下的契约样本（缺失即失败，绝不静默跳过）。
+func readFixture(t *testing.T, name string) []byte {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("testdata", name))
+	if err != nil {
+		t.Fatalf("读取契约样本 %s 失败（双仓同步约定要求该文件必须存在）: %v", name, err)
+	}
+	return raw
+}
+
+// decodeJSONStrict 严格 JSON 解码（禁止未知字段，字段名漂移即报错）。
+func decodeJSONStrict(raw []byte, v any) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	if dec.More() {
+		return errors.New("样本中存在多余 JSON 值")
+	}
+	return nil
 }
 
 // errCode 从错误中取 apperr 码。

@@ -101,6 +101,9 @@ type handlers struct {
 	// webviewTickets WebView 免登一次性 ticket 内存表（协议 §6.2）。
 	// 不落库：重启即失效可接受；无独立 GC 协程，签发时顺手清理过期项。
 	webviewTickets *webviewTicketStore
+	// capsCache 设备能力协商的 TTL 缓存（见 capability_cache.go）。
+	// 只加速对齐，**不承担安全判定**：能否列目录最终由端侧 Policy 白名单决定。
+	capsCache capabilityCache
 }
 
 // ============ 会话 ============

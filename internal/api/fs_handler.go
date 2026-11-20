@@ -279,7 +279,12 @@ func fsCheckHost(host string) (resolvedHost, deviceID string, err error) {
 //  1. 设备域是否启用（PathQuery 未装配 → 405/409，诚实报错）；
 //  2. 设备是否在线（Hub 实时判定，不用库里的 status，避免陈旧状态骗人）；
 //  3. 设备是否申报 `fs.list` 能力（协议坑 1：在线 ≠ 有列举能力，直接派发会超时）；
-//  4. 派发并等 3s 应答（超时 → fs.host_timeout）。
+//  4. 派发并等 3s 应答。
+//
+// ⚠️ 第 4 道失败时的错误码**不在这里判定**：超时是「临时慢」还是「端侧根本没实现
+// fs.list（帧被 serde 归为 Unknown 静默丢弃）」必须靠 device.PathQuery 的失败快照
+// 归类（fs.host_timeout 可重试 / fs.host_unsupported 不可重试），判据集中在
+// pathquery.go:classifyPathQueryFailure 一处，本函数只原样透出。
 func (h *handlers) fsDispatchDevice(ctx context.Context, deviceID, path string) (*fsDirsResp, error) {
 	pq := h.d.PathQuery
 	if pq == nil {
@@ -291,8 +296,11 @@ func (h *handlers) fsDispatchDevice(ctx context.Context, deviceID, path string) 
 			"该设备当前不在线，无法列举其目录").WithDetails(map[string]any{"device_id": deviceID})
 	}
 	// 能力协商：未申报 workspace.list 的设备（例如还没升级的旧客户端）不能派发。
+	//
+	// 走 capsCache（30s TTL）而不是直连端口：目录浏览是高频轻操作，每次查库纯属浪费。
+	// 缓存只加速对齐，不承担安全判定 —— 能否列目录最终由端侧 Policy 白名单决定。
 	if h.d.DeviceCapabilities != nil {
-		caps, capErr := h.d.DeviceCapabilities(ctx, deviceID)
+		caps, capErr := h.deviceCapabilitiesCached(ctx, deviceID)
 		if capErr == nil && !hasFsListCapability(caps) {
 			return nil, apperr.New(apperr.CodeFSHostUnsupported,
 				"该设备未申报目录列举能力（workspace.list），请升级客户端或手动填写路径").

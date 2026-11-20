@@ -57,6 +57,7 @@ type runnerConfig struct {
 	heartbeat  time.Duration
 	taskDelay  time.Duration
 	failTools  string
+	fsRoots    string
 	once       bool
 	maxRetries int
 }
@@ -86,13 +87,21 @@ func main() {
 	flag.StringVar(&cfg.name, "name", "假 Runner", "设备名称（配对时上报）")
 	flag.StringVar(&cfg.kind, "kind", "desktop", "设备形态：desktop|tablet|mobile|cli|browser")
 	flag.StringVar(&cfg.platform, "platform", "", "平台标识（默认 runtime.GOOS）")
-	flag.StringVar(&cfg.caps, "caps", "fs.read,fs.write,run_command", "能力项（逗号分隔，可带 @版本）")
+	flag.StringVar(&cfg.caps, "caps", "fs.read,fs.write,run_command,workspace.list", "能力项（逗号分隔，可带 @版本）")
 	flag.DurationVar(&cfg.heartbeat, "heartbeat", 15*time.Second, "心跳间隔（welcome 未下发时的兜底）")
 	flag.DurationVar(&cfg.taskDelay, "task-delay", 200*time.Millisecond, "模拟单任务执行耗时")
 	flag.StringVar(&cfg.failTools, "fail-tools", "", "指定工具名一律返回失败（逗号分隔，便于验证失败路径）")
+	flag.StringVar(&cfg.fsRoots, "fs-roots", "", "目录列举白名单根（逗号分隔；默认为当前工作目录）")
 	flag.BoolVar(&cfg.once, "once", false, "完成 1 个任务后退出（脚本验收用）")
 	flag.IntVar(&cfg.maxRetries, "max-retries", 5, "断线重连次数上限（<0 表示无限重连）")
 	flag.Parse()
+
+	if cfg.fsRoots == "" {
+		// 默认用 cwd：既能让服务端链路端到端验证，又不会把整机文件系统随意暴露出去。
+		if wd, wErr := os.Getwd(); wErr == nil {
+			cfg.fsRoots = wd
+		}
+	}
 
 	cfg.server = strings.TrimRight(strings.TrimSpace(cfg.server), "/")
 	if cfg.server == "" {
@@ -333,6 +342,22 @@ func (r *fakeRunner) session(ctx context.Context) error {
 			}
 			go r.handleTask(sessCtx, writeFrame, dp)
 
+		case device.MsgFsList:
+			// 目录列举（L1）：最小实现，只列目录、不读文件内容。
+			// 目的：让服务端链路（API → PathQuery → 帧 → 应答 → DTO）在没有桌面端
+			// 参与时也能在本仓端到端验证 —— 此前 fs.list 无人应答，只能等满 3 秒超时。
+			var fp device.FsListPayload
+			if dErr := env.Decode(&fp); dErr != nil {
+				r.log("fs.list 负载非法：%v", dErr)
+				continue
+			}
+			// 回帧必须同步由本协程写出（不另起 goroutine）：列举极轻，
+			// 且帧 ID 必须逐字回传请求的 id，否则服务端 reqID 配不上只能超时。
+			resp := device.MustEnvelope(device.MsgFsListResult, env.ID, r.fsList(fp))
+			if wErr := writeFrame(resp); wErr != nil {
+				r.log("fs.list.result 发送失败：%v", wErr)
+			}
+
 		case device.MsgError:
 			var ep device.ErrorPayload
 			_ = env.Decode(&ep)
@@ -428,6 +453,132 @@ func (r *fakeRunner) handleTask(ctx context.Context, writeFrame func(device.Enve
 
 // exitCodeOK 单任务模式正常退出码。
 const exitCodeOK = 0
+
+// fsList 最小目录列举实现（应答 fs.list）。
+//
+// ## 必须守住的四条契约（对齐 docs/工作区宿主与目录选择对接约定.md §3.3）
+//
+//  1. **separator 用宿主真实分隔符**（filepath.Separator）：前端据此切面包屑，
+//     猜错平台会让路径被错误切分；
+//  2. **parent 到根层必须是 nil**，绝不返回 ".."（前端会把它当可点入口，
+//     一旦点了就跑到白名单之外）；
+//  3. **dirs 只含目录**，绝不读文件内容（这是目录选择器，不是文件浏览器）；
+//  4. **只列白名单根之内**：越界一律回 code=path_denied，不存在回 path_not_found，
+//     与真实端侧的错误语义保持一致，从而服务端的 translate 分支也能被真实覆盖。
+//
+// 另外 with_roots 为真时（服务端 path 传空串 = 未定位）回 roots 让用户从根开始浏览。
+func (r *fakeRunner) fsList(p device.FsListPayload) device.FsListResultPayload {
+	roots := r.fsRootPaths()
+	sep := string(filepath.Separator)
+	res := device.FsListResultPayload{Separator: sep, Path: ""}
+	if p.WithRoots || strings.TrimSpace(p.Path) == "" {
+		res.Roots = fsEntriesOf(roots)
+		res.Dirs = []device.FsDirEntry{}
+		return res
+	}
+
+	target := filepath.Clean(strings.TrimSpace(p.Path))
+	if !fsWithinAnyRoot(target, roots) {
+		// 越界：如实回错，绝不降级成空列表（否则用户以为目录是空的）。
+		res.Error = "路径不在允许列举的白名单内"
+		res.Code = "path_denied"
+		return res
+	}
+	entries, err := os.ReadDir(target)
+	if err != nil {
+		res.Error = "目录不存在或不可读"
+		res.Code = "path_not_found"
+		return res
+	}
+
+	res.Path = target
+	dirs := make([]device.FsDirEntry, 0, len(entries))
+	for _, e := range entries {
+		// 只收目录：e.IsDir() 对符号链接恒为 false（不跟随），
+		// 因此软链不会泄漏到目录列表里（与服务端 L0 的 fsListSubdirs 口径一致）。
+		if !e.IsDir() {
+			continue
+		}
+		dirs = append(dirs, device.FsDirEntry{Name: e.Name(), Path: filepath.Join(target, e.Name())})
+	}
+	sort.Slice(dirs, func(i, j int) bool {
+		return strings.ToLower(dirs[i].Name) < strings.ToLower(dirs[j].Name)
+	})
+	// 上限与端侧 fsMaxDirs 对齐（500），超出即截断并标记。
+	if len(dirs) > fsListMaxDirs {
+		dirs = dirs[:fsListMaxDirs]
+		res.Truncated = true
+	}
+	res.Dirs = dirs
+	// parent 计算：已到白名单根时返回 nil，且上级必须仍在白名单内才给出。
+	for _, root := range roots {
+		if filepath.Clean(root) == target {
+			res.Parent = nil
+			return res
+		}
+	}
+	up := filepath.Dir(target)
+	if up != target && fsWithinAnyRoot(up, roots) {
+		res.Parent = &up
+	}
+	return res
+}
+
+// fsListMaxDirs 单次列举返回的目录上限（与桌面端 hd-core 的 FS_MAX_DIRS 一致）。
+const fsListMaxDirs = 500
+
+// fsRootPaths 解析 -fs-roots 为白名单根（均已 Clean + Abs 化）。
+func (r *fakeRunner) fsRootPaths() []string {
+	var out []string
+	seen := make(map[string]struct{})
+	for _, raw := range strings.Split(r.cfg.fsRoots, ",") {
+		p := strings.TrimSpace(raw)
+		if p == "" {
+			continue
+		}
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			continue
+		}
+		abs = filepath.Clean(abs)
+		if _, ok := seen[abs]; ok {
+			continue
+		}
+		seen[abs] = struct{}{}
+		out = append(out, abs)
+	}
+	return out
+}
+
+// fsEntriesOf 把路径列表转成目录项（显示名取末级名，盘符根取 "C:"）。
+func fsEntriesOf(paths []string) []device.FsDirEntry {
+	out := make([]device.FsDirEntry, 0, len(paths))
+	for _, p := range paths {
+		name := filepath.Base(p)
+		if name == "" || name == "." || name == string(filepath.Separator) {
+			name = filepath.VolumeName(p)
+			if name == "" {
+				name = p
+			}
+		}
+		out = append(out, device.FsDirEntry{Name: name, Path: p})
+	}
+	return out
+}
+
+// fsWithinAnyRoot 判断路径是否在任一白名单根内（大小写敏感按平台原生语义）。
+func fsWithinAnyRoot(target string, roots []string) bool {
+	for _, root := range roots {
+		rel, err := filepath.Rel(root, target)
+		if err != nil {
+			continue
+		}
+		if rel == "." || (!strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel)) {
+			return true
+		}
+	}
+	return false
+}
 
 // buildResult 构造端侧结果负载（假执行：原样回显工具名与参数）。
 func (r *fakeRunner) buildResult(p device.TaskDispatchPayload) device.TaskResultPayload {
